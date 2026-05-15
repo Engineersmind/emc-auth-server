@@ -1,6 +1,12 @@
 # Binaries
 emc-auth-server
+emc-auth-server~
 *.exe
+*.exe~
+
+# Logs
+*.log
+server*.log
 
 # Environment
 .env
