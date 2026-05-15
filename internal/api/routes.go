@@ -1,6 +1,8 @@
 package api
 
 import (
+	"net/http"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	echoMiddleware "github.com/labstack/echo/v4/middleware"
@@ -53,14 +55,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup := apiV1.Group("/auth")
 	authGroup.POST("/register", authHandler.Register)
 	authGroup.POST("/login", authHandler.Login)
+	authGroup.POST("/refresh", authHandler.Refresh)
+	authGroup.POST("/logout", authHandler.Logout)
 
-	// Auth routes — protected (JWTRequired middleware added in Plan 02-02)
-	// For now, /me is wired WITHOUT middleware so it compiles; Plan 02-02 adds JWTRequired.
-	authGroup.GET("/me", authHandler.Me)
+	// Auth routes — protected by JWTRequired (AUTH-09)
+	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
 
-	// Plan 02-02 will add:
-	//   authGroup.POST("/refresh", authHandler.Refresh)
-	//   authGroup.POST("/logout", authHandler.Logout)
+	// Canary route: demonstrates RequirePermission middleware (AUTH-10 / SC-4).
+	// A JWT without "admin:access" in permissions[] gets 403 — verifies SC-4.
+	// A JWT with "admin:access" gets 200 {"status":"admin ping ok"}.
+	adminGroup := apiV1.Group("/admin")
+	adminGroup.GET("/ping", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "admin ping ok"})
+	}, mw.JWTRequired(jwtSvc), mw.RequirePermission("admin:access"))
+
 	// Plan 02-04 will add:
 	//   authGroup.POST("/forgot-password", authHandler.ForgotPassword)
 	//   authGroup.POST("/reset-password", authHandler.ResetPassword)

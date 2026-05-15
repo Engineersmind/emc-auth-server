@@ -268,3 +268,88 @@ func (s *AuthService) Me(claims *Claims) *MeResult {
 		Permissions: claims.Permissions,
 	}
 }
+
+// ErrInvalidRefreshToken is returned when a refresh token is invalid, expired, or already used.
+var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
+
+// Refresh rotates a refresh token pair (AUTH-03).
+//
+// Algorithm:
+//  1. Hash the raw incoming refresh token.
+//  2. Look up the hash in refresh_tokens WHERE revoked_at IS NULL AND expires_at > NOW().
+//     - Not found → return ErrInvalidRefreshToken (401).
+//     - Found but revoked → return ErrInvalidRefreshToken (401). Replay attack blocked.
+//  3. Mark old token revoked (SET revoked_at = NOW()).
+//  4. Load user + role + permissions from DB.
+//  5. Issue new access token + new refresh token (persisted).
+//  6. Return new AuthResult.
+//
+// This is atomic: the old token is revoked BEFORE the new one is issued.
+// If step 5 fails, the old token is already revoked — user must log in again.
+func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*AuthResult, error) {
+	hash := HashToken(rawRefreshToken)
+
+	// Look up token — must be active (revoked_at IS NULL) and not expired.
+	var tokenID, userID, tenantID uuid.UUID
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, user_id, tenant_id
+		FROM refresh_tokens
+		WHERE token_hash = $1
+		  AND revoked_at IS NULL
+		  AND expires_at > NOW()
+	`, hash).Scan(&tokenID, &userID, &tenantID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrInvalidRefreshToken
+		}
+		return nil, fmt.Errorf("lookup refresh token: %w", err)
+	}
+
+	// Revoke the old token immediately.
+	_, err = s.pool.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1
+	`, tokenID)
+	if err != nil {
+		return nil, fmt.Errorf("revoke old refresh token: %w", err)
+	}
+
+	// Load user details for the new JWT.
+	var email, roleName string
+	var roleID *uuid.UUID
+	err = s.pool.QueryRow(ctx, `
+		SELECT u.email, COALESCE(r.name, ''), u.role_id
+		FROM users u
+		LEFT JOIN roles r ON r.id = u.role_id
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.is_deleted = false
+	`, userID, tenantID).Scan(&email, &roleName, &roleID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("user not found or inactive")
+		}
+		return nil, fmt.Errorf("fetch user for refresh: %w", err)
+	}
+
+	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions, continuing with empty set")
+		perms = []string{}
+	}
+
+	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms)
+}
+
+// Logout revokes a refresh token (AUTH-04).
+// The raw refresh token is hashed and the matching DB row is marked revoked.
+// If the token is already revoked or not found, Logout returns nil (idempotent).
+func (s *AuthService) Logout(ctx context.Context, rawRefreshToken string) error {
+	hash := HashToken(rawRefreshToken)
+	_, err := s.pool.Exec(ctx, `
+		UPDATE refresh_tokens
+		SET revoked_at = NOW()
+		WHERE token_hash = $1 AND revoked_at IS NULL
+	`, hash)
+	if err != nil {
+		return fmt.Errorf("revoke refresh token on logout: %w", err)
+	}
+	return nil
+}

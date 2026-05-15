@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -140,6 +141,64 @@ func (h *AuthHandler) Me(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
 	return c.JSON(http.StatusOK, h.svc.Me(claims))
+}
+
+// RefreshRequest is the JSON body for POST /api/v1/auth/refresh.
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// LogoutRequest is the JSON body for POST /api/v1/auth/logout.
+type LogoutRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+// Refresh handles POST /api/v1/auth/refresh (AUTH-03).
+//
+// Body: { "refresh_token": "<raw hex token>" }
+// Response 200: { "access_token": "...", "refresh_token": "...", "token_type": "Bearer", "expires_in": 3600 }
+// Response 401: invalid, expired, or already-consumed refresh token
+func (h *AuthHandler) Refresh(c echo.Context) error {
+	var req RefreshRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.RefreshToken == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "refresh_token is required"})
+	}
+
+	result, err := h.svc.Refresh(c.Request().Context(), req.RefreshToken)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("refresh failed")
+		if errors.Is(err, auth.ErrInvalidRefreshToken) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token refresh failed"})
+	}
+
+	return c.JSON(http.StatusOK, result)
+}
+
+// Logout handles POST /api/v1/auth/logout (AUTH-04).
+//
+// Body: { "refresh_token": "<raw hex token>" }
+// Response 200: { "message": "logged out" }
+// Response 400: missing refresh_token
+func (h *AuthHandler) Logout(c echo.Context) error {
+	var req LogoutRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.RefreshToken == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "refresh_token is required"})
+	}
+
+	if err := h.svc.Logout(c.Request().Context(), req.RefreshToken); err != nil {
+		h.logger.Error().Err(err).Msg("logout failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "logout failed"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "logged out"})
 }
 
 // containsMsg is a simple substring check for error classification.
