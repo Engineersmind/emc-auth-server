@@ -9,8 +9,12 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
+	echoSwagger "github.com/swaggo/echo-swagger"
+
+	"github.com/engineersmind/emc-auth-server/internal/admin"
 	"github.com/engineersmind/emc-auth-server/internal/api/handlers"
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
@@ -103,6 +107,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Health check — no auth required
 	e.GET("/health", handlers.HealthHandler)
 
+	// Swagger UI — available at /swagger/index.html
+	e.GET("/swagger/*", echoSwagger.WrapHandler)
+
 	// Build shared services
 	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
@@ -119,7 +126,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	})
 	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger)
 
-	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, deps.Logger)
+	// Audit logger — shared by both auth and admin handlers
+	auditLog := audit.New(deps.Pool, deps.Logger)
+
+	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger)
+
+	// Admin service (Phase 5)
+	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
+	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger)
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
@@ -140,9 +154,41 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Auth routes — protected by JWTRequired (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
 
-	// Admin routes — require JWTRequired + RequirePermission (AUTH-10 / SC-4 demonstration)
-	adminGroup := apiV1.Group("/admin")
+	// Admin routes — all require a valid JWT.
+	adminGroup := apiV1.Group("/admin", mw.JWTRequired(jwtSvc))
+
+	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "admin ping ok"})
-	}, mw.JWTRequired(jwtSvc), mw.RequirePermission("admin:access"))
+	}, mw.RequirePermission("admin:access"))
+
+	// Tenant management — super_admin only (tenant:manage permission)
+	tenantMgmt := adminGroup.Group("", mw.RequirePermission("tenant:manage"))
+	tenantMgmt.POST("/tenants", adminHandler.CreateTenant)
+	tenantMgmt.GET("/tenants", adminHandler.ListTenants)
+	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
+	tenantMgmt.DELETE("/tenants/:id", adminHandler.DeactivateTenant)
+
+	// Permission management — tenant admin (admin:access permission)
+	rbacGroup := adminGroup.Group("", mw.RequirePermission("admin:access"))
+	rbacGroup.POST("/permissions", adminHandler.CreatePermission)
+	rbacGroup.GET("/permissions", adminHandler.ListPermissions)
+	rbacGroup.DELETE("/permissions/:id", adminHandler.DeletePermission)
+	rbacGroup.POST("/roles", adminHandler.CreateRole)
+	rbacGroup.GET("/roles", adminHandler.ListRoles)
+	rbacGroup.PUT("/roles/:id/permissions", adminHandler.UpdateRolePermissions)
+	rbacGroup.DELETE("/roles/:id", adminHandler.DeleteRole)
+
+	// User pool management — tenant admin (admin:access permission)
+	rbacGroup.GET("/users", adminHandler.ListUsers)
+	rbacGroup.POST("/users", adminHandler.CreateAdminUser)
+	rbacGroup.GET("/users/:id", adminHandler.GetAdminUser)
+	rbacGroup.PUT("/users/:id", adminHandler.UpdateAdminUser)
+	rbacGroup.PUT("/users/:id/role", adminHandler.AssignUserRole)
+	rbacGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser)
+	rbacGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset)
+
+	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
+	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
+	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
 }

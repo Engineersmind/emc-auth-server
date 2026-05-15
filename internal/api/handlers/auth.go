@@ -1,28 +1,31 @@
 package handlers
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 )
 
 // AuthHandler holds HTTP handlers for auth endpoints.
-// Register, Login, and Me are implemented here.
-// Refresh, Logout are added in Plan 02-02.
-// ForgotPassword, ResetPassword are added in Plan 02-04.
 type AuthHandler struct {
 	svc      *auth.AuthService
 	resetSvc *auth.ResetService
+	audit    *audit.Logger
 	logger   zerolog.Logger
 }
 
 // NewAuthHandler creates an AuthHandler.
-func NewAuthHandler(svc *auth.AuthService, resetSvc *auth.ResetService, logger zerolog.Logger) *AuthHandler {
-	return &AuthHandler{svc: svc, resetSvc: resetSvc, logger: logger}
+func NewAuthHandler(svc *auth.AuthService, resetSvc *auth.ResetService, auditLog *audit.Logger, logger zerolog.Logger) *AuthHandler {
+	return &AuthHandler{svc: svc, resetSvc: resetSvc, audit: auditLog, logger: logger}
 }
 
 // RegisterRequest is the JSON body for POST /api/v1/auth/register.
@@ -48,12 +51,18 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 
 // Register handles POST /api/v1/auth/register.
 //
-// Required header: X-Tenant-Slug: <slug>
-// Body: { "email": "...", "password": "...", "first_name": "...", "last_name": "..." }
-// Response 201: { "access_token": "...", "refresh_token": "...", "token_type": "Bearer", "expires_in": 3600 }
-// Response 400: missing/invalid body
-// Response 404: unknown tenant slug
-// Response 409: duplicate email
+// @Summary      Register a new user
+// @Description  Creates a user account in the specified tenant and returns a token pair.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Param        X-Tenant-Slug  header    string          true  "Tenant slug (e.g. emc)"
+// @Param        body           body      RegisterRequest true  "Registration payload"
+// @Success      201            {object}  auth.AuthResult
+// @Failure      400            {object}  map[string]string
+// @Failure      404            {object}  map[string]string  "Tenant not found"
+// @Failure      409            {object}  map[string]string  "Email already registered"
+// @Router       /api/v1/auth/register [post]
 func (h *AuthHandler) Register(c echo.Context) error {
 	slug, ok := tenantSlugFromCtx(c)
 	if !ok {
@@ -89,15 +98,34 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
 
+	// Audit: new user registered.
+	tid, uid := claimsFromToken(result.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthRegister,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusCreated, result)
 }
 
 // Login handles POST /api/v1/auth/login.
 //
-// Required header: X-Tenant-Slug: <slug>
-// Body: { "email": "...", "password": "..." }
-// Response 200: { "access_token": "...", "refresh_token": "...", "token_type": "Bearer", "expires_in": 3600 }
-// Response 401: invalid credentials or inactive user
+// @Summary      Login
+// @Description  Authenticates an existing user and returns a JWT access token + refresh token pair.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Param        X-Tenant-Slug  header    string        true  "Tenant slug (e.g. emc)"
+// @Param        body           body      LoginRequest  true  "Login credentials"
+// @Success      200            {object}  auth.AuthResult
+// @Failure      400            {object}  map[string]string
+// @Failure      401            {object}  map[string]string  "Invalid credentials"
+// @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
 	slug, ok := tenantSlugFromCtx(c)
 	if !ok {
@@ -119,21 +147,45 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("login failed")
+		// Audit: failed login attempt (no tenant_id — we don't confirm tenant exists).
+		h.audit.Log(c.Request().Context(), audit.Event{
+			ActorEmail:   req.Email,
+			Action:       audit.ActionAuthLoginFailed,
+			ResourceType: "user",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		})
 		if containsMsg(err, "invalid credentials") {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
 
+	// Audit: successful login.
+	tid, uid := claimsFromToken(result.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthLogin,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusOK, result)
 }
 
 // Me handles GET /api/v1/auth/me.
-// This endpoint is protected by JWTRequired middleware (added in Plan 02-02).
-// The middleware stores *auth.Claims under the context key "user".
 //
-// Response 200: { "user_id": "...", "tenant_id": "...", "email": "...", "role": "...", "permissions": [...] }
-// Response 401: no or invalid JWT (enforced by middleware, not this handler)
+// @Summary      Get current user profile
+// @Description  Returns the authenticated user's profile decoded from the JWT.
+// @Tags         auth
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  auth.MeResult
+// @Failure      401  {object}  map[string]string
+// @Router       /api/v1/auth/me [get]
 func (h *AuthHandler) Me(c echo.Context) error {
 	// Claims are injected by JWTRequired middleware.
 	// Until Plan 02-02 wires the middleware, this handler extracts from context manually
@@ -157,9 +209,16 @@ type LogoutRequest struct {
 
 // Refresh handles POST /api/v1/auth/refresh (AUTH-03).
 //
-// Body: { "refresh_token": "<raw hex token>" }
-// Response 200: { "access_token": "...", "refresh_token": "...", "token_type": "Bearer", "expires_in": 3600 }
-// Response 401: invalid, expired, or already-consumed refresh token
+// @Summary      Refresh token rotation
+// @Description  Issues a new access + refresh token pair and immediately invalidates the old refresh token. Replaying the old token returns 401.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Param        body  body      RefreshRequest  true  "Refresh token"
+// @Success      200   {object}  auth.AuthResult
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid or expired refresh token"
+// @Router       /api/v1/auth/refresh [post]
 func (h *AuthHandler) Refresh(c echo.Context) error {
 	var req RefreshRequest
 	if err := c.Bind(&req); err != nil {
@@ -178,14 +237,31 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token refresh failed"})
 	}
 
+	// Audit: token refreshed.
+	tid, uid := claimsFromToken(result.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
+		Action:       audit.ActionAuthTokenRefresh,
+		ResourceType: "session",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusOK, result)
 }
 
 // Logout handles POST /api/v1/auth/logout (AUTH-04).
 //
-// Body: { "refresh_token": "<raw hex token>" }
-// Response 200: { "message": "logged out" }
-// Response 400: missing refresh_token
+// @Summary      Logout
+// @Description  Revokes the supplied refresh token. Idempotent — calling twice is safe.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Param        body  body      LogoutRequest  true  "Refresh token to revoke"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Router       /api/v1/auth/logout [post]
 func (h *AuthHandler) Logout(c echo.Context) error {
 	var req LogoutRequest
 	if err := c.Bind(&req); err != nil {
@@ -200,6 +276,13 @@ func (h *AuthHandler) Logout(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "logout failed"})
 	}
 
+	// Audit: logout (no access token available — tenant_id is nil).
+	h.audit.Log(c.Request().Context(), audit.Event{
+		Action:    audit.ActionAuthLogout,
+		IPAddress: c.RealIP(),
+		UserAgent: c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusOK, map[string]string{"message": "logged out"})
 }
 
@@ -210,13 +293,15 @@ type ForgotPasswordRequest struct {
 
 // ForgotPassword handles POST /api/v1/auth/forgot-password (RESET-01, RESET-03).
 //
-// Required header: X-Tenant-Slug: <slug>
-// Body: { "email": "user@example.com" }
-//
-// Response: ALWAYS HTTP 200 with a generic message, regardless of whether the email
-// is registered. This prevents email enumeration (RESET-03).
-//
-// The reset link is emailed to the user (or logged to console in development).
+// @Summary      Request password reset
+// @Description  Sends a reset link to the email address. ALWAYS returns 200 regardless of whether the email is registered (prevents email enumeration). In development the link is logged to the server console instead of being emailed.
+// @Tags         password-reset
+// @Accept       json
+// @Produce      json
+// @Param        X-Tenant-Slug  header    string                 true  "Tenant slug"
+// @Param        body           body      ForgotPasswordRequest  true  "Email address"
+// @Success      200            {object}  map[string]string
+// @Router       /api/v1/auth/forgot-password [post]
 func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 	slug, ok := tenantSlugFromCtx(c)
 	if !ok {
@@ -243,6 +328,15 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 		// Still return generic 200 (RESET-03 — do not leak error details).
 	}
 
+	// Audit: reset requested (always logged regardless of whether email exists — RESET-03 preserved).
+	h.audit.Log(c.Request().Context(), audit.Event{
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthPasswordResetReq,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusOK, map[string]string{
 		"message": "if that email address is registered, a password reset link has been sent",
 	})
@@ -257,10 +351,15 @@ type ResetPasswordRequest struct {
 
 // ResetPassword handles POST /api/v1/auth/reset-password (RESET-02).
 //
-// Body: { "token": "<raw_token_from_email>", "new_password": "NewPass123!" }
-//
-// Response 200: { "message": "password updated successfully" }
-// Response 400: invalid, expired, used token — or password too short
+// @Summary      Reset password
+// @Description  Validates the reset token, updates the user's password, and revokes all active refresh tokens (logs out all sessions). Token is single-use and expires in 15 minutes.
+// @Tags         password-reset
+// @Accept       json
+// @Produce      json
+// @Param        body  body      ResetPasswordRequest  true  "Token + new password"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string  "Invalid/expired token or weak password"
+// @Router       /api/v1/auth/reset-password [post]
 func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	var req ResetPasswordRequest
 	if err := c.Bind(&req); err != nil {
@@ -288,6 +387,14 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "password reset failed"})
 	}
 
+	// Audit: password reset completed.
+	h.audit.Log(c.Request().Context(), audit.Event{
+		Action:       audit.ActionAuthPasswordResetDone,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusOK, map[string]string{"message": "password updated successfully"})
 }
 
@@ -310,4 +417,40 @@ func includesSubstr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// claimsFromToken decodes the JWT payload (base64, not encrypted) without
+// signature verification to extract tenant_id and user_id for audit logging.
+// Safe to call on tokens we just generated — JWT payloads are always readable.
+func claimsFromToken(tokenStr string) (tenantID, userID *uuid.UUID) {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return nil, nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, nil
+	}
+	var c struct {
+		TenantID string `json:"tenant_id"`
+		UserID   string `json:"user_id"`
+	}
+	if err := json.Unmarshal(payload, &c); err != nil {
+		return nil, nil
+	}
+	if tid, err := uuid.Parse(c.TenantID); err == nil {
+		tenantID = &tid
+	}
+	if uid, err := uuid.Parse(c.UserID); err == nil {
+		userID = &uid
+	}
+	return tenantID, userID
+}
+
+// uuidPtr returns a pointer to the given UUID (nil if it's uuid.Nil).
+func uuidPtr(id uuid.UUID) *uuid.UUID {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &id
 }
