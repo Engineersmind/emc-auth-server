@@ -3,23 +3,28 @@ FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
-# Cache dependencies
-COPY go.mod go.sum ./
-RUN go mod download
+# Copy go.mod first; go.sum will be generated if absent
+COPY go.mod ./
+RUN go mod download -x 2>/dev/null; true
 
-# Build binary
+# Build binary — -mod=mod allows go to resolve and update go.sum during build
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o emc-auth-server ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -mod=mod \
+    -ldflags="-s -w -extldflags '-static'" \
+    -o emc-auth-server ./cmd/server
 
 # ── Runtime stage ───────────────────────────────────────────────
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata wget \
+    && adduser -D -u 1001 appuser
 
 WORKDIR /app
 
 COPY --from=builder /app/emc-auth-server .
-COPY --from=builder /app/migrations ./migrations
+
+USER appuser
 
 EXPOSE 8080
 

@@ -1,0 +1,372 @@
+{
+  "info": {
+    "name": "EMC Auth Server — Phase 2",
+    "_postman_id": "emc-auth-server-v2",
+    "description": "All Phase 2 Auth Engine endpoints. Set the `base_url` variable to your server address.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url",     "value": "http://localhost:8082", "type": "string" },
+    { "key": "tenant_slug",  "value": "emc",                  "type": "string" },
+    { "key": "access_token", "value": "",                      "type": "string" },
+    { "key": "refresh_token","value": "",                      "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "GET /health",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth — Public",
+      "item": [
+        {
+          "name": "Register",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('access_token',  b.access_token);",
+                  "  pm.collectionVariables.set('refresh_token', b.refresh_token);",
+                  "  pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "  pm.test('access_token present', () => pm.expect(b.access_token).to.be.a('string').and.not.empty);",
+                  "  pm.test('refresh_token present', () => pm.expect(b.refresh_token).to.be.a('string').and.not.empty);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type",  "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"newuser@emc.local\",\n  \"password\": \"TestPass123!\",\n  \"first_name\": \"New\",\n  \"last_name\": \"User\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/register", "host": ["{{base_url}}"], "path": ["api","v1","auth","register"] }
+          }
+        },
+        {
+          "name": "Login (seed admin)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('access_token',  b.access_token);",
+                  "  pm.collectionVariables.set('refresh_token', b.refresh_token);",
+                  "  pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "  pm.test('access_token is JWT', () => pm.expect(b.access_token.split('.').length).to.eql(3));",
+                  "  pm.test('token_type is Bearer', () => pm.expect(b.token_type).to.eql('Bearer'));",
+                  "  pm.test('expires_in is 3600', () => pm.expect(b.expires_in).to.eql(3600));",
+                  "  console.log('Tokens saved to collection variables');",
+                  "}",
+                  "pm.test('Not 500', () => pm.expect(pm.response.code).to.not.eql(500));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type",  "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@emc.local\",\n  \"password\": \"ChangeMe123!\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/login", "host": ["{{base_url}}"], "path": ["api","v1","auth","login"] }
+          }
+        },
+        {
+          "name": "Login — wrong password (expect 401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+                  "pm.test('error message present', () => pm.expect(pm.response.json().error).to.be.a('string'));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type",  "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@emc.local\",\n  \"password\": \"wrongpassword\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/login", "host": ["{{base_url}}"], "path": ["api","v1","auth","login"] }
+          }
+        },
+        {
+          "name": "Login — unknown tenant (expect 400/404)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type",  "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "nonexistent" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@emc.local\",\n  \"password\": \"ChangeMe123!\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/login", "host": ["{{base_url}}"], "path": ["api","v1","auth","login"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth — Protected",
+      "item": [
+        {
+          "name": "GET /me (uses saved token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('user_id present', () => pm.expect(b.user_id).to.be.a('string'));",
+                  "pm.test('email present',   () => pm.expect(b.email).to.be.a('string'));",
+                  "pm.test('role present',    () => pm.expect(b.role).to.be.a('string'));",
+                  "pm.test('permissions is array', () => pm.expect(b.permissions).to.be.an('array'));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/api/v1/auth/me", "host": ["{{base_url}}"], "path": ["api","v1","auth","me"] }
+          }
+        },
+        {
+          "name": "GET /me — no token (expect 401)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{base_url}}/api/v1/auth/me", "host": ["{{base_url}}"], "path": ["api","v1","auth","me"] }
+          }
+        },
+        {
+          "name": "Refresh Token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "if (pm.response.code === 200) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('access_token',  b.access_token);",
+                  "  pm.collectionVariables.set('refresh_token', b.refresh_token);",
+                  "  pm.test('new access_token issued', () => pm.expect(b.access_token).to.be.a('string').and.not.empty);",
+                  "  pm.test('new refresh_token issued', () => pm.expect(b.refresh_token).to.be.a('string').and.not.empty);",
+                  "  console.log('Tokens rotated and saved');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/refresh", "host": ["{{base_url}}"], "path": ["api","v1","auth","refresh"] }
+          }
+        },
+        {
+          "name": "Logout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set('refresh_token', '');"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/logout", "host": ["{{base_url}}"], "path": ["api","v1","auth","logout"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Password Reset",
+      "item": [
+        {
+          "name": "Forgot Password (registered email)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK — RESET-03 compliant', () => pm.response.to.have.status(200));",
+                  "pm.test('generic message', () => pm.expect(pm.response.json().message).to.be.a('string'));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type",  "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"admin@emc.local\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/forgot-password", "host": ["{{base_url}}"], "path": ["api","v1","auth","forgot-password"] }
+          }
+        },
+        {
+          "name": "Forgot Password (unregistered email — must also return 200)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 OK — no email enumeration leak', () => pm.response.to.have.status(200));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type",  "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"nobody@notreal.example\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/forgot-password", "host": ["{{base_url}}"], "path": ["api","v1","auth","forgot-password"] }
+          }
+        },
+        {
+          "name": "Reset Password (paste token from server log)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type",  "value": "application/json" },
+              { "key": "X-Tenant-Slug", "value": "{{tenant_slug}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"token\": \"PASTE_RAW_TOKEN_FROM_SERVER_LOG_HERE\",\n  \"new_password\": \"NewPassword123!\"\n}"
+            },
+            "url": { "raw": "{{base_url}}/api/v1/auth/reset-password", "host": ["{{base_url}}"], "path": ["api","v1","auth","reset-password"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Middleware Tests",
+      "item": [
+        {
+          "name": "RequirePermission — /admin/ping (expect 403, no admin:access)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('403 Forbidden — missing admin:access permission', () => pm.response.to.have.status(403));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": { "raw": "{{base_url}}/api/v1/admin/ping", "host": ["{{base_url}}"], "path": ["api","v1","admin","ping"] }
+          }
+        },
+        {
+          "name": "HSTS header check",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('HSTS header present', () => {",
+                  "  pm.expect(pm.response.headers.get('Strict-Transport-Security')).to.include('max-age=31536000');",
+                  "});"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] }
+          }
+        }
+      ]
+    }
+  ]
+}

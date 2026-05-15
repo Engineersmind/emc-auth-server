@@ -1,3 +1,20 @@
+// @title           EMC Auth Server
+// @version         1.0
+// @description     Standalone multi-tenant Identity Provider — email/password auth, JWT, refresh tokens, password reset.
+//
+// @contact.name    EngineersMind
+// @contact.url     https://github.com/engineersmind/emc-auth-server
+//
+// @license.name    MIT
+//
+// @host            localhost:8082
+// @BasePath        /
+//
+// @securityDefinitions.apikey BearerAuth
+// @in              header
+// @name            Authorization
+// @description     Enter: Bearer <your_access_token>
+
 package main
 
 import (
@@ -13,6 +30,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
+	"github.com/engineersmind/emc-auth-server/docs"   // swagger generated docs
 	"github.com/engineersmind/emc-auth-server/internal/api"
 	"github.com/engineersmind/emc-auth-server/internal/config"
 	"github.com/engineersmind/emc-auth-server/internal/store"
@@ -64,6 +82,9 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to connect to redis")
 	}
 	defer store.CloseRedis(rdb)
+
+	// Set Swagger host dynamically so "Try it out" points to this server's address
+	docs.SwaggerInfo.Host = "localhost:" + cfg.Port
 
 	// Echo instance
 	e := echo.New()

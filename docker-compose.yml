@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -36,13 +34,23 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
-    env_file:
-      - .env
+    environment:
+      PORT: "8080"
+      ENV: development
+      LOG_LEVEL: info
+      DATABASE_URL: postgres://emc_auth:password@postgres:5432/emc_auth?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 volumes:
   postgres_data:

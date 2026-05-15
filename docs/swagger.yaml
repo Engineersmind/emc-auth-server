@@ -1,0 +1,1067 @@
+basePath: /
+definitions:
+  admin.PermissionResult:
+    properties:
+      created_at:
+        type: string
+      description:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+      tenant_id:
+        type: string
+    type: object
+  admin.RoleResult:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      is_system:
+        type: boolean
+      name:
+        type: string
+      permissions:
+        items:
+          $ref: '#/definitions/admin.PermissionResult'
+        type: array
+      tenant_id:
+        type: string
+    type: object
+  admin.TenantResult:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      is_active:
+        type: boolean
+      name:
+        type: string
+      slug:
+        type: string
+    type: object
+  admin.UserResult:
+    properties:
+      created_at:
+        type: string
+      email:
+        type: string
+      first_name:
+        type: string
+      id:
+        type: string
+      is_active:
+        type: boolean
+      last_name:
+        type: string
+      role:
+        type: string
+      role_id:
+        type: string
+      tenant_id:
+        type: string
+    type: object
+  admin.UsersPage:
+    properties:
+      page:
+        type: integer
+      total:
+        type: integer
+      total_pages:
+        type: integer
+      users:
+        items:
+          $ref: '#/definitions/admin.UserResult'
+        type: array
+    type: object
+  auth.AuthResult:
+    properties:
+      access_token:
+        type: string
+      expires_in:
+        description: seconds
+        type: integer
+      refresh_token:
+        type: string
+      token_type:
+        type: string
+    type: object
+  auth.MeResult:
+    properties:
+      email:
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+      role:
+        type: string
+      tenant_id:
+        type: string
+      user_id:
+        type: string
+    type: object
+  handlers.AssignRoleRequest:
+    properties:
+      role_id:
+        type: string
+    type: object
+  handlers.CreatePermissionRequest:
+    properties:
+      description:
+        type: string
+      name:
+        type: string
+    type: object
+  handlers.CreateRoleRequest:
+    properties:
+      name:
+        type: string
+      permission_ids:
+        items:
+          type: string
+        type: array
+    type: object
+  handlers.CreateTenantRequest:
+    properties:
+      name:
+        type: string
+      slug:
+        type: string
+    type: object
+  handlers.CreateUserAdminRequest:
+    properties:
+      email:
+        type: string
+      first_name:
+        type: string
+      last_name:
+        type: string
+      password:
+        type: string
+      role_id:
+        type: string
+    type: object
+  handlers.ForgotPasswordRequest:
+    properties:
+      email:
+        type: string
+    type: object
+  handlers.HealthResponse:
+    properties:
+      service:
+        type: string
+      status:
+        type: string
+    type: object
+  handlers.LoginRequest:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  handlers.LogoutRequest:
+    properties:
+      refresh_token:
+        type: string
+    type: object
+  handlers.RefreshRequest:
+    properties:
+      refresh_token:
+        type: string
+    type: object
+  handlers.RegisterRequest:
+    properties:
+      email:
+        type: string
+      first_name:
+        type: string
+      last_name:
+        type: string
+      password:
+        minLength: 8
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  handlers.ResetPasswordRequest:
+    properties:
+      new_password:
+        type: string
+      token:
+        description: Token is the raw reset token from the email link query parameter.
+        type: string
+    type: object
+  handlers.UpdateRolePermissionsRequest:
+    properties:
+      permission_ids:
+        items:
+          type: string
+        type: array
+    type: object
+  handlers.UpdateTenantRequest:
+    properties:
+      name:
+        type: string
+    type: object
+  handlers.UpdateUserAdminRequest:
+    properties:
+      email:
+        type: string
+      first_name:
+        type: string
+      last_name:
+        type: string
+    type: object
+host: localhost:8082
+info:
+  contact:
+    name: EngineersMind
+    url: https://github.com/engineersmind/emc-auth-server
+  description: Standalone multi-tenant Identity Provider — email/password auth, JWT,
+    refresh tokens, password reset.
+  license:
+    name: MIT
+  title: EMC Auth Server
+  version: "1.0"
+paths:
+  /api/v1/admin/permissions:
+    get:
+      description: Returns all permissions for the caller's tenant. Requires admin:access.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.PermissionResult'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List permissions
+      tags:
+      - admin-rbac
+    post:
+      consumes:
+      - application/json
+      description: Creates a new permission within the caller's tenant. Requires admin:access.
+      parameters:
+      - description: Permission details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreatePermissionRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.PermissionResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Permission name already exists in this tenant
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create permission
+      tags:
+      - admin-rbac
+  /api/v1/admin/permissions/{id}:
+    delete:
+      description: Deletes a permission from the caller's tenant. Cascades to roles
+        and users. Requires admin:access.
+      parameters:
+      - description: Permission ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete permission
+      tags:
+      - admin-rbac
+  /api/v1/admin/roles:
+    get:
+      description: Returns all roles in the caller's tenant with their permission
+        lists. Requires admin:access.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.RoleResult'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List roles
+      tags:
+      - admin-rbac
+    post:
+      consumes:
+      - application/json
+      description: Creates a role in the caller's tenant with optional permission
+        assignments. Requires admin:access.
+      parameters:
+      - description: Role details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateRoleRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.RoleResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Role name already exists
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create role
+      tags:
+      - admin-rbac
+  /api/v1/admin/roles/{id}:
+    delete:
+      description: Deletes a non-system role from the tenant. Users assigned this
+        role will have their role cleared. Requires admin:access.
+      parameters:
+      - description: Role ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete role
+      tags:
+      - admin-rbac
+  /api/v1/admin/roles/{id}/permissions:
+    put:
+      consumes:
+      - application/json
+      description: Replaces the permission set on a role. Requires admin:access.
+      parameters:
+      - description: Role ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Permission IDs to assign
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateRolePermissionsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update role permissions
+      tags:
+      - admin-rbac
+  /api/v1/admin/tenants:
+    get:
+      description: Returns all tenants. Requires tenant:manage permission.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.TenantResult'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List tenants
+      tags:
+      - admin-tenants
+    post:
+      consumes:
+      - application/json
+      description: Creates a new isolated tenant. Requires tenant:manage permission
+        (super_admin only).
+      parameters:
+      - description: Tenant details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateTenantRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.TenantResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Slug already taken
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create tenant
+      tags:
+      - admin-tenants
+  /api/v1/admin/tenants/{id}:
+    delete:
+      description: Soft-deactivates a tenant (sets is_active=false). Requires tenant:manage
+        permission.
+      parameters:
+      - description: Tenant ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Deactivate tenant
+      tags:
+      - admin-tenants
+    put:
+      consumes:
+      - application/json
+      description: Updates the tenant's display name. Requires tenant:manage permission.
+      parameters:
+      - description: Tenant ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Updated fields
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateTenantRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.TenantResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update tenant
+      tags:
+      - admin-tenants
+  /api/v1/admin/users:
+    get:
+      description: Returns a paginated, searchable list of users in the caller's tenant.
+        Requires admin:access.
+      parameters:
+      - description: Search by email, first name, or last name
+        in: query
+        name: search
+        type: string
+      - description: 'Page number (default: 1)'
+        in: query
+        name: page
+        type: integer
+      - description: 'Page size (default: 20, max: 100)'
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UsersPage'
+      security:
+      - BearerAuth: []
+      summary: List users
+      tags:
+      - admin-users
+    post:
+      consumes:
+      - application/json
+      description: Creates a user in the caller's tenant with an optional role. Requires
+        admin:access.
+      parameters:
+      - description: User details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateUserAdminRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.UserResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Email already registered
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create user
+      tags:
+      - admin-users
+  /api/v1/admin/users/{id}:
+    delete:
+      description: Soft-deletes a user (is_deleted=true, is_active=false). ID preserved
+        for audit. Requires admin:access.
+      parameters:
+      - description: User ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete user
+      tags:
+      - admin-users
+    get:
+      description: Returns a user's details. Requires admin:access.
+      parameters:
+      - description: User ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserResult'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get user
+      tags:
+      - admin-users
+    put:
+      consumes:
+      - application/json
+      description: Updates a user's profile (email, name). Requires admin:access.
+      parameters:
+      - description: User ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Updated fields
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateUserAdminRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update user
+      tags:
+      - admin-users
+  /api/v1/admin/users/{id}/force-password-reset:
+    post:
+      description: Sends a password reset email to the specified user. Requires admin:access.
+      parameters:
+      - description: User ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Force password reset
+      tags:
+      - admin-users
+  /api/v1/admin/users/{id}/role:
+    put:
+      consumes:
+      - application/json
+      description: Sets the user's role within the tenant. Requires admin:access.
+      parameters:
+      - description: User ID (UUID)
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Role ID to assign
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AssignRoleRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Assign role to user
+      tags:
+      - admin-users
+  /api/v1/auth/forgot-password:
+    post:
+      consumes:
+      - application/json
+      description: Sends a reset link to the email address. ALWAYS returns 200 regardless
+        of whether the email is registered (prevents email enumeration). In development
+        the link is logged to the server console instead of being emailed.
+      parameters:
+      - description: Tenant slug
+        in: header
+        name: X-Tenant-Slug
+        required: true
+        type: string
+      - description: Email address
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ForgotPasswordRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Request password reset
+      tags:
+      - password-reset
+  /api/v1/auth/login:
+    post:
+      consumes:
+      - application/json
+      description: Authenticates an existing user and returns a JWT access token +
+        refresh token pair.
+      parameters:
+      - description: Tenant slug (e.g. emc)
+        in: header
+        name: X-Tenant-Slug
+        required: true
+        type: string
+      - description: Login credentials
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Login
+      tags:
+      - auth
+  /api/v1/auth/logout:
+    post:
+      consumes:
+      - application/json
+      description: Revokes the supplied refresh token. Idempotent — calling twice
+        is safe.
+      parameters:
+      - description: Refresh token to revoke
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.LogoutRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Logout
+      tags:
+      - auth
+  /api/v1/auth/me:
+    get:
+      description: Returns the authenticated user's profile decoded from the JWT.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MeResult'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get current user profile
+      tags:
+      - auth
+  /api/v1/auth/refresh:
+    post:
+      consumes:
+      - application/json
+      description: Issues a new access + refresh token pair and immediately invalidates
+        the old refresh token. Replaying the old token returns 401.
+      parameters:
+      - description: Refresh token
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.RefreshRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid or expired refresh token
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Refresh token rotation
+      tags:
+      - auth
+  /api/v1/auth/register:
+    post:
+      consumes:
+      - application/json
+      description: Creates a user account in the specified tenant and returns a token
+        pair.
+      parameters:
+      - description: Tenant slug (e.g. emc)
+        in: header
+        name: X-Tenant-Slug
+        required: true
+        type: string
+      - description: Registration payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.RegisterRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Tenant not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Email already registered
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Register a new user
+      tags:
+      - auth
+  /api/v1/auth/reset-password:
+    post:
+      consumes:
+      - application/json
+      description: Validates the reset token, updates the user's password, and revokes
+        all active refresh tokens (logs out all sessions). Token is single-use and
+        expires in 15 minutes.
+      parameters:
+      - description: Token + new password
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ResetPasswordRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Invalid/expired token or weak password
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Reset password
+      tags:
+      - password-reset
+  /health:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.HealthResponse'
+      summary: Health check
+      tags:
+      - system
+securityDefinitions:
+  BearerAuth:
+    description: 'Enter: Bearer <your_access_token>'
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"
