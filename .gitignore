@@ -1,0 +1,31 @@
+# Binaries
+emc-auth-server
+*.exe
+
+# Environment
+.env
+*.env.local
+
+# Certs
+certs/*.key
+certs/*.pem
+
+# Build
+dist/
+build/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Node (admin UI)
+ui/node_modules/
+ui/dist/
+ui/.env
