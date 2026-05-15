@@ -1,46 +1,111 @@
 package main
 
 import (
-	"log"
+	"context"
+	"errors"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
+	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/api"
+	"github.com/engineersmind/emc-auth-server/internal/config"
+	"github.com/engineersmind/emc-auth-server/internal/store"
+	"github.com/engineersmind/emc-auth-server/migrations"
 )
 
 func main() {
-	// Load environment variables
-	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using environment variables")
+	// Load .env file if present (non-fatal if absent)
+	_ = godotenv.Load()
+
+	// Load configuration from environment variables
+	cfg := config.Load()
+
+	// Initialize zerolog
+	zerolog.TimeFieldFormat = zerolog.TimeFormatUnixMs
+	level, err := zerolog.ParseLevel(cfg.LogLevel)
+	if err != nil {
+		level = zerolog.InfoLevel
+	}
+	zerolog.SetGlobalLevel(level)
+	logger := zerolog.New(os.Stdout).With().
+		Timestamp().
+		Str("service", "emc-auth-server").
+		Str("env", cfg.Env).
+		Logger()
+
+	ctx := context.Background()
+
+	// Connect to PostgreSQL
+	pool, err := store.NewDB(ctx, cfg.DatabaseURL, logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to connect to database")
+	}
+	defer store.CloseDB(pool)
+
+	// Run migrations from embedded SQL files (idempotent)
+	if err := store.RunMigrations(ctx, pool, migrations.FS, logger); err != nil {
+		logger.Fatal().Err(err).Msg("migrations failed")
 	}
 
+	// Seed default tenant and super-admin (idempotent)
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		logger.Fatal().Err(err).Msg("seed failed")
+	}
+
+	// Connect to Redis
+	rdb, err := store.NewRedis(ctx, cfg.RedisURL, logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to connect to redis")
+	}
+	defer store.CloseRedis(rdb)
+
+	// Echo instance
 	e := echo.New()
-	e.HideBanner = false
+	e.HideBanner = true
+	e.HidePort = true
 
-	// Global middleware
-	e.Use(middleware.Logger())
-	e.Use(middleware.Recover())
-	e.Use(middleware.CORS())
-	e.Use(middleware.RequestID())
-
-	// Health check
-	e.GET("/health", func(c echo.Context) error {
-		return c.JSON(200, map[string]string{
-			"status":  "ok",
-			"service": "emc-auth-server",
-		})
+	// Register routes and middleware
+	api.RegisterRoutes(e, api.Deps{
+		Logger: logger,
+		Pool:   pool,
+		Redis:  rdb,
+		Config: api.RoutesConfig{
+			JWTIssuer: cfg.JWTIssuer,
+			Env:       cfg.Env,
+		},
 	})
 
-	// TODO: wire up route groups
-	// api := e.Group("/api/v1")
-	// auth routes, admin routes, SAML, OIDC...
+	// Graceful shutdown via signal
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	s := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: e,
 	}
 
-	log.Printf("EMC Auth Server starting on :%s", port)
-	e.Logger.Fatal(e.Start(":" + port))
+	// Start server in goroutine
+	go func() {
+		logger.Info().Str("port", cfg.Port).Msg("server starting")
+		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Fatal().Err(err).Msg("server error")
+		}
+	}()
+
+	// Block until shutdown signal
+	<-shutdownCtx.Done()
+	logger.Info().Msg("shutting down")
+
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.Shutdown(timeoutCtx); err != nil {
+		logger.Error().Err(err).Msg("shutdown error")
+	}
+	logger.Info().Msg("server stopped")
 }
