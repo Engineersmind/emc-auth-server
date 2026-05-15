@@ -39,6 +39,134 @@ Built with Go + Echo + PostgreSQL + Redis. Ships as a **single binary** that boo
 
 ---
 
+## Architecture
+
+### Request Flow
+
+```
+Client
+  │
+  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Echo HTTP Server                           │
+│                                                                 │
+│  ┌──────────────┐  ┌────────────────┐  ┌────────────────────┐  │
+│  │  Request ID  │─►│Security Headers│─►│  HTTPS Redirect    │  │
+│  │  (per-req)   │  │ HSTS/CSP/etc.  │  │  (production only) │  │
+│  └──────────────┘  └────────────────┘  └─────────┬──────────┘  │
+│                                                   │             │
+│  ┌────────────────────────────────────────────────▼──────────┐  │
+│  │              Request Logger (zerolog JSON)                │  │
+│  └──────────────────────────┬─────────────────────────────┬─┘  │
+│                             │                             │     │
+│              ┌──────────────▼──────┐   ┌─────────────────▼──┐  │
+│              │   Public Endpoints  │   │ Protected Endpoints │  │
+│              │   /auth/*  /health  │   │ /admin/*  /auth/me  │  │
+│              │                     │   │                     │  │
+│              │  Rate Limiter       │   │  JWT Middleware      │  │
+│              │  (login: 5/min/IP   │   │  (verify HS256,     │  │
+│              │   10/min/tenant)    │   │   extract claims)   │  │
+│              │                     │   │                     │  │
+│              │  Tenant Resolution  │   │  Permission Guard   │  │
+│              │  X-Tenant-Slug hdr  │   │  (tenant:manage or  │  │
+│              │  → DB lookup → UUID │   │   admin:access)     │  │
+│              └──────────┬──────────┘   └──────────┬──────────┘  │
+│                         └──────────────┬───────────┘             │
+│                                        │                         │
+│                              ┌─────────▼──────────┐             │
+│                              │      Handler        │             │
+│                              │  (auth / admin)     │             │
+│                              └───────┬─────┬───────┘             │
+│                                      │     │                     │
+│                         ┌────────────▼──┐ ┌▼────────────┐       │
+│                         │  PostgreSQL   │ │    Redis    │       │
+│                         │  pgxpool(25)  │ │  (sessions, │       │
+│                         │  Users/Roles/ │ │   rate lim) │       │
+│                         │  Audit/Tokens │ │             │       │
+│                         └───────────────┘ └─────────────┘       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### JWT Token Flow
+
+```
+POST /auth/login
+  │
+  ├─► Resolve tenant (X-Tenant-Slug → tenants table)
+  ├─► Verify bcrypt hash (cost 12)
+  ├─► Load user roles + permissions from DB
+  ├─► Sign JWT (HS256, per-tenant secret, 1-hour TTL)
+  │     Payload: { user_id, tenant_id, email, role, permissions[], iss, aud, exp }
+  ├─► Generate refresh token (32-byte crypto/rand → SHA-256 hash stored in Redis)
+  └─► Return { access_token, refresh_token, token_type, expires_in }
+
+POST /auth/refresh
+  ├─► Hash incoming token → lookup in Redis
+  ├─► Atomically: delete old token, store new token
+  └─► Return new token pair (old token is immediately dead — replay → 401)
+```
+
+---
+
+## Two-Tier Access Model
+
+Every request resolves to one of three access tiers based on JWT claims:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 1 — System Level (super_admin / tenant:manage)             │
+│                                                                  │
+│  • Create / update / deactivate any tenant                       │
+│  • View system-wide audit log (all tenants)                      │
+│  • Assign super_admin role                                       │
+│  Scope: cross-tenant, system-wide                                │
+├──────────────────────────────────────────────────────────────────┤
+│  Tier 2 — Tenant Admin Level (admin:access)                      │
+│                                                                  │
+│  • Manage users within own tenant (create, update, delete)       │
+│  • Create / manage roles and permissions within own tenant       │
+│  • View tenant-scoped audit log (own tenant only)                │
+│  • Force password reset for any user in tenant                   │
+│  Scope: tenant-isolated, never cross-tenant                      │
+├──────────────────────────────────────────────────────────────────┤
+│  Tier 3 — Authenticated User                                     │
+│                                                                  │
+│  • Authenticate (login, refresh, logout)                         │
+│  • View own profile (GET /auth/me)                               │
+│  • Reset own password                                            │
+│  Scope: own user record only                                     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+Tier is determined from JWT claims at runtime — never from the request body. A token from tenant A cannot access tenant B's resources regardless of what the request contains.
+
+---
+
+## Role and Permission Model
+
+```
+Role (tenant-scoped)
+  └── has many Permissions (tenant-scoped, UNIQUE per tenant)
+
+User
+  └── assigned one Role per tenant
+
+JWT payload carries:
+  { role: "super_admin", permissions: ["tenant:manage", "admin:access"] }
+
+Seeded system permissions (emc tenant only):
+  tenant:manage  →  Tier 1 guard — super_admin operations
+  admin:access   →  Tier 2 guard — tenant admin operations
+
+Tenant-created permissions (examples):
+  invoice:read, invoice:write, report:export, user:impersonate
+  (each tenant defines its own; names are isolated by tenant_id)
+```
+
+Permissions flow: tenant admin creates permissions → assigns to roles → assigns roles to users → JWT contains permission list → `RequirePermission()` middleware enforces at the route level.
+
+---
+
 ## Quick Start — Docker (recommended)
 
 **Prerequisites:** Docker Desktop running.
@@ -263,6 +391,215 @@ Every security-relevant action is persisted to the `audit_logs` table:
 | `admin.user_role_assigned` | Role reassigned |
 | `admin.force_password_reset` | Admin-triggered reset |
 
+Query the audit log via API (JSON) or directly in SQL:
+
+```sql
+-- Last 50 failed logins across all tenants
+SELECT actor_email, ip_address, created_at
+FROM audit_logs
+WHERE action = 'auth.login_failed'
+ORDER BY created_at DESC
+LIMIT 50;
+
+-- All admin actions on a specific user
+SELECT action, actor_email, created_at
+FROM audit_logs
+WHERE resource_type = 'user'
+  AND resource_id = '<user-uuid>'
+ORDER BY created_at DESC;
+```
+
+---
+
+## Architecture Decisions (ADR Index)
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| ADR-01 | JWT signing algorithm | HS256 per-tenant secret | Simpler key management for self-hosted deployments; RS256 (asymmetric) deferred to v2 when external verifiers need public keys |
+| ADR-02 | Multi-tenancy strategy | `tenant_id` column (row-level) | Schema-per-tenant adds migration complexity and doesn't scale past ~100 tenants; row-level isolation is simpler and proven at scale |
+| ADR-03 | Migration tool | Goose v3 (embedded SQL) | Plain SQL files version-controlled alongside code; embedded via `embed.FS` — zero external tooling at runtime |
+| ADR-04 | ORM vs raw SQL | Raw SQL (pgx v5) | Auth queries are security-critical and latency-sensitive; full control over parameterization, no magic, no N+1 surprises |
+| ADR-05 | Tenant resolution | `X-Tenant-Slug` header | Human-readable slug over UUID; slug is stable and meaningful in logs and URLs |
+| ADR-06 | Rate limiter storage | In-memory (sync.Map + `x/time/rate`) | Sufficient for single-instance deployments; Redis-backed distributed limiting hooked in Phase 7 with explicit code comment |
+| ADR-07 | Refresh token storage | SHA-256 hash in Redis | Raw token never stored; Redis TTL handles expiry automatically; hash prevents token extraction if cache is compromised |
+| ADR-08 | Password hashing | bcrypt cost 12 | Industry standard; cost 12 gives ~300ms on modern hardware — strong against GPU brute-force while acceptable for login latency |
+| ADR-09 | Audit log failure mode | Fire-and-forget | Audit failure must never block authentication; errors are logged via zerolog but never returned to caller |
+| ADR-10 | Permission scope | Tenant-scoped (not system-global) | Permissions are business concepts owned by each tenant; system-global permissions would create cross-tenant coupling |
+| ADR-11 | Admin UI delivery | React SPA embedded via `embed.FS` | Single deployable artifact — no separate static file server or CDN required for self-hosted deployment (Phase 6) |
+| ADR-12 | Email enumeration prevention | `forgot-password` always returns HTTP 200 | Identical response body for registered and unregistered emails prevents user enumeration via timing or response diff |
+
+---
+
+## Security & Code Quality
+
+### Implemented Controls
+
+| Control | Implementation |
+|---------|---------------|
+| Password storage | bcrypt cost 12 — plaintext never persisted |
+| SQL injection | Parameterized queries via pgx v5 positional args (`$1, $2, ...`) throughout |
+| Token storage | Refresh and reset tokens stored as SHA-256 hashes — raw values never in DB |
+| JWT integrity | HS256 signed with per-tenant secret; signature verified on every protected request |
+| Session revocation | Logout and password reset atomically delete all Redis session keys for the user |
+| Rate limiting | 5 req/min/IP + 10 req/min/tenant on `/auth/login` — returns `429 Too Many Requests` |
+| Security headers | HSTS (1 year), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin` |
+| Replay protection | Refresh token rotation is atomic — consumed token is deleted before new token is issued |
+| Soft delete | Users marked `is_deleted=true` — IDs preserved for audit trail integrity |
+| Enumeration prevention | `forgot-password` returns identical HTTP 200 for both registered and unregistered emails |
+| Tenant isolation | JWT `tenant_id` claim is authoritative — never trust request body for tenant resolution on protected routes |
+
+### Planned — Phase 7
+
+```bash
+# Static analysis (SAST)
+gosec ./...                        # security-focused Go linter
+govulncheck ./...                  # known CVE scan for dependencies
+golangci-lint run                  # multi-linter: errcheck, staticcheck, unused, shadow
+
+# Dependency audit
+go list -m -json all | nancy sleuth   # OSS vulnerability database check
+
+# Security test scenarios
+# - Replay attack: re-submit consumed refresh token → assert 401
+# - Brute-force: 6th login attempt in 1 min → assert 429
+# - Email enumeration: diff forgot-password response for known vs unknown email → assert identical
+# - TOTP bypass: submit expired/wrong OTP → assert 401 (Phase 3)
+# - SQL injection probes on search and filter params
+
+# Load test
+k6 run --vus 500 --duration 60s load/login.js   # p99 ≤ 200ms target
+```
+
+### CI/CD Pipeline (Phase 7 — GitHub Actions)
+
+```yaml
+# .github/workflows/ci.yml (planned)
+on: [push, pull_request]
+jobs:
+  quality:
+    steps:
+      - go test ./... -coverprofile=coverage.out   # ≥80% gate
+      - gosec ./...
+      - govulncheck ./...
+      - golangci-lint run
+  build:
+    steps:
+      - docker build --target prod .               # distroless final image
+      - docker-compose up -d && sleep 5
+      - curl -f http://localhost:8080/health
+```
+
+---
+
+## Monitoring & Observability
+
+### Currently Instrumented
+
+| Signal | Implementation | Where to look |
+|--------|---------------|---------------|
+| Structured request logs | Zerolog JSON — method, path, status, latency, request_id | stdout / log aggregator |
+| Health check | `GET /health` → `{"status":"ok","service":"emc-auth-server"}` | Uptime monitors |
+| Audit trail | `audit_logs` table — 21 event types with tenant_id, user_id, IP | PostgreSQL / API |
+| Error logging | Zerolog `Error()` on all DB/Redis failures with context fields | stdout |
+
+### Observability Metrics (Planned — Phase 7)
+
+`GET /metrics` — Prometheus-compatible endpoint:
+
+```
+# Authentication
+emc_auth_login_total{tenant, result="success|failure"}
+emc_auth_register_total{tenant}
+emc_auth_token_refresh_total{tenant}
+emc_auth_rate_limit_hits_total{tenant, type="ip|tenant"}
+
+# Performance
+emc_auth_request_duration_seconds{method, route, status}   histogram
+emc_auth_db_query_duration_seconds{query}                  histogram
+emc_auth_redis_op_duration_seconds{op}                     histogram
+
+# System
+emc_auth_active_sessions{tenant}
+emc_auth_db_pool_acquired
+emc_auth_db_pool_idle
+```
+
+### Grafana Dashboard (Planned — Phase 7)
+
+```
+Row 1 — Traffic Overview
+  ├── Requests/sec (by endpoint)
+  ├── Login success rate (success / total)
+  └── Rate limit hit rate
+
+Row 2 — Auth Health
+  ├── Failed logins by tenant (bar chart — spike = brute-force attempt)
+  ├── Token refresh volume
+  └── Password reset requests
+
+Row 3 — Performance
+  ├── p50/p95/p99 request latency (heatmap)
+  ├── DB query latency
+  └── Redis operation latency
+
+Row 4 — Infrastructure
+  ├── DB connection pool utilization
+  ├── Go runtime memory (heap in use)
+  └── Goroutine count
+```
+
+### Alerting Rules (Planned — Phase 7)
+
+| Alert | Condition | Severity |
+|-------|-----------|----------|
+| Auth spike | Login failures > 50/min/tenant | Warning |
+| Brute-force | Rate limit hits > 100/min/IP | Critical |
+| DB saturation | Pool acquired > 90% for 5 min | Warning |
+| High latency | p99 login > 500ms for 2 min | Warning |
+| Server down | `/health` fails 3 consecutive checks | Critical |
+
+---
+
+## Admin Dashboard — Phase 6
+
+A React SPA embedded directly in the Go binary via `embed.FS` — no separate web server or CDN needed.
+
+**Planned screens:**
+
+| Screen | Capabilities |
+|--------|-------------|
+| Login | Email/password + TOTP (if enabled); establishes admin session |
+| Dashboard | Active user count, recent login events, auth success rate tile |
+| User Pool | Paginated + searchable table; create, edit, assign role, soft-delete, force reset |
+| Roles & Permissions | Create/edit roles with permission assignments; create custom permissions |
+| Tenant Management | Super-admin only — create, rename, deactivate tenants (cross-tenant view) |
+| API Keys | Create (one-time reveal), list with last_used, revoke |
+| SAML Config | Per-tenant IdP entity ID, SSO URL, X.509 cert |
+| Audit Log Viewer | Filterable table — action type, date range, user, IP |
+
+**Build pipeline:** Vite + React + TypeScript → `go generate` embeds the `ui/dist/` output into the binary → served at `/` by Echo static middleware.
+
+---
+
+## Enhancements — Planned Outside Main Roadmap
+
+Items tracked for v2 (post-Phase 7):
+
+| Enhancement | Description | Priority |
+|-------------|-------------|----------|
+| OAuth2 / OIDC server | Expose authorization_code + client_credentials flows so third-party apps can use EMC-Auth as a full OAuth2 provider | High |
+| Social login | Google, GitHub, Microsoft OAuth2 login with account linking | Medium |
+| Passwordless / magic link | Email-based one-click login for low-friction onboarding | Medium |
+| RS256 JWT | Asymmetric signing — public key endpoint so external services can verify tokens without calling EMC-Auth | Medium |
+| Webhooks | POST to a configured URL on user lifecycle events: `user.created`, `user.deleted`, `auth.login_failed` | Medium |
+| SDK libraries | Node.js and Python client libraries for JWT verification and token introspection | Medium |
+| White-label login page | Per-tenant custom logo, colors, and domain on the hosted login UI | Low |
+| Audit log retention | Configurable retention window + archive to S3/GCS after N days | Low |
+| Login anomaly detection | Flag logins from new country/device; alert admin or require MFA step-up | Low |
+| CORS per tenant | Tenant-configurable allowed origins stored in DB; enforced by middleware | Low |
+| Distributed rate limiting | Replace in-memory rate limiter with Redis-backed solution for multi-instance deployments | Phase 7 |
+| Token introspection endpoint | `POST /oauth/introspect` — RFC 7662 token introspection for resource servers | v2 |
+
 ---
 
 ## Project Structure
@@ -309,7 +646,7 @@ swag init -g cmd/server/main.go --output docs
 - [ ] **Phase 3** — TOTP 2FA + API Keys (machine-to-machine auth)
 - [ ] **Phase 4** — SAML 2.0 (enterprise SSO)
 - [ ] **Phase 6** — Admin UI (React SPA embedded in binary)
-- [ ] **Phase 7** — Testing & Hardening (≥80% coverage, load test, security suite, CI/CD)
+- [ ] **Phase 7** — Testing & Hardening: ≥80% coverage, security test suite, load test, CI/CD pipeline, Prometheus metrics, Grafana dashboard
 
 ---
 
