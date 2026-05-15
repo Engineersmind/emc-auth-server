@@ -12,6 +12,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/api/handlers"
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
 // Deps holds shared dependencies injected into route handlers.
@@ -28,6 +29,14 @@ type RoutesConfig struct {
 	JWTIssuer string
 	// Env is "development" or "production" — controls HTTPS enforcement behaviour.
 	Env string
+	// AppBaseURL is prepended to the reset token link in emails.
+	AppBaseURL string
+	// SMTP fields for mailer (used in production; dev logs to console).
+	SMTPHost     string
+	SMTPPort     int
+	SMTPFrom     string
+	SMTPUsername string
+	SMTPPassword string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -97,7 +106,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Build shared services
 	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
-	authHandler := handlers.NewAuthHandler(authSvc, deps.Logger)
+
+	// Mailer: dev (console log) or SMTP based on Env
+	m := mailer.NewMailer(mailer.MailerConfig{
+		Env:          deps.Config.Env,
+		SMTPHost:     deps.Config.SMTPHost,
+		SMTPPort:     deps.Config.SMTPPort,
+		SMTPFrom:     deps.Config.SMTPFrom,
+		SMTPUsername: deps.Config.SMTPUsername,
+		SMTPPassword: deps.Config.SMTPPassword,
+		Logger:       deps.Logger,
+	})
+	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger)
+
+	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, deps.Logger)
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
@@ -112,6 +134,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/login", authHandler.Login, mw.LoginRateLimiter(rlCfg))
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
+	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
+	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
 	// Auth routes — protected by JWTRequired (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
@@ -121,8 +145,4 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/ping", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"status": "admin ping ok"})
 	}, mw.JWTRequired(jwtSvc), mw.RequirePermission("admin:access"))
-
-	// Plan 02-04 will add:
-	//   authGroup.POST("/forgot-password", authHandler.ForgotPassword)
-	//   authGroup.POST("/reset-password", authHandler.ResetPassword)
 }

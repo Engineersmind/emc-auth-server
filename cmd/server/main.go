@@ -76,8 +76,14 @@ func main() {
 		Pool:   pool,
 		Redis:  rdb,
 		Config: api.RoutesConfig{
-			JWTIssuer: cfg.JWTIssuer,
-			Env:       cfg.Env,
+			JWTIssuer:    cfg.JWTIssuer,
+			Env:          cfg.Env,
+			AppBaseURL:   cfg.AppBaseURL,
+			SMTPHost:     cfg.SMTPHost,
+			SMTPPort:     cfg.SMTPPort,
+			SMTPFrom:     cfg.SMTPFrom,
+			SMTPUsername: cfg.SMTPUsername,
+			SMTPPassword: cfg.SMTPPassword,
 		},
 	})
 

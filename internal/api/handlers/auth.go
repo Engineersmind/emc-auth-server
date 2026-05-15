@@ -13,14 +13,16 @@ import (
 // AuthHandler holds HTTP handlers for auth endpoints.
 // Register, Login, and Me are implemented here.
 // Refresh, Logout are added in Plan 02-02.
+// ForgotPassword, ResetPassword are added in Plan 02-04.
 type AuthHandler struct {
-	svc    *auth.AuthService
-	logger zerolog.Logger
+	svc      *auth.AuthService
+	resetSvc *auth.ResetService
+	logger   zerolog.Logger
 }
 
 // NewAuthHandler creates an AuthHandler.
-func NewAuthHandler(svc *auth.AuthService, logger zerolog.Logger) *AuthHandler {
-	return &AuthHandler{svc: svc, logger: logger}
+func NewAuthHandler(svc *auth.AuthService, resetSvc *auth.ResetService, logger zerolog.Logger) *AuthHandler {
+	return &AuthHandler{svc: svc, resetSvc: resetSvc, logger: logger}
 }
 
 // RegisterRequest is the JSON body for POST /api/v1/auth/register.
@@ -199,6 +201,94 @@ func (h *AuthHandler) Logout(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "logged out"})
+}
+
+// ForgotPasswordRequest is the JSON body for POST /api/v1/auth/forgot-password.
+type ForgotPasswordRequest struct {
+	Email string `json:"email"`
+}
+
+// ForgotPassword handles POST /api/v1/auth/forgot-password (RESET-01, RESET-03).
+//
+// Required header: X-Tenant-Slug: <slug>
+// Body: { "email": "user@example.com" }
+//
+// Response: ALWAYS HTTP 200 with a generic message, regardless of whether the email
+// is registered. This prevents email enumeration (RESET-03).
+//
+// The reset link is emailed to the user (or logged to console in development).
+func (h *AuthHandler) ForgotPassword(c echo.Context) error {
+	slug, ok := tenantSlugFromCtx(c)
+	if !ok {
+		// Even for missing tenant slug, return generic success to prevent enumeration.
+		// Log at debug so we can diagnose misconfigured clients without leaking to callers.
+		h.logger.Debug().Msg("forgot-password: missing X-Tenant-Slug header")
+		return c.JSON(http.StatusOK, map[string]string{
+			"message": "if that email address is registered, a password reset link has been sent",
+		})
+	}
+
+	var req ForgotPasswordRequest
+	if err := c.Bind(&req); err != nil || req.Email == "" {
+		// Return generic 200 even on bad body (RESET-03).
+		return c.JSON(http.StatusOK, map[string]string{
+			"message": "if that email address is registered, a password reset link has been sent",
+		})
+	}
+
+	// Errors from ForgotPassword are swallowed here — the service itself returns nil
+	// for "user not found" cases (RESET-03). Any infrastructure errors are logged by the service.
+	if err := h.resetSvc.ForgotPassword(c.Request().Context(), slug, req.Email); err != nil {
+		h.logger.Error().Err(err).Msg("forgot-password: unexpected service error")
+		// Still return generic 200 (RESET-03 — do not leak error details).
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{
+		"message": "if that email address is registered, a password reset link has been sent",
+	})
+}
+
+// ResetPasswordRequest is the JSON body for POST /api/v1/auth/reset-password.
+type ResetPasswordRequest struct {
+	// Token is the raw reset token from the email link query parameter.
+	Token       string `json:"token"`
+	NewPassword string `json:"new_password"`
+}
+
+// ResetPassword handles POST /api/v1/auth/reset-password (RESET-02).
+//
+// Body: { "token": "<raw_token_from_email>", "new_password": "NewPass123!" }
+//
+// Response 200: { "message": "password updated successfully" }
+// Response 400: invalid, expired, used token — or password too short
+func (h *AuthHandler) ResetPassword(c echo.Context) error {
+	var req ResetPasswordRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "token is required"})
+	}
+	if req.NewPassword == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "new_password is required"})
+	}
+
+	err := h.resetSvc.ResetPassword(c.Request().Context(), auth.ResetPasswordInput{
+		RawToken:    req.Token,
+		NewPassword: req.NewPassword,
+	})
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidResetToken) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired reset token"})
+		}
+		if containsMsg(err, "at least 8 characters") {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		}
+		h.logger.Error().Err(err).Msg("reset-password failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "password reset failed"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "password updated successfully"})
 }
 
 // containsMsg is a simple substring check for error classification.
