@@ -13,12 +13,14 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/admin"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 )
 
 // AdminHandler holds handlers for all Admin API endpoints.
 type AdminHandler struct {
 	svc         *admin.Service
 	appLimitSvc *auth.AppRateLimitService
+	corsSvc     *mw.TenantCORSService
 	audit       *audit.Logger
 	logger      zerolog.Logger
 }
@@ -31,6 +33,12 @@ func NewAdminHandler(svc *admin.Service, auditLog *audit.Logger, logger zerolog.
 // WithAppRateLimits attaches the AppRateLimitService for CRUD handler support.
 func (h *AdminHandler) WithAppRateLimits(svc *auth.AppRateLimitService) *AdminHandler {
 	h.appLimitSvc = svc
+	return h
+}
+
+// WithCORS attaches the TenantCORSService for cache invalidation on origin updates.
+func (h *AdminHandler) WithCORS(svc *mw.TenantCORSService) *AdminHandler {
+	h.corsSvc = svc
 	return h
 }
 
@@ -923,6 +931,68 @@ func parseUUIDs(strs []string) ([]uuid.UUID, error) {
 		result = append(result, id)
 	}
 	return result, nil
+}
+
+// ---------------------------------------------------------------------------
+// Tenant CORS origins management (requires "tenant:manage")
+// ---------------------------------------------------------------------------
+
+// UpdateCORSOriginsRequest is the body for PUT /api/v1/admin/tenants/:id/cors-origins.
+type UpdateCORSOriginsRequest struct {
+	Origins []string `json:"origins"` // e.g. ["https://app.example.com"]
+}
+
+// UpdateTenantCORSOrigins handles PUT /api/v1/admin/tenants/:id/cors-origins.
+//
+// @Summary      Update tenant CORS origins
+// @Description  Replaces the list of allowed CORS origins for a tenant. Pass an empty array to disable CORS enforcement. Requires tenant:manage.
+// @Tags         admin-tenants
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      string                  true  "Tenant ID (UUID)"
+// @Param        body  body      UpdateCORSOriginsRequest true  "Allowed origins"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      404   {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{id}/cors-origins [put]
+func (h *AdminHandler) UpdateTenantCORSOrigins(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+
+	var req UpdateCORSOriginsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	if err := h.svc.UpdateTenantCORSOrigins(c.Request().Context(), tenantID, req.Origins); err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: update cors origins failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update CORS origins"})
+	}
+
+	// Invalidate CORS cache for the tenant slug so changes take effect immediately.
+	if h.corsSvc != nil {
+		callerClaims := claims
+		if callerClaims != nil {
+			// We only have the tenant ID here; slug invalidation happens lazily on next miss.
+			// For an exact flush, the caller can pass X-Tenant-Slug as a query param.
+			if slug := c.QueryParam("slug"); slug != "" {
+				h.corsSvc.InvalidateCache(c.Request().Context(), slug)
+			}
+		}
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminCORSUpdated, "tenant", tenantID.String())
+	return c.JSON(http.StatusOK, map[string]string{"message": "CORS origins updated"})
 }
 
 // ---------------------------------------------------------------------------

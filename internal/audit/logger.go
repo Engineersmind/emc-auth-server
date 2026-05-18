@@ -55,6 +55,9 @@ const (
 	ActionAdminAppLimitCreated = "admin.app_limit_created"
 	ActionAdminAppLimitUpdated = "admin.app_limit_updated"
 	ActionAdminAppLimitDeleted = "admin.app_limit_deleted"
+
+	// Admin — tenant CORS configuration
+	ActionAdminCORSUpdated = "admin.cors_origins_updated"
 )
 
 // ---------------------------------------------------------------------------

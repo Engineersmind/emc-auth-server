@@ -184,6 +184,25 @@ func (s *Service) DeactivateTenant(ctx context.Context, tenantID uuid.UUID) erro
 	return nil
 }
 
+// UpdateTenantCORSOrigins replaces the allowed CORS origins for a tenant.
+// Pass an empty slice to clear all origins (disables per-tenant CORS enforcement).
+func (s *Service) UpdateTenantCORSOrigins(ctx context.Context, tenantID uuid.UUID, origins []string) error {
+	if origins == nil {
+		origins = []string{}
+	}
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE tenants SET cors_origins = $2, updated_at = NOW()
+		WHERE id = $1
+	`, tenantID, origins)
+	if err != nil {
+		return fmt.Errorf("update cors_origins: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Permission management (tenant-scoped)
 // ---------------------------------------------------------------------------

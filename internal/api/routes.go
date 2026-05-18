@@ -157,11 +157,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
 	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
+
+	// Per-tenant CORS service — DB-backed, Redis-cached, 60s TTL.
+	corsSvc := mw.NewTenantCORSService(deps.Pool, deps.Redis, deps.Logger)
+
 	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
-		WithAppRateLimits(appLimitSvc)
+		WithAppRateLimits(appLimitSvc).
+		WithCORS(corsSvc)
 
 	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
 	e.Use(mw.AppRateLimiter(appLimitSvc))
+
+	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
+	e.Use(mw.TenantCORS(corsSvc))
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
@@ -208,6 +216,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt.GET("/tenants", adminHandler.ListTenants)
 	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
 	tenantMgmt.DELETE("/tenants/:id", adminHandler.DeactivateTenant)
+	tenantMgmt.PUT("/tenants/:id/cors-origins", adminHandler.UpdateTenantCORSOrigins)
 
 	// Permission management — tenant admin (admin:access permission)
 	rbacGroup := adminGroup.Group("", mw.RequirePermission("admin:access"))
