@@ -638,15 +638,305 @@ swag init -g cmd/server/main.go --output docs
 
 ---
 
-## Roadmap
+## Phase Tracking
 
-- [x] **Phase 1** — Foundation: schema, migrations, Docker, seed, health endpoint
-- [x] **Phase 2** — Auth Engine: JWT, refresh rotation, password reset, rate limiting, security headers
-- [x] **Phase 5** — Admin API: tenant management, user pool, RBAC, audit logs
-- [ ] **Phase 3** — TOTP 2FA + API Keys (machine-to-machine auth)
-- [ ] **Phase 4** — SAML 2.0 (enterprise SSO)
-- [ ] **Phase 6** — Admin UI (React SPA embedded in binary)
-- [ ] **Phase 7** — Testing & Hardening: ≥80% coverage, security test suite, load test, CI/CD pipeline, Prometheus metrics, Grafana dashboard
+### Progress Overview
+
+```
+Phase 1  Foundation            ████████████████████  COMPLETE  ✓  (3/3 plans)
+Phase 2  Auth Engine           ████████████████████  COMPLETE  ✓  (4/4 plans)
+Phase 3  TOTP + API Keys       ░░░░░░░░░░░░░░░░░░░░  PLANNED      (0/3 plans)
+Phase 4  SAML 2.0              ░░░░░░░░░░░░░░░░░░░░  PLANNED      (0/2 plans)
+Phase 5  Admin API             ████████████████████  COMPLETE  ✓  (3/3 plans)
+Phase 6  Admin UI              ░░░░░░░░░░░░░░░░░░░░  PLANNED      (0/4 plans)
+Phase 7  Testing & Hardening   ░░░░░░░░░░░░░░░░░░░░  PLANNED      (0/5 plans)
+Phase 8  AI/Agent Security     ░░░░░░░░░░░░░░░░░░░░  PLANNED      (0/4 plans)
+─────────────────────────────────────────────────────────────────
+         3 of 8 phases complete  ·  10/21 sub-plans done  ·  37%
+```
+
+### Sub-plan Detail
+
+<details>
+<summary>Phase 1 — Foundation (COMPLETE)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 01-01 | Go module, Echo skeleton, logging, health, Dockerfile, docker-compose | ✓ Done |
+| 01-02 | Goose migration files — all schema tables, FKs, indexes | ✓ Done |
+| 01-03 | PostgreSQL + Redis pool, idempotent seed (tenant + super-admin) | ✓ Done |
+
+</details>
+
+<details>
+<summary>Phase 2 — Auth Engine (COMPLETE)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 02-01 | Register, login, bcrypt cost 12, JWT HS256, `GET /auth/me` | ✓ Done |
+| 02-02 | Refresh rotation (Redis), logout, JWTRequired, RequirePermission middleware | ✓ Done |
+| 02-03 | Rate limiting (5/min/IP, 10/min/tenant), HTTPS enforcement, HSTS headers | ✓ Done |
+| 02-04 | Password reset — forgot-password, SHA-256 token, email dispatch, session revocation | ✓ Done |
+
+</details>
+
+<details>
+<summary>Phase 3 — TOTP + API Keys (branch: feat/phase-3-totp-api-keys)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 03-01 | TOTP enroll/verify/disable, AES-256 secret encryption, backup codes | Planned |
+| 03-02 | TOTP step injected into login flow when TOTP is active | Planned |
+| 03-03 | API key CRUD (create/list/revoke) + `APIKeyAuth` middleware + `last_used` | Planned |
+
+</details>
+
+<details>
+<summary>Phase 4 — SAML 2.0 (branch: feat/phase-4-saml)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 04-01 | Per-tenant SAML config model, `GET /saml/metadata` using crewjam/saml | Planned |
+| 04-02 | SP-initiated login, ACS handler, assertion validation, JIT provisioning | Planned |
+
+</details>
+
+<details>
+<summary>Phase 5 — Admin API (COMPLETE)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 05-01 | Tenant management endpoints with tenant:manage guard | ✓ Done |
+| 05-02 | AdminService — user pool, RBAC, role/permission CRUD | ✓ Done |
+| 05-03 | AdminHandler — all admin REST endpoints + audit query handlers | ✓ Done |
+
+</details>
+
+<details>
+<summary>Phase 6 — Admin UI (branch: feat/phase-6-admin-ui)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 06-01 | Vite + React + TypeScript scaffold, auth context, login page, protected routes | Planned |
+| 06-02 | Tenant management views (super-admin) + user pool table (search, filter, paginate) | Planned |
+| 06-03 | User detail page (edit, role assign, force reset) + roles/permissions management | Planned |
+| 06-04 | API keys page, SAML config, dashboard metrics tile, `embed.FS` static serving | Planned |
+
+</details>
+
+<details>
+<summary>Phase 7 — Testing & Hardening (branch: feat/phase-7-hardening)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 07-01 | Unit + integration tests for `internal/auth/` and `internal/store/` (≥80% coverage) | Planned |
+| 07-02 | Security test suite — replay, rate limit, enumeration, TOTP bypass, SQL injection | Planned |
+| 07-03 | Load test (k6, 500 VUs), production Dockerfile (distroless), deployment runbook | Planned |
+| 07-04 | CI/CD — GitHub Actions: test + coverage gate, gosec, govulncheck, golangci-lint | Planned |
+| 07-05 | Observability — Prometheus `/metrics`, Grafana dashboard JSON, alerting rules | Planned |
+
+</details>
+
+<details>
+<summary>Phase 8 — AI/Agent Security (branch: feat/phase-8-ai-agent-security)</summary>
+
+| Plan | Description | Status |
+|------|-------------|--------|
+| 08-01 | Agent registration (`agent_registrations` table), authenticate endpoint, agent JWT variant | Planned |
+| 08-02 | Per-application rate limiting — configurable limits per `app_id`, DB-backed, Redis-cached | Planned |
+| 08-03 | Agent audit trail — `agent_id` in audit_logs, `?agent_id=` filter, `GET /admin/agents` list | Planned |
+| 08-04 | Security analysis engine — `GET /admin/agents/analysis` risk scoring, anomaly flags | Planned |
+
+</details>
+
+---
+
+## Branch Strategy
+
+```
+master
+  ├── feat/phase-3-totp-api-keys      ← TOTP 2FA + API key auth
+  ├── feat/phase-4-saml               ← SAML 2.0 enterprise SSO
+  ├── feat/phase-6-admin-ui           ← React admin dashboard
+  ├── feat/phase-7-hardening          ← tests, CI/CD, Prometheus
+  └── feat/phase-8-ai-agent-security  ← AI/agent identity + rate limits
+```
+
+**Rules:**
+- All feature work happens on its phase branch — never directly on `master`
+- Each branch maps to exactly one phase; sub-plans are tracked as commits on that branch
+- A phase branch merges to `master` only when **all** its sub-plans are complete and validated
+- Each merge to `master` is tagged with a semantic version: `v1.3.0`, `v1.4.0`, etc.
+
+**Completion gate before merge:**
+```
+□ All sub-plans committed and self-tested
+□ go build ./... succeeds with zero warnings
+□ go test ./... passes (≥80% coverage on auth core — Phase 7+)
+□ gosec ./... clean (Phase 7+)
+□ swag init updated if handlers changed
+□ README roadmap and ROADMAP.md updated
+□ PR created, reviewed, and approved
+```
+
+---
+
+## AI/Agent Security — Phase 8
+
+EMC-Auth treats AI agents as first-class authenticated identities — not anonymous API consumers. Any LLM, orchestrator, or automated service can register, authenticate, and be governed by the same tenant-scoped permission and audit model as human users.
+
+### Agent Identity Model
+
+```
+agent_registrations
+  ├── id            UUID PRIMARY KEY
+  ├── tenant_id     UUID  (tenant-scoped — agent A cannot cross into tenant B)
+  ├── name          TEXT  (human-readable label, e.g. "invoice-classifier-v2")
+  ├── agent_type    TEXT  (llm | tool | orchestrator | service)
+  ├── capabilities  TEXT[] (declared scopes: ["invoice:read", "report:export"])
+  ├── api_key_hash  TEXT  (SHA-256 of raw key — raw key shown once at registration)
+  ├── is_active     BOOL
+  └── created_at    TIMESTAMPTZ
+
+Agent JWT payload (same middleware, different claims):
+  {
+    "agent_id":    "uuid",
+    "agent_type":  "llm",
+    "tenant_id":   "uuid",
+    "capabilities": ["invoice:read"],
+    "iss": "https://auth.emc.local",
+    "exp": 1234567890
+  }
+```
+
+### Per-Application Rate Limiting
+
+Rate limits are configurable per `app_id` (header `X-App-ID`) without a server restart:
+
+```
+app_rate_limits table
+  ├── app_id          TEXT PRIMARY KEY
+  ├── tenant_id       UUID
+  ├── requests_per_minute  INT  (default: 60)
+  ├── burst           INT  (default: 10)
+  └── updated_at      TIMESTAMPTZ
+
+Enforcement:
+  1. Middleware reads limit from Redis (key: rate:app:{app_id})
+  2. Cache miss → query DB → write to Redis with 60s TTL
+  3. Admin updates limit → next DB read (within 60s) picks up change
+  4. Exceeds limit → 429 with Retry-After header
+
+Admin API:
+  POST   /api/v1/admin/apps              Create app rate config
+  GET    /api/v1/admin/apps              List all app configs (tenant-scoped)
+  PUT    /api/v1/admin/apps/:app_id      Update limit (effective within 60s)
+  DELETE /api/v1/admin/apps/:app_id      Remove custom limit (falls back to default)
+```
+
+### Security Analysis
+
+`GET /api/v1/admin/agents/analysis` — requires `admin:access`
+
+```json
+{
+  "window": "24h",
+  "agents": [
+    {
+      "agent_id": "uuid",
+      "name": "invoice-classifier-v2",
+      "agent_type": "llm",
+      "total_requests": 4821,
+      "rate_limit_hits": 12,
+      "unique_ips": 3,
+      "off_hours_access": false,
+      "risk_score": 14,
+      "flags": []
+    },
+    {
+      "agent_id": "uuid",
+      "name": "data-scraper-unknown",
+      "agent_type": "service",
+      "total_requests": 98200,
+      "rate_limit_hits": 447,
+      "unique_ips": 31,
+      "off_hours_access": true,
+      "risk_score": 87,
+      "flags": ["high_volume", "many_ips", "off_hours", "rate_limit_abuse"]
+    }
+  ]
+}
+```
+
+**Risk score signals (weighted):**
+
+| Signal | Weight | Threshold |
+|--------|--------|-----------|
+| Rate limit hit rate > 1% | 20 | hits/total > 0.01 |
+| Unique IPs > 5 in 24h | 25 | unusual for a single agent |
+| Off-hours access (outside 06–22 UTC) | 15 | any request in window |
+| Request volume > 10k/24h | 20 | high automated load |
+| New agent (< 7 days old) | 10 | elevated caution period |
+| Capability mismatch (accessing non-declared routes) | 30 | critical |
+
+---
+
+## Enhancements — Planned Outside Main Roadmap
+
+Items tracked for v2 (post-Phase 8):
+
+| Enhancement | Description | Priority |
+|-------------|-------------|----------|
+| OAuth2 / OIDC server | Expose authorization_code + client_credentials flows so third-party apps can use EMC-Auth as a full OAuth2 provider | High |
+| Social login | Google, GitHub, Microsoft OAuth2 login with account linking | Medium |
+| Passwordless / magic link | Email-based one-click login for low-friction onboarding | Medium |
+| RS256 JWT | Asymmetric signing — public key endpoint so external services can verify tokens without calling EMC-Auth | Medium |
+| Webhooks | POST to a configured URL on user lifecycle events: `user.created`, `user.deleted`, `auth.login_failed` | Medium |
+| SDK libraries | Node.js and Python client libraries for JWT verification and token introspection | Medium |
+| White-label login page | Per-tenant custom logo, colors, and domain on the hosted login UI | Low |
+| Audit log retention | Configurable retention window + archive to S3/GCS after N days | Low |
+| Login anomaly detection | Flag logins from new country/device; alert admin or require MFA step-up | Low |
+| CORS per tenant | Tenant-configurable allowed origins stored in DB; enforced by middleware | Low |
+| Distributed rate limiting | Replace in-memory rate limiter with Redis-backed solution for multi-instance deployments | Phase 7 |
+| Token introspection endpoint | `POST /oauth/introspect` — RFC 7662 token introspection for resource servers | v2 |
+| Agent federation | Allow agents registered in tenant A to present credentials to tenant B with explicit trust grant | v2 |
+| Agent behavior baseline | ML-based normal behavior model per agent; alert on deviation from baseline | v2 |
+
+---
+
+## Project Structure
+
+```
+emc-auth-server/
+├── cmd/server/main.go       # entrypoint — wires everything and starts HTTP server
+├── internal/
+│   ├── admin/               # Admin service: tenant CRUD, user pool, role/permission CRUD
+│   ├── api/
+│   │   ├── handlers/        # HTTP handlers: auth.go, admin.go, health.go
+│   │   └── middleware/      # jwt.go, permission.go, ratelimit.go, logger.go
+│   ├── audit/               # Audit logger (write + paginated query)
+│   ├── auth/                # JWT service, auth service, reset service, token utils
+│   ├── config/              # Environment variable loader
+│   ├── mailer/              # DevMailer (console) + SMTPMailer
+│   └── store/               # DB pool, Redis client, migration runner, seed
+├── migrations/              # Goose SQL files (00001–00016), embedded via embed.FS
+├── docs/                    # Swagger-generated files (auto-generated, do not edit)
+├── .env.example             # Template for local configuration
+└── docker-compose.yml       # Postgres 16 + Redis 7 + app service
+```
+
+---
+
+## Regenerating Swagger Docs
+
+After adding or modifying handler annotations:
+
+```bash
+# Install swag if not already installed
+go install github.com/swaggo/swag/cmd/swag@latest
+
+swag init -g cmd/server/main.go --output docs
+```
 
 ---
 
