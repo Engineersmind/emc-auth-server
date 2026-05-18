@@ -35,6 +35,8 @@ type RoutesConfig struct {
 	Env string
 	// AppBaseURL is prepended to the reset token link in emails.
 	AppBaseURL string
+	// TOTPEncryptionKey is the 64-char hex key for AES-256-GCM TOTP secret encryption.
+	TOTPEncryptionKey string
 	// SMTP fields for mailer (used in production; dev logs to console).
 	SMTPHost     string
 	SMTPPort     int
@@ -114,6 +116,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
 
+	// TOTP service — requires encryption key; logs warning in dev if missing.
+	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Logger)
+	if totpErr != nil {
+		deps.Logger.Fatal().Err(totpErr).Msg("TOTP service init failed — check TOTP_ENCRYPTION_KEY")
+	}
+	authSvc.WithTOTP(totpSvc, deps.Redis)
+
+	// API key service
+	apiKeySvc := auth.NewAPIKeyService(deps.Pool, deps.Logger)
+
 	// Mailer: dev (console log) or SMTP based on Env
 	m := mailer.NewMailer(mailer.MailerConfig{
 		Env:          deps.Config.Env,
@@ -129,7 +141,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logger — shared by both auth and admin handlers
 	auditLog := audit.New(deps.Pool, deps.Logger)
 
-	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger)
+	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
+		WithTOTP(totpSvc).
+		WithAPIKeys(apiKeySvc)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
@@ -146,6 +160,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/register", authHandler.Register)
 	// Login is rate-limited at route level (not global) to avoid impacting other endpoints.
 	authGroup.POST("/login", authHandler.Login, mw.LoginRateLimiter(rlCfg))
+	authGroup.POST("/login/otp", authHandler.LoginOTP) // complete TOTP-gated login (03-02)
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
@@ -153,6 +168,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Auth routes — protected by JWTRequired (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
+
+	// TOTP management — protected (03-01)
+	otpGroup := authGroup.Group("/otp", mw.JWTRequired(jwtSvc))
+	otpGroup.POST("/enroll", authHandler.TOTPEnroll)
+	otpGroup.POST("/activate", authHandler.TOTPActivate)
+	otpGroup.DELETE("", authHandler.TOTPDisable)
 
 	// Admin routes — all require a valid JWT.
 	adminGroup := apiV1.Group("/admin", mw.JWTRequired(jwtSvc))
@@ -187,6 +208,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.PUT("/users/:id/role", adminHandler.AssignUserRole)
 	rbacGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser)
 	rbacGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset)
+
+	// API key management — tenant admin (admin:access) (03-03)
+	rbacGroup.POST("/api-keys", authHandler.CreateAPIKey)
+	rbacGroup.GET("/api-keys", authHandler.ListAPIKeys)
+	rbacGroup.DELETE("/api-keys/:id", authHandler.RevokeAPIKey)
 
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
