@@ -180,6 +180,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
+	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
+	authGroup.POST("/session", authHandler.SessionLogin)
+	authGroup.POST("/session/refresh", authHandler.SessionRefresh)
+	authGroup.POST("/session/logout", authHandler.SessionLogout)
+
 	// Auth routes — protected by JWTRequired (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
 
