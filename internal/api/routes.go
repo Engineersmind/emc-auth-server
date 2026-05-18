@@ -147,7 +147,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
-	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger)
+
+	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
+	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
+	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
+		WithAppRateLimits(appLimitSvc)
+
+	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
+	e.Use(mw.AppRateLimiter(appLimitSvc))
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
@@ -217,4 +224,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
+
+	// Per-app rate limit management — tenant admin (admin:access) (08-02)
+	rbacGroup.POST("/app-limits", adminHandler.CreateAppLimit)
+	rbacGroup.GET("/app-limits", adminHandler.ListAppLimits)
+	rbacGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit)
+	rbacGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit)
 }
