@@ -1089,16 +1089,3 @@ func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "app rate limit deleted"})
 }
 
-// containsMsg checks whether an error message contains a substring.
-func containsMsg(err error, sub string) bool {
-	if err == nil {
-		return false
-	}
-	s := err.Error()
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
-}

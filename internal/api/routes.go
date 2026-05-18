@@ -6,6 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	echoMiddleware "github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
@@ -104,10 +105,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.Use(securityHeaders())
 	e.Use(httpsRedirect(deps.Config.Env))
 	e.Use(mw.RequestLogger(deps.Logger))
+	e.Use(mw.PrometheusMetrics())
 	e.Use(echoMiddleware.Recover())
 
 	// Health check — no auth required
 	e.GET("/health", handlers.HealthHandler)
+
+	// Prometheus metrics — internal observability endpoint (07-05).
+	// Bind to 127.0.0.1 in production via reverse proxy; no auth by design
+	// (Prometheus scrapes this; protect via network policy).
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	// Swagger UI — available at /swagger/index.html
 	e.GET("/swagger/*", echoSwagger.WrapHandler)
