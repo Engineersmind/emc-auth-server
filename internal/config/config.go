@@ -25,6 +25,11 @@ type Config struct {
 	// AppBaseURL is prepended to the reset token link in emails.
 	// Example: "https://auth.emc.local"
 	AppBaseURL string
+
+	// TOTPEncryptionKey is a 32-byte hex-encoded key used to AES-256-GCM encrypt
+	// TOTP secrets at rest. Generate with: openssl rand -hex 32
+	// Required when TOTP is used. Must be exactly 64 hex characters.
+	TOTPEncryptionKey string
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -42,7 +47,8 @@ func Load() *Config {
 		SMTPFrom:     getEnv("SMTP_FROM", "no-reply@emc.local"),
 		SMTPUsername: getEnv("SMTP_USERNAME", ""),
 		SMTPPassword: getEnv("SMTP_PASSWORD", ""),
-		AppBaseURL:   getEnv("APP_BASE_URL", "http://localhost:8080"),
+		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:8080"),
+		TOTPEncryptionKey: getEnv("TOTP_ENCRYPTION_KEY", ""),
 	}
 }
 

@@ -1,0 +1,43 @@
+run:
+  timeout: 5m
+  go: "1.23"
+
+linters:
+  enable:
+    - errcheck        # unchecked errors
+    - gosimple        # simplification suggestions
+    - govet           # go vet checks
+    - ineffassign     # unused assignments
+    - staticcheck     # advanced static analysis
+    - unused          # unused code
+    - gofmt           # formatting
+    - goimports       # import ordering
+    - gosec           # security checks
+    - misspell        # typos
+    - noctx           # http calls without context
+    - bodyclose       # http response body not closed
+    - sqlcloserows    # sql rows not closed
+    - revive          # general linter (replaces golint)
+  disable:
+    - depguard        # dependency restrictions (not needed here)
+
+linters-settings:
+  gosec:
+    excludes:
+      - G401   # use of weak cryptographic primitive (MD5 allowed in non-security contexts)
+      - G501   # import of unsafe crypto (we use bcrypt + AES-GCM explicitly)
+  errcheck:
+    check-type-assertions: true
+  revive:
+    rules:
+      - name: exported
+        disabled: true  # don't require godoc on all exported symbols
+
+issues:
+  exclude-rules:
+    - path: "_test.go"
+      linters: [gosec, errcheck]
+    - path: "docs/"
+      linters: [all]
+  max-issues-per-linter: 50
+  max-same-issues: 10
