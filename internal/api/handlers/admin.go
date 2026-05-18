@@ -13,18 +13,33 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/admin"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 )
 
 // AdminHandler holds handlers for all Admin API endpoints.
 type AdminHandler struct {
-	svc    *admin.Service
-	audit  *audit.Logger
-	logger zerolog.Logger
+	svc         *admin.Service
+	appLimitSvc *auth.AppRateLimitService
+	corsSvc     *mw.TenantCORSService
+	audit       *audit.Logger
+	logger      zerolog.Logger
 }
 
 // NewAdminHandler creates an AdminHandler.
 func NewAdminHandler(svc *admin.Service, auditLog *audit.Logger, logger zerolog.Logger) *AdminHandler {
 	return &AdminHandler{svc: svc, audit: auditLog, logger: logger}
+}
+
+// WithAppRateLimits attaches the AppRateLimitService for CRUD handler support.
+func (h *AdminHandler) WithAppRateLimits(svc *auth.AppRateLimitService) *AdminHandler {
+	h.appLimitSvc = svc
+	return h
+}
+
+// WithCORS attaches the TenantCORSService for cache invalidation on origin updates.
+func (h *AdminHandler) WithCORS(svc *mw.TenantCORSService) *AdminHandler {
+	h.corsSvc = svc
+	return h
 }
 
 // claimsFromCtx extracts *auth.Claims injected by JWTRequired middleware.
@@ -917,3 +932,230 @@ func parseUUIDs(strs []string) ([]uuid.UUID, error) {
 	}
 	return result, nil
 }
+
+// ---------------------------------------------------------------------------
+// Tenant CORS origins management (requires "tenant:manage")
+// ---------------------------------------------------------------------------
+
+// UpdateCORSOriginsRequest is the body for PUT /api/v1/admin/tenants/:id/cors-origins.
+type UpdateCORSOriginsRequest struct {
+	Origins []string `json:"origins"` // e.g. ["https://app.example.com"]
+}
+
+// UpdateTenantCORSOrigins handles PUT /api/v1/admin/tenants/:id/cors-origins.
+//
+// @Summary      Update tenant CORS origins
+// @Description  Replaces the list of allowed CORS origins for a tenant. Pass an empty array to disable CORS enforcement. Requires tenant:manage.
+// @Tags         admin-tenants
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      string                  true  "Tenant ID (UUID)"
+// @Param        body  body      UpdateCORSOriginsRequest true  "Allowed origins"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      404   {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{id}/cors-origins [put]
+func (h *AdminHandler) UpdateTenantCORSOrigins(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+
+	var req UpdateCORSOriginsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	if err := h.svc.UpdateTenantCORSOrigins(c.Request().Context(), tenantID, req.Origins); err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: update cors origins failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update CORS origins"})
+	}
+
+	// Invalidate CORS cache for the tenant slug so changes take effect immediately.
+	if h.corsSvc != nil {
+		callerClaims := claims
+		if callerClaims != nil {
+			// We only have the tenant ID here; slug invalidation happens lazily on next miss.
+			// For an exact flush, the caller can pass X-Tenant-Slug as a query param.
+			if slug := c.QueryParam("slug"); slug != "" {
+				h.corsSvc.InvalidateCache(c.Request().Context(), slug)
+			}
+		}
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminCORSUpdated, "tenant", tenantID.String())
+	return c.JSON(http.StatusOK, map[string]string{"message": "CORS origins updated"})
+}
+
+// ---------------------------------------------------------------------------
+// Per-app rate limit management (08-02, requires "admin:access")
+// ---------------------------------------------------------------------------
+
+// AppLimitRequest is the body for create/update app rate limit endpoints.
+type AppLimitRequest struct {
+	AppID       string `json:"app_id"`
+	RPM         int    `json:"requests_per_minute"`
+	Burst       int    `json:"burst"`
+	Description string `json:"description"`
+}
+
+// CreateAppLimit handles POST /api/v1/admin/app-limits.
+//
+// @Summary      Create app rate limit
+// @Description  Sets a custom per-minute request limit for an application identified by X-App-ID. Requires admin:access.
+// @Tags         admin-rate-limits
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      AppLimitRequest      true  "App limit config"
+// @Success      201   {object}  auth.AppRateLimit
+// @Failure      400   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "app_id already has a rate limit config"
+// @Router       /api/v1/admin/app-limits [post]
+func (h *AdminHandler) CreateAppLimit(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+	}
+
+	var req AppLimitRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.AppID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "app_id is required"})
+	}
+
+	limit, err := h.appLimitSvc.CreateAppLimit(c.Request().Context(), tenantID, req.AppID, req.RPM, req.Burst, req.Description)
+	if err != nil {
+		if containsMsg(err, "already has a rate limit") {
+			return c.JSON(http.StatusConflict, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: create app limit failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create app rate limit"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminAppLimitCreated, "app_rate_limit", req.AppID)
+	return c.JSON(http.StatusCreated, limit)
+}
+
+// ListAppLimits handles GET /api/v1/admin/app-limits.
+//
+// @Summary      List app rate limits
+// @Description  Returns all per-app rate limit configs for the caller's tenant. Requires admin:access.
+// @Tags         admin-rate-limits
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {array}   auth.AppRateLimit
+// @Router       /api/v1/admin/app-limits [get]
+func (h *AdminHandler) ListAppLimits(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+	}
+
+	limits, err := h.appLimitSvc.ListAppLimits(c.Request().Context(), tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: list app limits failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list app rate limits"})
+	}
+	return c.JSON(http.StatusOK, limits)
+}
+
+// UpdateAppLimit handles PUT /api/v1/admin/app-limits/:app_id.
+//
+// @Summary      Update app rate limit
+// @Description  Updates the rate limit config for an existing app_id in the tenant. Requires admin:access.
+// @Tags         admin-rate-limits
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        app_id  path      string          true  "App ID"
+// @Param        body    body      AppLimitRequest true  "Updated limit config"
+// @Success      200     {object}  auth.AppRateLimit
+// @Failure      404     {object}  map[string]string
+// @Router       /api/v1/admin/app-limits/{app_id} [put]
+func (h *AdminHandler) UpdateAppLimit(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+	}
+
+	appID := c.Param("app_id")
+	if appID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "app_id path param required"})
+	}
+
+	var req AppLimitRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	limit, err := h.appLimitSvc.UpdateAppLimit(c.Request().Context(), tenantID, appID, req.RPM, req.Burst, req.Description)
+	if err != nil {
+		if containsMsg(err, "not found") {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: update app limit failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update app rate limit"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminAppLimitUpdated, "app_rate_limit", appID)
+	return c.JSON(http.StatusOK, limit)
+}
+
+// DeleteAppLimit handles DELETE /api/v1/admin/app-limits/:app_id.
+//
+// @Summary      Delete app rate limit
+// @Description  Removes the custom rate limit for an app_id; it falls back to the default limit. Requires admin:access.
+// @Tags         admin-rate-limits
+// @Produce      json
+// @Security     BearerAuth
+// @Param        app_id  path      string  true  "App ID"
+// @Success      200     {object}  map[string]string
+// @Failure      404     {object}  map[string]string
+// @Router       /api/v1/admin/app-limits/{app_id} [delete]
+func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+	}
+
+	appID := c.Param("app_id")
+	if appID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "app_id path param required"})
+	}
+
+	if err := h.appLimitSvc.DeleteAppLimit(c.Request().Context(), tenantID, appID); err != nil {
+		if containsMsg(err, "not found") {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: delete app limit failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete app rate limit"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminAppLimitDeleted, "app_rate_limit", appID)
+	return c.JSON(http.StatusOK, map[string]string{"message": "app rate limit deleted"})
+}
+

@@ -50,6 +50,14 @@ const (
 	ActionAdminUserDeleted          = "admin.user_deleted"
 	ActionAdminUserRoleAssigned     = "admin.user_role_assigned"
 	ActionAdminForcePasswordReset   = "admin.force_password_reset"
+
+	// Admin — per-app rate limit management (08-02)
+	ActionAdminAppLimitCreated = "admin.app_limit_created"
+	ActionAdminAppLimitUpdated = "admin.app_limit_updated"
+	ActionAdminAppLimitDeleted = "admin.app_limit_deleted"
+
+	// Admin — tenant CORS configuration
+	ActionAdminCORSUpdated = "admin.cors_origins_updated"
 )
 
 // ---------------------------------------------------------------------------

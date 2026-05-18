@@ -6,6 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	echoMiddleware "github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
@@ -104,10 +105,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.Use(securityHeaders())
 	e.Use(httpsRedirect(deps.Config.Env))
 	e.Use(mw.RequestLogger(deps.Logger))
+	e.Use(mw.PrometheusMetrics())
 	e.Use(echoMiddleware.Recover())
 
 	// Health check — no auth required
 	e.GET("/health", handlers.HealthHandler)
+
+	// Prometheus metrics — internal observability endpoint (07-05).
+	// Bind to 127.0.0.1 in production via reverse proxy; no auth by design
+	// (Prometheus scrapes this; protect via network policy).
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	// Swagger UI — available at /swagger/index.html
 	e.GET("/swagger/*", echoSwagger.WrapHandler)
@@ -147,7 +154,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
-	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger)
+
+	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
+	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
+
+	// Per-tenant CORS service — DB-backed, Redis-cached, 60s TTL.
+	corsSvc := mw.NewTenantCORSService(deps.Pool, deps.Redis, deps.Logger)
+
+	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
+		WithAppRateLimits(appLimitSvc).
+		WithCORS(corsSvc)
+
+	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
+	e.Use(mw.AppRateLimiter(appLimitSvc))
+
+	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
+	e.Use(mw.TenantCORS(corsSvc))
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
@@ -165,6 +187,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/logout", authHandler.Logout)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
+
+	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
+	authGroup.POST("/session", authHandler.SessionLogin)
+	authGroup.POST("/session/refresh", authHandler.SessionRefresh)
+	authGroup.POST("/session/logout", authHandler.SessionLogout)
 
 	// Auth routes — protected by JWTRequired (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
@@ -189,6 +216,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt.GET("/tenants", adminHandler.ListTenants)
 	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
 	tenantMgmt.DELETE("/tenants/:id", adminHandler.DeactivateTenant)
+	tenantMgmt.PUT("/tenants/:id/cors-origins", adminHandler.UpdateTenantCORSOrigins)
 
 	// Permission management — tenant admin (admin:access permission)
 	rbacGroup := adminGroup.Group("", mw.RequirePermission("admin:access"))
@@ -217,4 +245,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
+
+	// Per-app rate limit management — tenant admin (admin:access) (08-02)
+	rbacGroup.POST("/app-limits", adminHandler.CreateAppLimit)
+	rbacGroup.GET("/app-limits", adminHandler.ListAppLimits)
+	rbacGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit)
+	rbacGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit)
 }
