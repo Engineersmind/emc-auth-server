@@ -1,0 +1,65 @@
+name: Feature Request
+description: Propose a new capability or enhancement
+labels: ["enhancement"]
+assignees:
+  - EM-ShreyashGondane
+
+body:
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Which roadmap phase does this belong to?
+      options:
+        - Phase 4 — SAML 2.0
+        - Phase 6 — Admin UI
+        - Phase 7 — Testing & Hardening (remaining plans)
+        - Phase 8 — AI/Agent Security (remaining plans)
+        - v2 backlog (OAuth2, OIDC, social login, etc.)
+        - New — not on current roadmap
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What problem does this solve? Who is affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe what you want. API surface, behaviour, constraints.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security impact checklist
+      options:
+        - label: This touches authentication or session management
+        - label: This touches authorization / permissions
+        - label: This introduces new DB schema
+        - label: This changes existing audit log behaviour
+        - label: No security impact
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will we know this is done?
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: false

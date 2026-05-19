@@ -590,7 +590,9 @@ emc_auth_operations_total{operation, outcome}                  counter
 emc_auth_rate_limit_hits_total{limiter}                        counter
 ```
 
-### Grafana Dashboard (Planned — Phase 7)
+### Grafana Dashboard (Implemented — Phase 7)
+
+Provisioned JSON at `infra/grafana/dashboards/emc-auth.json` — auto-loaded by the production compose stack.
 
 ```
 Row 1 — Traffic Overview
@@ -614,7 +616,9 @@ Row 4 — Infrastructure
   └── Goroutine count
 ```
 
-### Alerting Rules (Planned — Phase 7)
+### Alerting Rules (Implemented — Phase 7)
+
+Rules file: `infra/prometheus/rules.yml`
 
 | Alert | Condition | Severity |
 |-------|-----------|----------|
@@ -799,18 +803,19 @@ Phase 8  AI/Agent Security     ████████░░░░░░░░�
 
 ```
 master
-  ├── feat/phase-3-totp-api-keys      ← TOTP 2FA + API key auth
-  ├── feat/phase-4-saml               ← SAML 2.0 enterprise SSO
-  ├── feat/phase-6-admin-ui           ← React admin dashboard
-  ├── feat/phase-7-hardening          ← tests, CI/CD, Prometheus
-  └── feat/phase-8-ai-agent-security  ← AI/agent identity + rate limits
+  ├── feat/phase-4-saml               ← SAML 2.0 enterprise SSO (planned)
+  ├── feat/phase-6-admin-ui           ← React admin dashboard (planned)
+  ├── feat/phase-7-hardening          ← remaining: tests, load test
+  └── feat/phase-8-ai-agent-security  ← remaining: agent registration, audit trail, risk scoring
 ```
 
-**Rules:**
-- All feature work happens on its phase branch — never directly on `master`
-- Each branch maps to exactly one phase; sub-plans are tracked as commits on that branch
-- A phase branch merges to `master` only when **all** its sub-plans are complete and validated
-- Each merge to `master` is tagged with a semantic version: `v1.3.0`, `v1.4.0`, etc.
+**Naming convention:** `feat/`, `fix/`, `hotfix/`, `chore/`, `docs/`, `refactor/`, `test/` prefix required. Direct pushes to `master` are blocked by repository ruleset.
+
+**Merge policy:** Merge commits only (`--no-ff`) — squash and rebase are disabled. This preserves per-feature commit history on `master` so `git log --oneline` reads as a narrative.
+
+**Branch lifecycle:** Feature branches are automatically deleted after merge (`delete_branch_on_merge: true`).
+
+**Each merge to `master` is tagged** with a semantic version (`v1.x.0`) and a GitHub Release with detailed notes.
 
 **Completion gate before merge:**
 ```
@@ -819,9 +824,24 @@ master
 □ go test ./... passes (≥80% coverage on auth core — Phase 7+)
 □ gosec ./... clean (Phase 7+)
 □ swag init updated if handlers changed
-□ README roadmap and ROADMAP.md updated
-□ PR created, reviewed, and approved
+□ README phase tracking and ROADMAP.md updated
+□ PR created — CODEOWNERS review approved, CI green, 2 reviewers signed off
 ```
+
+## Repository Governance
+
+| Control | Configuration | Status |
+|---------|--------------|--------|
+| PR required on master | Org ruleset: Protected Branch Standards | Active |
+| 2 reviewer approvals | Org ruleset: 2-Approval Gate (main + master) | Active |
+| CODEOWNERS review | `.github/CODEOWNERS` + require_code_owner_review | Active |
+| CI must pass before merge | Repo ruleset: CI Gates (Test + Lint + Docker Build) | Active |
+| Copilot code review | Org ruleset: Require Copilot Code Review | Active |
+| Merge commit only | `allow_squash_merge: false`, `allow_rebase_merge: false` | Active |
+| Auto-delete merged branches | `delete_branch_on_merge: true` | Active |
+| No force-push | Org ruleset: non_fast_forward rule | Active |
+| No branch deletion | Org ruleset: deletion rule | Active |
+| Branch naming | `feat/`, `fix/`, `chore/`, `hotfix/`, `docs/`, `refactor/`, `test/` | Convention |
 
 ---
 
@@ -966,9 +986,13 @@ emc-auth-server/
 │   └── store/               # DB pool, Redis client, migration runner, seed
 ├── migrations/              # Goose SQL files (00001–00018), embedded via embed.FS
 ├── infra/                   # docker-compose.prod.yml, prometheus/, grafana/
-├── .github/workflows/       # ci.yml, release.yml
+├── .github/
+│   ├── workflows/           # ci.yml (test+lint+build), release.yml (Docker publish on tag)
+│   ├── ISSUE_TEMPLATE/      # bug.yml, feature.yml, config.yml
+│   ├── PULL_REQUEST_TEMPLATE.md
+│   └── CODEOWNERS           # path-based ownership for code review enforcement
 ├── Makefile
-├── REVIEW.md                # Human review checklist
+├── REVIEW.md                # Human review checklist with known issues
 ├── docs/                    # Swagger-generated files (auto-generated, do not edit)
 ├── .env.example             # Template for local configuration
 └── docker-compose.yml       # Postgres 16 + Redis 7 + app service
