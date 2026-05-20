@@ -454,6 +454,8 @@ Every security-relevant action is persisted to the `audit_logs` table:
 | `admin.user_created/updated/deleted` | User pool management |
 | `admin.user_role_assigned` | Role reassigned |
 | `admin.force_password_reset` | Admin-triggered reset |
+| `admin.app_limit_created/updated/deleted` | Per-app rate limit config changed |
+| `admin.cors_origins_updated` | Tenant CORS origins replaced |
 
 Query the audit log via API (JSON) or directly in SQL:
 
@@ -520,25 +522,33 @@ ORDER BY created_at DESC;
 | Per-tenant CORS | Origin whitelist per tenant, DB-backed, Redis-cached (60s TTL) |
 | Per-app rate limits | `X-App-ID` token bucket, 60s Redis cache, 429+Retry-After |
 
-### Planned — Phase 7
+### Implemented in CI — Phase 7 (07-04)
+
+These run on every push and PR via `.github/workflows/ci.yml`:
 
 ```bash
-# Static analysis (SAST)
-gosec ./...                        # security-focused Go linter
-govulncheck ./...                  # known CVE scan for dependencies
-golangci-lint run                  # multi-linter: errcheck, staticcheck, unused, shadow
+gosec ./...              # security-focused Go linter — SARIF output uploaded to GitHub Security
+govulncheck ./...        # known CVE scan across all dependencies
+golangci-lint run        # errcheck, staticcheck, unused, shadow, etc.
+go test ./...            # build + unit tests (coverage report artifact)
+docker build .           # smoke-tests the production image builds cleanly
+```
 
-# Dependency audit
-go list -m -json all | nancy sleuth   # OSS vulnerability database check
+### Pending — Phase 7 (07-01, 07-02, 07-03)
 
-# Security test scenarios
+```bash
+# 07-01: Test coverage gate (target ≥80% on internal/auth/ and internal/store/)
+go test ./... -coverprofile=coverage.out
+go tool cover -func=coverage.out
+
+# 07-02: Security test suite (to be written)
 # - Replay attack: re-submit consumed refresh token → assert 401
 # - Brute-force: 6th login attempt in 1 min → assert 429
-# - Email enumeration: diff forgot-password response for known vs unknown email → assert identical
-# - TOTP bypass: submit expired/wrong OTP → assert 401 (Phase 3)
+# - Email enumeration: diff forgot-password response for known vs unknown → assert identical
+# - TOTP bypass: submit expired/wrong OTP → assert 401
 # - SQL injection probes on search and filter params
 
-# Load test
+# 07-03: Load test + distroless production image
 k6 run --vus 500 --duration 60s load/login.js   # p99 ≤ 200ms target
 ```
 
@@ -833,15 +843,15 @@ master
 | Control | Configuration | Status |
 |---------|--------------|--------|
 | PR required on master | Org ruleset: Protected Branch Standards | Active |
-| 2 reviewer approvals | Org ruleset: 2-Approval Gate (main + master) | Active |
-| CODEOWNERS review | `.github/CODEOWNERS` + require_code_owner_review | Active |
+| 2 reviewer approvals | Org ruleset: 2-Approval Gate (`main` + `production`) | Active — `master` scope pending `admin:org` |
+| CODEOWNERS review required | `.github/CODEOWNERS` — auth / middleware / migrations / .github | Active |
 | CI must pass before merge | Repo ruleset: CI Gates (Test + Lint + Docker Build) | Active |
 | Copilot code review | Org ruleset: Require Copilot Code Review | Active |
-| Merge commit only | `allow_squash_merge: false`, `allow_rebase_merge: false` | Active |
+| Merge commit only — no squash/rebase | `allow_squash_merge: false`, `allow_rebase_merge: false` | Active |
 | Auto-delete merged branches | `delete_branch_on_merge: true` | Active |
-| No force-push | Org ruleset: non_fast_forward rule | Active |
+| No force-push to master | Org ruleset: non_fast_forward rule | Active |
 | No branch deletion | Org ruleset: deletion rule | Active |
-| Branch naming | `feat/`, `fix/`, `chore/`, `hotfix/`, `docs/`, `refactor/`, `test/` | Convention |
+| Branch naming convention | Repo ruleset: regex `^(feat\|fix\|chore\|hotfix\|docs\|refactor\|test)/.+` | Active |
 
 ---
 
