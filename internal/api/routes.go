@@ -57,6 +57,7 @@ type RoutesConfig struct {
 //   - X-Content-Type-Options: nosniff
 //   - X-Frame-Options: DENY
 //   - Referrer-Policy: strict-origin-when-cross-origin
+//   - Content-Security-Policy: restricts sources for scripts, styles, images, etc.
 //
 // In development (Env != "production"), HSTS is still set so that the header
 // is visible during local testing. Adjust if local HTTPS is not configured.
@@ -69,9 +70,22 @@ func securityHeaders() echo.MiddlewareFunc {
 			// Prevent MIME sniffing attacks.
 			h.Set("X-Content-Type-Options", "nosniff")
 			// Prevent clickjacking via iframes.
+			// frame-ancestors 'none' in CSP makes this redundant but keep both
+			// for older browser compatibility.
 			h.Set("X-Frame-Options", "DENY")
 			// Control referrer information leakage.
 			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			// Content Security Policy — primary browser XSS mitigation (HIGH-03).
+			// style-src includes 'unsafe-inline' because Tailwind CSS injects
+			// inline styles at runtime. All other sources are restricted to 'self'.
+			h.Set("Content-Security-Policy",
+				"default-src 'self'; "+
+					"script-src 'self'; "+
+					"style-src 'self' 'unsafe-inline'; "+
+					"img-src 'self' data:; "+
+					"connect-src 'self'; "+
+					"font-src 'self'; "+
+					"frame-ancestors 'none'")
 			return next(c)
 		}
 	}
