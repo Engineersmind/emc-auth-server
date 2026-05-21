@@ -301,10 +301,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/saml/login", samlHandler.InitiateLogin)
 	e.POST("/saml/acs", samlHandler.HandleACS)
 
-	// Agent management — tenant admin (admin:access) (08-01)
+	// Agent management — tenant admin (admin:access) (08-01, 08-04)
 	rbacGroup.POST("/agents", agentHandler.RegisterAgent)
 	rbacGroup.GET("/agents", agentHandler.ListAgents)
 	rbacGroup.DELETE("/agents/:id", agentHandler.RevokeAgent)
+	rbacGroup.GET("/agents/analysis", agentHandler.GetAgentAnalysis)
 
 	// Agent authentication — public (no JWT required) — issues agent JWT from raw key
 	apiV1.POST("/agents/authenticate", agentHandler.AuthenticateAgent)

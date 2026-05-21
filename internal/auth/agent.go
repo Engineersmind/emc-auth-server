@@ -61,6 +61,19 @@ type AgentWithStats struct {
 	LastActive   *time.Time `json:"last_active"`         // most recent audit event timestamp
 }
 
+// AgentAnalysis holds 24h risk-scoring data for a single agent (08-04).
+type AgentAnalysis struct {
+	AgentID       string  `json:"agent_id"`
+	AgentName     string  `json:"agent_name"`
+	AgentType     string  `json:"agent_type"`
+	RequestCount  int     `json:"request_count_24h"`   // total audit events in last 24h
+	RateLimitHits int     `json:"rate_limit_hits_24h"` // events with action containing "rate_limit"
+	UniqueIPs     int     `json:"unique_ips_24h"`      // distinct IP addresses seen
+	OffHoursCount int     `json:"off_hours_count_24h"` // requests outside 08:00–20:00 UTC
+	RiskScore     int     `json:"risk_score"`          // 0–100 composite score
+	RiskFactors   []string `json:"risk_factors"`        // human-readable reasons for elevated score
+}
+
 // AgentIdentity is resolved by AuthenticateAgent — acts like a machine identity.
 type AgentIdentity struct {
 	AgentID      uuid.UUID
@@ -68,6 +81,86 @@ type AgentIdentity struct {
 	Name         string
 	AgentType    string
 	Capabilities []string
+}
+
+// AnalyzeAgents returns 24h risk analysis for all active agents in a tenant (08-04).
+// Risk score (0–100) is computed from weighted signals:
+//   - Volume:          >1000 requests/24h          → +30
+//   - Rate-limit hits: >10 rate_limit events/24h   → +25
+//   - Unique IPs:      >5 distinct IPs/24h         → +25
+//   - Off-hours:       >20% requests off-hours     → +20
+func (s *AgentService) AnalyzeAgents(ctx context.Context, tenantID uuid.UUID) ([]AgentAnalysis, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+		    a.id,
+		    a.name,
+		    a.agent_type,
+		    COUNT(al.id)                                                        AS request_count,
+		    COUNT(al.id) FILTER (WHERE al.action LIKE '%rate_limit%')           AS rate_limit_hits,
+		    COUNT(DISTINCT al.ip_address) FILTER (WHERE al.ip_address <> '')    AS unique_ips,
+		    COUNT(al.id) FILTER (
+		        WHERE EXTRACT(HOUR FROM al.created_at AT TIME ZONE 'UTC') < 8
+		           OR EXTRACT(HOUR FROM al.created_at AT TIME ZONE 'UTC') >= 20
+		    )                                                                    AS off_hours_count
+		FROM agent_registrations a
+		LEFT JOIN audit_logs al
+		    ON al.agent_id = a.id
+		    AND al.created_at >= NOW() - INTERVAL '24 hours'
+		WHERE a.tenant_id = $1 AND a.revoked_at IS NULL
+		GROUP BY a.id, a.name, a.agent_type
+		ORDER BY a.created_at DESC
+	`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("analyze agents: %w", err)
+	}
+	defer rows.Close()
+
+	var result []AgentAnalysis
+	for rows.Next() {
+		var a AgentAnalysis
+		var id uuid.UUID
+		if err := rows.Scan(&id, &a.AgentName, &a.AgentType,
+			&a.RequestCount, &a.RateLimitHits, &a.UniqueIPs, &a.OffHoursCount); err != nil {
+			return nil, fmt.Errorf("scan agent analysis: %w", err)
+		}
+		a.AgentID = id.String()
+
+		// Compute risk score and collect explanatory factors.
+		score := 0
+		var factors []string
+
+		if a.RequestCount > 1000 {
+			score += 30
+			factors = append(factors, fmt.Sprintf("high volume: %d requests in 24h", a.RequestCount))
+		}
+		if a.RateLimitHits > 10 {
+			score += 25
+			factors = append(factors, fmt.Sprintf("rate-limit hits: %d events in 24h", a.RateLimitHits))
+		}
+		if a.UniqueIPs > 5 {
+			score += 25
+			factors = append(factors, fmt.Sprintf("many source IPs: %d distinct addresses in 24h", a.UniqueIPs))
+		}
+		if a.RequestCount > 0 && a.OffHoursCount*100/a.RequestCount > 20 {
+			score += 20
+			factors = append(factors, fmt.Sprintf("off-hours activity: %d%% of requests outside 08:00–20:00 UTC",
+				a.OffHoursCount*100/a.RequestCount))
+		}
+		if score > 100 {
+			score = 100
+		}
+		if factors == nil {
+			factors = []string{}
+		}
+		a.RiskScore = score
+		a.RiskFactors = factors
+
+		result = append(result, a)
+	}
+	if result == nil {
+		result = []AgentAnalysis{}
+	}
+	return result, rows.Err()
 }
 
 // RegisterAgent creates a new agent registration for the given tenant.

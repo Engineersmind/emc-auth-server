@@ -116,6 +116,28 @@ func (h *AgentHandler) RevokeAgent(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
+// GetAgentAnalysis handles GET /api/v1/admin/agents/analysis.
+// Returns 24h risk-scored analysis for all active agents in the tenant (08-04).
+func (h *AgentHandler) GetAgentAnalysis(c echo.Context) error {
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return echo.ErrUnauthorized
+	}
+
+	tenantID, err := uuid.Parse(claims.TenantID)
+	if err != nil {
+		return echo.ErrUnauthorized
+	}
+
+	analysis, err := h.agentSvc.AnalyzeAgents(c.Request().Context(), tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("agent analysis failed")
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to analyze agents")
+	}
+
+	return c.JSON(http.StatusOK, analysis)
+}
+
 // AuthenticateAgent handles POST /api/v1/agents/authenticate.
 // Validates an agent key and returns a signed JWT. Public endpoint — no prior auth required.
 func (h *AgentHandler) AuthenticateAgent(c echo.Context) error {
