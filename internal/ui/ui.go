@@ -27,3 +27,13 @@ func StaticFS() http.FileSystem {
 func EmbedFS() embed.FS {
 	return dist
 }
+
+// DistFS returns the dist/ subtree as an fs.FS, suitable for use with
+// echo.StaticFS, echo.FileFS, and c.FileFS (Echo v4.12+).
+func DistFS() fs.FS {
+	sub, err := fs.Sub(dist, "dist")
+	if err != nil {
+		panic("ui: failed to sub dist/ from embed: " + err.Error())
+	}
+	return sub
+}
