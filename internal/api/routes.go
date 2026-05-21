@@ -1,7 +1,9 @@
 package api
 
 import (
+	"io/fs"
 	"net/http"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
@@ -18,6 +20,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	"github.com/engineersmind/emc-auth-server/internal/ui"
 )
 
 // Deps holds shared dependencies injected into route handlers.
@@ -54,6 +57,7 @@ type RoutesConfig struct {
 //   - X-Content-Type-Options: nosniff
 //   - X-Frame-Options: DENY
 //   - Referrer-Policy: strict-origin-when-cross-origin
+//   - Content-Security-Policy: restricts sources for scripts, styles, images, etc.
 //
 // In development (Env != "production"), HSTS is still set so that the header
 // is visible during local testing. Adjust if local HTTPS is not configured.
@@ -66,9 +70,22 @@ func securityHeaders() echo.MiddlewareFunc {
 			// Prevent MIME sniffing attacks.
 			h.Set("X-Content-Type-Options", "nosniff")
 			// Prevent clickjacking via iframes.
+			// frame-ancestors 'none' in CSP makes this redundant but keep both
+			// for older browser compatibility.
 			h.Set("X-Frame-Options", "DENY")
 			// Control referrer information leakage.
 			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+			// Content Security Policy — primary browser XSS mitigation (HIGH-03).
+			// style-src includes 'unsafe-inline' because Tailwind CSS injects
+			// inline styles at runtime. All other sources are restricted to 'self'.
+			h.Set("Content-Security-Policy",
+				"default-src 'self'; "+
+					"script-src 'self'; "+
+					"style-src 'self' 'unsafe-inline'; "+
+					"img-src 'self' data:; "+
+					"connect-src 'self'; "+
+					"font-src 'self'; "+
+					"frame-ancestors 'none'")
 			return next(c)
 		}
 	}
@@ -251,4 +268,46 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.GET("/app-limits", adminHandler.ListAppLimits)
 	rbacGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit)
 	rbacGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit)
+
+	// Serve the React Admin SPA for all non-API routes.
+	// Must come AFTER all /api/, /metrics, /swagger, /saml, /health routes so it
+	// does not shadow them. Static assets (JS/CSS) use the /assets/* prefix
+	// produced by Vite; everything else falls back to index.html for client-side
+	// routing.
+	distFS := ui.DistFS()
+
+	// /assets/* — serve bundled JS, CSS, fonts directly from embed.FS.
+	e.StaticFS("/assets", mustSubFS(distFS, "assets"))
+
+	// favicon and vite default icon
+	e.GET("/favicon.ico", echo.WrapHandler(http.FileServer(http.FS(distFS))))
+	e.GET("/vite.svg", echo.WrapHandler(http.FileServer(http.FS(distFS))))
+
+	// SPA fallback — serve index.html for all unmatched GET routes so that
+	// React Router can handle client-side navigation.
+	// Guard: /api/ paths return 404 rather than index.html (CRIT-02 review fix).
+	// Guard: if the path starts with /api/, return 404 rather than serving the
+	// SPA. Without this guard, a typo'd or unregistered API route returns HTTP
+	// 200 + text/html, making routing bugs very hard to diagnose.
+	e.GET("/*", func(c echo.Context) error {
+		if strings.HasPrefix(c.Request().URL.Path, "/api/") {
+			return echo.ErrNotFound
+		}
+		f, err := distFS.Open("index.html")
+		if err != nil {
+			return echo.ErrNotFound
+		}
+		defer f.Close()
+		return c.Stream(http.StatusOK, "text/html; charset=utf-8", f)
+	})
+}
+
+// mustSubFS returns a sub-filesystem rooted at dir within fsys.
+// Panics on error (programming error — embedded paths must exist at build time).
+func mustSubFS(fsys fs.FS, dir string) fs.FS {
+	sub, err := fs.Sub(fsys, dir)
+	if err != nil {
+		panic("ui: failed to open sub-FS " + dir + ": " + err.Error())
+	}
+	return sub
 }
