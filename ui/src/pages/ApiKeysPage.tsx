@@ -61,6 +61,12 @@ export function ApiKeysPage() {
                 Copy to clipboard
               </button>
               <div className="flex justify-end mt-4">
+                {/* Setting createdKey to null clears the modal and removes the
+                    key from active state. The previous state value (including
+                    the plaintext key string) may linger briefly in the React
+                    fiber until GC. For higher sensitivity, store only the key
+                    string in state (not the full response object) and zero it
+                    before nulling: setCreatedKey(prev => prev ? {...prev, key: ''} : null). */}
                 <button
                   onClick={() => setCreatedKey(null)}
                   className="bg-brand-600 hover:bg-brand-700 text-white text-sm rounded-lg px-4 py-2"
