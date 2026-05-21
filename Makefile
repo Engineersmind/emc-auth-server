@@ -109,6 +109,11 @@ vuln:
 .PHONY: check
 check: lint gosec vuln test
 
+## Run k6 load test (requires k6 installed and server running on localhost:8080)
+.PHONY: load-test
+load-test:
+	k6 run scripts/load-test.js
+
 # ─── Database ───────────────────────────────────────────────────────────────
 
 ## Apply all pending migrations (requires DATABASE_URL set or .env loaded)
