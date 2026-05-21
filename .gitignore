@@ -8,30 +8,49 @@ emc-auth-server~
 *.log
 server*.log
 
-# Environment
+# Environment — never commit secrets
 .env
 *.env.local
+.env.*.local
 
-# Certs
+# Certs and keys — never commit private material
 certs/*.key
 certs/*.pem
+*.pem
+*.key
+*.p12
+*.pfx
 
-# Build
+# Build artifacts
 dist/
 build/
+tmp/
+
+# Go test + coverage artifacts
+*.test
+coverage.out
+coverage.html
+cpu.pprof
+mem.pprof
+*.prof
 
 # IDE
 .vscode/settings.json
+.vscode/launch.json
 .idea/
+*.swp
+*.swo
 
 # OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Go
+# Go vendor (use go modules instead)
 vendor/
 
-# Node (admin UI)
+# Node (admin UI — Phase 6)
 ui/node_modules/
 ui/dist/
 ui/.env
+ui/.env.local

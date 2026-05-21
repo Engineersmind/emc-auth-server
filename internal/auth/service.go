@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -18,14 +20,24 @@ const BcryptCost = 12
 
 // AuthService implements the business logic for registration, login, and profile lookup.
 type AuthService struct {
-	pool   *pgxpool.Pool
-	jwtSvc *JWTService
-	logger zerolog.Logger
+	pool     *pgxpool.Pool
+	jwtSvc   *JWTService
+	totpSvc  *TOTPService  // nil when TOTP not configured
+	redisCli *redis.Client // used for OTP session storage
+	logger   zerolog.Logger
 }
 
 // NewAuthService creates an AuthService.
 func NewAuthService(pool *pgxpool.Pool, jwtSvc *JWTService, logger zerolog.Logger) *AuthService {
 	return &AuthService{pool: pool, jwtSvc: jwtSvc, logger: logger}
+}
+
+// WithTOTP attaches a TOTPService and Redis client so the auth service can enforce
+// TOTP on login. Call this after NewAuthService when TOTP is enabled.
+func (s *AuthService) WithTOTP(totpSvc *TOTPService, redisCli *redis.Client) *AuthService {
+	s.totpSvc = totpSvc
+	s.redisCli = redisCli
+	return s
 }
 
 // RegisterInput is the payload for creating a new user.
@@ -44,12 +56,27 @@ type LoginInput struct {
 	Password   string
 }
 
-// AuthResult is returned by both Register and Login.
+// AuthResult is returned by both Register and Login (when TOTP is not required).
 type AuthResult struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int    `json:"expires_in"` // seconds
+}
+
+// OTPChallenge is returned by Login when the user has active TOTP.
+// The client must call POST /auth/login/otp with this token + the TOTP code.
+type OTPChallenge struct {
+	RequiresOTP     bool   `json:"requires_otp"`
+	OTPSessionToken string `json:"otp_session_token"`
+	ExpiresIn       int    `json:"expires_in"` // seconds until the session token expires
+}
+
+// LoginResult wraps either a full token pair or an OTP challenge.
+// Exactly one of Token or OTPChallenge will be non-nil.
+type LoginResult struct {
+	Token        *AuthResult
+	OTPChallenge *OTPChallenge
 }
 
 // MeResult is returned by GET /api/v1/auth/me.
@@ -214,8 +241,9 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 }
 
 // Login authenticates an existing user by email and password.
-// Returns AUTH-01 compliant token pair on success.
-func (s *AuthService) Login(ctx context.Context, in LoginInput) (*AuthResult, error) {
+// If the user has active TOTP, returns a LoginResult with an OTPChallenge instead of tokens.
+// The caller must then call LoginOTP with the challenge token + TOTP code to get tokens.
+func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
 	tenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -254,7 +282,105 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*AuthResult, er
 		perms = []string{}
 	}
 
-	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms)
+	// Check for active TOTP enrollment (03-02).
+	if s.totpSvc != nil && s.redisCli != nil {
+		active, err := s.totpSvc.IsActive(ctx, userID)
+		if err != nil {
+			s.logger.Warn().Err(err).Msg("login: failed to check TOTP status, skipping TOTP step")
+		} else if active {
+			challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms)
+			if err != nil {
+				return nil, fmt.Errorf("create OTP session: %w", err)
+			}
+			return &LoginResult{OTPChallenge: challenge}, nil
+		}
+	}
+
+	tokens, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms)
+	if err != nil {
+		return nil, err
+	}
+	return &LoginResult{Token: tokens}, nil
+}
+
+// LoginOTPInput is the payload for completing a TOTP-gated login.
+type LoginOTPInput struct {
+	OTPSessionToken string // from the OTPChallenge returned by Login
+	Code            string // 6-digit TOTP code or 8-character backup code
+}
+
+// LoginOTP completes a TOTP-gated login. It validates the code against the
+// pre-auth session stored in Redis, then issues the full JWT token pair.
+func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResult, error) {
+	if s.totpSvc == nil || s.redisCli == nil {
+		return nil, fmt.Errorf("TOTP not configured on this server")
+	}
+
+	session, err := s.loadOTPSession(ctx, in.OTPSessionToken)
+	if err != nil {
+		return nil, fmt.Errorf("invalid or expired OTP session")
+	}
+
+	// Try TOTP code first, then backup code.
+	err = s.totpSvc.Verify(ctx, session.UserID, in.Code)
+	if err != nil {
+		err2 := s.totpSvc.VerifyBackupCode(ctx, session.UserID, in.Code)
+		if err2 != nil {
+			return nil, fmt.Errorf("invalid TOTP code")
+		}
+	}
+
+	// Consume the OTP session (single-use).
+	s.redisCli.Del(ctx, otpSessionKey(in.OTPSessionToken)) //nolint:errcheck
+
+	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms)
+}
+
+// createOTPSession stores pre-auth user state in Redis and returns a challenge token.
+func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID uuid.UUID, email, roleName string, perms []string) (*OTPChallenge, error) {
+	raw, err := GenerateRefreshToken() // reuse 32-byte random generator
+	if err != nil {
+		return nil, err
+	}
+	sessionToken := raw // raw token IS the session key (no need to hash — it's in Redis, not DB)
+
+	payload, err := json.Marshal(OTPSession{
+		UserID:   userID,
+		TenantID: tenantID,
+		Email:    email,
+		RoleName: roleName,
+		Perms:    perms,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.redisCli.Set(ctx, otpSessionKey(sessionToken), payload, OTPSessionTTL).Err(); err != nil {
+		return nil, fmt.Errorf("store OTP session: %w", err)
+	}
+
+	return &OTPChallenge{
+		RequiresOTP:     true,
+		OTPSessionToken: sessionToken,
+		ExpiresIn:       int(OTPSessionTTL.Seconds()),
+	}, nil
+}
+
+// loadOTPSession retrieves and decodes the pre-auth session from Redis.
+func (s *AuthService) loadOTPSession(ctx context.Context, token string) (*OTPSession, error) {
+	data, err := s.redisCli.Get(ctx, otpSessionKey(token)).Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("OTP session not found or expired: %w", err)
+	}
+	var sess OTPSession
+	if err := json.Unmarshal(data, &sess); err != nil {
+		return nil, fmt.Errorf("decode OTP session: %w", err)
+	}
+	return &sess, nil
+}
+
+func otpSessionKey(token string) string {
+	return "otp:session:" + token
 }
 
 // Me returns profile information derived from JWT claims.

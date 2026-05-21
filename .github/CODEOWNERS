@@ -1,0 +1,31 @@
+# CODEOWNERS — every PR must be reviewed by the owner of each changed path.
+# GitHub enforces this when "Require code owner review" is active.
+# Format: <pattern>  <owner> [<additional owner> ...]
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# ─── Default — project lead reviews everything ────────────────────────────────
+*                                       @EM-ShreyashGondane
+
+# ─── Security-critical paths — require lead sign-off ─────────────────────────
+# Auth service (JWT, sessions, password reset, TOTP, API keys)
+/internal/auth/                         @EM-ShreyashGondane
+
+# HTTP middleware (JWT verification, permissions, rate limiting, CORS)
+/internal/api/middleware/               @EM-ShreyashGondane
+
+# Audit logging — tamper-evident trail must not regress
+/internal/audit/                        @EM-ShreyashGondane
+
+# ─── Database schema — destructive migrations need extra eyes ─────────────────
+/migrations/                            @EM-ShreyashGondane @dmisra
+
+# ─── CI/CD and repository governance — no silent changes ─────────────────────
+/.github/                               @EM-ShreyashGondane
+/Makefile                               @EM-ShreyashGondane
+
+# ─── Infrastructure configuration ────────────────────────────────────────────
+/infra/                                 @EM-ShreyashGondane
+/docker-compose.yml                     @EM-ShreyashGondane
+
+# ─── Environment template — ensure no secrets are added ──────────────────────
+/.env.example                           @EM-ShreyashGondane

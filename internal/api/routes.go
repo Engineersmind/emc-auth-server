@@ -6,6 +6,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	echoMiddleware "github.com/labstack/echo/v4/middleware"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
@@ -35,6 +36,8 @@ type RoutesConfig struct {
 	Env string
 	// AppBaseURL is prepended to the reset token link in emails.
 	AppBaseURL string
+	// TOTPEncryptionKey is the 64-char hex key for AES-256-GCM TOTP secret encryption.
+	TOTPEncryptionKey string
 	// SMTP fields for mailer (used in production; dev logs to console).
 	SMTPHost     string
 	SMTPPort     int
@@ -102,10 +105,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.Use(securityHeaders())
 	e.Use(httpsRedirect(deps.Config.Env))
 	e.Use(mw.RequestLogger(deps.Logger))
+	e.Use(mw.PrometheusMetrics())
 	e.Use(echoMiddleware.Recover())
 
 	// Health check — no auth required
 	e.GET("/health", handlers.HealthHandler)
+
+	// Prometheus metrics — internal observability endpoint (07-05).
+	// Bind to 127.0.0.1 in production via reverse proxy; no auth by design
+	// (Prometheus scrapes this; protect via network policy).
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	// Swagger UI — available at /swagger/index.html
 	e.GET("/swagger/*", echoSwagger.WrapHandler)
@@ -113,6 +122,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Build shared services
 	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
+
+	// TOTP service — requires encryption key; logs warning in dev if missing.
+	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Logger)
+	if totpErr != nil {
+		deps.Logger.Fatal().Err(totpErr).Msg("TOTP service init failed — check TOTP_ENCRYPTION_KEY")
+	}
+	authSvc.WithTOTP(totpSvc, deps.Redis)
+
+	// API key service
+	apiKeySvc := auth.NewAPIKeyService(deps.Pool, deps.Logger)
 
 	// Mailer: dev (console log) or SMTP based on Env
 	m := mailer.NewMailer(mailer.MailerConfig{
@@ -129,11 +148,28 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logger — shared by both auth and admin handlers
 	auditLog := audit.New(deps.Pool, deps.Logger)
 
-	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger)
+	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
+		WithTOTP(totpSvc).
+		WithAPIKeys(apiKeySvc)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
-	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger)
+
+	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
+	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
+
+	// Per-tenant CORS service — DB-backed, Redis-cached, 60s TTL.
+	corsSvc := mw.NewTenantCORSService(deps.Pool, deps.Redis, deps.Logger)
+
+	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
+		WithAppRateLimits(appLimitSvc).
+		WithCORS(corsSvc)
+
+	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
+	e.Use(mw.AppRateLimiter(appLimitSvc))
+
+	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
+	e.Use(mw.TenantCORS(corsSvc))
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
@@ -146,13 +182,25 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/register", authHandler.Register)
 	// Login is rate-limited at route level (not global) to avoid impacting other endpoints.
 	authGroup.POST("/login", authHandler.Login, mw.LoginRateLimiter(rlCfg))
+	authGroup.POST("/login/otp", authHandler.LoginOTP) // complete TOTP-gated login (03-02)
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
+	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
+	authGroup.POST("/session", authHandler.SessionLogin)
+	authGroup.POST("/session/refresh", authHandler.SessionRefresh)
+	authGroup.POST("/session/logout", authHandler.SessionLogout)
+
 	// Auth routes — protected by JWTRequired (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
+
+	// TOTP management — protected (03-01)
+	otpGroup := authGroup.Group("/otp", mw.JWTRequired(jwtSvc))
+	otpGroup.POST("/enroll", authHandler.TOTPEnroll)
+	otpGroup.POST("/activate", authHandler.TOTPActivate)
+	otpGroup.DELETE("", authHandler.TOTPDisable)
 
 	// Admin routes — all require a valid JWT.
 	adminGroup := apiV1.Group("/admin", mw.JWTRequired(jwtSvc))
@@ -168,6 +216,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt.GET("/tenants", adminHandler.ListTenants)
 	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
 	tenantMgmt.DELETE("/tenants/:id", adminHandler.DeactivateTenant)
+	tenantMgmt.PUT("/tenants/:id/cors-origins", adminHandler.UpdateTenantCORSOrigins)
 
 	// Permission management — tenant admin (admin:access permission)
 	rbacGroup := adminGroup.Group("", mw.RequirePermission("admin:access"))
@@ -188,7 +237,18 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser)
 	rbacGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset)
 
+	// API key management — tenant admin (admin:access) (03-03)
+	rbacGroup.POST("/api-keys", authHandler.CreateAPIKey)
+	rbacGroup.GET("/api-keys", authHandler.ListAPIKeys)
+	rbacGroup.DELETE("/api-keys/:id", authHandler.RevokeAPIKey)
+
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
+
+	// Per-app rate limit management — tenant admin (admin:access) (08-02)
+	rbacGroup.POST("/app-limits", adminHandler.CreateAppLimit)
+	rbacGroup.GET("/app-limits", adminHandler.ListAppLimits)
+	rbacGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit)
+	rbacGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit)
 }

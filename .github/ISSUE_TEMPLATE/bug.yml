@@ -1,0 +1,92 @@
+name: Bug Report
+description: Something is broken or behaving unexpectedly
+labels: ["bug", "triage"]
+assignees:
+  - EM-ShreyashGondane
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before filing:** check the [REVIEW.md](../../REVIEW.md) for known issues and the audit log for relevant events.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - Authentication (login / register / refresh / logout)
+        - JWT / token validation
+        - TOTP 2FA
+        - API Keys
+        - Cookie sessions
+        - Password reset
+        - Admin API (tenants / users / roles / permissions)
+        - Audit logging
+        - Rate limiting (per-IP / per-app)
+        - CORS
+        - Prometheus metrics
+        - CI/CD pipeline
+        - Database migrations
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Critical (security vulnerability or data loss)
+        - High (auth broken, users locked out)
+        - Medium (feature degraded but workaround exists)
+        - Low (cosmetic / minor)
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug. Include request/response if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Set X-Tenant-Slug: emc
+        2. POST /api/v1/auth/login with { ... }
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: |
+        Server version / git commit:
+        Go version:
+        PostgreSQL version:
+        Redis version:
+        ENV (development/production):
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error output
+      render: text
+    validations:
+      required: false

@@ -13,12 +13,15 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 )
 
 // AuthHandler holds HTTP handlers for auth endpoints.
 type AuthHandler struct {
 	svc      *auth.AuthService
 	resetSvc *auth.ResetService
+	totpSvc  *auth.TOTPService  // nil when TOTP not configured
+	apiKeySvc *auth.APIKeyService
 	audit    *audit.Logger
 	logger   zerolog.Logger
 }
@@ -26,6 +29,18 @@ type AuthHandler struct {
 // NewAuthHandler creates an AuthHandler.
 func NewAuthHandler(svc *auth.AuthService, resetSvc *auth.ResetService, auditLog *audit.Logger, logger zerolog.Logger) *AuthHandler {
 	return &AuthHandler{svc: svc, resetSvc: resetSvc, audit: auditLog, logger: logger}
+}
+
+// WithTOTP attaches a TOTPService to the handler (called from routes.go after init).
+func (h *AuthHandler) WithTOTP(totpSvc *auth.TOTPService) *AuthHandler {
+	h.totpSvc = totpSvc
+	return h
+}
+
+// WithAPIKeys attaches an APIKeyService to the handler (called from routes.go after init).
+func (h *AuthHandler) WithAPIKeys(apiKeySvc *auth.APIKeyService) *AuthHandler {
+	h.apiKeySvc = apiKeySvc
+	return h
 }
 
 // RegisterRequest is the JSON body for POST /api/v1/auth/register.
@@ -147,7 +162,6 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("login failed")
-		// Audit: failed login attempt (no tenant_id — we don't confirm tenant exists).
 		h.audit.Log(c.Request().Context(), audit.Event{
 			ActorEmail:   req.Email,
 			Action:       audit.ActionAuthLoginFailed,
@@ -161,12 +175,69 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
 
-	// Audit: successful login.
-	tid, uid := claimsFromToken(result.AccessToken)
+	// TOTP required — return challenge, not token pair.
+	if result.OTPChallenge != nil {
+		return c.JSON(http.StatusOK, result.OTPChallenge)
+	}
+
+	// Full login — audit and return token pair.
+	tid, uid := claimsFromToken(result.Token.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
 		TenantID:     tid,
 		UserID:       uid,
 		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthLogin,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	return c.JSON(http.StatusOK, result.Token)
+}
+
+// LoginOTPRequest is the JSON body for POST /api/v1/auth/login/otp.
+type LoginOTPRequest struct {
+	OTPSessionToken string `json:"otp_session_token"`
+	Code            string `json:"code"` // 6-digit TOTP code or 8-char backup code
+}
+
+// LoginOTP handles POST /api/v1/auth/login/otp — completes a TOTP-gated login.
+//
+// @Summary      Complete TOTP login
+// @Description  Submit the TOTP code (or backup code) to complete a two-step login. Use the otp_session_token from the login response.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Param        body  body      LoginOTPRequest  true  "OTP session token + TOTP code"
+// @Success      200   {object}  auth.AuthResult
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid or expired OTP code"
+// @Router       /api/v1/auth/login/otp [post]
+func (h *AuthHandler) LoginOTP(c echo.Context) error {
+	var req LoginOTPRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.OTPSessionToken == "" || req.Code == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "otp_session_token and code are required"})
+	}
+
+	result, err := h.svc.LoginOTP(c.Request().Context(), auth.LoginOTPInput{
+		OTPSessionToken: req.OTPSessionToken,
+		Code:            req.Code,
+	})
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("login OTP failed")
+		if containsMsg(err, "invalid TOTP") || containsMsg(err, "invalid or expired") || containsMsg(err, "invalid backup") {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired OTP code"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "OTP login failed"})
+	}
+
+	tid, uid := claimsFromToken(result.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
 		Action:       audit.ActionAuthLogin,
 		ResourceType: "user",
 		IPAddress:    c.RealIP(),
@@ -398,6 +469,243 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "password updated successfully"})
 }
 
+// ─── TOTP Handlers ───────────────────────────────────────────────────────────
+
+// TOTPEnrollRequest is the JSON body for POST /api/v1/auth/otp/enroll.
+// No body needed — user identity comes from the JWT claims.
+type TOTPEnrollRequest struct{}
+
+// TOTPEnroll handles POST /api/v1/auth/otp/enroll.
+//
+// @Summary      Enroll in TOTP 2FA
+// @Description  Generates a TOTP secret, encrypts it, and returns an otpauth:// URI for QR code scanning plus one-time backup codes. The TOTP is inactive until POST /auth/otp/activate is called with a valid code.
+// @Tags         auth
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  auth.EnrollResult
+// @Failure      401  {object}  map[string]string
+// @Failure      500  {object}  map[string]string
+// @Router       /api/v1/auth/otp/enroll [post]
+func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
+	if h.totpSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	userID, err := uuid.Parse(claims.UserID)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid user_id in token"})
+	}
+	tenantID, err := uuid.Parse(claims.TenantID)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant_id in token"})
+	}
+
+	result, err := h.totpSvc.Enroll(c.Request().Context(), userID, tenantID, claims.Email)
+	if err != nil {
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("TOTP enroll failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "TOTP enrollment failed"})
+	}
+
+	return c.JSON(http.StatusOK, result)
+}
+
+// TOTPActivateRequest is the JSON body for POST /api/v1/auth/otp/activate.
+type TOTPActivateRequest struct {
+	Code string `json:"code"` // 6-digit TOTP code from authenticator app
+}
+
+// TOTPActivate handles POST /api/v1/auth/otp/activate — confirms enrollment.
+//
+// @Summary      Activate TOTP 2FA
+// @Description  Verifies the first TOTP code from the authenticator app and marks the enrollment active. Must be called after /otp/enroll.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      TOTPActivateRequest  true  "First TOTP code"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string
+// @Router       /api/v1/auth/otp/activate [post]
+func (h *AuthHandler) TOTPActivate(c echo.Context) error {
+	if h.totpSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	var req TOTPActivateRequest
+	if err := c.Bind(&req); err != nil || req.Code == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required"})
+	}
+
+	userID, _ := uuid.Parse(claims.UserID)
+	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
+		if containsMsg(err, "invalid TOTP") {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid TOTP code — check your authenticator app"})
+		}
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "TOTP 2FA activated successfully"})
+}
+
+// TOTPDisableRequest is the JSON body for DELETE /api/v1/auth/otp.
+type TOTPDisableRequest struct {
+	Code string `json:"code"` // current TOTP code or backup code
+}
+
+// TOTPDisable handles DELETE /api/v1/auth/otp — disables TOTP for the authenticated user.
+//
+// @Summary      Disable TOTP 2FA
+// @Description  Disables TOTP for the current user. Requires a valid TOTP code or backup code as confirmation.
+// @Tags         auth
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      TOTPDisableRequest  true  "Current TOTP or backup code"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string
+// @Router       /api/v1/auth/otp [delete]
+func (h *AuthHandler) TOTPDisable(c echo.Context) error {
+	if h.totpSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	var req TOTPDisableRequest
+	if err := c.Bind(&req); err != nil || req.Code == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required to disable 2FA"})
+	}
+
+	userID, _ := uuid.Parse(claims.UserID)
+	if err := h.totpSvc.Disable(c.Request().Context(), userID, req.Code); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "TOTP 2FA disabled"})
+}
+
+// ─── API Key Handlers ─────────────────────────────────────────────────────────
+
+// CreateAPIKeyRequest is the JSON body for POST /api/v1/admin/api-keys.
+type CreateAPIKeyRequest struct {
+	Name        string   `json:"name"`
+	Permissions []string `json:"permissions"`
+}
+
+// CreateAPIKey handles POST /api/v1/admin/api-keys.
+//
+// @Summary      Create API key
+// @Description  Creates a new API key for machine-to-machine auth. The raw key is returned exactly once.
+// @Tags         api-keys
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      CreateAPIKeyRequest  true  "Key name and permissions"
+// @Success      201   {object}  auth.APIKeyResult
+// @Failure      400   {object}  map[string]string
+// @Router       /api/v1/admin/api-keys [post]
+func (h *AuthHandler) CreateAPIKey(c echo.Context) error {
+	if h.apiKeySvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "API keys not configured"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	var req CreateAPIKeyRequest
+	if err := c.Bind(&req); err != nil || req.Name == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+	}
+
+	tenantID, _ := uuid.Parse(claims.TenantID)
+	result, err := h.apiKeySvc.CreateAPIKey(c.Request().Context(), tenantID, req.Name, req.Permissions)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("create API key failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create API key"})
+	}
+
+	return c.JSON(http.StatusCreated, result)
+}
+
+// ListAPIKeys handles GET /api/v1/admin/api-keys.
+//
+// @Summary      List API keys
+// @Description  Returns all active API keys for the caller's tenant. The raw key is never included.
+// @Tags         api-keys
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {array}   auth.APIKeySummary
+// @Failure      401  {object}  map[string]string
+// @Router       /api/v1/admin/api-keys [get]
+func (h *AuthHandler) ListAPIKeys(c echo.Context) error {
+	if h.apiKeySvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "API keys not configured"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	tenantID, _ := uuid.Parse(claims.TenantID)
+	keys, err := h.apiKeySvc.ListAPIKeys(c.Request().Context(), tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("list API keys failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list API keys"})
+	}
+
+	return c.JSON(http.StatusOK, keys)
+}
+
+// RevokeAPIKey handles DELETE /api/v1/admin/api-keys/:id.
+//
+// @Summary      Revoke API key
+// @Description  Permanently revokes an API key. The key is immediately invalid.
+// @Tags         api-keys
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "API key ID"
+// @Success      200  {object}  map[string]string
+// @Failure      400  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/api-keys/{id} [delete]
+func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
+	if h.apiKeySvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "API keys not configured"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	keyID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid key ID"})
+	}
+
+	tenantID, _ := uuid.Parse(claims.TenantID)
+	if err := h.apiKeySvc.RevokeAPIKey(c.Request().Context(), tenantID, keyID); err != nil {
+		if containsMsg(err, "not found") || containsMsg(err, "already revoked") {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke API key"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "API key revoked"})
+}
+
 // containsMsg is a simple substring check for error classification.
 // Avoids importing strings for a trivial helper.
 func containsMsg(err error, substr string) bool {
@@ -453,4 +761,202 @@ func uuidPtr(id uuid.UUID) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+// ---------------------------------------------------------------------------
+// Cookie-based session endpoints (browser / SPA integration)
+// ---------------------------------------------------------------------------
+//
+// These endpoints mirror the Bearer token flow but store tokens in
+// HttpOnly + SameSite=Lax cookies so that browser clients never need to
+// manage tokens in JavaScript:
+//
+//   POST /api/v1/auth/session          — login, sets access + refresh cookies
+//   POST /api/v1/auth/session/refresh  — rotate tokens, refresh cookie required
+//   POST /api/v1/auth/session/logout   — clear both cookies
+
+// SessionLoginRequest is the body for POST /api/v1/auth/session.
+type SessionLoginRequest = LoginRequest // same fields
+
+// SessionLogin handles POST /api/v1/auth/session.
+//
+// @Summary      Cookie-based login
+// @Description  Authenticates the user and stores the access token + refresh token in HttpOnly SameSite=Lax cookies. The response body contains only metadata — no raw tokens.
+// @Tags         auth-session
+// @Accept       json
+// @Produce      json
+// @Param        X-Tenant-Slug  header    string              true  "Tenant slug"
+// @Param        body           body      SessionLoginRequest true  "Credentials"
+// @Success      200            {object}  map[string]string
+// @Failure      400            {object}  map[string]string
+// @Failure      401            {object}  map[string]string
+// @Router       /api/v1/auth/session [post]
+func (h *AuthHandler) SessionLogin(c echo.Context) error {
+	slug, ok := tenantSlugFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "X-Tenant-Slug header is required"})
+	}
+
+	var req LoginRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Email == "" || req.Password == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
+	}
+
+	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
+		TenantSlug: slug,
+		Email:      req.Email,
+		Password:   req.Password,
+	})
+	if err != nil {
+		h.logger.Warn().Err(err).Str("email", req.Email).Msg("session login failed")
+		h.audit.Log(c.Request().Context(), audit.Event{
+			ActorEmail:   req.Email,
+			Action:       audit.ActionAuthLoginFailed,
+			ResourceType: "user",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		})
+		if containsMsg(err, "invalid credentials") {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+	}
+
+	// TOTP required — cannot issue cookies yet, return challenge for client to handle.
+	if result.OTPChallenge != nil {
+		return c.JSON(http.StatusOK, result.OTPChallenge)
+	}
+
+	secure := c.Request().TLS != nil || c.Request().Header.Get("X-Forwarded-Proto") == "https"
+	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, secure)
+
+	tid, uid := claimsFromToken(result.Token.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthLogin,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	return c.JSON(http.StatusOK, map[string]string{
+		"message":    "logged in",
+		"expires_in": "3600",
+	})
+}
+
+// SessionRefresh handles POST /api/v1/auth/session/refresh.
+//
+// @Summary      Cookie session refresh
+// @Description  Rotates the access and refresh tokens using the refresh cookie. Old refresh cookie is invalidated immediately.
+// @Tags         auth-session
+// @Produce      json
+// @Success      200  {object}  map[string]string
+// @Failure      401  {object}  map[string]string  "Missing or expired refresh cookie"
+// @Router       /api/v1/auth/session/refresh [post]
+func (h *AuthHandler) SessionRefresh(c echo.Context) error {
+	cookie, err := c.Cookie(mw.RefreshTokenCookie)
+	if err != nil || cookie.Value == "" {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "refresh cookie missing or expired"})
+	}
+
+	result, err := h.svc.Refresh(c.Request().Context(), cookie.Value)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("session refresh failed")
+		clearAuthCookies(c)
+		if errors.Is(err, auth.ErrInvalidRefreshToken) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token refresh failed"})
+	}
+
+	secure := c.Request().TLS != nil || c.Request().Header.Get("X-Forwarded-Proto") == "https"
+	setAuthCookies(c, result.AccessToken, result.RefreshToken, secure)
+
+	tid, uid := claimsFromToken(result.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
+		Action:       audit.ActionAuthTokenRefresh,
+		ResourceType: "session",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	return c.JSON(http.StatusOK, map[string]string{
+		"message":    "session refreshed",
+		"expires_in": "3600",
+	})
+}
+
+// SessionLogout handles POST /api/v1/auth/session/logout.
+//
+// @Summary      Cookie session logout
+// @Description  Revokes the refresh token stored in the cookie and clears both auth cookies.
+// @Tags         auth-session
+// @Produce      json
+// @Success      200  {object}  map[string]string
+// @Router       /api/v1/auth/session/logout [post]
+func (h *AuthHandler) SessionLogout(c echo.Context) error {
+	if cookie, err := c.Cookie(mw.RefreshTokenCookie); err == nil && cookie.Value != "" {
+		// Best-effort revocation — ignore errors (cookie may be expired or already revoked).
+		_ = h.svc.Logout(c.Request().Context(), cookie.Value)
+	}
+	clearAuthCookies(c)
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		Action:    audit.ActionAuthLogout,
+		IPAddress: c.RealIP(),
+		UserAgent: c.Request().UserAgent(),
+	})
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "logged out"})
+}
+
+// ---------------------------------------------------------------------------
+// Cookie helpers
+// ---------------------------------------------------------------------------
+
+// setAuthCookies writes the access + refresh tokens as HttpOnly cookies.
+// The refresh token has a restricted path to reduce its attack surface.
+func setAuthCookies(c echo.Context, accessToken, refreshToken string, secure bool) {
+	ac := new(http.Cookie)
+	ac.Name = mw.AccessTokenCookie
+	ac.Value = accessToken
+	ac.HttpOnly = true
+	ac.SameSite = http.SameSiteLaxMode
+	ac.Secure = secure
+	ac.Path = "/api/v1"
+	ac.MaxAge = 3600 // 1 hour — matches JWT access token lifetime
+
+	rc := new(http.Cookie)
+	rc.Name = mw.RefreshTokenCookie
+	rc.Value = refreshToken
+	rc.HttpOnly = true
+	rc.SameSite = http.SameSiteLaxMode
+	rc.Secure = secure
+	rc.Path = "/api/v1/auth/session/refresh"
+	rc.MaxAge = 30 * 24 * 3600 // 30 days — matches refresh token lifetime
+
+	http.SetCookie(c.Response().Writer, ac)
+	http.SetCookie(c.Response().Writer, rc)
+}
+
+// clearAuthCookies expires both auth cookies immediately.
+func clearAuthCookies(c echo.Context) {
+	for _, name := range []string{mw.AccessTokenCookie, mw.RefreshTokenCookie} {
+		expired := &http.Cookie{
+			Name:     name,
+			Value:    "",
+			HttpOnly: true,
+			MaxAge:   -1,
+			Path:     "/api/v1",
+		}
+		http.SetCookie(c.Response().Writer, expired)
+	}
 }
