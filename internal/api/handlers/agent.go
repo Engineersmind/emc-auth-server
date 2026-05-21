@@ -81,7 +81,7 @@ func (h *AgentHandler) ListAgents(c echo.Context) error {
 		return echo.ErrUnauthorized
 	}
 
-	agents, err := h.agentSvc.ListAgents(c.Request().Context(), tenantID)
+	agents, err := h.agentSvc.ListAgentsWithStats(c.Request().Context(), tenantID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("list agents failed")
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list agents")

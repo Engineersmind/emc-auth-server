@@ -902,10 +902,11 @@ func auditQueryParams(c echo.Context) audit.QueryParams {
 	page, _ := strconv.Atoi(c.QueryParam("page"))
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	p := audit.QueryParams{
-		Action: c.QueryParam("action"),
-		UserID: c.QueryParam("user_id"),
-		Page:   page,
-		Limit:  limit,
+		Action:  c.QueryParam("action"),
+		UserID:  c.QueryParam("user_id"),
+		AgentID: c.QueryParam("agent_id"),
+		Page:    page,
+		Limit:   limit,
 	}
 	if from := c.QueryParam("from"); from != "" {
 		if t, err := time.Parse(time.RFC3339, from); err == nil {

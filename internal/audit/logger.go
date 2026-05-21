@@ -70,6 +70,8 @@ type Event struct {
 	TenantID *uuid.UUID
 	// UserID is the user who performed the action. Nil for unauthenticated events.
 	UserID *uuid.UUID
+	// AgentID is the agent that performed the action. Nil for human-initiated events (08-03).
+	AgentID *uuid.UUID
 	// ActorEmail is the email of the actor (denormalized at log time).
 	ActorEmail string
 	// Action is one of the Action* constants above.
@@ -94,6 +96,7 @@ type LogEntry struct {
 	TenantID     *string   `json:"tenant_id"`
 	TenantSlug   *string   `json:"tenant_slug"`
 	UserID       *string   `json:"user_id"`
+	AgentID      *string   `json:"agent_id,omitempty"`
 	ActorEmail   string    `json:"actor_email"`
 	Action       string    `json:"action"`
 	ResourceType string    `json:"resource_type"`
@@ -117,6 +120,7 @@ type QueryParams struct {
 	TenantID *uuid.UUID
 	Action   string
 	UserID   string
+	AgentID  string // optional UUID string; filters to events by a specific agent (08-03)
 	From     *time.Time
 	To       *time.Time
 	Page     int
@@ -143,10 +147,10 @@ func New(pool *pgxpool.Pool, logger zerolog.Logger) *Logger {
 func (l *Logger) Log(ctx context.Context, e Event) {
 	_, err := l.pool.Exec(ctx, `
 		INSERT INTO audit_logs
-		  (id, tenant_id, user_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
+		  (id, tenant_id, user_id, agent_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
 		VALUES
-		  (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
-	`, e.TenantID, e.UserID, e.ActorEmail, e.Action,
+		  (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, e.TenantID, e.UserID, e.AgentID, e.ActorEmail, e.Action,
 		e.ResourceType, e.ResourceID, e.IPAddress, e.UserAgent)
 	if err != nil {
 		l.logger.Error().Err(err).Str("action", e.Action).Msg("audit: failed to write log entry")
@@ -192,6 +196,13 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 			where += fmt.Sprintf(" AND al.user_id = $%d", len(args))
 		}
 	}
+	if p.AgentID != "" {
+		aid, err := uuid.Parse(p.AgentID)
+		if err == nil {
+			args = append(args, aid)
+			where += fmt.Sprintf(" AND al.agent_id = $%d", len(args))
+		}
+	}
 	if p.From != nil {
 		args = append(args, *p.From)
 		where += fmt.Sprintf(" AND al.created_at >= $%d", len(args))
@@ -216,7 +227,7 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 	offsetArg := len(args)
 
 	querySQL := fmt.Sprintf(`
-		SELECT al.id, al.tenant_id, t.slug, al.user_id,
+		SELECT al.id, al.tenant_id, t.slug, al.user_id, al.agent_id,
 		       al.actor_email, al.action, al.resource_type,
 		       al.resource_id, al.ip_address, al.created_at
 		FROM audit_logs al
@@ -237,9 +248,10 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 		var e LogEntry
 		var tenantID *uuid.UUID
 		var userID *uuid.UUID
+		var agentID *uuid.UUID
 		var tenantSlug *string
 		if err := rows.Scan(
-			&e.ID, &tenantID, &tenantSlug, &userID,
+			&e.ID, &tenantID, &tenantSlug, &userID, &agentID,
 			&e.ActorEmail, &e.Action, &e.ResourceType,
 			&e.ResourceID, &e.IPAddress, &e.CreatedAt,
 		); err != nil {
@@ -252,6 +264,10 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 		if userID != nil {
 			s := userID.String()
 			e.UserID = &s
+		}
+		if agentID != nil {
+			s := agentID.String()
+			e.AgentID = &s
 		}
 		e.TenantSlug = tenantSlug
 		logs = append(logs, e)

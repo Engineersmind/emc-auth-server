@@ -54,6 +54,13 @@ type AgentSummary struct {
 	CreatedAt    time.Time  `json:"created_at"`
 }
 
+// AgentWithStats includes audit-derived activity metrics (08-03).
+type AgentWithStats struct {
+	AgentSummary
+	RequestCount int        `json:"request_count"`       // total audit events attributed to this agent
+	LastActive   *time.Time `json:"last_active"`         // most recent audit event timestamp
+}
+
 // AgentIdentity is resolved by AuthenticateAgent — acts like a machine identity.
 type AgentIdentity struct {
 	AgentID      uuid.UUID
@@ -140,6 +147,47 @@ func (s *AgentService) ListAgents(ctx context.Context, tenantID uuid.UUID) ([]Ag
 	}
 	if agents == nil {
 		agents = []AgentSummary{}
+	}
+	return agents, rows.Err()
+}
+
+// ListAgentsWithStats returns all active agent registrations with audit-derived metrics (08-03).
+// request_count and last_active are pulled from audit_logs.agent_id associations.
+func (s *AgentService) ListAgentsWithStats(ctx context.Context, tenantID uuid.UUID) ([]AgentWithStats, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+		    a.id, a.name, a.agent_type, a.capabilities, a.key_prefix, a.last_used_at, a.created_at,
+		    COUNT(al.id)            AS request_count,
+		    MAX(al.created_at)      AS last_active
+		FROM agent_registrations a
+		LEFT JOIN audit_logs al ON al.agent_id = a.id
+		WHERE a.tenant_id = $1 AND a.revoked_at IS NULL
+		GROUP BY a.id, a.name, a.agent_type, a.capabilities, a.key_prefix, a.last_used_at, a.created_at
+		ORDER BY a.created_at DESC
+	`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list agents with stats: %w", err)
+	}
+	defer rows.Close()
+
+	var agents []AgentWithStats
+	for rows.Next() {
+		var a AgentWithStats
+		var id uuid.UUID
+		if err := rows.Scan(
+			&id, &a.Name, &a.AgentType, &a.Capabilities, &a.KeyPrefix, &a.LastUsedAt, &a.CreatedAt,
+			&a.RequestCount, &a.LastActive,
+		); err != nil {
+			return nil, fmt.Errorf("scan agent with stats: %w", err)
+		}
+		a.ID = id.String()
+		if a.Capabilities == nil {
+			a.Capabilities = []string{}
+		}
+		agents = append(agents, a)
+	}
+	if agents == nil {
+		agents = []AgentWithStats{}
 	}
 	return agents, rows.Err()
 }
