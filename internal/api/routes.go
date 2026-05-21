@@ -272,6 +272,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// SPA fallback — serve index.html for all unmatched GET routes so that
 	// React Router can handle client-side navigation.
 	// Guard: /api/ paths return 404 rather than index.html (CRIT-02 review fix).
+	// Guard: if the path starts with /api/, return 404 rather than serving the
+	// SPA. Without this guard, a typo'd or unregistered API route returns HTTP
+	// 200 + text/html, making routing bugs very hard to diagnose.
 	e.GET("/*", func(c echo.Context) error {
 		if strings.HasPrefix(c.Request().URL.Path, "/api/") {
 			return echo.ErrNotFound
