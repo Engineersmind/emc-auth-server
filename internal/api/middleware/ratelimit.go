@@ -101,6 +101,15 @@ func startCleanup() {
 	})
 }
 
+// ResetStoresForTest clears all in-memory rate limiter state. It exists to allow
+// tests to start from a clean bucket state so that running with -count=N or in
+// a test suite that reuses the process does not pollute token buckets across runs.
+// MUST NOT be called in production code.
+func ResetStoresForTest() {
+	ipStore.store.Range(func(k, _ any) bool { ipStore.store.Delete(k); return true })
+	tenantStore.store.Range(func(k, _ any) bool { tenantStore.store.Delete(k); return true })
+}
+
 // LoginRateLimiter returns an Echo middleware that enforces two-level rate limiting
 // on the login endpoint (AUTH-07):
 //
