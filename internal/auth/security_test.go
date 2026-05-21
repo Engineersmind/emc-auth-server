@@ -111,6 +111,11 @@ func TestReplayAttack_RefreshToken(t *testing.T) {
 	if final == nil || final.AccessToken == "" {
 		t.Fatal("second Refresh returned empty access token")
 	}
+	// Prove the new access token is distinct — rotation must issue a fresh JWT,
+	// not return the same (cached) token from the previous call (M-02).
+	if final.AccessToken == rotated.AccessToken {
+		t.Error("second Refresh returned the same access token as the first — token not rotated")
+	}
 }
 
 // TestEmailEnumeration_ForgotPassword proves that ForgotPassword returns nil
