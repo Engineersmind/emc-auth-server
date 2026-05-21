@@ -28,6 +28,28 @@ export function DashboardPage() {
             <p className="mt-1 text-lg font-semibold text-gray-900">{user?.permissions.length ?? 0}</p>
           </div>
         </div>
+
+        <div className="bg-white rounded-xl border border-gray-200 p-6 mt-6">
+          <h2 className="text-sm font-semibold text-gray-900 mb-3">Monitoring</h2>
+          <div className="flex items-center space-x-6">
+            <a
+              href="/metrics"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm text-brand-600 hover:text-brand-800"
+            >
+              Prometheus Metrics &rarr;
+            </a>
+            <a
+              href="/swagger/index.html"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-sm text-brand-600 hover:text-brand-800"
+            >
+              API Documentation &rarr;
+            </a>
+          </div>
+        </div>
       </div>
     </Layout>
   );
