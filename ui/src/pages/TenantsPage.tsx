@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Layout } from '../components/Layout';
 import { useAuth } from '../contexts/AuthContext';
@@ -127,7 +128,13 @@ export function TenantsPage() {
                         <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">Active</span>
                       )}
                     </td>
-                    <td className="px-6 py-4 text-right">
+                    <td className="px-6 py-4 text-right space-x-4">
+                      <Link
+                        to={`/tenants/${tenant.id}`}
+                        className="text-sm text-brand-600 hover:text-brand-800"
+                      >
+                        Manage
+                      </Link>
                       {!tenant.deleted_at && (
                         <button
                           onClick={() => {

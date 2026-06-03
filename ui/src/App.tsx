@@ -8,6 +8,7 @@ import { DashboardPage } from './pages/DashboardPage';
 // Lazy-loaded pages (added in 06-02, 06-03, 06-04)
 import { lazy, Suspense } from 'react';
 const TenantsPage = lazy(() => import('./pages/TenantsPage').then(m => ({ default: m.TenantsPage })));
+const TenantDetailPage = lazy(() => import('./pages/TenantDetailPage').then(m => ({ default: m.TenantDetailPage })));
 const UsersPage = lazy(() => import('./pages/UsersPage').then(m => ({ default: m.UsersPage })));
 const UserDetailPage = lazy(() => import('./pages/UserDetailPage').then(m => ({ default: m.UserDetailPage })));
 const RolesPage = lazy(() => import('./pages/RolesPage').then(m => ({ default: m.RolesPage })));
@@ -51,6 +52,16 @@ export default function App() {
                 <ProtectedRoute>
                   <Suspense fallback={<PageLoader />}>
                     <TenantsPage />
+                  </Suspense>
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/tenants/:id"
+              element={
+                <ProtectedRoute>
+                  <Suspense fallback={<PageLoader />}>
+                    <TenantDetailPage />
                   </Suspense>
                 </ProtectedRoute>
               }
