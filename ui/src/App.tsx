@@ -2,8 +2,10 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AuthProvider } from './contexts/AuthContext';
 import { ProtectedRoute } from './components/ProtectedRoute';
+import { AdminRoute } from './components/AdminRoute';
 import { LoginPage } from './pages/LoginPage';
 import { DashboardPage } from './pages/DashboardPage';
+import { AccountPage } from './pages/AccountPage';
 
 // Lazy-loaded pages (added in 06-02, 06-03, 06-04)
 import { lazy, Suspense } from 'react';
@@ -47,73 +49,81 @@ export default function App() {
               }
             />
             <Route
-              path="/tenants"
+              path="/account"
               element={
                 <ProtectedRoute>
+                  <AccountPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/tenants"
+              element={
+                <AdminRoute>
                   <Suspense fallback={<PageLoader />}>
                     <TenantsPage />
                   </Suspense>
-                </ProtectedRoute>
+                </AdminRoute>
               }
             />
             <Route
               path="/tenants/:id"
               element={
-                <ProtectedRoute>
+                <AdminRoute>
                   <Suspense fallback={<PageLoader />}>
                     <TenantDetailPage />
                   </Suspense>
-                </ProtectedRoute>
+                </AdminRoute>
               }
             />
             <Route
               path="/users"
               element={
-                <ProtectedRoute>
+                <AdminRoute>
                   <Suspense fallback={<PageLoader />}>
                     <UsersPage />
                   </Suspense>
-                </ProtectedRoute>
+                </AdminRoute>
               }
             />
             <Route
               path="/users/:id"
               element={
-                <ProtectedRoute>
+                <AdminRoute>
                   <Suspense fallback={<PageLoader />}>
                     <UserDetailPage />
                   </Suspense>
-                </ProtectedRoute>
+                </AdminRoute>
               }
             />
             <Route
               path="/roles"
               element={
-                <ProtectedRoute>
+                <AdminRoute>
                   <Suspense fallback={<PageLoader />}>
                     <RolesPage />
                   </Suspense>
-                </ProtectedRoute>
+                </AdminRoute>
               }
             />
             <Route
               path="/api-keys"
               element={
-                <ProtectedRoute>
+                <AdminRoute>
                   <Suspense fallback={<PageLoader />}>
                     <ApiKeysPage />
                   </Suspense>
-                </ProtectedRoute>
+                </AdminRoute>
               }
             />
             <Route
               path="/saml"
               element={
-                <ProtectedRoute>
+                <AdminRoute>
                   <Suspense fallback={<PageLoader />}>
                     <SamlPage />
                   </Suspense>
-                </ProtectedRoute>
+                </AdminRoute>
               }
             />
           </Routes>

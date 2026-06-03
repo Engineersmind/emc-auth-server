@@ -4,6 +4,9 @@ import { authApi, UserInfo } from '../api/auth';
 interface AuthContextValue {
   user: UserInfo | null;
   loading: boolean;
+  isAdmin: boolean;       // has admin:access permission
+  isSuperAdmin: boolean;  // has tenant:manage permission
+  hasPermission: (perm: string) => boolean;
   login: (email: string, password: string) => Promise<{ requiresTotp: boolean; sessionId?: string }>;
   loginTotp: (sessionId: string, code: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -14,6 +17,10 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const hasPermission = (perm: string) => user?.permissions?.includes(perm) ?? false;
+  const isAdmin      = hasPermission('admin:access');
+  const isSuperAdmin = hasPermission('tenant:manage');
 
   useEffect(() => {
     authApi.me()
@@ -49,7 +56,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, loginTotp, logout }}>
+    <AuthContext.Provider value={{ user, loading, isAdmin, isSuperAdmin, hasPermission, login, loginTotp, logout }}>
       {children}
     </AuthContext.Provider>
   );
