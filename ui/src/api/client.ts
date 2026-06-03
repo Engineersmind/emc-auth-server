@@ -1,10 +1,13 @@
 import axios from 'axios';
 
+const tenant = import.meta.env.VITE_TENANT_SLUG ?? 'emc';
+
 const client = axios.create({
   baseURL: '/api/v1',
   withCredentials: true, // send HttpOnly cookies automatically
   headers: {
     'Content-Type': 'application/json',
+    'X-Tenant-Slug': tenant,
   },
 });
 
