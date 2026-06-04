@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EMC Auth Server — Release Notes</title>
+  <style>
+    :root {
+      --brand:    #1e3a5f;
+      --brand-lt: #2d5f99;
+      --accent:   #0ea5e9;
+      --green:    #16a34a;
+      --amber:    #d97706;
+      --red:      #dc2626;
+      --gray-50:  #f8fafc;
+      --gray-100: #f1f5f9;
+      --gray-200: #e2e8f0;
+      --gray-500: #64748b;
+      --gray-700: #334155;
+      --gray-900: #0f172a;
+      --radius:   8px;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--gray-50);
+      color: var(--gray-700);
+      line-height: 1.6;
+    }
+
+    /* ── Header ── */
+    header {
+      background: linear-gradient(135deg, var(--brand) 0%, var(--brand-lt) 100%);
+      color: #fff;
+      padding: 48px 24px 40px;
+      text-align: center;
+    }
+    header h1 { font-size: 2.25rem; font-weight: 700; letter-spacing: -0.5px; }
+    header p  { margin-top: 8px; font-size: 1.05rem; opacity: .85; }
+    .badge-row {
+      display: flex; flex-wrap: wrap; gap: 10px;
+      justify-content: center; margin-top: 20px;
+    }
+    .badge-row a img { height: 22px; }
+
+    /* ── Nav ── */
+    nav.toc {
+      background: #fff;
+      border-bottom: 1px solid var(--gray-200);
+      padding: 12px 24px;
+      position: sticky; top: 0; z-index: 100;
+      display: flex; gap: 24px; flex-wrap: wrap; justify-content: center;
+    }
+    nav.toc a {
+      text-decoration: none; font-size: .85rem; font-weight: 500;
+      color: var(--brand-lt);
+    }
+    nav.toc a:hover { color: var(--accent); }
+
+    /* ── Layout ── */
+    main { max-width: 960px; margin: 0 auto; padding: 40px 20px 80px; }
+
+    /* ── Section headers ── */
+    .section-title {
+      font-size: 1.5rem; font-weight: 700; color: var(--brand);
+      padding-bottom: 8px; border-bottom: 2px solid var(--accent);
+      margin: 56px 0 24px;
+    }
+
+    /* ── Version cards ── */
+    .version-card {
+      background: #fff;
+      border: 1px solid var(--gray-200);
+      border-radius: var(--radius);
+      margin-bottom: 28px;
+      overflow: hidden;
+    }
+    .version-header {
+      display: flex; align-items: center; gap: 16px;
+      background: var(--gray-100);
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--gray-200);
+    }
+    .version-tag {
+      background: var(--brand);
+      color: #fff;
+      font-size: .8rem; font-weight: 700;
+      padding: 4px 12px; border-radius: 999px;
+      white-space: nowrap;
+    }
+    .version-tag.latest { background: var(--green); }
+    .version-date {
+      font-size: .85rem; color: var(--gray-500);
+    }
+    .version-links {
+      margin-left: auto; display: flex; gap: 12px;
+    }
+    .version-links a {
+      font-size: .8rem; font-weight: 500; text-decoration: none;
+      color: var(--brand-lt); border: 1px solid var(--gray-200);
+      padding: 3px 10px; border-radius: 6px;
+    }
+    .version-links a:hover { background: var(--gray-100); }
+    .version-body { padding: 20px 24px; }
+
+    /* ── Feature list ── */
+    .feature-group { margin-bottom: 20px; }
+    .feature-group h3 {
+      font-size: .8rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .08em; color: var(--gray-500); margin-bottom: 8px;
+    }
+    .feature-list { list-style: none; }
+    .feature-list li {
+      font-size: .9rem; padding: 5px 0;
+      display: flex; align-items: flex-start; gap: 8px;
+    }
+    .feature-list li::before { content: "✦"; color: var(--accent); font-size: .7rem; margin-top: 4px; flex-shrink: 0; }
+    .feature-list li.fixed::before { content: "⚑"; color: var(--amber); }
+    .feature-list code {
+      font-family: "SF Mono", Menlo, monospace;
+      font-size: .82rem; background: var(--gray-100);
+      padding: 1px 6px; border-radius: 4px; color: var(--brand);
+    }
+
+    /* ── API table ── */
+    .api-table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    .api-table th {
+      background: var(--brand); color: #fff;
+      padding: 10px 14px; text-align: left; font-weight: 600;
+    }
+    .api-table td { padding: 9px 14px; border-bottom: 1px solid var(--gray-200); }
+    .api-table tr:last-child td { border-bottom: none; }
+    .api-table tr:nth-child(even) td { background: var(--gray-50); }
+    .method {
+      display: inline-block; font-family: monospace; font-size: .78rem;
+      font-weight: 700; padding: 2px 8px; border-radius: 4px;
+      min-width: 56px; text-align: center;
+    }
+    .method.GET    { background: #dcfce7; color: #166534; }
+    .method.POST   { background: #dbeafe; color: #1e40af; }
+    .method.PUT    { background: #fef9c3; color: #854d0e; }
+    .method.DELETE { background: #fee2e2; color: #991b1b; }
+    .endpoint-url {
+      font-family: "SF Mono", Menlo, monospace; font-size: .82rem; color: var(--gray-700);
+    }
+    .req-badge {
+      font-size: .72rem; font-weight: 600; padding: 2px 7px; border-radius: 999px;
+    }
+    .req-public  { background: #e0f2fe; color: #075985; }
+    .req-admin   { background: #ede9fe; color: #4c1d95; }
+    .req-super   { background: #fce7f3; color: #831843; }
+    .req-jwt     { background: #f0fdf4; color: #14532d; }
+
+    /* ── Schedule table ── */
+    .schedule-table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+    .schedule-table th {
+      background: var(--brand); color: #fff;
+      padding: 10px 14px; text-align: left;
+    }
+    .schedule-table td { padding: 9px 14px; border-bottom: 1px solid var(--gray-200); vertical-align: top; }
+    .schedule-table tr:last-child td { border-bottom: none; }
+    .phase-badge {
+      display: inline-block; font-size: .75rem; font-weight: 700;
+      padding: 2px 9px; border-radius: 999px; white-space: nowrap;
+    }
+    .phase-done     { background: #dcfce7; color: #166534; }
+    .phase-partial  { background: #fef9c3; color: #854d0e; }
+    .phase-planned  { background: #e0f2fe; color: #075985; }
+
+    /* ── Info boxes ── */
+    .info-box {
+      border-radius: var(--radius); padding: 16px 20px;
+      margin: 20px 0; font-size: .9rem;
+    }
+    .info-box.blue   { background: #eff6ff; border-left: 4px solid var(--accent); }
+    .info-box.green  { background: #f0fdf4; border-left: 4px solid var(--green); }
+    .info-box.amber  { background: #fffbeb; border-left: 4px solid var(--amber); }
+    .info-box strong { display: block; margin-bottom: 4px; }
+
+    /* ── Footer ── */
+    footer {
+      text-align: center; padding: 32px 20px;
+      font-size: .82rem; color: var(--gray-500);
+      border-top: 1px solid var(--gray-200);
+    }
+    footer a { color: var(--brand-lt); text-decoration: none; }
+
+    @media (max-width: 640px) {
+      header h1 { font-size: 1.6rem; }
+      .version-header { flex-wrap: wrap; }
+      .version-links { margin-left: 0; }
+      .api-table, .schedule-table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════════
+     HEADER
+═════════════════════════════════════════════════════ -->
+<header>
+  <h1>EMC Auth Server</h1>
+  <p>Standalone, self-hosted multi-tenant Identity Provider — Auth0 replacement built for EngineersMind</p>
+  <div class="badge-row">
+    <a href="https://github.com/Engineersmind/emc-auth-server/releases/tag/v1.5.0">
+      <img alt="Latest Release" src="https://img.shields.io/github/v/release/Engineersmind/emc-auth-server?label=release&style=flat-square&color=1e3a5f" />
+    </a>
+    <a href="https://github.com/Engineersmind/emc-auth-server/actions/workflows/ci.yml">
+      <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Engineersmind/emc-auth-server/ci.yml?branch=main&label=CI&style=flat-square" />
+    </a>
+    <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/LICENSE">
+      <img alt="License" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" />
+    </a>
+    <a href="https://pkg.go.dev/github.com/engineersmind/emc-auth-server">
+      <img alt="Go" src="https://img.shields.io/badge/Go-1.23-00ADD8?style=flat-square&logo=go" />
+    </a>
+    <a href="https://github.com/Engineersmind/emc-auth-server/pkgs/container/emc-auth-server">
+      <img alt="Docker" src="https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker" />
+    </a>
+  </div>
+</header>
+
+<!-- ════════════════════════════════════════════════════
+     STICKY NAV
+═════════════════════════════════════════════════════ -->
+<nav class="toc">
+  <a href="#versions">Version History</a>
+  <a href="#api">API Reference</a>
+  <a href="#schedule">Release Schedule</a>
+  <a href="#roadmap">Roadmap</a>
+  <a href="#links">Links</a>
+</nav>
+
+<main>
+
+  <!-- ── Quick info ── -->
+  <div class="info-box blue" style="margin-top:32px;">
+    <strong>Current Version: v1.5.0</strong>
+    Go 1.23 · Echo v4 · PostgreSQL 16 · Redis 7 · React 18 · TypeScript · MIT License
+  </div>
+
+  <!-- ════════════════════════════════════
+       SECTION: VERSION HISTORY
+  ═════════════════════════════════════ -->
+  <h2 class="section-title" id="versions">Version History</h2>
+
+  <!-- v1.5.0 -->
+  <div class="version-card">
+    <div class="version-header">
+      <span class="version-tag latest">v1.5.0 LATEST</span>
+      <span class="version-date">2026-05-18</span>
+      <div class="version-links">
+        <a href="https://github.com/Engineersmind/emc-auth-server/releases/tag/v1.5.0">GitHub Release</a>
+        <a href="https://github.com/Engineersmind/emc-auth-server/compare/v1.4.0...v1.5.0">Diff</a>
+        <a href="https://github.com/Engineersmind/emc-auth-server/pkgs/container/emc-auth-server">Docker</a>
+      </div>
+    </div>
+    <div class="version-body">
+      <div class="feature-group">
+        <h3>Admin UI — Phase 6</h3>
+        <ul class="feature-list">
+          <li>React 18 + TypeScript SPA embedded in Go binary via <code>embed.FS</code> — no separate deployment</li>
+          <li>Login page with TOTP 2FA second-step flow</li>
+          <li>Dashboard: tenant, role, and permission summary cards</li>
+          <li>Users: list, create, edit role, force-password-reset, delete</li>
+          <li>Roles: create, assign/replace permissions, delete</li>
+          <li>API Keys: generate (raw shown once), list, revoke</li>
+          <li>SAML: configure IdP metadata per tenant</li>
+          <li>Tenants: list all tenants with drill-down detail page</li>
+          <li>Tenant Detail: 3-tab layout (Permissions / Roles / Users) using cross-tenant API</li>
+        </ul>
+      </div>
+      <div class="feature-group">
+        <h3>Permission-Based Routing</h3>
+        <ul class="feature-list">
+          <li><code>admin:access</code> gates all admin pages — non-admins redirected to <code>/account</code></li>
+          <li><code>tenant:manage</code> gates Tenants nav and cross-tenant routes</li>
+          <li><code>AccountPage</code> — self-service portal for tenant users (profile, role, permissions)</li>
+          <li><code>AdminRoute</code> guard component — clean redirect, no 403 flash</li>
+        </ul>
+      </div>
+      <div class="feature-group">
+        <h3>Cross-Tenant Management API</h3>
+        <ul class="feature-list">
+          <li>Super-admin can manage permissions, roles, users in any tenant without switching context</li>
+          <li>Routes: <code>/api/v1/admin/tenants/:tid/permissions</code>, <code>/roles</code>, <code>/users</code></li>
+        </ul>
+      </div>
+      <div class="feature-group">
+        <h3>Fixed</h3>
+        <ul class="feature-list">
+          <li class="fixed">Cookie login: POST <code>/auth/session</code> now hydrates user state via GET <code>/auth/me</code></li>
+          <li class="fixed">API client: missing <code>X-Tenant-Slug</code> header added to base config</li>
+          <li class="fixed">Vite proxy port corrected to 9090</li>
+          <li class="fixed">TypeScript type mismatches in roles and API keys response models</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- v1.4.0 -->
+  <div class="version-card">
+    <div class="version-header">
+      <span class="version-tag">v1.4.0</span>
+      <span class="version-date">2026-05-18</span>
+      <div class="version-links">
+        <a href="https://github.com/Engineersmind/emc-auth-server/releases/tag/v1.4.0">GitHub Release</a>
+        <a href="https://github.com/Engineersmind/emc-auth-server/compare/v1.3.0...v1.4.0">Diff</a>
+      </div>
+    </div>
+    <div class="version-body">
+      <div class="feature-group">
+        <h3>SAML 2.0 — Phase 4</h3>
+        <ul class="feature-list">
+          <li>SAML config storage per tenant (<code>saml_configs</code> table)</li>
+          <li>SP metadata: <code>GET /saml/metadata</code></li>
+          <li>SP-initiated SSO: <code>GET /saml/login</code> → IdP redirect</li>
+          <li>Assertion Consumer Service: <code>POST /saml/acs</code> — validates IdP response</li>
+          <li>JIT user provisioning — creates user account on first successful SAML login</li>
+          <li>Admin config: <code>GET/PUT /api/v1/admin/saml-config</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- v1.3.0 -->
+  <div class="version-card">
+    <div class="version-header">
+      <span class="version-tag">v1.3.0</span>
+      <span class="version-date">2026-05-18</span>
+      <div class="version-links">
+        <a href="https://github.com/Engineersmind/emc-auth-server/releases/tag/v1.3.0">GitHub Release</a>
+        <a href="https://github.com/Engineersmind/emc-auth-server/compare/v1.2.0...v1.3.0">Diff</a>
+      </div>
+    </div>
+    <div class="version-body">
+      <div class="feature-group">
+        <h3>Infrastructure — Phase 7 Partial</h3>
+        <ul class="feature-list">
+          <li>GitHub Actions CI: test (≥50% coverage), golangci-lint, gosec SAST, govulncheck, Docker build</li>
+          <li>Release automation: Docker image → GHCR + Linux binaries (amd64/arm64) on <code>v*.*.*</code> tag</li>
+          <li>Prometheus metrics: <code>GET /metrics</code> — latency histogram, in-flight gauge, operation counters</li>
+          <li>Grafana dashboard JSON + alerting rules (latency, error rate, in-flight)</li>
+        </ul>
+      </div>
+      <div class="feature-group">
+        <h3>AI/Agent Security — Phase 8 Partial</h3>
+        <ul class="feature-list">
+          <li>Per-app rate limiting via <code>X-App-ID</code> header — configurable limits per application</li>
+          <li><code>app_rate_limits</code> table, Redis-cached 60s TTL, <code>429 + Retry-After</code> response</li>
+          <li>Admin CRUD: <code>POST/GET /api/v1/admin/app-limits</code>, <code>PUT/DELETE /api/v1/admin/app-limits/:app_id</code></li>
+        </ul>
+      </div>
+      <div class="feature-group">
+        <h3>Browser/SPA Support</h3>
+        <ul class="feature-list">
+          <li>Cookie sessions: <code>POST /api/v1/auth/session</code> — sets HttpOnly + SameSite=Lax cookies</li>
+          <li>Cookie refresh: <code>POST /api/v1/auth/session/refresh</code></li>
+          <li>Cookie logout: <code>POST /api/v1/auth/session/logout</code></li>
+          <li>Per-tenant CORS: origin whitelist in <code>cors_origins[]</code>, Redis-cached 60s TTL</li>
+          <li><code>PUT /api/v1/admin/tenants/:id/cors-origins</code> — replace allowed origins</li>
+        </ul>
+      </div>
+      <div class="feature-group">
+        <h3>Fixed</h3>
+        <ul class="feature-list">
+          <li class="fixed">401 interceptor infinite redirect loop on <code>/login</code></li>
+          <li class="fixed">SPA fallback: <code>/api/*</code> paths now return 404 instead of <code>index.html</code></li>
+          <li class="fixed">API key modal state leak on dismiss</li>
+          <li class="fixed">Content-Security-Policy header added</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- v1.2.0 -->
+  <div class="version-card">
+    <div class="version-header">
+      <span class="version-tag">v1.2.0</span>
+      <span class="version-date">2026-05-18</span>
+      <div class="version-links">
+        <a href="https://github.com/Engineersmind/emc-auth-server/releases/tag/v1.2.0">GitHub Release</a>
+        <a href="https://github.com/Engineersmind/emc-auth-server/compare/v1.1.0...v1.2.0">Diff</a>
+      </div>
+    </div>
+    <div class="version-body">
+      <div class="feature-group">
+        <h3>Admin API — Phase 5</h3>
+        <ul class="feature-list">
+          <li>Tenant management: create, list, update, soft-deactivate</li>
+          <li>RBAC: permissions CRUD, roles CRUD with permission assignment</li>
+          <li>User pool: list (search/page/limit), create, update, delete, role reassignment, force-password-reset</li>
+          <li>Audit logs: 21 event types, tenant-scoped and system-wide views, filterable by action/user/date</li>
+          <li>CODEOWNERS: path-based review enforcement for auth, middleware, audit, and migration paths</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- v1.1.0 -->
+  <div class="version-card">
+    <div class="version-header">
+      <span class="version-tag">v1.1.0</span>
+      <span class="version-date">2026-05-18</span>
+      <div class="version-links">
+        <a href="https://github.com/Engineersmind/emc-auth-server/releases/tag/v1.1.0">GitHub Release</a>
+        <a href="https://github.com/Engineersmind/emc-auth-server/compare/v1.0.0...v1.1.0">Diff</a>
+      </div>
+    </div>
+    <div class="version-body">
+      <div class="feature-group">
+        <h3>TOTP 2FA — Phase 3</h3>
+        <ul class="feature-list">
+          <li>Enroll: <code>POST /api/v1/auth/otp/enroll</code> — returns <code>otpauth://</code> URI + 8 single-use backup codes</li>
+          <li>Activate: <code>POST /api/v1/auth/otp/activate</code> — validates first code, marks TOTP active</li>
+          <li>Disable: <code>DELETE /api/v1/auth/otp</code> — requires valid TOTP or backup code</li>
+          <li>Two-step login: <code>POST /auth/login</code> returns <code>totp_session_id</code>; <code>POST /auth/login/otp</code> completes auth</li>
+          <li>TOTP secrets encrypted at rest with AES-256-GCM; backup codes SHA-256 hashed, single-use</li>
+        </ul>
+      </div>
+      <div class="feature-group">
+        <h3>API Keys — Phase 3</h3>
+        <ul class="feature-list">
+          <li>Create: <code>POST /api/v1/admin/api-keys</code> — <code>emck_</code> prefix, 32-byte random, raw shown once only</li>
+          <li>List: <code>GET /api/v1/admin/api-keys</code> — name, created_at, last_used (raw never returned again)</li>
+          <li>Revoke: <code>DELETE /api/v1/admin/api-keys/:id</code></li>
+          <li>Auth via <code>X-API-Key</code> or <code>Authorization: ApiKey &lt;key&gt;</code> header; SHA-256 hash stored in DB</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- v1.0.0 -->
+  <div class="version-card">
+    <div class="version-header">
+      <span class="version-tag">v1.0.0</span>
+      <span class="version-date">2026-05-18</span>
+      <div class="version-links">
+        <a href="https://github.com/Engineersmind/emc-auth-server/releases/tag/v1.0.0">GitHub Release</a>
+      </div>
+    </div>
+    <div class="version-body">
+      <div class="feature-group">
+        <h3>Foundation — Phase 1 + 2</h3>
+        <ul class="feature-list">
+          <li>Go 1.23 + Echo v4, PostgreSQL 16 (pgx v5 + pgxpool), Redis 7, Goose migrations, Zerolog</li>
+          <li>User registration with bcrypt cost-12 and duplicate detection</li>
+          <li>Login with JWT HS256 (per-tenant secret), 1-hour access + 30-day refresh token</li>
+          <li>Atomic refresh rotation — old token revoked before new issued; replay returns 401</li>
+          <li>Password reset: SHA-256 token, 15-min TTL, enumeration-safe responses</li>
+          <li>Rate limiting: 5/min/IP + 10/min/tenant on login endpoint</li>
+          <li>Swagger UI at <code>/swagger/index.html</code></li>
+          <li>3-stage Docker build → distroless/static ~5MB final image</li>
+          <li>Single binary: migrations + seed embedded via <code>embed.FS</code>, boots in &lt;1s</li>
+          <li>Security headers: HSTS, X-Content-Type-Options, X-Frame-Options, Referrer-Policy</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════════════════
+       SECTION: API REFERENCE
+  ═════════════════════════════════════ -->
+  <h2 class="section-title" id="api">API Reference</h2>
+
+  <div class="info-box green">
+    <strong>Base URL</strong>
+    All REST endpoints are under <code>https://your-host/api/v1</code> &nbsp;·&nbsp;
+    Interactive docs: <a href="/swagger/index.html">/swagger/index.html</a>
+  </div>
+
+  <h3 style="margin:24px 0 12px;color:var(--brand);">Public Authentication</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/register</td><td><span class="req-badge req-public">public</span></td><td>Register new user (tenant-scoped)</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/login</td><td><span class="req-badge req-public">public</span></td><td>Login — returns JWT or totp_session_id if 2FA enrolled</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/login/otp</td><td><span class="req-badge req-public">public</span></td><td>Complete TOTP-gated login</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/refresh</td><td><span class="req-badge req-public">public</span></td><td>Rotate refresh token (atomic)</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/logout</td><td><span class="req-badge req-public">public</span></td><td>Revoke refresh token</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/forgot-password</td><td><span class="req-badge req-public">public</span></td><td>Request password reset link (enumeration-safe)</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/reset-password</td><td><span class="req-badge req-public">public</span></td><td>Set new password with reset token</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/session</td><td><span class="req-badge req-public">public</span></td><td>Login via HttpOnly cookie (SPA)</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/session/refresh</td><td><span class="req-badge req-public">public</span></td><td>Refresh via cookie</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/session/logout</td><td><span class="req-badge req-public">public</span></td><td>Clear cookies and revoke token</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:24px 0 12px;color:var(--brand);">Current User &amp; TOTP</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/auth/me</td><td><span class="req-badge req-jwt">JWT</span></td><td>Get current user profile and permissions</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/otp/enroll</td><td><span class="req-badge req-jwt">JWT</span></td><td>Begin TOTP enrollment — returns otpauth URI + 8 backup codes</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/auth/otp/activate</td><td><span class="req-badge req-jwt">JWT</span></td><td>Activate TOTP with first valid code</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/auth/otp</td><td><span class="req-badge req-jwt">JWT</span></td><td>Disable TOTP (requires valid TOTP or backup code)</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:24px 0 12px;color:var(--brand);">Admin — Tenant Management</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/tenants</td><td><span class="req-badge req-super">super-admin</span></td><td>Create tenant</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/tenants</td><td><span class="req-badge req-super">super-admin</span></td><td>List all tenants</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/tenants/:id</td><td><span class="req-badge req-super">super-admin</span></td><td>Update tenant name</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/tenants/:id</td><td><span class="req-badge req-super">super-admin</span></td><td>Soft-deactivate tenant</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/tenants/:id/cors-origins</td><td><span class="req-badge req-super">super-admin</span></td><td>Replace allowed CORS origins</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:24px 0 12px;color:var(--brand);">Admin — Cross-Tenant Management</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/permissions</td><td><span class="req-badge req-super">super-admin</span></td><td>List permissions in target tenant</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/permissions</td><td><span class="req-badge req-super">super-admin</span></td><td>Create permission in target tenant</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/permissions/:pid</td><td><span class="req-badge req-super">super-admin</span></td><td>Delete permission in target tenant</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/roles</td><td><span class="req-badge req-super">super-admin</span></td><td>List roles in target tenant</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/roles</td><td><span class="req-badge req-super">super-admin</span></td><td>Create role in target tenant</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/roles/:rid/permissions</td><td><span class="req-badge req-super">super-admin</span></td><td>Replace role permissions</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/roles/:rid</td><td><span class="req-badge req-super">super-admin</span></td><td>Delete role in target tenant</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/users</td><td><span class="req-badge req-super">super-admin</span></td><td>List users in target tenant</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/users</td><td><span class="req-badge req-super">super-admin</span></td><td>Create user in target tenant</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/tenants/:tid/users/:uid</td><td><span class="req-badge req-super">super-admin</span></td><td>Delete user in target tenant</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:24px 0 12px;color:var(--brand);">Admin — RBAC &amp; Users</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/permissions</td><td><span class="req-badge req-admin">admin</span></td><td>Create permission (tenant-scoped)</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/permissions</td><td><span class="req-badge req-admin">admin</span></td><td>List permissions</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/permissions/:id</td><td><span class="req-badge req-admin">admin</span></td><td>Delete permission</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/roles</td><td><span class="req-badge req-admin">admin</span></td><td>Create role with permission assignments</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/roles</td><td><span class="req-badge req-admin">admin</span></td><td>List roles (with embedded permissions)</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/roles/:id/permissions</td><td><span class="req-badge req-admin">admin</span></td><td>Replace role's permission set</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/roles/:id</td><td><span class="req-badge req-admin">admin</span></td><td>Delete role</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/users</td><td><span class="req-badge req-admin">admin</span></td><td>List users (search, page, limit)</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/users</td><td><span class="req-badge req-admin">admin</span></td><td>Create user with optional role</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/users/:id</td><td><span class="req-badge req-admin">admin</span></td><td>Get user details</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/users/:id</td><td><span class="req-badge req-admin">admin</span></td><td>Update user profile</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/users/:id/role</td><td><span class="req-badge req-admin">admin</span></td><td>Reassign user role</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/users/:id</td><td><span class="req-badge req-admin">admin</span></td><td>Soft-delete user</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/users/:id/force-password-reset</td><td><span class="req-badge req-admin">admin</span></td><td>Send password reset email</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:24px 0 12px;color:var(--brand);">Admin — API Keys, Rate Limits, SAML, Audit</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/api-keys</td><td><span class="req-badge req-admin">admin</span></td><td>Create API key (raw shown once)</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/api-keys</td><td><span class="req-badge req-admin">admin</span></td><td>List keys (name, created_at, last_used)</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/api-keys/:id</td><td><span class="req-badge req-admin">admin</span></td><td>Revoke API key</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/api/v1/admin/app-limits</td><td><span class="req-badge req-admin">admin</span></td><td>Create per-app rate limit</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/app-limits</td><td><span class="req-badge req-admin">admin</span></td><td>List app rate limits</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/app-limits/:app_id</td><td><span class="req-badge req-admin">admin</span></td><td>Update limit (effective within 60s)</td></tr>
+      <tr><td><span class="method DELETE">DEL</span></td><td class="endpoint-url">/api/v1/admin/app-limits/:app_id</td><td><span class="req-badge req-admin">admin</span></td><td>Remove limit (falls back to default)</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/saml-config</td><td><span class="req-badge req-admin">admin</span></td><td>Get SAML config for tenant</td></tr>
+      <tr><td><span class="method PUT">PUT</span></td><td class="endpoint-url">/api/v1/admin/saml-config</td><td><span class="req-badge req-admin">admin</span></td><td>Upsert SAML IdP config</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/audit-logs</td><td><span class="req-badge req-admin">admin</span></td><td>Tenant-scoped audit log (21 event types)</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/api/v1/admin/audit-logs/system</td><td><span class="req-badge req-super">super-admin</span></td><td>System-wide audit log (all tenants)</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:24px 0 12px;color:var(--brand);">SAML SP &amp; System</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Path</th><th>Auth</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/saml/metadata</td><td><span class="req-badge req-public">public</span></td><td>SP metadata XML for IdP configuration</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/saml/login</td><td><span class="req-badge req-public">public</span></td><td>Initiate SP-initiated SAML login</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td class="endpoint-url">/saml/acs</td><td><span class="req-badge req-public">public</span></td><td>Assertion Consumer Service — receives IdP response</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/health</td><td><span class="req-badge req-public">public</span></td><td>Health check</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/metrics</td><td><span class="req-badge req-public">public</span></td><td>Prometheus metrics (restrict via network policy)</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td class="endpoint-url">/swagger/*</td><td><span class="req-badge req-public">public</span></td><td>Swagger UI — interactive API explorer</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ════════════════════════════════════
+       SECTION: RELEASE SCHEDULE
+  ═════════════════════════════════════ -->
+  <h2 class="section-title" id="schedule">Weekly Release Schedule</h2>
+
+  <div class="info-box amber">
+    <strong>Release Cadence</strong>
+    EMC Auth follows a <strong>weekly release cycle</strong>. Releases are tagged every Monday on <code>main</code> after all CI checks pass.
+    Hotfixes ship same-day on a <code>hotfix/*</code> branch and merge as a patch release (e.g. v1.5.1).
+  </div>
+
+  <table class="schedule-table">
+    <thead>
+      <tr>
+        <th>Target Date</th>
+        <th>Version</th>
+        <th>Phase</th>
+        <th>Focus</th>
+        <th>Key Deliverables</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>2026-05-18</td>
+        <td><strong>v1.0.0 → v1.5.0</strong></td>
+        <td><span class="phase-badge phase-done">Done</span></td>
+        <td>Foundation → Admin UI</td>
+        <td>Auth engine, TOTP, API keys, Admin API, SAML SP, CI/CD, cookie sessions, Admin UI, permission routing</td>
+      </tr>
+      <tr>
+        <td>2026-06-09</td>
+        <td><strong>v1.6.0</strong></td>
+        <td><span class="phase-badge phase-partial">In Progress</span></td>
+        <td>Phase 7 — Testing &amp; Hardening</td>
+        <td>Unit test suite (≥80% coverage gate), security test suite (auth bypass, injection, privilege escalation), load test baseline</td>
+      </tr>
+      <tr>
+        <td>2026-06-16</td>
+        <td><strong>v1.7.0</strong></td>
+        <td><span class="phase-badge phase-planned">Planned</span></td>
+        <td>Phase 8 — AI/Agent Security</td>
+        <td>Agent registration + M2M auth, agent activity audit trail, risk scoring engine, agent analytics dashboard</td>
+      </tr>
+      <tr>
+        <td>2026-06-23</td>
+        <td><strong>v1.8.0</strong></td>
+        <td><span class="phase-badge phase-planned">Planned</span></td>
+        <td>Phase 9 — OAuth 2.0 / OIDC</td>
+        <td>Authorization Code flow, PKCE, introspection endpoint, UserInfo endpoint, JWKS endpoint, OIDC discovery</td>
+      </tr>
+      <tr>
+        <td>2026-06-30</td>
+        <td><strong>v1.9.0</strong></td>
+        <td><span class="phase-badge phase-planned">Planned</span></td>
+        <td>Phase 9 — OAuth Clients &amp; Scopes</td>
+        <td>OAuth client management UI, scope definitions, token exchange, M2M client credentials flow</td>
+      </tr>
+      <tr>
+        <td>2026-07-07</td>
+        <td><strong>v2.0.0</strong></td>
+        <td><span class="phase-badge phase-planned">Planned</span></td>
+        <td>General Availability</td>
+        <td>RS256 JWT (per ADR-01), production hardening, documented upgrade path from v1.x, GA announcement</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ════════════════════════════════════
+       SECTION: ROADMAP
+  ═════════════════════════════════════ -->
+  <h2 class="section-title" id="roadmap">Feature Roadmap</h2>
+
+  <table class="schedule-table">
+    <thead>
+      <tr><th>Phase</th><th>Feature</th><th>Status</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>Go + Echo foundation, PostgreSQL, Redis, migrations, seed</td><td><span class="phase-badge phase-done">Complete</span></td><td>v1.0.0</td></tr>
+      <tr><td>2</td><td>Auth engine: register, login, JWT, refresh rotation, password reset, rate limiting</td><td><span class="phase-badge phase-done">Complete</span></td><td>v1.0.0</td></tr>
+      <tr><td>3</td><td>TOTP 2FA (AES-256-GCM), API Keys (SHA-256), backup codes</td><td><span class="phase-badge phase-done">Complete</span></td><td>v1.1.0</td></tr>
+      <tr><td>4</td><td>SAML 2.0 SP — SP-initiated SSO, ACS, JIT provisioning</td><td><span class="phase-badge phase-done">Complete</span></td><td>v1.4.0</td></tr>
+      <tr><td>5</td><td>Admin API — tenant mgmt, RBAC, user pool, audit logs</td><td><span class="phase-badge phase-done">Complete</span></td><td>v1.2.0</td></tr>
+      <tr><td>6</td><td>Admin UI — React SPA embedded in binary, permission routing</td><td><span class="phase-badge phase-done">Complete</span></td><td>v1.5.0</td></tr>
+      <tr><td>7</td><td>Testing &amp; hardening — unit tests ≥80%, security suite, load tests</td><td><span class="phase-badge phase-partial">Partial</span></td><td>CI/CD + metrics done; tests pending</td></tr>
+      <tr><td>8</td><td>AI/Agent security — registration, M2M auth, audit, risk scoring</td><td><span class="phase-badge phase-partial">Partial</span></td><td>Per-app rate limiting done</td></tr>
+      <tr><td>9</td><td>OAuth 2.0 Authorization Server + OIDC Provider</td><td><span class="phase-badge phase-planned">Planned</span></td><td>Auth Code + PKCE, JWKS, UserInfo, discovery</td></tr>
+      <tr><td>10</td><td>RS256 JWT migration (ADR-01 deferred)</td><td><span class="phase-badge phase-planned">Planned</span></td><td>v2.0.0 GA milestone</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ════════════════════════════════════
+       SECTION: LINKS
+  ═════════════════════════════════════ -->
+  <h2 class="section-title" id="links">Links &amp; Resources</h2>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-top:8px;">
+
+    <div class="info-box blue">
+      <strong>Repository</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server">github.com/Engineersmind/emc-auth-server</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>GitHub Releases</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/releases">All versions &amp; release binaries</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>Docker Image</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/pkgs/container/emc-auth-server">ghcr.io/engineersmind/emc-auth-server</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>API Docs (Swagger)</strong>
+      <a href="/swagger/index.html">/swagger/index.html</a> (running instance)
+    </div>
+
+    <div class="info-box blue">
+      <strong>CI / Build Status</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/actions">GitHub Actions</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>Issue Tracker</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/issues">GitHub Issues</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>Security Policy</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/SECURITY.md">SECURITY.md</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>Changelog</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/CHANGELOG.md">CHANGELOG.md</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>Contributing Guide</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>Deployment Guide</strong>
+      <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/docs/DEPLOYMENT.md">docs/DEPLOYMENT.md</a>
+    </div>
+
+    <div class="info-box blue">
+      <strong>Prometheus Metrics</strong>
+      <a href="/metrics">/metrics</a> (running instance — restrict via network policy)
+    </div>
+
+    <div class="info-box blue">
+      <strong>Health Check</strong>
+      <a href="/health">/health</a>
+    </div>
+
+  </div>
+
+  <div class="info-box green" style="margin-top:32px;">
+    <strong>Quick Start</strong>
+    <code>docker pull ghcr.io/engineersmind/emc-auth-server:v1.5.0</code><br />
+    <code>docker-compose up -d</code><br />
+    Server starts, migrates, and seeds in &lt;1 second. Visit <a href="/swagger/index.html">/swagger/index.html</a>.
+  </div>
+
+</main>
+
+<footer>
+  <p>EMC Auth Server &nbsp;·&nbsp; <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/LICENSE">MIT License</a> &nbsp;·&nbsp; &copy; 2026 EngineersMind</p>
+  <p style="margin-top:6px;">
+    <a href="https://github.com/Engineersmind/emc-auth-server/releases">Releases</a> &nbsp;·&nbsp;
+    <a href="https://github.com/Engineersmind/emc-auth-server/issues">Issues</a> &nbsp;·&nbsp;
+    <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/SECURITY.md">Security</a> &nbsp;·&nbsp;
+    <a href="https://github.com/Engineersmind/emc-auth-server/blob/main/CONTRIBUTING.md">Contributing</a>
+  </p>
+</footer>
+
+</body>
+</html>
