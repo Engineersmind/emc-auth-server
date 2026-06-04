@@ -1,6 +1,6 @@
 // @title           EMC Auth Server
-// @version         1.0
-// @description     Standalone multi-tenant Identity Provider — email/password auth, JWT, refresh tokens, password reset.
+// @version         1.5.0
+// @description     Standalone multi-tenant Identity Provider — email/password auth, JWT, refresh tokens, TOTP 2FA, SAML 2.0, RBAC, Admin UI, and AI/Agent security.
 //
 // @contact.name    EngineersMind
 // @contact.url     https://github.com/engineersmind/emc-auth-server
