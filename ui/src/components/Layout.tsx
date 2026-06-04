@@ -2,10 +2,8 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 
 export function Layout({ children }: { children: React.ReactNode }) {
-  const { user, logout } = useAuth();
+  const { user, logout, isAdmin, isSuperAdmin } = useAuth();
   const navigate = useNavigate();
-
-  const isSuperAdmin = user?.role === 'super_admin';
 
   const handleLogout = async () => {
     await logout();
@@ -18,17 +16,30 @@ export function Layout({ children }: { children: React.ReactNode }) {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-16">
             <div className="flex items-center space-x-8">
-              <Link to="/dashboard" className="text-lg font-semibold tracking-tight">
+              <Link to={isAdmin ? '/dashboard' : '/account'} className="text-lg font-semibold tracking-tight">
                 EMC Auth
               </Link>
-              <Link to="/dashboard" className="text-sm hover:text-brand-100 transition-colors">Dashboard</Link>
+              {isAdmin && (
+                <Link to="/dashboard" className="text-sm hover:text-brand-100 transition-colors">Dashboard</Link>
+              )}
               {isSuperAdmin && (
                 <Link to="/tenants" className="text-sm hover:text-brand-100 transition-colors">Tenants</Link>
               )}
-              <Link to="/users" className="text-sm hover:text-brand-100 transition-colors">Users</Link>
-              <Link to="/roles" className="text-sm hover:text-brand-100 transition-colors">Roles</Link>
-              <Link to="/api-keys" className="text-sm hover:text-brand-100 transition-colors">API Keys</Link>
-              <Link to="/saml" className="text-sm hover:text-brand-100 transition-colors">SAML</Link>
+              {isAdmin && (
+                <Link to="/users" className="text-sm hover:text-brand-100 transition-colors">Users</Link>
+              )}
+              {isAdmin && (
+                <Link to="/roles" className="text-sm hover:text-brand-100 transition-colors">Roles</Link>
+              )}
+              {isAdmin && (
+                <Link to="/api-keys" className="text-sm hover:text-brand-100 transition-colors">API Keys</Link>
+              )}
+              {isAdmin && (
+                <Link to="/saml" className="text-sm hover:text-brand-100 transition-colors">SAML</Link>
+              )}
+              {!isAdmin && (
+                <Link to="/account" className="text-sm hover:text-brand-100 transition-colors">My Account</Link>
+              )}
             </div>
             <div className="flex items-center space-x-4">
               <span className="text-sm text-brand-200">{user?.email}</span>

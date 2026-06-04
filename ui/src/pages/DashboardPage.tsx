@@ -1,8 +1,11 @@
+import { Navigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { Layout } from '../components/Layout';
 
 export function DashboardPage() {
-  const { user } = useAuth();
+  const { user, isAdmin, loading } = useAuth();
+
+  if (!loading && !isAdmin) return <Navigate to="/account" replace />;
 
   return (
     <Layout>
