@@ -20,6 +20,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	samlsvc "github.com/engineersmind/emc-auth-server/internal/saml"
 	"github.com/engineersmind/emc-auth-server/internal/ui"
 )
 
@@ -182,6 +183,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithAppRateLimits(appLimitSvc).
 		WithCORS(corsSvc)
 
+	// SAML service (Phase 4) — lightweight SP, no external dependencies.
+	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
+	samlHandler := handlers.NewSAMLHandler(samlService, jwtSvc, deps.Logger)
+
 	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
 	e.Use(mw.AppRateLimiter(appLimitSvc))
 
@@ -281,6 +286,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.GET("/app-limits", adminHandler.ListAppLimits)
 	rbacGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit)
 	rbacGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit)
+
+	// SAML admin config — tenant admin (admin:access) (04-01)
+	rbacGroup.GET("/saml-config", samlHandler.GetSAMLConfig)
+	rbacGroup.PUT("/saml-config", samlHandler.UpsertSAMLConfig)
+
+	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
+	// Must be registered before the SPA wildcard catch-all.
+	e.GET("/saml/metadata", samlHandler.GetMetadata)
+	e.GET("/saml/login", samlHandler.InitiateLogin)
+	e.POST("/saml/acs", samlHandler.HandleACS)
 
 	// Serve the React Admin SPA for all non-API routes.
 	// Must come AFTER all /api/, /metrics, /swagger, /saml, /health routes so it
