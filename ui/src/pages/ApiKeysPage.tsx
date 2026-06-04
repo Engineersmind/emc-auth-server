@@ -121,7 +121,7 @@ export function ApiKeysPage() {
                       {new Date(key.created_at).toLocaleDateString()}
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-500">
-                      {key.last_used ? new Date(key.last_used).toLocaleString() : '\u2014'}
+                      {key.last_used_at ? new Date(key.last_used_at).toLocaleString() : '\u2014'}
                     </td>
                     <td className="px-6 py-4 text-right">
                       <button
