@@ -1,17 +1,100 @@
 import { useState } from 'react';
-import { useQuery, keepPreviousData } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { Layout } from '../components/Layout';
 import { SearchInput } from '../components/SearchInput';
 import { Pagination } from '../components/Pagination';
-import { usersApi } from '../api/users';
+import { usersApi, CreateUserRequest } from '../api/users';
+import { rolesApi } from '../api/roles';
+
+function CreateUserModal({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient();
+  const [form, setForm] = useState<CreateUserRequest>({
+    email: '',
+    first_name: '',
+    last_name: '',
+    password: '',
+    role: 'user',
+  });
+  const [error, setError] = useState('');
+
+  const { data: roles = [] } = useQuery({
+    queryKey: ['roles'],
+    queryFn: () => rolesApi.list().then(r => r.data),
+  });
+
+  const { mutate, isPending } = useMutation({
+    mutationFn: usersApi.create,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['users'] });
+      onClose();
+    },
+    onError: (e: any) => setError(e.response?.data?.message || 'Failed to create user'),
+  });
+
+  const field = (label: string, key: keyof CreateUserRequest, type = 'text', placeholder = '') => (
+    <div>
+      <label className="block text-sm font-medium text-gray-700 mb-1">{label}</label>
+      <input
+        type={type}
+        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+        value={form[key] as string}
+        onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
+        placeholder={placeholder}
+      />
+    </div>
+  );
+
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+      <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
+        <h2 className="text-lg font-semibold mb-4">Create User</h2>
+        {error && <div className="mb-3 text-sm text-red-600 bg-red-50 rounded-lg p-3">{error}</div>}
+        <div className="space-y-3">
+          {field('First name', 'first_name', 'text', 'Jane')}
+          {field('Last name', 'last_name', 'text', 'Doe')}
+          {field('Email', 'email', 'email', 'jane@example.com')}
+          {field('Password', 'password', 'password', '••••••••')}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Role</label>
+            <select
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500"
+              value={form.role}
+              onChange={e => setForm(f => ({ ...f, role: e.target.value }))}
+            >
+              {roles.length > 0
+                ? roles.map(r => <option key={r.id} value={r.name}>{r.name}</option>)
+                : ['user', 'admin', 'super_admin', 'service'].map(r => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+            </select>
+          </div>
+        </div>
+        <div className="flex justify-end space-x-3 mt-6">
+          <button onClick={onClose} className="text-sm text-gray-600 hover:text-gray-900 px-4 py-2">
+            Cancel
+          </button>
+          <button
+            onClick={() => mutate(form)}
+            disabled={isPending || !form.email || !form.password}
+            className="bg-brand-600 hover:bg-brand-700 text-white text-sm rounded-lg px-4 py-2 disabled:opacity-60 transition-colors"
+          >
+            {isPending ? 'Creating…' : 'Create user'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 const ROLES = ['', 'super_admin', 'admin', 'user', 'service'];
 
 export function UsersPage() {
+  const qc = useQueryClient();
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState('');
+  const [showCreate, setShowCreate] = useState(false);
   const LIMIT = 20;
 
   const { data, isLoading, isError } = useQuery({
@@ -22,26 +105,34 @@ export function UsersPage() {
     placeholderData: keepPreviousData,
   });
 
-  const handleSearchChange = (val: string) => {
-    setSearch(val);
-    setPage(1);
-  };
+  const { mutate: deleteUser } = useMutation({
+    mutationFn: usersApi.delete,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['users'] }),
+  });
 
-  const handleRoleChange = (val: string) => {
-    setRoleFilter(val);
-    setPage(1);
-  };
+  const handleSearchChange = (val: string) => { setSearch(val); setPage(1); };
+  const handleRoleChange = (val: string) => { setRoleFilter(val); setPage(1); };
 
   return (
     <Layout>
+      {showCreate && <CreateUserModal onClose={() => setShowCreate(false)} />}
+
       <div className="space-y-6">
-        <h1 className="text-2xl font-semibold text-gray-900">Users</h1>
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-semibold text-gray-900">Users</h1>
+          <button
+            onClick={() => setShowCreate(true)}
+            className="bg-brand-600 hover:bg-brand-700 text-white text-sm rounded-lg px-4 py-2 transition-colors"
+          >
+            + New User
+          </button>
+        </div>
 
         <div className="flex items-center space-x-3">
           <SearchInput
             value={search}
             onChange={handleSearchChange}
-            placeholder="Search by email or name\u2026"
+            placeholder="Search by email or name…"
           />
           <select
             value={roleFilter}
@@ -55,7 +146,7 @@ export function UsersPage() {
           </select>
         </div>
 
-        {isLoading && <div className="text-sm text-gray-500">Loading\u2026</div>}
+        {isLoading && <div className="text-sm text-gray-500">Loading…</div>}
         {isError && <div className="text-sm text-red-600">Failed to load users</div>}
 
         {data && (
@@ -96,12 +187,24 @@ export function UsersPage() {
                         {new Date(user.created_at).toLocaleDateString()}
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <Link
-                          to={`/users/${user.id}`}
-                          className="text-sm text-brand-600 hover:text-brand-800"
-                        >
-                          View \u2192
-                        </Link>
+                        <div className="flex items-center justify-end space-x-3">
+                          <Link
+                            to={`/users/${user.id}`}
+                            className="text-sm text-brand-600 hover:text-brand-800"
+                          >
+                            View →
+                          </Link>
+                          {!user.deleted_at && (
+                            <button
+                              onClick={() => {
+                                if (confirm(`Delete user "${user.email}"?`)) deleteUser(user.id);
+                              }}
+                              className="text-sm text-red-500 hover:text-red-700"
+                            >
+                              Delete
+                            </button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))}
