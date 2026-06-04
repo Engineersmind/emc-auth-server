@@ -1159,3 +1159,250 @@ func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "app rate limit deleted"})
 }
 
+// ---------------------------------------------------------------------------
+// Cross-tenant management — super_admin only (tenant:manage permission)
+// All handlers below accept :tid as the target tenant UUID in the path.
+// The caller's own tenant is irrelevant; authority is checked by middleware.
+// ---------------------------------------------------------------------------
+
+// targetTenantID parses :tid from the request path.
+func targetTenantID(c echo.Context) (uuid.UUID, error) {
+	return uuid.Parse(c.Param("tid"))
+}
+
+// --- Permissions under a tenant ---
+
+// TenantListPermissions handles GET /api/v1/admin/tenants/:tid/permissions.
+func (h *AdminHandler) TenantListPermissions(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	perms, err := h.svc.ListPermissions(c.Request().Context(), tid)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: tenant list permissions failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list permissions"})
+	}
+	return c.JSON(http.StatusOK, perms)
+}
+
+// TenantCreatePermission handles POST /api/v1/admin/tenants/:tid/permissions.
+func (h *AdminHandler) TenantCreatePermission(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	var req struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+	if err := c.Bind(&req); err != nil || req.Name == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+	}
+	result, err := h.svc.CreatePermission(c.Request().Context(), tid, req.Name, req.Description)
+	if err != nil {
+		if errors.Is(err, admin.ErrAlreadyExists) {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "permission name already exists in this tenant"})
+		}
+		h.logger.Error().Err(err).Msg("admin: tenant create permission failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create permission"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminPermissionCreated, "permission", result.ID)
+	return c.JSON(http.StatusCreated, result)
+}
+
+// TenantDeletePermission handles DELETE /api/v1/admin/tenants/:tid/permissions/:pid.
+func (h *AdminHandler) TenantDeletePermission(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	pid, err := uuid.Parse(c.Param("pid"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission id"})
+	}
+	if err := h.svc.DeletePermission(c.Request().Context(), tid, pid); err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "permission not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: tenant delete permission failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete permission"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminPermissionDeleted, "permission", pid.String())
+	return c.JSON(http.StatusOK, map[string]string{"message": "permission deleted"})
+}
+
+// --- Roles under a tenant ---
+
+// TenantListRoles handles GET /api/v1/admin/tenants/:tid/roles.
+func (h *AdminHandler) TenantListRoles(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	roles, err := h.svc.ListRoles(c.Request().Context(), tid)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: tenant list roles failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list roles"})
+	}
+	return c.JSON(http.StatusOK, roles)
+}
+
+// TenantCreateRole handles POST /api/v1/admin/tenants/:tid/roles.
+func (h *AdminHandler) TenantCreateRole(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	var req CreateRoleRequest
+	if err := c.Bind(&req); err != nil || req.Name == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+	}
+	permUUIDs, err := parseUUIDs(req.PermissionIDs)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission_id: " + err.Error()})
+	}
+	result, err := h.svc.CreateRole(c.Request().Context(), tid, req.Name, permUUIDs)
+	if err != nil {
+		if errors.Is(err, admin.ErrAlreadyExists) {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "role name already exists in this tenant"})
+		}
+		h.logger.Error().Err(err).Msg("admin: tenant create role failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create role"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminRoleCreated, "role", result.ID)
+	return c.JSON(http.StatusCreated, result)
+}
+
+// TenantUpdateRolePermissions handles PUT /api/v1/admin/tenants/:tid/roles/:rid/permissions.
+func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	rid, err := uuid.Parse(c.Param("rid"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
+	}
+	var req UpdateRolePermissionsRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	permUUIDs, err := parseUUIDs(req.PermissionIDs)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission_id: " + err.Error()})
+	}
+	if err := h.svc.UpdateRolePermissions(c.Request().Context(), tid, rid, permUUIDs); err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: tenant update role permissions failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update role permissions"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminRolePermissionsUpdated, "role", rid.String())
+	return c.JSON(http.StatusOK, map[string]string{"message": "role permissions updated"})
+}
+
+// TenantDeleteRole handles DELETE /api/v1/admin/tenants/:tid/roles/:rid.
+func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	rid, err := uuid.Parse(c.Param("rid"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
+	}
+	if err := h.svc.DeleteRole(c.Request().Context(), tid, rid); err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found or is a system role"})
+		}
+		h.logger.Error().Err(err).Msg("admin: tenant delete role failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", rid.String())
+	return c.JSON(http.StatusOK, map[string]string{"message": "role deleted"})
+}
+
+// --- Users under a tenant ---
+
+// TenantListUsers handles GET /api/v1/admin/tenants/:tid/users.
+func (h *AdminHandler) TenantListUsers(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	page, _ := strconv.Atoi(c.QueryParam("page"))
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	search := c.QueryParam("search")
+	users, err := h.svc.ListUsers(c.Request().Context(), tid, search, page, limit)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: tenant list users failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list users"})
+	}
+	return c.JSON(http.StatusOK, users)
+}
+
+// TenantCreateUser handles POST /api/v1/admin/tenants/:tid/users.
+func (h *AdminHandler) TenantCreateUser(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	var req CreateUserAdminRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Email == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email is required"})
+	}
+	if len(req.Password) < 8 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+	}
+	var roleID *uuid.UUID
+	if req.RoleID != nil && *req.RoleID != "" {
+		rid, err := uuid.Parse(*req.RoleID)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
+		}
+		roleID = &rid
+	}
+	result, err := h.svc.CreateUser(c.Request().Context(), tid, req.Email, req.Password, req.FirstName, req.LastName, roleID)
+	if err != nil {
+		if errors.Is(err, admin.ErrAlreadyExists) {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "email already registered in this tenant"})
+		}
+		h.logger.Error().Err(err).Msg("admin: tenant create user failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create user"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminUserCreated, "user", result.ID)
+	return c.JSON(http.StatusCreated, result)
+}
+
+// TenantDeleteUser handles DELETE /api/v1/admin/tenants/:tid/users/:uid.
+func (h *AdminHandler) TenantDeleteUser(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	uid, err := uuid.Parse(c.Param("uid"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+	if err := h.svc.DeleteUser(c.Request().Context(), tid, uid); err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: tenant delete user failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete user"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminUserDeleted, "user", uid.String())
+	return c.JSON(http.StatusOK, map[string]string{"message": "user deleted"})
+}

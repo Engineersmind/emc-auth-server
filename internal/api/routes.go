@@ -235,6 +235,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt.DELETE("/tenants/:id", adminHandler.DeactivateTenant)
 	tenantMgmt.PUT("/tenants/:id/cors-origins", adminHandler.UpdateTenantCORSOrigins)
 
+	// Cross-tenant management — drill into any tenant's permissions / roles / users.
+	// :tid = target tenant UUID. Caller must have tenant:manage (super_admin only).
+	tenantMgmt.GET("/tenants/:tid/permissions", adminHandler.TenantListPermissions)
+	tenantMgmt.POST("/tenants/:tid/permissions", adminHandler.TenantCreatePermission)
+	tenantMgmt.DELETE("/tenants/:tid/permissions/:pid", adminHandler.TenantDeletePermission)
+	tenantMgmt.GET("/tenants/:tid/roles", adminHandler.TenantListRoles)
+	tenantMgmt.POST("/tenants/:tid/roles", adminHandler.TenantCreateRole)
+	tenantMgmt.PUT("/tenants/:tid/roles/:rid/permissions", adminHandler.TenantUpdateRolePermissions)
+	tenantMgmt.DELETE("/tenants/:tid/roles/:rid", adminHandler.TenantDeleteRole)
+	tenantMgmt.GET("/tenants/:tid/users", adminHandler.TenantListUsers)
+	tenantMgmt.POST("/tenants/:tid/users", adminHandler.TenantCreateUser)
+	tenantMgmt.DELETE("/tenants/:tid/users/:uid", adminHandler.TenantDeleteUser)
+
 	// Permission management — tenant admin (admin:access permission)
 	rbacGroup := adminGroup.Group("", mw.RequirePermission("admin:access"))
 	rbacGroup.POST("/permissions", adminHandler.CreatePermission)
