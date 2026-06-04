@@ -27,7 +27,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requires_totp) {
       return { requiresTotp: true, sessionId: data.totp_session_id };
     }
-    if (data.user) setUser(data.user);
+    // /auth/session sets an HttpOnly cookie but returns no user body — fetch /auth/me to hydrate state
+    if (data.user) {
+      setUser(data.user);
+    } else {
+      const me = await authApi.me();
+      setUser(me.data);
+    }
     return { requiresTotp: false };
   }
 
