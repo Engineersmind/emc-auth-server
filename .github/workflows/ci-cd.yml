@@ -78,6 +78,17 @@ jobs:
           echo "image_uri=${{ steps.meta.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
         id: export_uri
 
+      - name: Sync compose files to SSM Parameter Store
+        run: |
+          aws ssm put-parameter \
+            --name "/${{ env.APP_NAME }}/compose/prod" \
+            --value "$(cat infra/docker-compose.prod.yml)" \
+            --type String --overwrite
+          aws ssm put-parameter \
+            --name "/${{ env.APP_NAME }}/compose/ec2-override" \
+            --value "$(cat infra/docker-compose.ec2.override.yml)" \
+            --type String --overwrite
+
   # ── 2. Deploy to EC2 via SSM (master branch only) ──────────────────────────
   deploy:
     name: Deploy to EC2
@@ -122,17 +133,19 @@ jobs:
             --comment        "Deploy $IMAGE_URI" \
             --parameters     "commands=[
               'set -eu',
+              'echo \"[deploy] Fetching compose files from SSM Parameter Store...\"',
+              'mkdir -p ${{ env.APP_DIR }}/src/infra',
+              'aws ssm get-parameter --region $REGION --name /${{ env.APP_NAME }}/compose/prod --query Parameter.Value --output text > ${{ env.COMPOSE_BASE }}',
+              'aws ssm get-parameter --region $REGION --name /${{ env.APP_NAME }}/compose/ec2-override --query Parameter.Value --output text > ${{ env.COMPOSE_OVR }}',
               'echo \"[deploy] Fetching env from Secrets Manager...\"',
-              'mkdir -p /opt/emc-auth',
-              'aws secretsmanager get-secret-value --secret-id ${{ vars.SECRET_ID }} --region $REGION --query SecretString --output text | python3 -c \"import sys,json; [print(k+chr(61)+v) for k,v in json.load(sys.stdin).items()]\" > /opt/emc-auth/.env',
+              'aws secretsmanager get-secret-value --secret-id ${{ vars.SECRET_ID }} --region $REGION --query SecretString --output text | python3 -c \"import sys,json; [print(k+chr(61)+v) for k,v in json.load(sys.stdin).items()]\" > ${{ env.ENV_FILE }}',
               'echo \"[deploy] Logging in to ECR...\"',
               'aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $(echo $IMAGE_URI | cut -d/ -f1)',
               'echo \"[deploy] Pulling image: $IMAGE_URI\"',
               'docker pull $IMAGE_URI',
               'echo \"[deploy] Starting compose with new image...\"',
               'export ECR_IMAGE_URI=\"$IMAGE_URI\"',
-              'docker compose -f ${{ env.COMPOSE_BASE }} -f ${{ env.COMPOSE_OVR }} --env-file ${{ env.ENV_FILE }} --project-name ${{ env.APP_NAME }} pull app',
-              'docker compose -f ${{ env.COMPOSE_BASE }} -f ${{ env.COMPOSE_OVR }} --env-file ${{ env.ENV_FILE }} --project-name ${{ env.APP_NAME }} up -d --no-build app',
+              'docker compose -f ${{ env.COMPOSE_BASE }} -f ${{ env.COMPOSE_OVR }} --env-file ${{ env.ENV_FILE }} --project-name ${{ env.APP_NAME }} up -d --no-build app redis',
               'echo \"[deploy] Waiting for health check...\"',
               'for i in $(seq 1 20); do curl -sf http://127.0.0.1:8080/health && break || sleep 5; done',
               'echo \"[deploy] Done. Image: $IMAGE_URI\"'
