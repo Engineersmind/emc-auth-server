@@ -85,13 +85,16 @@ info ".env written ($(wc -l < "${ENV_FILE}") vars)."
 info "Writing compose override..."
 cat > "${APP_SRC}/infra/docker-compose.ec2.override.yml" <<YAML
 # EC2 overlay — managed by 02-deploy.sh
-# postgres disabled — using AWS RDS instead.
+# postgres disabled — using AWS RDS (DATABASE_URL in Secrets Manager).
 # Monitoring disabled — handled by DevOps Copilot.
 services:
   app:
     image: "${ECR_IMAGE_URI:-${APP_NAME}:latest}"
     ports:
       - "127.0.0.1:${APP_PORT}:${APP_PORT}"
+    depends_on:
+      redis:
+        condition: service_healthy
   postgres:
     profiles: ["disabled"]
   prometheus:

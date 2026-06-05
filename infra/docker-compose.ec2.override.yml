@@ -15,18 +15,19 @@ services:
   app:
     image: "${ECR_IMAGE_URI:-emc-auth-server:latest}"
     ports:
-      - "127.0.0.1:8080:8080"    # nginx reverse-proxies to this
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
 
   redis:
-    # Keep redis as a local container; password comes from .env (Secrets Manager)
     restart: unless-stopped
 
-  # Disabled — PostgreSQL is hosted on AWS RDS
   postgres:
     profiles: ["disabled"]
 
-  # Disabled — monitoring done manually via DevOps Copilot
   prometheus:
     profiles: ["disabled"]
+
   grafana:
     profiles: ["disabled"]
