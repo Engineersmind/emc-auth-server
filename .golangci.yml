@@ -1,6 +1,6 @@
 run:
   timeout: 5m
-  go: "1.23"
+  go: "1.25"
 
 linters:
   enable:
@@ -16,7 +16,7 @@ linters:
     - misspell        # typos
     - noctx           # http calls without context
     - bodyclose       # http response body not closed
-    - sqlcloserows    # sql rows not closed
+    - sqlclosecheck   # sql rows/stmt not closed (renamed from sqlcloserows in v1.64+)
     - revive          # general linter (replaces golint)
   disable:
     - depguard        # dependency restrictions (not needed here)

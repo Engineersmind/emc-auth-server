@@ -23,9 +23,13 @@ env:
 jobs:
 
   # ── 1. Build & push Docker image to ECR ──────────────────────────────────
+  # [CI-CD-01] Skip gracefully when AWS credentials are not configured.
+  # Required repo secrets:  AWS_CICD_ROLE_ARN
+  # Required repo variables: AWS_REGION, ECR_REPO, EC2_TAG_NAME, SECRET_ID, DOMAIN
   build:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
+    if: ${{ secrets.AWS_CICD_ROLE_ARN != '' && vars.AWS_REGION != '' }}
     outputs:
       image_uri: ${{ steps.uri.outputs.image_uri }}
 
