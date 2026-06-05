@@ -1,0 +1,185 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Grant OIDC token so the job can assume the AWS CICD role — no stored keys
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION:   ${{ vars.AWS_REGION }}       # e.g. us-east-1
+  ECR_REPO:     ${{ vars.ECR_REPO }}         # e.g. dev-emc-auth-app
+  EC2_TAG_NAME: ${{ vars.EC2_TAG_NAME }}     # e.g. dev-emc-auth-ec2
+  APP_NAME:     emc-auth-server
+  APP_DIR:      /opt/emc-auth
+  COMPOSE_BASE: /opt/emc-auth/src/infra/docker-compose.prod.yml
+  COMPOSE_OVR:  /opt/emc-auth/src/infra/docker-compose.ec2.override.yml
+  ENV_FILE:     /opt/emc-auth/.env
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ── 1. Build & push Docker image to ECR ──────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    # Run on every push; skip deploy on PRs (deploy job handles that gate)
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr_login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Derive image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | head -c 8)
+          echo "tag=sha-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "registry=${{ steps.ecr_login.outputs.registry }}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.meta.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+          # Pass build metadata to the action output
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Export image URI
+        run: |
+          echo "image_uri=${{ steps.meta.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}"
+          echo "image_uri=${{ steps.meta.outputs.registry }}/${{ env.ECR_REPO }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_OUTPUT"
+        id: export_uri
+
+  # ── 2. Deploy to EC2 via SSM (main branch only) ───────────────────────────
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CICD_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Find EC2 instance ID by Name tag
+        id: ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Name,Values=${{ env.EC2_TAG_NAME }}" \
+              "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" \
+            --output text)
+
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+            echo "No running EC2 instance found with Name=${{ env.EC2_TAG_NAME }}"
+            exit 1
+          fi
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "EC2 instance: $INSTANCE_ID"
+
+      - name: Deploy via SSM Run Command
+        id: ssm
+        run: |
+          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
+          REGION="${{ env.AWS_REGION }}"
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+
+          CMD_ID=$(aws ssm send-command \
+            --region         "$REGION" \
+            --instance-ids   "$INSTANCE_ID" \
+            --document-name  "AWS-RunShellScript" \
+            --comment        "Deploy $IMAGE_URI" \
+            --parameters     "commands=[
+              'set -euo pipefail',
+              'echo \"[deploy] Logging in to ECR...\"',
+              'aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $(echo $IMAGE_URI | cut -d/ -f1)',
+              'echo \"[deploy] Pulling image: $IMAGE_URI\"',
+              'docker pull $IMAGE_URI',
+              'echo \"[deploy] Starting compose with new image...\"',
+              'export ECR_IMAGE_URI=\"$IMAGE_URI\"',
+              'docker compose -f ${{ env.COMPOSE_BASE }} -f ${{ env.COMPOSE_OVR }} --env-file ${{ env.ENV_FILE }} --project-name ${{ env.APP_NAME }} pull app',
+              'docker compose -f ${{ env.COMPOSE_BASE }} -f ${{ env.COMPOSE_OVR }} --env-file ${{ env.ENV_FILE }} --project-name ${{ env.APP_NAME }} up -d --no-build app',
+              'echo \"[deploy] Waiting for health check...\"',
+              'for i in $(seq 1 20); do curl -sf http://127.0.0.1:8080/health && break || sleep 5; done',
+              'echo \"[deploy] Done. Image: $IMAGE_URI\"'
+            ]" \
+            --output-s3-bucket-name "" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM command ID: $CMD_ID"
+
+      - name: Wait for SSM command to complete
+        run: |
+          REGION="${{ env.AWS_REGION }}"
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          INSTANCE_ID="${{ steps.ec2.outputs.instance_id }}"
+
+          echo "Waiting for command $CMD_ID on $INSTANCE_ID..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --region       "$REGION" \
+              --command-id   "$CMD_ID" \
+              --instance-id  "$INSTANCE_ID" \
+              --query        "Status" \
+              --output       text 2>/dev/null || echo "Pending")
+
+            echo "  Attempt $i: $STATUS"
+            case "$STATUS" in
+              Success)
+                echo "Deployment succeeded."
+                exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                echo "Deployment failed with status: $STATUS"
+                aws ssm get-command-invocation \
+                  --region      "$REGION" \
+                  --command-id  "$CMD_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query       "StandardErrorContent" \
+                  --output      text
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "Timed out waiting for SSM command."
+          exit 1
+
+      - name: Print deployment summary
+        if: success()
+        run: |
+          echo "✅ Deployed ${{ needs.build.outputs.image_uri }}"
+          echo "   EC2: ${{ steps.ec2.outputs.instance_id }}"
+          echo "   SHA: ${{ github.sha }}"
