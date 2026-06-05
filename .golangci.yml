@@ -3,6 +3,11 @@ version: "2"
 run:
   timeout: 5m
 
+formatters:
+  enable:
+    - gofmt           # formatting
+    - goimports       # import ordering
+
 linters:
   enable:
     - errcheck        # unchecked errors
@@ -11,8 +16,6 @@ linters:
     - ineffassign     # unused assignments
     - staticcheck     # advanced static analysis
     - unused          # unused code
-    - gofmt           # formatting
-    - goimports       # import ordering
     - gosec           # security checks
     - misspell        # typos
     - noctx           # http calls without context

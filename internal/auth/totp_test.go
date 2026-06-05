@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/pquerna/otp/totp"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
@@ -63,7 +62,7 @@ func secretFromOTPURI(t *testing.T, uri string) string {
 func TestTOTPService_Enroll_ReturnsURIAndCodes(t *testing.T) {
 	svc, ctx := newTOTPService(t)
 
-	userID := uuid.New()
+	userID := store.SeedUserID
 	tenantID := store.SeedTenantID
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "test@emc.local")
@@ -97,7 +96,7 @@ func TestTOTPService_VerifyAndActivate(t *testing.T) {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := uuid.New()
+	userID := store.SeedUserID
 	tenantID := store.SeedTenantID
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "activate@emc.local")
@@ -139,7 +138,7 @@ func TestTOTPService_Verify_InvalidCode(t *testing.T) {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := uuid.New()
+	userID := store.SeedUserID
 	tenantID := store.SeedTenantID
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "verify-invalid@emc.local")
@@ -178,7 +177,7 @@ func TestTOTPService_VerifyBackupCode_ConsumesCode(t *testing.T) {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := uuid.New()
+	userID := store.SeedUserID
 	tenantID := store.SeedTenantID
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "backupcode@emc.local")
@@ -219,7 +218,7 @@ func TestTOTPService_Disable(t *testing.T) {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := uuid.New()
+	userID := store.SeedUserID
 	tenantID := store.SeedTenantID
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "disable@emc.local")
