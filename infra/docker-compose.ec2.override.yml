@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.ec2.override.yml
+#
+# EC2 production overlay — applied on top of docker-compose.prod.yml:
+#   docker compose -f docker-compose.prod.yml -f docker-compose.ec2.override.yml
+#
+# Image resolution:
+#   ECR_IMAGE_URI (set by CI/CD deploy step via SSM) → uses ECR image
+#   Fallback: emc-auth-server:latest (built locally by user_data.sh first boot)
+#
+# Port binding:
+#   app port is bound to 127.0.0.1 only — nginx proxies public traffic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  app:
+    image: "${ECR_IMAGE_URI:-emc-auth-server:latest}"
+    ports:
+      - "127.0.0.1:8080:8080"    # nginx → 127.0.0.1:8080 → container
+
+  # Prometheus and Grafana are disabled — monitoring handled by DevOps Copilot.
+  prometheus:
+    profiles: ["disabled"]
+  grafana:
+    profiles: ["disabled"]
