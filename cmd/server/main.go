@@ -114,8 +114,9 @@ func main() {
 	defer stop()
 
 	s := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: e,
+		Addr:              ":" + cfg.Port,
+		Handler:           e,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Start server in goroutine

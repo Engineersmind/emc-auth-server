@@ -81,6 +81,7 @@ func (s *JWTService) Sign(ctx context.Context, tenantID uuid.UUID, audience stri
 
 	now := time.Now().UTC()
 	c.RegisteredClaims = jwt.RegisteredClaims{
+		ID:        uuid.New().String(),
 		Issuer:    s.issuer,
 		Audience:  jwt.ClaimStrings{audience},
 		Subject:   c.UserID,

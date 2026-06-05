@@ -755,14 +755,6 @@ func claimsFromToken(tokenStr string) (tenantID, userID *uuid.UUID) {
 	return tenantID, userID
 }
 
-// uuidPtr returns a pointer to the given UUID (nil if it's uuid.Nil).
-func uuidPtr(id uuid.UUID) *uuid.UUID {
-	if id == uuid.Nil {
-		return nil
-	}
-	return &id
-}
-
 // ---------------------------------------------------------------------------
 // Cookie-based session endpoints (browser / SPA integration)
 // ---------------------------------------------------------------------------

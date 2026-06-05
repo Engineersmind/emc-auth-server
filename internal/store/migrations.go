@@ -17,7 +17,7 @@ import (
 func RunMigrations(ctx context.Context, pool *pgxpool.Pool, embedFS embed.FS, logger zerolog.Logger) error {
 	// goose requires *sql.DB — bridge from pgxpool via stdlib adapter
 	db := stdlib.OpenDBFromPool(pool)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	provider, err := goose.NewProvider(
 		goose.DialectPostgres,
@@ -27,7 +27,7 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, embedFS embed.FS, lo
 	if err != nil {
 		return fmt.Errorf("create goose provider: %w", err)
 	}
-	defer provider.Close()
+	defer func() { _ = provider.Close() }()
 
 	results, err := provider.Up(ctx)
 	if err != nil {
