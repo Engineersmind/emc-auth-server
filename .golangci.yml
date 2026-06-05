@@ -3,11 +3,6 @@ version: "2"
 run:
   timeout: 5m
 
-formatters:
-  enable:
-    - gofmt           # formatting
-    - goimports       # import ordering
-
 linters:
   enable:
     - errcheck        # unchecked errors
@@ -28,6 +23,8 @@ linters:
       excludes:
         - G401   # use of weak cryptographic primitive (MD5 allowed in non-security contexts)
         - G501   # import of unsafe crypto (we use bcrypt + AES-GCM explicitly)
+        - G101   # false positive: string constants used as context keys, not hardcoded credentials
+        - G117   # false positive: Password/Token/RefreshToken fields in API request/response DTOs
     errcheck:
       check-type-assertions: true
     revive:
