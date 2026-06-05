@@ -151,6 +151,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// API key service
 	apiKeySvc := auth.NewAPIKeyService(deps.Pool, deps.Logger)
 
+	// Agent service (08-01) — machine-to-machine authentication
+	agentSvc := auth.NewAgentService(deps.Pool, deps.Logger)
+	agentHandler := handlers.NewAgentHandler(agentSvc, jwtSvc, deps.Logger)
+
 	// Mailer: dev (console log) or SMTP based on Env
 	m := mailer.NewMailer(mailer.MailerConfig{
 		Env:          deps.Config.Env,
@@ -296,6 +300,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
 	e.GET("/saml/login", samlHandler.InitiateLogin)
 	e.POST("/saml/acs", samlHandler.HandleACS)
+
+	// Agent management — tenant admin (admin:access) (08-01, 08-04)
+	rbacGroup.POST("/agents", agentHandler.RegisterAgent)
+	rbacGroup.GET("/agents", agentHandler.ListAgents)
+	rbacGroup.DELETE("/agents/:id", agentHandler.RevokeAgent)
+	rbacGroup.GET("/agents/analysis", agentHandler.GetAgentAnalysis)
+
+	// Agent authentication — public (no JWT required) — issues agent JWT from raw key
+	apiV1.POST("/agents/authenticate", agentHandler.AuthenticateAgent)
 
 	// Serve the React Admin SPA for all non-API routes.
 	// Must come AFTER all /api/, /metrics, /swagger, /saml, /health routes so it

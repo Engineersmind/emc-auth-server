@@ -22,6 +22,18 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
+// AgentClaims is the JWT payload for machine-to-machine agent tokens (08-01).
+type AgentClaims struct {
+	AgentID      string   `json:"agent_id"`
+	TenantID     string   `json:"tenant_id"`
+	AgentType    string   `json:"agent_type"`
+	Capabilities []string `json:"capabilities"`
+	jwt.RegisteredClaims
+}
+
+// AgentTokenTTL is the lifetime of an agent access token.
+const AgentTokenTTL = 1 * time.Hour
+
 // JWTService signs and verifies JWTs using a per-tenant HS256 secret.
 type JWTService struct {
 	pool *pgxpool.Pool
@@ -80,6 +92,37 @@ func (s *JWTService) Sign(ctx context.Context, tenantID uuid.UUID, audience stri
 	signed, err := token.SignedString([]byte(secret))
 	if err != nil {
 		return "", fmt.Errorf("sign jwt: %w", err)
+	}
+	return signed, nil
+}
+
+// SignAgent creates and signs a JWT for an authenticated agent identity.
+// Uses the tenant's HS256 secret — same trust boundary as user JWTs.
+func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (string, error) {
+	secret, err := s.tenantSecret(ctx, identity.TenantID)
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC()
+	claims := &AgentClaims{
+		AgentID:      identity.AgentID.String(),
+		TenantID:     identity.TenantID.String(),
+		AgentType:    identity.AgentType,
+		Capabilities: identity.Capabilities,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    s.issuer,
+			Audience:  jwt.ClaimStrings{"emc-auth-agent"},
+			Subject:   identity.AgentID.String(),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(AgentTokenTTL)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("sign agent jwt: %w", err)
 	}
 	return signed, nil
 }
