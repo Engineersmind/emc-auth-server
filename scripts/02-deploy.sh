@@ -85,12 +85,15 @@ info ".env written ($(wc -l < "${ENV_FILE}") vars)."
 info "Writing compose override..."
 cat > "${APP_SRC}/infra/docker-compose.ec2.override.yml" <<YAML
 # EC2 overlay — managed by 02-deploy.sh
+# postgres disabled — using AWS RDS instead.
 # Monitoring disabled — handled by DevOps Copilot.
 services:
   app:
     image: "${ECR_IMAGE_URI:-${APP_NAME}:latest}"
     ports:
       - "127.0.0.1:${APP_PORT}:${APP_PORT}"
+  postgres:
+    profiles: ["disabled"]
   prometheus:
     profiles: ["disabled"]
   grafana:
@@ -111,7 +114,15 @@ else
   docker build -t "${APP_NAME}:latest" .
 fi
 
-# ── 5. Start docker compose ───────────────────────────────────────────────────
+# ── 5. Stop existing containers to free ports ────────────────────────────────
+info "Stopping existing containers..."
+docker compose \
+  -f "${COMPOSE_BASE}" \
+  -f "${COMPOSE_OVR}" \
+  --project-name "${APP_NAME}" \
+  down --remove-orphans 2>/dev/null || true
+
+# ── 6. Start docker compose ───────────────────────────────────────────────────
 info "Starting containers..."
 docker compose \
   -f "${COMPOSE_BASE}" \
