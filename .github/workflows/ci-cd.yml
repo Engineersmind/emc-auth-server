@@ -111,8 +111,13 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --comment       "Deploy ${IMAGE_URI}" \
             --parameters    "commands=[
-              'cd /opt/emc-auth/src && git pull origin master',
-              'bash ${SCRIPT} \"${IMAGE_URI}\" \"${SECRET}\" \"${REGION}\" \"${DOMAIN}\"'
+              'aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin $(echo ${IMAGE_URI} | cut -d/ -f1)',
+              'docker pull ${IMAGE_URI}',
+              'aws secretsmanager get-secret-value --secret-id ${SECRET} --region ${REGION} --query SecretString --output text | python3 -c \"import sys,json; [print(k+chr(61)+str(v)) for k,v in json.load(sys.stdin).items()]\" > /tmp/app.env',
+              'echo REDIS_URL=redis://:$(grep ^REDIS_PASSWORD= /tmp/app.env | cut -d= -f2-)@emc-auth-redis:6379 >> /tmp/app.env',
+              'echo ENV=production >> /tmp/app.env && echo PORT=8080 >> /tmp/app.env && echo JWT_ISSUER=https://${DOMAIN} >> /tmp/app.env && echo APP_BASE_URL=https://${DOMAIN} >> /tmp/app.env',
+              'docker rm -f emc-auth-app 2>/dev/null || true',
+              'docker run -d --name emc-auth-app --network emc-auth-net --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file /tmp/app.env ${IMAGE_URI}'
             ]" \
             --query "Command.CommandId" \
             --output text)
@@ -150,3 +155,4 @@ jobs:
         run: |
           echo "✅ Deployed ${{ needs.build.outputs.image_uri }}"
           echo "   EC2: ${{ steps.ec2.outputs.instance_id }}"
+``
