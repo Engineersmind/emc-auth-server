@@ -122,6 +122,9 @@ jobs:
             --comment        "Deploy $IMAGE_URI" \
             --parameters     "commands=[
               'set -eu',
+              'echo \"[deploy] Fetching env from Secrets Manager...\"',
+              'mkdir -p /opt/emc-auth',
+              'aws secretsmanager get-secret-value --secret-id ${{ vars.SECRET_ID }} --region $REGION --query SecretString --output text > /opt/emc-auth/.env',
               'echo \"[deploy] Logging in to ECR...\"',
               'aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $(echo $IMAGE_URI | cut -d/ -f1)',
               'echo \"[deploy] Pulling image: $IMAGE_URI\"',
