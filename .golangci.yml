@@ -11,11 +11,9 @@ formatters:
 linters:
   enable:
     - errcheck        # unchecked errors
-    - gosimple        # simplification suggestions
     - govet           # go vet checks
     - ineffassign     # unused assignments
-    - staticcheck     # advanced static analysis
-    - unused          # unused code
+    - staticcheck     # advanced static analysis (includes gosimple + unused in v2)
     - gosec           # security checks
     - misspell        # typos
     - noctx           # http calls without context
