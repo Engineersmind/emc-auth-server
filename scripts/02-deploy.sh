@@ -23,7 +23,7 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 SECRET_NAME="${SECRET_NAME:-dev/EMC_Auth}"
 DOMAIN="${DOMAIN:-auth.senie.ai}"
 REPO_URL="${REPO_URL:-https://github.com/Engineersmind/emc-auth-server.git}"
-REPO_BRANCH="${REPO_BRANCH:-main}"
+REPO_BRANCH="${REPO_BRANCH:-master}"
 ECR_IMAGE_URI="${ECR_IMAGE_URI:-}"   # leave empty to build locally
 
 COMPOSE_BASE="${APP_SRC}/infra/docker-compose.prod.yml"
