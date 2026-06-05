@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     # Run on every push; skip deploy on PRs (deploy job handles that gate)
     outputs:
-      image_uri: ${{ steps.build.outputs.image_uri }}
+      image_uri: ${{ steps.export_uri.outputs.image_uri }}
       image_tag: ${{ steps.meta.outputs.tag }}
 
     steps:
@@ -134,7 +134,6 @@ jobs:
               'for i in $(seq 1 20); do curl -sf http://127.0.0.1:8080/health && break || sleep 5; done',
               'echo \"[deploy] Done. Image: $IMAGE_URI\"'
             ]" \
-            --output-s3-bucket-name "" \
             --query "Command.CommandId" \
             --output text)
 
