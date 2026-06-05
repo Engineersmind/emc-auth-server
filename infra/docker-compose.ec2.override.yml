@@ -1,24 +1,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# docker-compose.ec2.override.yml
+# docker-compose.ec2.override.yml  —  EC2 production overlay
 #
-# EC2 production overlay — applied on top of docker-compose.prod.yml:
+# Architecture:
+#   app      → ECR image (CI/CD deploys), bound to 127.0.0.1:8080 (nginx proxies)
+#   redis    → local Docker container (REDIS_PASSWORD from Secrets Manager)
+#   postgres → DISABLED — using AWS RDS (DATABASE_URL in Secrets Manager)
+#   prometheus/grafana → DISABLED — monitoring done manually
+#
+# Applied by CI/CD and deploy scripts:
 #   docker compose -f docker-compose.prod.yml -f docker-compose.ec2.override.yml
-#
-# Image resolution:
-#   ECR_IMAGE_URI (set by CI/CD deploy step via SSM) → uses ECR image
-#   Fallback: emc-auth-server:latest (built locally by user_data.sh first boot)
-#
-# Port binding:
-#   app port is bound to 127.0.0.1 only — nginx proxies public traffic.
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
   app:
     image: "${ECR_IMAGE_URI:-emc-auth-server:latest}"
     ports:
-      - "127.0.0.1:8080:8080"    # nginx → 127.0.0.1:8080 → container
+      - "127.0.0.1:8080:8080"    # nginx reverse-proxies to this
 
-  # Prometheus and Grafana are disabled — monitoring handled by DevOps Copilot.
+  redis:
+    # Keep redis as a local container; password comes from .env (Secrets Manager)
+    restart: unless-stopped
+
+  # Disabled — PostgreSQL is hosted on AWS RDS
+  postgres:
+    profiles: ["disabled"]
+
+  # Disabled — monitoring done manually via DevOps Copilot
   prometheus:
     profiles: ["disabled"]
   grafana:
