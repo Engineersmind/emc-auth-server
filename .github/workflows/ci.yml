@@ -12,7 +12,7 @@ env:
 jobs:
   # ─── Test + Coverage ────────────────────────────────────────────────────────
   test:
-    name: Test (Go ${{ env.GO_VERSION }})
+    name: Test
     runs-on: ubuntu-latest
 
     services:
