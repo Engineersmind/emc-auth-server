@@ -1,6 +1,7 @@
+version: "2"
+
 run:
   timeout: 5m
-  go: "1.25"
 
 linters:
   enable:
@@ -21,17 +22,17 @@ linters:
   disable:
     - depguard        # dependency restrictions (not needed here)
 
-linters-settings:
-  gosec:
-    excludes:
-      - G401   # use of weak cryptographic primitive (MD5 allowed in non-security contexts)
-      - G501   # import of unsafe crypto (we use bcrypt + AES-GCM explicitly)
-  errcheck:
-    check-type-assertions: true
-  revive:
-    rules:
-      - name: exported
-        disabled: true  # don't require godoc on all exported symbols
+  settings:
+    gosec:
+      excludes:
+        - G401   # use of weak cryptographic primitive (MD5 allowed in non-security contexts)
+        - G501   # import of unsafe crypto (we use bcrypt + AES-GCM explicitly)
+    errcheck:
+      check-type-assertions: true
+    revive:
+      rules:
+        - name: exported
+          disabled: true  # don't require godoc on all exported symbols
 
 issues:
   exclude-rules:

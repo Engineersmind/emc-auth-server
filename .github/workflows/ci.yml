@@ -93,8 +93,9 @@ jobs:
       JWT_ISSUER: https://auth.emc.local
       APP_BASE_URL: http://localhost:8080
       SEED_ADMIN_PASSWORD: TestAdmin123!
-      # [CI-04] Full 64-char hex key — AES-256-GCM requires exactly 32 bytes (64 hex chars)
-      TOTP_ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      # [CI-04] Full 64-char hex key — AES-256-GCM requires exactly 32 bytes (64 hex chars).
+      # MUST be quoted: unquoted all-zero YAML value is parsed as integer 0, not string.
+      TOTP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       ENV: test
 
     steps:
