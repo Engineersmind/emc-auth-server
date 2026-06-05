@@ -92,6 +92,7 @@ func CleanupTables(t *testing.T, pool *pgxpool.Pool) {
 		_, err := pool.Exec(ctx, `
 			TRUNCATE TABLE
 				audit_logs,
+				agent_registrations,
 				app_rate_limits,
 				totp_secrets,
 				api_keys,
