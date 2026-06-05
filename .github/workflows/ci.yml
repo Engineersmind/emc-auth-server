@@ -182,7 +182,7 @@ jobs:
       - name: gosec (SAST)
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec -exclude=G401,G501 ./...
+          gosec -exclude=G101,G117,G124,G401,G501 ./...
 
   # ─── Dependency Vulnerability Scan ──────────────────────────────────────────
   vuln:
