@@ -14,7 +14,7 @@ env:
   AWS_REGION:   ${{ vars.AWS_REGION }}      # e.g. us-east-1
   ECR_REPO:     ${{ vars.ECR_REPO }}        # e.g. dev-emc-auth-app
   EC2_TAG_NAME: ${{ vars.EC2_TAG_NAME }}    # e.g. dev-emc-auth-ec2
-  SECRET_NAME:  ${{ vars.SECRET_NAME }}     # e.g. dev/EMC_Auth
+  SECRET_NAME:  ${{ vars.SECRET_ID }}        # e.g. dev/EMC_Auth  (repo var name: SECRET_ID)
   DOMAIN:       ${{ vars.DOMAIN }}          # e.g. auth.senie.ai
   APP_CONTAINER: emc-auth-app
   REDIS_CONTAINER: emc-auth-redis
