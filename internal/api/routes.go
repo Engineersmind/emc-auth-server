@@ -77,11 +77,18 @@ func securityHeaders() echo.MiddlewareFunc {
 			// Control referrer information leakage.
 			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 			// Content Security Policy — primary browser XSS mitigation (HIGH-03).
+			// Swagger UI (/swagger/*) uses inline <script> blocks for SwaggerUIBundle
+			// initialization, so it requires 'unsafe-inline' in script-src.
+			// All other routes use the stricter policy.
+			scriptSrc := "'self'"
+			if strings.HasPrefix(c.Request().URL.Path, "/swagger/") {
+				scriptSrc = "'self' 'unsafe-inline'"
+			}
 			// style-src includes 'unsafe-inline' because Tailwind CSS injects
 			// inline styles at runtime. All other sources are restricted to 'self'.
 			h.Set("Content-Security-Policy",
 				"default-src 'self'; "+
-					"script-src 'self'; "+
+					"script-src "+scriptSrc+"; "+
 					"style-src 'self' 'unsafe-inline'; "+
 					"img-src 'self' data:; "+
 					"connect-src 'self'; "+
