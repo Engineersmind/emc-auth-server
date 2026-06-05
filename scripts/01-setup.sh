@@ -23,6 +23,14 @@ error() { echo -e "${RED}[setup]${NC} $*" >&2; }
 
 [[ $EUID -eq 0 ]] || { error "Run as root: sudo bash $0"; exit 1; }
 
+# ── 0. Remove any corrupted apt source files ─────────────────────────────────
+# A previous user_data.sh run may have written a malformed docker.list.
+# Remove it so apt-get update succeeds before we re-add the correct entry.
+if [[ -f /etc/apt/sources.list.d/docker.list ]]; then
+  rm -f /etc/apt/sources.list.d/docker.list
+  info "Removed stale docker.list."
+fi
+
 # ── 1. System packages ───────────────────────────────────────────────────────
 info "Updating system packages..."
 export DEBIAN_FRONTEND=noninteractive
