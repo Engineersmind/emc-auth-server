@@ -345,7 +345,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		if err != nil {
 			return echo.ErrNotFound
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		return c.Stream(http.StatusOK, "text/html; charset=utf-8", f)
 	})
 }
