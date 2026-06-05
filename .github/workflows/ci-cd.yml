@@ -102,10 +102,8 @@ jobs:
           REGION="${{ env.AWS_REGION }}"
           SECRET="${{ env.SECRET_NAME }}"
           DOMAIN="${{ env.DOMAIN }}"
-          APP="${{ env.APP_CONTAINER }}"
-          REDIS="${{ env.REDIS_CONTAINER }}"
-          NET="${{ env.NETWORK }}"
           INSTANCE="${{ steps.ec2.outputs.instance_id }}"
+          SCRIPT="/opt/emc-auth/src/scripts/deploy-ecr.sh"
 
           CMD_ID=$(aws ssm send-command \
             --region        "$REGION" \
@@ -113,40 +111,8 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --comment       "Deploy ${IMAGE_URI}" \
             --parameters    "commands=[
-              'set -euo pipefail',
-
-              '# 1. ECR login',
-              'ECR_HOST=$(echo ${IMAGE_URI} | cut -d/ -f1)',
-              'aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin \"\${ECR_HOST}\"',
-
-              '# 2. Pull new image',
-              'docker pull ${IMAGE_URI}',
-
-              '# 3. Fetch secrets from Secrets Manager → env file',
-              'aws secretsmanager get-secret-value --secret-id ${SECRET} --region ${REGION} --query SecretString --output text | jq -r \"to_entries[] | \\\\\"\(.key)=\(.value)\\\\\"\" > /tmp/app.env',
-              'REDIS_PASS=$(grep ^REDIS_PASSWORD /tmp/app.env | cut -d= -f2)',
-              'printf \"ENV=production\nPORT=8080\nJWT_ISSUER=https://${DOMAIN}\nJWT_AUDIENCE=https://${DOMAIN}\nAPP_BASE_URL=https://${DOMAIN}\nREDIS_URL=redis://:\${REDIS_PASS}@${REDIS}:6379\n\" >> /tmp/app.env',
-              'chmod 600 /tmp/app.env',
-
-              '# 4. Ensure network exists',
-              'docker network create ${NET} 2>/dev/null || true',
-
-              '# 5. Ensure Redis is running',
-              'if ! docker ps --filter name=^/${REDIS}$ --filter status=running -q | grep -q .; then',
-              '  docker rm -f ${REDIS} 2>/dev/null || true',
-              '  docker run -d --name ${REDIS} --network ${NET} --restart unless-stopped redis:7-alpine redis-server --requirepass \"\${REDIS_PASS}\" --maxmemory 128mb --maxmemory-policy allkeys-lru --save \"\"',
-              '  sleep 3',
-              'fi',
-
-              '# 6. Replace app container with new image',
-              'docker rm -f ${APP} 2>/dev/null || true',
-              'docker run -d --name ${APP} --network ${NET} --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file /tmp/app.env ${IMAGE_URI}',
-
-              '# 7. Health check',
-              'for i in \$(seq 1 24); do curl -sf http://127.0.0.1:8080/health && echo \"App healthy\" && break || sleep 5; done',
-
-              '# 8. Clean up old images',
-              'docker image prune -f --filter until=24h'
+              'cd /opt/emc-auth/src && git pull origin master',
+              'bash ${SCRIPT} \"${IMAGE_URI}\" \"${SECRET}\" \"${REGION}\" \"${DOMAIN}\"'
             ]" \
             --query "Command.CommandId" \
             --output text)
