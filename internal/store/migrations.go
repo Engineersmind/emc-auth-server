@@ -23,6 +23,7 @@ func RunMigrations(ctx context.Context, pool *pgxpool.Pool, embedFS embed.FS, lo
 		goose.DialectPostgres,
 		db,
 		embedFS,
+		goose.WithAllowOutofOrder(true),
 	)
 	if err != nil {
 		return fmt.Errorf("create goose provider: %w", err)
