@@ -8,6 +8,7 @@ export function LoginPage() {
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [tenantSlug, setTenantSlug] = useState('emc');
   const [totpCode, setTotpCode] = useState('');
   const [totpSessionId, setTotpSessionId] = useState<string | null>(null);
   const [error, setError] = useState('');
@@ -18,14 +19,14 @@ export function LoginPage() {
     setError('');
     setSubmitting(true);
     try {
-      const result = await login(email, password);
+      const result = await login(email, password, tenantSlug.trim() || 'emc');
       if (result.requiresTotp && result.sessionId) {
         setTotpSessionId(result.sessionId);
       } else {
         navigate('/dashboard');
       }
     } catch {
-      setError('Invalid email or password');
+      setError('Invalid email, password, or workspace');
     } finally {
       setSubmitting(false);
     }
@@ -50,9 +51,9 @@ export function LoginPage() {
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center">
       <div className="w-full max-w-md">
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
-          <h1 className="text-2xl font-semibold text-gray-900 mb-2">EMC Auth Admin</h1>
+          <h1 className="text-2xl font-semibold text-gray-900 mb-2">EMC Auth</h1>
           <p className="text-sm text-gray-500 mb-8">
-            {totpSessionId ? 'Enter your authenticator code' : 'Sign in to your account'}
+            {totpSessionId ? 'Enter your authenticator code' : 'Sign in to your workspace'}
           </p>
 
           {error && (
@@ -64,14 +65,33 @@ export function LoginPage() {
           {!totpSessionId ? (
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Workspace
+                  <span className="ml-1 text-xs text-gray-400 font-normal">(tenant slug)</span>
+                </label>
+                <input
+                  type="text"
+                  value={tenantSlug}
+                  onChange={e => setTenantSlug(e.target.value)}
+                  required
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
+                  placeholder="emc"
+                  autoComplete="organization"
+                />
+                <p className="mt-1 text-xs text-gray-400">
+                  Available: <span className="font-mono">emc · outreach · senie · acme</span>
+                </p>
+              </div>
+              <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
                 <input
                   type="email"
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={e => setEmail(e.target.value)}
                   required
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
                   placeholder="admin@example.com"
+                  autoComplete="email"
                 />
               </div>
               <div>
@@ -79,9 +99,10 @@ export function LoginPage() {
                 <input
                   type="password"
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={e => setPassword(e.target.value)}
                   required
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
+                  autoComplete="current-password"
                 />
               </div>
               <button
@@ -89,7 +110,7 @@ export function LoginPage() {
                 disabled={submitting}
                 className="w-full bg-brand-600 hover:bg-brand-700 text-white rounded-lg py-2.5 text-sm font-medium transition-colors disabled:opacity-60"
               >
-                {submitting ? 'Signing in...' : 'Sign in'}
+                {submitting ? 'Signing in…' : 'Sign in'}
               </button>
             </form>
           ) : (
@@ -101,9 +122,10 @@ export function LoginPage() {
                 <input
                   type="text"
                   value={totpCode}
-                  onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ''))}
+                  onChange={e => setTotpCode(e.target.value.replace(/\D/g, ''))}
                   required
                   maxLength={6}
+                  autoFocus
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-center tracking-widest font-mono focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
                   placeholder="000000"
                 />
@@ -113,7 +135,7 @@ export function LoginPage() {
                 disabled={submitting}
                 className="w-full bg-brand-600 hover:bg-brand-700 text-white rounded-lg py-2.5 text-sm font-medium transition-colors disabled:opacity-60"
               >
-                {submitting ? 'Verifying...' : 'Verify'}
+                {submitting ? 'Verifying…' : 'Verify'}
               </button>
               <button
                 type="button"

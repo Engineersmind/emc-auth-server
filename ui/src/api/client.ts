@@ -1,24 +1,36 @@
 import axios from 'axios';
 
-const tenant = import.meta.env.VITE_TENANT_SLUG ?? 'emc';
-
 const client = axios.create({
   baseURL: '/api/v1',
-  withCredentials: true, // send HttpOnly cookies automatically
-  headers: {
-    'Content-Type': 'application/json',
-    'X-Tenant-Slug': tenant,
-  },
+  withCredentials: true,
+  headers: { 'Content-Type': 'application/json' },
 });
 
-// Intercept 401 — redirect to login unless we are already on the login page
-// or the request is an auth-bootstrap / TOTP call that handles 401 in-page.
-// Guard by current page URL (not request URL) to prevent an infinite redirect
-// loop: AuthContext calls /auth/me on every mount; on /login this returns 401,
-// which without this guard would fire window.location.href='/login' again and again.
+// Read tenant slug dynamically — set after login, falls back to env then 'emc'
+export function getActiveTenant(): string {
+  return localStorage.getItem('tenantSlug')
+    ?? import.meta.env.VITE_TENANT_SLUG
+    ?? 'emc';
+}
+
+export function setActiveTenant(slug: string) {
+  localStorage.setItem('tenantSlug', slug);
+}
+
+export function clearActiveTenant() {
+  localStorage.removeItem('tenantSlug');
+}
+
+// Attach current tenant slug on every request
+client.interceptors.request.use(config => {
+  config.headers['X-Tenant-Slug'] = getActiveTenant();
+  return config;
+});
+
+// Redirect to login on 401 (except auth bootstrap calls)
 client.interceptors.response.use(
-  (response) => response,
-  (error) => {
+  response => response,
+  error => {
     if (
       error.response?.status === 401 &&
       !error.config?.url?.includes('/auth/session') &&
@@ -26,6 +38,7 @@ client.interceptors.response.use(
       !error.config?.url?.includes('/auth/otp/') &&
       window.location.pathname !== '/login'
     ) {
+      clearActiveTenant();
       window.location.href = '/login';
     }
     return Promise.reject(error);
