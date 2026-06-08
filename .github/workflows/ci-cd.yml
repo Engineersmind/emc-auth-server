@@ -159,4 +159,3 @@ jobs:
         run: |
           echo "✅ Deployed ${{ needs.build.outputs.image_uri }}"
           echo "   EC2: ${{ steps.ec2.outputs.instance_id }}"
-``
