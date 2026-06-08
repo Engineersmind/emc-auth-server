@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { Layout } from '../components/Layout';
@@ -8,7 +8,27 @@ import { usersApi, CreateUserRequest } from '../api/users';
 import { rolesApi } from '../api/roles';
 import { tenantsApi, Tenant } from '../api/tenants';
 
-function CreateUserModal({ onClose, tenantId }: { onClose: () => void; tenantId: string | null }) {
+function Toast({ message, type, onClose }: { message: string; type: 'success' | 'error'; onClose: () => void }) {
+  useEffect(() => {
+    const t = setTimeout(onClose, 3500);
+    return () => clearTimeout(t);
+  }, [onClose]);
+  return (
+    <div className={`fixed bottom-4 right-4 z-50 flex items-center space-x-3 px-4 py-3 rounded-xl shadow-lg text-sm font-medium
+      ${type === 'success' ? 'bg-green-50 border border-green-200 text-green-800' : 'bg-red-50 border border-red-200 text-red-800'}`}>
+      <span>{type === 'success' ? '✓' : '✕'}</span>
+      <span>{message}</span>
+      <button onClick={onClose} className="ml-2 text-gray-400 hover:text-gray-600 text-base leading-none">×</button>
+    </div>
+  );
+}
+
+function CreateUserModal({ onClose, tenantId, onSuccess, onError }: {
+  onClose: () => void;
+  tenantId: string | null;
+  onSuccess: (msg: string) => void;
+  onError: (msg: string) => void;
+}) {
   const qc = useQueryClient();
   const [form, setForm] = useState<CreateUserRequest>({
     email: '',
@@ -30,11 +50,16 @@ function CreateUserModal({ onClose, tenantId }: { onClose: () => void; tenantId:
     mutationFn: (data: CreateUserRequest) => tenantId
       ? tenantsApi.createUser(tenantId, { ...data, first_name: data.first_name, last_name: data.last_name })
       : usersApi.create(data),
-    onSuccess: () => {
+    onSuccess: (_, data) => {
       qc.invalidateQueries({ queryKey: tenantId ? ['tenant-users', tenantId] : ['users'] });
+      onSuccess(`User "${data.email}" created successfully`);
       onClose();
     },
-    onError: (e: any) => setError(e.response?.data?.message || 'Failed to create user'),
+    onError: (e: any) => {
+      const msg = e.response?.data?.message || e.response?.data?.error || 'Failed to create user';
+      setError(msg);
+      onError(msg);
+    },
   });
 
   const field = (label: string, key: keyof CreateUserRequest, type = 'text', placeholder = '') => (
@@ -53,9 +78,8 @@ function CreateUserModal({ onClose, tenantId }: { onClose: () => void; tenantId:
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
       <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
-        <h2 className="text-lg font-semibold mb-4">
-          Create User{tenantId && <span className="ml-2 text-xs font-normal text-gray-400">in selected tenant</span>}
-        </h2>
+        <h2 className="text-lg font-semibold mb-1">Create User</h2>
+        {tenantId && <p className="text-xs text-gray-400 mb-4">in selected tenant</p>}
         {error && <div className="mb-3 text-sm text-red-600 bg-red-50 rounded-lg p-3">{error}</div>}
         <div className="space-y-3">
           {field('First name', 'first_name', 'text', 'Jane')}
@@ -103,6 +127,8 @@ export function UsersPage() {
   const [roleFilter, setRoleFilter] = useState('');
   const [selectedTenantId, setSelectedTenantId] = useState('');
   const [showCreate, setShowCreate] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const showToast = (message: string, type: 'success' | 'error' = 'success') => setToast({ message, type });
   const LIMIT = 20;
 
   const { data: tenants = [] } = useQuery({
@@ -151,7 +177,9 @@ export function UsersPage() {
       : usersApi.delete(userId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: selectedTenantId ? ['tenant-users', selectedTenantId] : ['users'] });
+      showToast('User deleted');
     },
+    onError: () => showToast('Failed to delete user', 'error'),
   });
 
   const handleSearchChange = (val: string) => { setSearch(val); setPage(1); };
@@ -164,7 +192,15 @@ export function UsersPage() {
 
   return (
     <Layout>
-      {showCreate && <CreateUserModal onClose={() => setShowCreate(false)} tenantId={selectedTenantId || null} />}
+      {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+      {showCreate && (
+        <CreateUserModal
+          onClose={() => setShowCreate(false)}
+          tenantId={selectedTenantId || null}
+          onSuccess={msg => showToast(msg, 'success')}
+          onError={msg => showToast(msg, 'error')}
+        />
+      )}
 
       <div className="space-y-6">
         <div className="flex items-center justify-between">
