@@ -134,11 +134,18 @@ jobs:
             case "$STATUS" in
               Success) echo "Deployed successfully"; exit 0 ;;
               Failed|Cancelled|TimedOut)
+                echo "--- STDOUT ---"
                 aws ssm get-command-invocation \
                   --region      "${{ env.AWS_REGION }}" \
                   --command-id  "${{ steps.ssm.outputs.command_id }}" \
                   --instance-id "${{ steps.ec2.outputs.instance_id }}" \
                   --query       "StandardOutputContent" --output text
+                echo "--- STDERR ---"
+                aws ssm get-command-invocation \
+                  --region      "${{ env.AWS_REGION }}" \
+                  --command-id  "${{ steps.ssm.outputs.command_id }}" \
+                  --instance-id "${{ steps.ec2.outputs.instance_id }}" \
+                  --query       "StandardErrorContent" --output text
                 exit 1 ;;
             esac
             sleep 10
