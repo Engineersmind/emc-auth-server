@@ -18,12 +18,13 @@ import (
 
 // AuthHandler holds HTTP handlers for auth endpoints.
 type AuthHandler struct {
-	svc      *auth.AuthService
-	resetSvc *auth.ResetService
-	totpSvc  *auth.TOTPService  // nil when TOTP not configured
+	svc       *auth.AuthService
+	resetSvc  *auth.ResetService
+	totpSvc   *auth.TOTPService // nil when TOTP not configured
 	apiKeySvc *auth.APIKeyService
-	audit    *audit.Logger
-	logger   zerolog.Logger
+	jwtSvc    *auth.JWTService
+	audit     *audit.Logger
+	logger    zerolog.Logger
 }
 
 // NewAuthHandler creates an AuthHandler.
@@ -40,6 +41,12 @@ func (h *AuthHandler) WithTOTP(totpSvc *auth.TOTPService) *AuthHandler {
 // WithAPIKeys attaches an APIKeyService to the handler (called from routes.go after init).
 func (h *AuthHandler) WithAPIKeys(apiKeySvc *auth.APIKeyService) *AuthHandler {
 	h.apiKeySvc = apiKeySvc
+	return h
+}
+
+// WithJWT attaches a JWTService to the handler (needed for management token endpoint).
+func (h *AuthHandler) WithJWT(jwtSvc *auth.JWTService) *AuthHandler {
+	h.jwtSvc = jwtSvc
 	return h
 }
 
@@ -704,6 +711,55 @@ func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "API key revoked"})
+}
+
+// ManagementToken exchanges an API key for a short-lived management JWT.
+// The JWT carries the API key's permissions so it can call /admin/* endpoints
+// for the key's tenant — equivalent to Auth0's client_credentials grant.
+//
+// Usage:
+//
+//	POST /api/v1/auth/management-token
+//	X-API-Key: emck_<key>
+//	→ { "access_token": "<jwt>", "expires_in": 900, "token_type": "Bearer" }
+//
+// Then use the returned token as: Authorization: Bearer <jwt>
+func (h *AuthHandler) ManagementToken(c echo.Context) error {
+	if h.apiKeySvc == nil || h.jwtSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "management tokens not configured"})
+	}
+
+	rawKey := c.Request().Header.Get(mw.APIKeyHeader)
+	if rawKey == "" {
+		authHdr := c.Request().Header.Get("Authorization")
+		if strings.HasPrefix(authHdr, "ApiKey ") {
+			rawKey = strings.TrimPrefix(authHdr, "ApiKey ")
+		}
+	}
+	if rawKey == "" {
+		return c.JSON(http.StatusUnauthorized, map[string]string{
+			"error": "API key required — set X-API-Key or Authorization: ApiKey <key>",
+		})
+	}
+
+	identity, err := h.apiKeySvc.AuthenticateAPIKey(c.Request().Context(), rawKey)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or revoked API key"})
+	}
+
+	token, err := h.jwtSvc.SignManagement(c.Request().Context(), identity)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("management token: sign failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to issue management token"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]any{
+		"access_token": token,
+		"token_type":   "Bearer",
+		"expires_in":   int(auth.ManagementTokenTTL.Seconds()),
+		"permissions":  identity.Permissions,
+		"tenant_id":    identity.TenantID.String(),
+	})
 }
 
 // containsMsg is a simple substring check for error classification.

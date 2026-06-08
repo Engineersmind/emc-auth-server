@@ -70,6 +70,10 @@ const AccessTokenTTL = 1 * time.Hour
 // RefreshTokenTTL is the lifetime of a refresh token (AUTH-06).
 const RefreshTokenTTL = 30 * 24 * time.Hour
 
+// ManagementTokenTTL is the lifetime of an API-key-derived management token.
+// Short-lived by design — callers must re-exchange the API key to get a new one.
+const ManagementTokenTTL = 15 * time.Minute
+
 // Sign creates and signs a JWT for the given claims using the tenant's HS256 secret.
 // The caller must populate all domain fields (UserID, TenantID, Email, Role, Permissions).
 // Sign fills in iss, aud, exp, iat, and sub automatically.
@@ -93,6 +97,40 @@ func (s *JWTService) Sign(ctx context.Context, tenantID uuid.UUID, audience stri
 	signed, err := token.SignedString([]byte(secret))
 	if err != nil {
 		return "", fmt.Errorf("sign jwt: %w", err)
+	}
+	return signed, nil
+}
+
+// SignManagement issues a short-lived management JWT from an API key identity.
+// The token carries the API key's permissions so it can call /admin/* endpoints
+// for the key's tenant — equivalent to Auth0's client_credentials management token.
+func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentity) (string, error) {
+	secret, err := s.tenantSecret(ctx, identity.TenantID)
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC()
+	claims := &Claims{
+		UserID:      "key:" + identity.KeyID.String(),
+		TenantID:    identity.TenantID.String(),
+		Email:       identity.Name + "@apikey",
+		Role:        "api_key",
+		Permissions: identity.Permissions,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.New().String(),
+			Issuer:    s.issuer,
+			Audience:  jwt.ClaimStrings{"emc-auth-management"},
+			Subject:   "key:" + identity.KeyID.String(),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ManagementTokenTTL)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("sign management token: %w", err)
 	}
 	return signed, nil
 }
