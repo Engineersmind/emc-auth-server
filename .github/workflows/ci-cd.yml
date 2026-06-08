@@ -94,26 +94,38 @@ jobs:
 
       - name: Deploy via SSM
         id: ssm
+        env:
+          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
+          REGION:    ${{ env.AWS_REGION }}
+          SECRET:    ${{ env.SECRET_NAME }}
+          DOMAIN:    ${{ env.DOMAIN }}
+          INSTANCE:  ${{ steps.ec2.outputs.instance_id }}
         run: |
-          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
-          REGION="${{ env.AWS_REGION }}"
-          SECRET="${{ env.SECRET_NAME }}"
-          DOMAIN="${{ env.DOMAIN }}"
-          INSTANCE="${{ steps.ec2.outputs.instance_id }}"
-          SCRIPT="/opt/emc-auth/src/scripts/deploy-ecr.sh"
-          # Write SSM input as JSON file to avoid shell quoting issues
-          python3 -c "
-          import json, sys
-          cmd = 'bash {} {} {} {} {}'.format(
-              sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
-          payload = {
-              'DocumentName': 'AWS-RunShellScript',
-              'InstanceIds': [sys.argv[6]],
-              'Parameters': {'commands': [cmd]}
-          }
-          print(json.dumps(payload))
-          " "$SCRIPT" "$IMAGE_URI" "$SECRET" "$REGION" "$DOMAIN" "$INSTANCE" \
-            > /tmp/ssm-input.json
+          REGISTRY=$(echo "$IMAGE_URI" | cut -d/ -f1)
+          # Build SSM JSON payload — write Python to file first to avoid heredoc quoting issues
+          cat > /tmp/mk.py << 'EOF'
+          import json, os, sys
+          img = os.environ["IMAGE_URI"]
+          secret = os.environ["SECRET"]
+          region = os.environ["REGION"]
+          domain = os.environ["DOMAIN"]
+          instance = os.environ["INSTANCE"]
+          registry = img.split("/")[0]
+          cmds = [
+            f"aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {registry}",
+            f"docker pull {img}",
+            "aws secretsmanager get-secret-value --secret-id " + secret + " --region " + region + " --query SecretString --output text | python3 -c 'import sys,json; [print(k+chr(61)+str(v)) for k,v in json.load(sys.stdin).items()]' > /tmp/app.env",
+            "RPASS=$(grep '^REDIS_PASSWORD=' /tmp/app.env | cut -d= -f2-) && echo \"REDIS_URL=redis://:${RPASS}@emc-auth-redis:6379\" >> /tmp/app.env",
+            "echo ENV=production >> /tmp/app.env && echo PORT=8080 >> /tmp/app.env && echo JWT_ISSUER=https://" + domain + " >> /tmp/app.env && echo APP_BASE_URL=https://" + domain + " >> /tmp/app.env",
+            "docker rm -f emc-auth-app 2>/dev/null || true",
+            f"docker run -d --name emc-auth-app --network emc-auth-net --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file /tmp/app.env {img}",
+            f"echo Deployed: {img}",
+          ]
+          payload = {"DocumentName": "AWS-RunShellScript", "InstanceIds": [instance], "Parameters": {"commands": cmds}}
+          print(json.dumps(payload, indent=2))
+          EOF
+          python3 /tmp/mk.py > /tmp/ssm-input.json
+          cat /tmp/ssm-input.json
           CMD_ID=$(aws ssm send-command \
             --region        "$REGION" \
             --cli-input-json file:///tmp/ssm-input.json \
