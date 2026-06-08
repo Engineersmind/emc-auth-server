@@ -136,22 +136,38 @@ export function UsersPage() {
     queryFn: () => tenantsApi.list().then(r => r.data),
   });
 
-  const serverQuery = useQuery({
-    queryKey: ['users', page, search, roleFilter],
-    queryFn: () =>
-      usersApi.list({ page, limit: LIMIT, search: search || undefined, role: roleFilter || undefined })
-        .then(r => r.data),
-    placeholderData: keepPreviousData,
-    enabled: !selectedTenantId,
+  // All-tenants view: fetch every tenant's users in parallel and merge
+  const allTenantsQuery = useQuery({
+    queryKey: ['all-tenants-users', tenants.map((t: Tenant) => t.id).join(',')],
+    queryFn: async () => {
+      const results = await Promise.all(
+        tenants.map(async (t: Tenant) => {
+          const users = await tenantsApi.listUsers(t.id).then(r => r.data);
+          return users.map(u => ({ ...u, _tenantId: t.id, _tenantSlug: t.slug, _tenantName: t.name }));
+        })
+      );
+      return results.flat();
+    },
+    enabled: !selectedTenantId && tenants.length > 0,
   });
 
+  // Single tenant view
   const tenantUsersQuery = useQuery({
     queryKey: ['tenant-users', selectedTenantId],
-    queryFn: () => tenantsApi.listUsers(selectedTenantId).then(r => r.data),
+    queryFn: () => tenantsApi.listUsers(selectedTenantId).then(r =>
+      r.data.map(u => {
+        const t = tenants.find((x: Tenant) => x.id === selectedTenantId);
+        return { ...u, _tenantId: selectedTenantId, _tenantSlug: t?.slug ?? '', _tenantName: t?.name ?? '' };
+      })
+    ),
     enabled: !!selectedTenantId,
   });
 
-  const filteredTenantUsers = (tenantUsersQuery.data ?? []).filter(u => {
+  const rawUsers = selectedTenantId
+    ? (tenantUsersQuery.data ?? [])
+    : (allTenantsQuery.data ?? []);
+
+  const filteredUsers = rawUsers.filter(u => {
     const matchesSearch = !search ||
       u.email.toLowerCase().includes(search.toLowerCase()) ||
       `${u.first_name} ${u.last_name}`.toLowerCase().includes(search.toLowerCase());
@@ -159,24 +175,18 @@ export function UsersPage() {
     return matchesSearch && matchesRole;
   });
 
-  const paginatedTenantUsers = filteredTenantUsers.slice((page - 1) * LIMIT, page * LIMIT);
+  const totalUsers = filteredUsers.length;
+  const displayUsers = filteredUsers.slice((page - 1) * LIMIT, page * LIMIT);
 
-  const isLoading = selectedTenantId ? tenantUsersQuery.isLoading : serverQuery.isLoading;
-  const isError = selectedTenantId ? tenantUsersQuery.isError : serverQuery.isError;
-
-  const displayUsers = selectedTenantId
-    ? paginatedTenantUsers
-    : (serverQuery.data?.users ?? []);
-  const totalUsers = selectedTenantId
-    ? filteredTenantUsers.length
-    : (serverQuery.data?.total ?? 0);
+  const isLoading = selectedTenantId ? tenantUsersQuery.isLoading : allTenantsQuery.isLoading;
+  const isError = selectedTenantId ? tenantUsersQuery.isError : allTenantsQuery.isError;
 
   const { mutate: deleteUser } = useMutation({
-    mutationFn: (userId: string) => selectedTenantId
-      ? tenantsApi.deleteUser(selectedTenantId, userId)
-      : usersApi.delete(userId),
+    mutationFn: ({ userId, tenantId }: { userId: string; tenantId: string }) =>
+      tenantsApi.deleteUser(tenantId, userId),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: selectedTenantId ? ['tenant-users', selectedTenantId] : ['users'] });
+      qc.invalidateQueries({ queryKey: ['all-tenants-users'] });
+      qc.invalidateQueries({ queryKey: ['tenant-users', selectedTenantId] });
       showToast('User deleted');
     },
     onError: () => showToast('Failed to delete user', 'error'),
@@ -184,11 +194,7 @@ export function UsersPage() {
 
   const handleSearchChange = (val: string) => { setSearch(val); setPage(1); };
   const handleRoleChange = (val: string) => { setRoleFilter(val); setPage(1); };
-  const handleTenantChange = (val: string) => { setSelectedTenantId(val); setPage(1); };
-
-  const showTenantColumn = !selectedTenantId;
-
-  const tenantSlugMap = Object.fromEntries(tenants.map((t: Tenant) => [t.id, t.slug]));
+  const handleTenantChange = (val: string) => { setSelectedTenantId(val); setSearch(''); setRoleFilter(''); setPage(1); };
 
   return (
     <Layout>
@@ -241,17 +247,23 @@ export function UsersPage() {
           </select>
         </div>
 
-        {isLoading && <div className="text-sm text-gray-500">Loading…</div>}
-        {isError && <div className="text-sm text-red-600">Failed to load users</div>}
+        {isLoading && (
+          <div className="flex items-center space-x-2 text-sm text-gray-500">
+            <div className="animate-spin h-4 w-4 border-2 border-brand-500 border-t-transparent rounded-full" />
+            <span>Loading users…</span>
+          </div>
+        )}
+        {isError && <div className="text-sm text-red-600 bg-red-50 rounded-lg p-3">Failed to load users</div>}
 
-        {(serverQuery.data || selectedTenantId) && !isLoading && !isError && (
+        {!isLoading && !isError && (
           <>
+            <div className="text-xs text-gray-400">{totalUsers} user{totalUsers !== 1 ? 's' : ''} found</div>
             <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
               <table className="min-w-full divide-y divide-gray-200">
                 <thead className="bg-gray-50">
                   <tr>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
-                    {showTenantColumn && (
+                    {!selectedTenantId && (
                       <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tenant</th>
                     )}
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
@@ -262,17 +274,17 @@ export function UsersPage() {
                 </thead>
                 <tbody className="bg-white divide-y divide-gray-100">
                   {displayUsers.map(user => (
-                    <tr key={user.id} className="hover:bg-gray-50">
+                    <tr key={`${(user as any)._tenantId}-${user.id}`} className="hover:bg-gray-50">
                       <td className="px-6 py-4">
                         <div className="text-sm font-medium text-gray-900">
                           {user.first_name} {user.last_name}
                         </div>
                         <div className="text-xs text-gray-500">{user.email}</div>
                       </td>
-                      {showTenantColumn && (
+                      {!selectedTenantId && (
                         <td className="px-6 py-4">
                           <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono bg-gray-100 text-gray-500">
-                            {tenantSlugMap[(user as any).tenant_id] ?? '—'}
+                            {(user as any)._tenantSlug ?? '—'}
                           </span>
                         </td>
                       )}
@@ -293,16 +305,14 @@ export function UsersPage() {
                       </td>
                       <td className="px-6 py-4 text-right">
                         <div className="flex items-center justify-end space-x-3">
-                          <Link
-                            to={`/users/${user.id}`}
-                            className="text-sm text-brand-600 hover:text-brand-800"
-                          >
+                          <Link to={`/users/${user.id}`} className="text-sm text-brand-600 hover:text-brand-800">
                             View →
                           </Link>
                           {!user.deleted_at && (
                             <button
                               onClick={() => {
-                                if (confirm(`Delete user "${user.email}"?`)) deleteUser(user.id);
+                                if (confirm(`Delete user "${user.email}"?`))
+                                  deleteUser({ userId: user.id, tenantId: (user as any)._tenantId });
                               }}
                               className="text-sm text-red-500 hover:text-red-700"
                             >
@@ -315,8 +325,8 @@ export function UsersPage() {
                   ))}
                   {displayUsers.length === 0 && (
                     <tr>
-                      <td colSpan={showTenantColumn ? 6 : 5} className="px-6 py-8 text-center text-sm text-gray-500">
-                        No users found
+                      <td colSpan={selectedTenantId ? 5 : 6} className="px-6 py-8 text-center text-sm text-gray-500">
+                        {search ? `No users matching "${search}"` : 'No users found'}
                       </td>
                     </tr>
                   )}
