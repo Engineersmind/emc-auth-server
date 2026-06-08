@@ -76,6 +76,13 @@ func main() {
 		logger.Fatal().Err(err).Msg("seed failed")
 	}
 
+	// Seed demo tenants + users when SEED_DEMO_DATA=true (local dev / QA only)
+	if os.Getenv("SEED_DEMO_DATA") == "true" {
+		if err := store.RunDemoSeed(ctx, pool, logger); err != nil {
+			logger.Fatal().Err(err).Msg("demo seed failed")
+		}
+	}
+
 	// Connect to Redis
 	rdb, err := store.NewRedis(ctx, cfg.RedisURL, logger)
 	if err != nil {

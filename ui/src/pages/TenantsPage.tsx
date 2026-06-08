@@ -3,7 +3,27 @@ import { Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Layout } from '../components/Layout';
 import { useAuth } from '../contexts/AuthContext';
-import { tenantsApi, CreateTenantRequest } from '../api/tenants';
+import { tenantsApi, CreateTenantRequest, Tenant } from '../api/tenants';
+import { SearchInput } from '../components/SearchInput';
+
+function TenantStats({ tenantId }: { tenantId: string }) {
+  const { data: users } = useQuery({
+    queryKey: ['tenant-users', tenantId],
+    queryFn: () => tenantsApi.listUsers(tenantId).then(r => r.data),
+  });
+  const { data: roles } = useQuery({
+    queryKey: ['tenant-roles', tenantId],
+    queryFn: () => tenantsApi.listRoles(tenantId).then(r => r.data),
+  });
+
+  if (users === undefined && roles === undefined) return null;
+
+  return (
+    <span className="text-xs text-gray-400 ml-2">
+      {users?.length ?? '…'} users · {roles?.length ?? '…'} roles
+    </span>
+  );
+}
 
 function CreateTenantModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
@@ -51,7 +71,7 @@ function CreateTenantModal({ onClose }: { onClose: () => void }) {
             disabled={isPending || !form.name || !form.slug}
             className="bg-brand-600 hover:bg-brand-700 text-white text-sm rounded-lg px-4 py-2 disabled:opacity-60 transition-colors"
           >
-            {isPending ? 'Creating\u2026' : 'Create'}
+            {isPending ? 'Creating…' : 'Create'}
           </button>
         </div>
       </div>
@@ -63,6 +83,7 @@ export function TenantsPage() {
   const { user } = useAuth();
   const qc = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
+  const [search, setSearch] = useState('');
 
   const { data, isLoading, isError } = useQuery({
     queryKey: ['tenants'],
@@ -78,11 +99,16 @@ export function TenantsPage() {
     return (
       <Layout>
         <div className="text-center py-12 text-gray-500">
-          Access denied \u2014 super admin only
+          Access denied — super admin only
         </div>
       </Layout>
     );
   }
+
+  const filtered = (data ?? []).filter((t: Tenant) => {
+    const q = search.toLowerCase();
+    return !q || t.name.toLowerCase().includes(q) || t.slug.toLowerCase().includes(q);
+  });
 
   return (
     <Layout>
@@ -98,7 +124,13 @@ export function TenantsPage() {
           </button>
         </div>
 
-        {isLoading && <div className="text-sm text-gray-500">Loading\u2026</div>}
+        <SearchInput
+          value={search}
+          onChange={setSearch}
+          placeholder="Search by name or slug…"
+        />
+
+        {isLoading && <div className="text-sm text-gray-500">Loading…</div>}
         {isError && <div className="text-sm text-red-600">Failed to load tenants</div>}
 
         {data && (
@@ -114,9 +146,12 @@ export function TenantsPage() {
                 </tr>
               </thead>
               <tbody className="bg-white divide-y divide-gray-100">
-                {data.map(tenant => (
+                {filtered.map((tenant: Tenant) => (
                   <tr key={tenant.id} className="hover:bg-gray-50">
-                    <td className="px-6 py-4 text-sm font-medium text-gray-900">{tenant.name}</td>
+                    <td className="px-6 py-4 text-sm font-medium text-gray-900">
+                      {tenant.name}
+                      <TenantStats tenantId={tenant.id} />
+                    </td>
                     <td className="px-6 py-4 text-sm text-gray-500 font-mono">{tenant.slug}</td>
                     <td className="px-6 py-4 text-sm text-gray-500">
                       {new Date(tenant.created_at).toLocaleDateString()}
@@ -150,6 +185,13 @@ export function TenantsPage() {
                     </td>
                   </tr>
                 ))}
+                {filtered.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="px-6 py-8 text-center text-sm text-gray-500">
+                      No tenants found
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
