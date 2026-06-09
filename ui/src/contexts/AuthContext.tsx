@@ -1,6 +1,5 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { authApi, UserInfo } from '../api/auth';
-import { setActiveTenant, clearActiveTenant } from '../api/client';
 
 interface AuthContextValue {
   user: UserInfo | null;
@@ -8,7 +7,7 @@ interface AuthContextValue {
   isAdmin: boolean;
   isSuperAdmin: boolean;
   hasPermission: (perm: string) => boolean;
-  login: (email: string, password: string, tenantSlug?: string) => Promise<{ requiresTotp: boolean; sessionId?: string }>;
+  login: (email: string, password: string) => Promise<{ requiresTotp: boolean; sessionId?: string }>;
   loginTotp: (sessionId: string, code: string) => Promise<void>;
   logout: () => Promise<void>;
 }
@@ -30,26 +29,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       .finally(() => setLoading(false));
   }, []);
 
-  async function login(email: string, password: string, tenantSlug = 'emc') {
-    // Store slug before the request so the interceptor picks it up
-    setActiveTenant(tenantSlug);
-    try {
-      const { data } = await authApi.login({ email, password });
-      if (data.requires_totp) {
-        return { requiresTotp: true, sessionId: data.totp_session_id };
-      }
-      if (data.user) {
-        setUser(data.user);
-      } else {
-        const me = await authApi.me();
-        setUser(me.data);
-      }
-      return { requiresTotp: false };
-    } catch (err) {
-      // If login fails, don't keep the tenant slug stored
-      clearActiveTenant();
-      throw err;
+  async function login(email: string, password: string) {
+    const { data } = await authApi.login({ email, password });
+    if (data.requires_totp) {
+      return { requiresTotp: true, sessionId: data.totp_session_id };
     }
+    if (data.user) {
+      setUser(data.user);
+    } else {
+      const me = await authApi.me();
+      setUser(me.data);
+    }
+    return { requiresTotp: false };
   }
 
   async function loginTotp(sessionId: string, code: string) {
@@ -59,7 +50,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   async function logout() {
     await authApi.logout();
-    clearActiveTenant();
     setUser(null);
     window.location.href = '/login';
   }

@@ -8,7 +8,6 @@ export function LoginPage() {
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [tenantSlug, setTenantSlug] = useState('emc');
   const [totpCode, setTotpCode] = useState('');
   const [totpSessionId, setTotpSessionId] = useState<string | null>(null);
   const [error, setError] = useState('');
@@ -19,14 +18,14 @@ export function LoginPage() {
     setError('');
     setSubmitting(true);
     try {
-      const result = await login(email, password, tenantSlug.trim() || 'emc');
+      const result = await login(email, password);
       if (result.requiresTotp && result.sessionId) {
         setTotpSessionId(result.sessionId);
       } else {
         navigate('/dashboard');
       }
     } catch {
-      setError('Invalid email, password, or workspace');
+      setError('Invalid email or password');
     } finally {
       setSubmitting(false);
     }
@@ -53,7 +52,7 @@ export function LoginPage() {
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
           <h1 className="text-2xl font-semibold text-gray-900 mb-2">EMC Auth</h1>
           <p className="text-sm text-gray-500 mb-8">
-            {totpSessionId ? 'Enter your authenticator code' : 'Sign in to your workspace'}
+            {totpSessionId ? 'Enter your authenticator code' : 'Sign in to your account'}
           </p>
 
           {error && (
@@ -65,32 +64,15 @@ export function LoginPage() {
           {!totpSessionId ? (
             <form onSubmit={handleLogin} className="space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Workspace
-                  <span className="ml-1 text-xs text-gray-400 font-normal">(tenant slug)</span>
-                </label>
-                <input
-                  type="text"
-                  value={tenantSlug}
-                  onChange={e => setTenantSlug(e.target.value)}
-                  required
-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
-                  placeholder="emc"
-                  autoComplete="organization"
-                />
-                <p className="mt-1 text-xs text-gray-400">
-                  Available: <span className="font-mono">emc · outreach · senie · acme</span>
-                </p>
-              </div>
-              <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
                 <input
                   type="email"
                   value={email}
                   onChange={e => setEmail(e.target.value)}
                   required
+                  autoFocus
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
-                  placeholder="admin@example.com"
+                  placeholder="admin@emc.local"
                   autoComplete="email"
                 />
               </div>

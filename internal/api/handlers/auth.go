@@ -72,15 +72,6 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 	return slug, slug != ""
 }
 
-// tenantSlugOrDefault returns the X-Tenant-Slug header value, falling back to
-// "emc" when the header is absent. Used by login endpoints where the header is
-// optional — callers that omit it are assumed to be on the primary tenant.
-func tenantSlugOrDefault(c echo.Context) string {
-	if slug := c.Request().Header.Get("X-Tenant-Slug"); slug != "" {
-		return slug
-	}
-	return "emc"
-}
 
 // Register handles POST /api/v1/auth/register.
 //
@@ -153,14 +144,13 @@ func (h *AuthHandler) Register(c echo.Context) error {
 // @Tags         auth
 // @Accept       json
 // @Produce      json
-// @Param        X-Tenant-Slug  header    string        false  "Tenant slug (e.g. emc) — defaults to 'emc' if omitted"
-// @Param        body           body      LoginRequest  true  "Login credentials"
-// @Success      200            {object}  auth.AuthResult
-// @Failure      400            {object}  map[string]string
-// @Failure      401            {object}  map[string]string  "Invalid credentials"
+// @Param        body  body      LoginRequest  true  "Login credentials"
+// @Success      200   {object}  auth.AuthResult
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid credentials"
 // @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
-	slug := tenantSlugOrDefault(c)
+	slug := "emc"
 
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
@@ -841,14 +831,13 @@ type SessionLoginRequest = LoginRequest // same fields
 // @Tags         auth-session
 // @Accept       json
 // @Produce      json
-// @Param        X-Tenant-Slug  header    string              false "Tenant slug — defaults to 'emc' if omitted"
-// @Param        body           body      SessionLoginRequest true  "Credentials"
-// @Success      200            {object}  map[string]string
-// @Failure      400            {object}  map[string]string
-// @Failure      401            {object}  map[string]string
+// @Param        body  body      SessionLoginRequest true  "Credentials"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/session [post]
 func (h *AuthHandler) SessionLogin(c echo.Context) error {
-	slug := tenantSlugOrDefault(c)
+	slug := "emc"
 
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
