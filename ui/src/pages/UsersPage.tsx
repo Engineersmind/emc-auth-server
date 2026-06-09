@@ -142,7 +142,7 @@ export function UsersPage() {
     queryFn: async () => {
       const results = await Promise.all(
         tenants.map(async (t: Tenant) => {
-          const users = await tenantsApi.listUsers(t.id).then(r => r.data);
+          const users = await tenantsApi.listUsers(t.id).then(r => r.data.users ?? []);
           return users.map(u => ({ ...u, _tenantId: t.id, _tenantSlug: t.slug, _tenantName: t.name }));
         })
       );
@@ -155,7 +155,7 @@ export function UsersPage() {
   const tenantUsersQuery = useQuery({
     queryKey: ['tenant-users', selectedTenantId],
     queryFn: () => tenantsApi.listUsers(selectedTenantId).then(r =>
-      r.data.map(u => {
+      (r.data.users ?? []).map(u => {
         const t = tenants.find((x: Tenant) => x.id === selectedTenantId);
         return { ...u, _tenantId: selectedTenantId, _tenantSlug: t?.slug ?? '', _tenantName: t?.name ?? '' };
       })

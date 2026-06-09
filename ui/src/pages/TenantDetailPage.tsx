@@ -300,7 +300,7 @@ function UsersTab({ tid }: { tid: string }) {
 
   const { data: users = [], isLoading } = useQuery({
     queryKey: ['tenant-users', tid],
-    queryFn: () => tenantsApi.listUsers(tid).then(r => r.data),
+    queryFn: () => tenantsApi.listUsers(tid).then(r => r.data.users ?? []),
   });
 
   const { data: roles = [] } = useQuery({
