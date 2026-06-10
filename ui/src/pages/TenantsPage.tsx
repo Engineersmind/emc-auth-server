@@ -9,7 +9,7 @@ import { SearchInput } from '../components/SearchInput';
 function TenantStats({ tenantId }: { tenantId: string }) {
   const { data: users } = useQuery({
     queryKey: ['tenant-users', tenantId],
-    queryFn: () => tenantsApi.listUsers(tenantId).then(r => r.data),
+    queryFn: () => tenantsApi.listUsers(tenantId).then(r => r.data.users ?? []),
   });
   const { data: roles } = useQuery({
     queryKey: ['tenant-roles', tenantId],

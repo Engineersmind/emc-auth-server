@@ -50,7 +50,7 @@ export function LoginPage() {
     <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center">
       <div className="w-full max-w-md">
         <div className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
-          <h1 className="text-2xl font-semibold text-gray-900 mb-2">EMC Auth Admin</h1>
+          <h1 className="text-2xl font-semibold text-gray-900 mb-2">EMC Auth</h1>
           <p className="text-sm text-gray-500 mb-8">
             {totpSessionId ? 'Enter your authenticator code' : 'Sign in to your account'}
           </p>
@@ -68,10 +68,12 @@ export function LoginPage() {
                 <input
                   type="email"
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={e => setEmail(e.target.value)}
                   required
+                  autoFocus
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
-                  placeholder="admin@example.com"
+                  placeholder="admin@emc.local"
+                  autoComplete="email"
                 />
               </div>
               <div>
@@ -79,9 +81,10 @@ export function LoginPage() {
                 <input
                   type="password"
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={e => setPassword(e.target.value)}
                   required
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
+                  autoComplete="current-password"
                 />
               </div>
               <button
@@ -89,7 +92,7 @@ export function LoginPage() {
                 disabled={submitting}
                 className="w-full bg-brand-600 hover:bg-brand-700 text-white rounded-lg py-2.5 text-sm font-medium transition-colors disabled:opacity-60"
               >
-                {submitting ? 'Signing in...' : 'Sign in'}
+                {submitting ? 'Signing in…' : 'Sign in'}
               </button>
             </form>
           ) : (
@@ -101,9 +104,10 @@ export function LoginPage() {
                 <input
                   type="text"
                   value={totpCode}
-                  onChange={(e) => setTotpCode(e.target.value.replace(/\D/g, ''))}
+                  onChange={e => setTotpCode(e.target.value.replace(/\D/g, ''))}
                   required
                   maxLength={6}
+                  autoFocus
                   className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-center tracking-widest font-mono focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent"
                   placeholder="000000"
                 />
@@ -113,7 +117,7 @@ export function LoginPage() {
                 disabled={submitting}
                 className="w-full bg-brand-600 hover:bg-brand-700 text-white rounded-lg py-2.5 text-sm font-medium transition-colors disabled:opacity-60"
               >
-                {submitting ? 'Verifying...' : 'Verify'}
+                {submitting ? 'Verifying…' : 'Verify'}
               </button>
               <button
                 type="button"

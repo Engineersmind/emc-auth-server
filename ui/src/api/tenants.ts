@@ -31,12 +31,22 @@ export interface TenantRole {
 
 export interface TenantUser {
   id: string;
+  tenant_id: string;
   email: string;
   first_name: string;
   last_name: string;
   role: string;
+  role_id: string | null;
+  is_active: boolean;
   created_at: string;
   deleted_at: string | null;
+}
+
+export interface TenantUsersPage {
+  users: TenantUser[];
+  total: number;
+  page: number;
+  total_pages: number;
 }
 
 export interface CreateTenantUserRequest {
@@ -81,9 +91,9 @@ export const tenantsApi = {
   deleteRole: (tid: string, rid: string) =>
     client.delete(`/admin/tenants/${tid}/roles/${rid}`),
 
-  // Cross-tenant user management
+  // Cross-tenant user management — server returns UsersPage { users[], total, page }
   listUsers: (tid: string) =>
-    client.get<TenantUser[]>(`/admin/tenants/${tid}/users`),
+    client.get<TenantUsersPage>(`/admin/tenants/${tid}/users`),
   createUser: (tid: string, data: CreateTenantUserRequest) =>
     client.post<TenantUser>(`/admin/tenants/${tid}/users`, data),
   deleteUser: (tid: string, uid: string) =>

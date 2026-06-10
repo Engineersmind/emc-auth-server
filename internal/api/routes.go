@@ -179,7 +179,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
 		WithTOTP(totpSvc).
-		WithAPIKeys(apiKeySvc)
+		WithAPIKeys(apiKeySvc).
+		WithJWT(jwtSvc)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
@@ -220,6 +221,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/logout", authHandler.Logout)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
+
+	// Management token — exchange an API key for a short-lived admin JWT.
+	// Equivalent to Auth0 client_credentials grant for the Management API.
+	// Usage: POST /api/v1/auth/management-token with X-API-Key: emck_<key>
+	authGroup.POST("/management-token", authHandler.ManagementToken)
 
 	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
 	authGroup.POST("/session", authHandler.SessionLogin)

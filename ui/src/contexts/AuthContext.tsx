@@ -4,8 +4,8 @@ import { authApi, UserInfo } from '../api/auth';
 interface AuthContextValue {
   user: UserInfo | null;
   loading: boolean;
-  isAdmin: boolean;       // has admin:access permission
-  isSuperAdmin: boolean;  // has tenant:manage permission
+  isAdmin: boolean;
+  isSuperAdmin: boolean;
   hasPermission: (perm: string) => boolean;
   login: (email: string, password: string) => Promise<{ requiresTotp: boolean; sessionId?: string }>;
   loginTotp: (sessionId: string, code: string) => Promise<void>;
@@ -24,7 +24,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     authApi.me()
-      .then((r) => setUser(r.data))
+      .then(r => setUser(r.data))
       .catch(() => setUser(null))
       .finally(() => setLoading(false));
   }, []);
@@ -34,7 +34,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (data.requires_totp) {
       return { requiresTotp: true, sessionId: data.totp_session_id };
     }
-    // /auth/session sets an HttpOnly cookie but returns no user body — fetch /auth/me to hydrate state
     if (data.user) {
       setUser(data.user);
     } else {
