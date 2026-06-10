@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -48,6 +49,34 @@ func (h *AuthHandler) WithAPIKeys(apiKeySvc *auth.APIKeyService) *AuthHandler {
 func (h *AuthHandler) WithJWT(jwtSvc *auth.JWTService) *AuthHandler {
 	h.jwtSvc = jwtSvc
 	return h
+}
+
+// MyActivity handles GET /api/v1/auth/my-activity.
+// Returns the current user's own audit log entries (any logged-in user).
+func (h *AuthHandler) MyActivity(c echo.Context) error {
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := uuid.Parse(claims.TenantID)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant"})
+	}
+	page := 1
+	if p, err := strconv.Atoi(c.QueryParam("page")); err == nil && p > 0 {
+		page = p
+	}
+	result, err := h.audit.Query(c.Request().Context(), audit.QueryParams{
+		TenantID: &tenantID,
+		UserID:   claims.UserID,
+		Page:     page,
+		Limit:    50,
+	})
+	if err != nil {
+		h.logger.Error().Err(err).Msg("auth: my-activity query failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query activity"})
+	}
+	return c.JSON(http.StatusOK, result)
 }
 
 // RegisterRequest is the JSON body for POST /api/v1/auth/register.

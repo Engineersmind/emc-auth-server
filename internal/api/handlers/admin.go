@@ -808,6 +808,38 @@ func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 }
 
 // ---------------------------------------------------------------------------
+// Monitoring stats endpoints
+// ---------------------------------------------------------------------------
+
+// GetStats handles GET /api/v1/admin/stats — tenant-scoped summary for admins.
+func (h *AdminHandler) GetStats(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+	}
+	result, err := h.audit.Stats(c.Request().Context(), &tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: stats query failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query stats"})
+	}
+	return c.JSON(http.StatusOK, result)
+}
+
+// GetSystemStats handles GET /api/v1/admin/stats/system — system-wide, super_admin only.
+func (h *AdminHandler) GetSystemStats(c echo.Context) error {
+	result, err := h.audit.Stats(c.Request().Context(), nil)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: system stats query failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query system stats"})
+	}
+	return c.JSON(http.StatusOK, result)
+}
+
+// ---------------------------------------------------------------------------
 // Audit log query endpoints
 // ---------------------------------------------------------------------------
 

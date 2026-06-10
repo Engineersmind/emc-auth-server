@@ -161,6 +161,57 @@ func (l *Logger) Log(ctx context.Context, e Event) {
 // Query — tenant-scoped (admin:access) and system-wide (tenant:manage)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Stats — aggregated counts for the monitoring dashboard
+// ---------------------------------------------------------------------------
+
+// StatsResult holds aggregated counts for the monitoring dashboard.
+type StatsResult struct {
+	LoginsToday       int        `json:"logins_today"`
+	FailedLoginsToday int        `json:"failed_logins_today"`
+	LogoutsToday      int        `json:"logouts_today"`
+	ActiveUsersWeek   int        `json:"active_users_week"`
+	TotalAuditEvents  int        `json:"total_audit_events"`
+	RecentEvents      []LogEntry `json:"recent_events"`
+}
+
+// Stats returns aggregated counts for the monitoring dashboard.
+// When tenantID is nil, returns system-wide counts.
+func (l *Logger) Stats(ctx context.Context, tenantID *uuid.UUID) (*StatsResult, error) {
+	where := "WHERE 1=1"
+	args := []any{}
+	if tenantID != nil {
+		args = append(args, *tenantID)
+		where += fmt.Sprintf(" AND tenant_id = $%d", len(args))
+	}
+
+	var s StatsResult
+	err := l.pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT
+			COUNT(*) FILTER (WHERE action = 'auth.login'        AND created_at >= NOW() - INTERVAL '24 hours'),
+			COUNT(*) FILTER (WHERE action = 'auth.login_failed' AND created_at >= NOW() - INTERVAL '24 hours'),
+			COUNT(*) FILTER (WHERE action = 'auth.logout'       AND created_at >= NOW() - INTERVAL '24 hours'),
+			COUNT(DISTINCT user_id) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id IS NOT NULL),
+			COUNT(*)
+		FROM audit_logs %s
+	`, where), args...).Scan(
+		&s.LoginsToday, &s.FailedLoginsToday, &s.LogoutsToday,
+		&s.ActiveUsersWeek, &s.TotalAuditEvents,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit stats: %w", err)
+	}
+
+	page, err := l.Query(ctx, QueryParams{TenantID: tenantID, Page: 1, Limit: 10})
+	if err != nil {
+		return nil, fmt.Errorf("audit stats recent: %w", err)
+	}
+	s.RecentEvents = page.Logs
+	return &s, nil
+}
+
+// ---------------------------------------------------------------------------
+
 // Query returns a paginated, filtered list of audit log entries.
 // When p.TenantID is set, results are scoped to that tenant only.
 // When p.TenantID is nil, results span all tenants (system-wide view).

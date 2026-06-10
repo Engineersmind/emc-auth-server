@@ -234,6 +234,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Auth routes — protected by JWTRequired (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
+	authGroup.GET("/my-activity", authHandler.MyActivity, mw.JWTRequired(jwtSvc))
 
 	// TOTP management — protected (03-01)
 	otpGroup := authGroup.Group("/otp", mw.JWTRequired(jwtSvc))
@@ -293,6 +294,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.POST("/api-keys", authHandler.CreateAPIKey)
 	rbacGroup.GET("/api-keys", authHandler.ListAPIKeys)
 	rbacGroup.DELETE("/api-keys/:id", authHandler.RevokeAPIKey)
+
+	// Monitoring stats — tenant-scoped (admin:access) and system-wide (tenant:manage)
+	rbacGroup.GET("/stats", adminHandler.GetStats)
+	tenantMgmt.GET("/stats/system", adminHandler.GetSystemStats)
 
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
