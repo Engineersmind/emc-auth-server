@@ -8,7 +8,7 @@ import { usersApi, CreateUserRequest } from '../api/users';
 import { rolesApi } from '../api/roles';
 import { tenantsApi, Tenant } from '../api/tenants';
 
-function CreateUserModal({ onClose }: { onClose: () => void }) {
+function CreateUserModal({ onClose, tenantId }: { onClose: () => void; tenantId: string | null }) {
   const qc = useQueryClient();
   const [form, setForm] = useState<CreateUserRequest>({
     email: '',
@@ -20,14 +20,18 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState('');
 
   const { data: roles = [] } = useQuery({
-    queryKey: ['roles'],
-    queryFn: () => rolesApi.list().then(r => r.data),
+    queryKey: tenantId ? ['tenant-roles', tenantId] : ['roles'],
+    queryFn: () => tenantId
+      ? tenantsApi.listRoles(tenantId).then(r => r.data)
+      : rolesApi.list().then(r => r.data),
   });
 
   const { mutate, isPending } = useMutation({
-    mutationFn: usersApi.create,
+    mutationFn: (data: CreateUserRequest) => tenantId
+      ? tenantsApi.createUser(tenantId, { ...data, first_name: data.first_name, last_name: data.last_name })
+      : usersApi.create(data),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['users'] });
+      qc.invalidateQueries({ queryKey: tenantId ? ['tenant-users', tenantId] : ['users'] });
       onClose();
     },
     onError: (e: any) => setError(e.response?.data?.message || 'Failed to create user'),
@@ -49,7 +53,9 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
   return (
     <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
       <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
-        <h2 className="text-lg font-semibold mb-4">Create User</h2>
+        <h2 className="text-lg font-semibold mb-4">
+          Create User{tenantId && <span className="ml-2 text-xs font-normal text-gray-400">in selected tenant</span>}
+        </h2>
         {error && <div className="mb-3 text-sm text-red-600 bg-red-50 rounded-lg p-3">{error}</div>}
         <div className="space-y-3">
           {field('First name', 'first_name', 'text', 'Jane')}
@@ -140,8 +146,12 @@ export function UsersPage() {
     : (serverQuery.data?.total ?? 0);
 
   const { mutate: deleteUser } = useMutation({
-    mutationFn: usersApi.delete,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['users'] }),
+    mutationFn: (userId: string) => selectedTenantId
+      ? tenantsApi.deleteUser(selectedTenantId, userId)
+      : usersApi.delete(userId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: selectedTenantId ? ['tenant-users', selectedTenantId] : ['users'] });
+    },
   });
 
   const handleSearchChange = (val: string) => { setSearch(val); setPage(1); };
@@ -154,7 +164,7 @@ export function UsersPage() {
 
   return (
     <Layout>
-      {showCreate && <CreateUserModal onClose={() => setShowCreate(false)} />}
+      {showCreate && <CreateUserModal onClose={() => setShowCreate(false)} tenantId={selectedTenantId || null} />}
 
       <div className="space-y-6">
         <div className="flex items-center justify-between">
