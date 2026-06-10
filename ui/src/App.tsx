@@ -16,6 +16,7 @@ const UserDetailPage = lazy(() => import('./pages/UserDetailPage').then(m => ({ 
 const RolesPage = lazy(() => import('./pages/RolesPage').then(m => ({ default: m.RolesPage })));
 const ApiKeysPage = lazy(() => import('./pages/ApiKeysPage').then(m => ({ default: m.ApiKeysPage })));
 const SamlPage = lazy(() => import('./pages/SamlPage').then(m => ({ default: m.SamlPage })));
+const MonitoringPage = lazy(() => import('./pages/MonitoringPage').then(m => ({ default: m.MonitoringPage })));
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -134,6 +135,16 @@ export default function App() {
                     <SamlPage />
                   </Suspense>
                 </AdminRoute>
+              }
+            />
+            <Route
+              path="/monitoring"
+              element={
+                <ProtectedRoute>
+                  <Suspense fallback={<PageLoader />}>
+                    <MonitoringPage />
+                  </Suspense>
+                </ProtectedRoute>
               }
             />
           </Routes>

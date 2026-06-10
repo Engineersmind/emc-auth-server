@@ -37,6 +37,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
               {isAdmin && (
                 <Link to="/saml" className="text-sm hover:text-brand-100 transition-colors">SAML</Link>
               )}
+              <Link to="/monitoring" className="text-sm hover:text-brand-100 transition-colors">Monitoring</Link>
               {!isAdmin && (
                 <Link to="/account" className="text-sm hover:text-brand-100 transition-colors">My Account</Link>
               )}
