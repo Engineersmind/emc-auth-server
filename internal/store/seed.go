@@ -99,12 +99,12 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 
 	// 7. Assign both permissions to the super_admin role (idempotent).
 	_, err = pool.Exec(ctx, `
-		INSERT INTO role_permissions (role_id, permission_id)
+		INSERT INTO role_permissions (role_id, permission_id, tenant_id)
 		VALUES
-		  ($1, $2),
-		  ($1, $3)
+		  ($1, $2, $4),
+		  ($1, $3, $4)
 		ON CONFLICT DO NOTHING
-	`, SeedRoleID, SeedPermTenantManage, SeedPermAdminAccess)
+	`, SeedRoleID, SeedPermTenantManage, SeedPermAdminAccess, SeedTenantID)
 	if err != nil {
 		return fmt.Errorf("seed role_permissions: %w", err)
 	}
