@@ -36,7 +36,7 @@ type Config struct {
 func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
-		Port:         getEnv("PORT", "8080"),
+		Port:         getEnv("PORT", "9090"),
 		DatabaseURL:  getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5432/emc_auth?sslmode=disable"),
 		RedisURL:     getEnv("REDIS_URL", "redis://localhost:6379/0"),
 		LogLevel:     getEnv("LOG_LEVEL", "info"),
@@ -47,7 +47,7 @@ func Load() *Config {
 		SMTPFrom:     getEnv("SMTP_FROM", "no-reply@emc.local"),
 		SMTPUsername: getEnv("SMTP_USERNAME", ""),
 		SMTPPassword: getEnv("SMTP_PASSWORD", ""),
-		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:8080"),
+		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:9090"),
 		TOTPEncryptionKey: getEnv("TOTP_ENCRYPTION_KEY", ""),
 	}
 }

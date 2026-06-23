@@ -33,9 +33,9 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "9090:9090"
     environment:
-      PORT: "8080"
+      PORT: "9090"
       ENV: development
       LOG_LEVEL: info
       DATABASE_URL: postgres://emc_auth:password@postgres:5432/emc_auth?sslmode=disable
@@ -46,7 +46,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/health || exit 1"]
       interval: 10s
       timeout: 5s
       start_period: 30s

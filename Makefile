@@ -109,7 +109,7 @@ vuln:
 .PHONY: check
 check: lint gosec vuln test
 
-## Run k6 load test (requires k6 installed and server running on localhost:8080)
+## Run k6 load test (requires k6 installed and server running on localhost:9090)
 .PHONY: load-test
 load-test:
 	k6 run scripts/load-test.js
