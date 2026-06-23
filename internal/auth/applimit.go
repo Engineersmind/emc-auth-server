@@ -84,7 +84,7 @@ func (s *AppRateLimitService) ListAppLimits(ctx context.Context, tenantID uuid.U
 	rows, err := s.pool.Query(ctx, `
 		SELECT app_id, tenant_id, requests_per_minute, burst, description, created_at, updated_at
 		FROM app_rate_limits
-		WHERE tenant_id = $1
+		WHERE tenant_id = $1 AND deleted_at IS NULL
 		ORDER BY app_id
 	`, tenantID)
 	if err != nil {
@@ -120,7 +120,7 @@ func (s *AppRateLimitService) UpdateAppLimit(ctx context.Context, tenantID uuid.
 	err := s.pool.QueryRow(ctx, `
 		UPDATE app_rate_limits
 		SET requests_per_minute = $3, burst = $4, description = $5, updated_at = NOW()
-		WHERE app_id = $1 AND tenant_id = $2
+		WHERE app_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 		RETURNING app_id, tenant_id, requests_per_minute, burst, description, created_at, updated_at
 	`, appID, tenantID, rpm, burst, description).Scan(
 		&limit.AppID, &limit.TenantID, &limit.RequestsPerMinute,
@@ -140,7 +140,8 @@ func (s *AppRateLimitService) UpdateAppLimit(ctx context.Context, tenantID uuid.
 // DeleteAppLimit removes a rate limit config. The app falls back to the default limit.
 func (s *AppRateLimitService) DeleteAppLimit(ctx context.Context, tenantID uuid.UUID, appID string) error {
 	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM app_rate_limits WHERE app_id = $1 AND tenant_id = $2
+		UPDATE app_rate_limits SET deleted_at = NOW(), updated_at = NOW()
+		WHERE app_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, appID, tenantID)
 	if err != nil {
 		return fmt.Errorf("delete app_rate_limit: %w", err)
@@ -175,7 +176,8 @@ func (s *AppRateLimitService) GetLimit(ctx context.Context, appID string) (rpm, 
 	// Cache miss — query DB.
 	var dbRPM, dbBurst int
 	dbErr := s.pool.QueryRow(ctx, `
-		SELECT requests_per_minute, burst FROM app_rate_limits WHERE app_id = $1
+		SELECT requests_per_minute, burst FROM app_rate_limits
+		WHERE app_id = $1 AND deleted_at IS NULL
 	`, appID).Scan(&dbRPM, &dbBurst)
 
 	if dbErr != nil || dbRPM <= 0 {

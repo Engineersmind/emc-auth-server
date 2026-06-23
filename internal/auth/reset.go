@@ -67,7 +67,7 @@ func (s *ResetService) ForgotPassword(ctx context.Context, tenantSlug, email str
 	// 2. Look up user by email in this tenant.
 	var userID uuid.UUID
 	err = s.pool.QueryRow(ctx,
-		`SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND is_active = true AND is_deleted = false`,
+		`SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND is_active = true AND deleted_at IS NULL`,
 		tenantID, email,
 	).Scan(&userID)
 	if err != nil {

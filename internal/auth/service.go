@@ -262,7 +262,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		FROM users u
 		JOIN user_credentials uc ON uc.user_id = u.id
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.tenant_id = $1 AND u.email = $2 AND u.is_active = true AND u.is_deleted = false
+		WHERE u.tenant_id = $1 AND u.email = $2 AND u.is_active = true AND u.deleted_at IS NULL
 	`, tenantID, in.Email).Scan(&userID, &email, &passwordHash, &roleName, &roleID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -446,7 +446,7 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		SELECT u.email, COALESCE(r.name, ''), u.role_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.is_deleted = false
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
 	`, userID, tenantID).Scan(&email, &roleName, &roleID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

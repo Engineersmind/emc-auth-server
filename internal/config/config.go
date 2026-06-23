@@ -37,7 +37,7 @@ func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
 		Port:         getEnv("PORT", "9090"),
-		DatabaseURL:  getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5432/emc_auth?sslmode=disable"),
+		DatabaseURL:  getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
 		RedisURL:     getEnv("REDIS_URL", "redis://localhost:6379/0"),
 		LogLevel:     getEnv("LOG_LEVEL", "info"),
 		Env:          getEnv("ENV", "development"),

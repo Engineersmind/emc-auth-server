@@ -434,7 +434,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID uuid.UUID, search stri
 		SELECT COUNT(*)
 		FROM users
 		WHERE tenant_id = $1
-		  AND is_deleted = false
+		  AND deleted_at IS NULL
 		  AND ($2 = '%%' OR email ILIKE $2 OR first_name ILIKE $2 OR last_name ILIKE $2)
 	`, tenantID, searchPattern).Scan(&total)
 	if err != nil {
@@ -447,7 +447,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID uuid.UUID, search stri
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.tenant_id = $1
-		  AND u.is_deleted = false
+		  AND u.deleted_at IS NULL
 		  AND ($2 = '%%' OR u.email ILIKE $2 OR u.first_name ILIKE $2 OR u.last_name ILIKE $2)
 		ORDER BY u.created_at DESC
 		LIMIT $3 OFFSET $4
@@ -545,7 +545,7 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID, userID uuid.UUID, em
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE users
 		SET email = $1, first_name = $2, last_name = $3, updated_at = NOW()
-		WHERE id = $4 AND tenant_id = $5 AND is_deleted = false
+		WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
 	`, email, firstName, lastName, userID, tenantID)
 	if err != nil {
 		if isDuplicateErr(err) {
@@ -570,7 +570,7 @@ func (s *Service) AssignUserRole(ctx context.Context, tenantID, userID, roleID u
 
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE users SET role_id = $1, updated_at = NOW()
-		WHERE id = $2 AND tenant_id = $3 AND is_deleted = false
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
 	`, roleID, userID, tenantID)
 	if err != nil {
 		return fmt.Errorf("assign role: %w", err)
@@ -581,11 +581,11 @@ func (s *Service) AssignUserRole(ctx context.Context, tenantID, userID, roleID u
 	return nil
 }
 
-// DeleteUser soft-deletes a user (sets is_deleted = true, is_active = false).
+// DeleteUser soft-deletes a user (sets deleted_at, is_active = false).
 func (s *Service) DeleteUser(ctx context.Context, tenantID, userID uuid.UUID) error {
 	ct, err := s.pool.Exec(ctx, `
-		UPDATE users SET is_deleted = true, is_active = false, updated_at = NOW()
-		WHERE id = $1 AND tenant_id = $2 AND is_deleted = false
+		UPDATE users SET deleted_at = NOW(), is_active = false, updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, userID, tenantID)
 	if err != nil {
 		return fmt.Errorf("delete user: %w", err)
@@ -603,7 +603,7 @@ func (s *Service) ForcePasswordReset(ctx context.Context, tenantID, userID uuid.
 		SELECT u.email, t.slug
 		FROM users u
 		JOIN tenants t ON t.id = u.tenant_id
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.is_deleted = false
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
 	`, userID, tenantID).Scan(&email, &tenantSlug)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -628,7 +628,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID, userID uuid.UUID) (
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_deleted = false
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
 	`, userID, tenantID).Scan(
 		&u.ID, &u.TenantID, &u.Email, &u.FirstName, &u.LastName,
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
