@@ -5,69 +5,83 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
-)
-
-// Well-known UUIDs for seed data — deterministic so ON CONFLICT works reliably.
-var (
-	SeedTenantID         = uuid.MustParse("00000000-0000-0000-0000-000000000001")
-	SeedRoleID           = uuid.MustParse("00000000-0000-0000-0000-000000000010")
-	SeedUserID           = uuid.MustParse("00000000-0000-0000-0000-000000000100")
-	SeedPermTenantManage = uuid.MustParse("00000000-0000-0000-0000-000000000201")
-	SeedPermAdminAccess  = uuid.MustParse("00000000-0000-0000-0000-000000000202")
 )
 
 const defaultSeedPassword = "ChangeMe123!"
 
 // RunSeed creates the default emc tenant, super_admin role, and super-admin user.
 // All inserts use ON CONFLICT DO NOTHING for idempotency — safe to run multiple times.
+// BIGINT IDENTITY PKs are auto-generated; we INSERT without explicit id, then SELECT
+// to retrieve the generated value for use in subsequent inserts.
 // The admin password is read from SEED_ADMIN_PASSWORD env var; falls back to "ChangeMe123!"
 // with a prominent warning log.
 func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) error {
-	// 1. Determine seed password
 	seedPassword := os.Getenv("SEED_ADMIN_PASSWORD")
 	if seedPassword == "" {
 		seedPassword = defaultSeedPassword
 		logger.Warn().Msg("SEED_ADMIN_PASSWORD not set — using default password. Override this in production!")
 	}
 
-	// 2. Seed default tenant (idempotent)
+	// 1. Seed default tenant (idempotent via slug unique index).
 	_, err := pool.Exec(ctx, `
-		INSERT INTO tenants (id, name, slug, jwt_secret, is_active)
-		VALUES ($1, 'EMC', 'emc', gen_random_uuid()::text, true)
-		ON CONFLICT (id) DO NOTHING
-	`, SeedTenantID)
+		INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		VALUES ('EMC', 'emc', gen_random_uuid()::text, true)
+		ON CONFLICT (slug) WHERE deleted_at IS NULL DO NOTHING
+	`)
 	if err != nil {
 		return fmt.Errorf("seed tenant: %w", err)
 	}
-	logger.Info().Str("tenant", "emc").Str("id", SeedTenantID.String()).Msg("seed tenant ensured")
 
-	// 3. Seed super_admin role (idempotent)
+	var tenantID int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`,
+	).Scan(&tenantID); err != nil {
+		return fmt.Errorf("seed: fetch tenant id: %w", err)
+	}
+	logger.Info().Str("tenant", "emc").Int64("id", tenantID).Msg("seed tenant ensured")
+
+	// 2. Seed super_admin role (idempotent via name+tenant unique index).
 	_, err = pool.Exec(ctx, `
-		INSERT INTO roles (id, tenant_id, name, is_system)
-		VALUES ($1, $2, 'super_admin', true)
-		ON CONFLICT (id) DO NOTHING
-	`, SeedRoleID, SeedTenantID)
+		INSERT INTO roles (tenant_id, name, is_system)
+		VALUES ($1, 'super_admin', true)
+		ON CONFLICT (tenant_id, name) WHERE deleted_at IS NULL DO NOTHING
+	`, tenantID)
 	if err != nil {
 		return fmt.Errorf("seed role: %w", err)
 	}
-	logger.Info().Str("role", "super_admin").Msg("seed role ensured")
 
-	// 4. Seed super-admin user (idempotent — targets partial index idx_users_email_active)
+	var roleID int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM roles WHERE tenant_id = $1 AND name = 'super_admin'`,
+		tenantID,
+	).Scan(&roleID); err != nil {
+		return fmt.Errorf("seed: fetch role id: %w", err)
+	}
+	logger.Info().Str("role", "super_admin").Int64("id", roleID).Msg("seed role ensured")
+
+	// 3. Seed super-admin user (idempotent via partial index idx_users_email_active).
 	_, err = pool.Exec(ctx, `
-		INSERT INTO users (id, tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES ($1, $2, 'admin@emc.local', 'Super', 'Admin', $3, true)
+		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
+		VALUES ($1, 'admin@emc.local', 'Super', 'Admin', $2, true)
 		ON CONFLICT (tenant_id, email) WHERE deleted_at IS NULL DO NOTHING
-	`, SeedUserID, SeedTenantID, SeedRoleID)
+	`, tenantID, roleID)
 	if err != nil {
 		return fmt.Errorf("seed user: %w", err)
 	}
-	logger.Info().Str("email", "admin@emc.local").Msg("seed user ensured")
 
-	// 5. Seed password for super-admin (bcrypt cost 12 per AUTH-02 requirement)
+	var userID int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM users WHERE tenant_id = $1 AND email = 'admin@emc.local' AND deleted_at IS NULL`,
+		tenantID,
+	).Scan(&userID); err != nil {
+		return fmt.Errorf("seed: fetch user id: %w", err)
+	}
+	logger.Info().Str("email", "admin@emc.local").Int64("id", userID).Msg("seed user ensured")
+
+	// 4. Seed password for super-admin (bcrypt cost 12 per AUTH-02 requirement).
 	hash, err := bcrypt.GenerateFromPassword([]byte(seedPassword), 12)
 	if err != nil {
 		return fmt.Errorf("hash seed password: %w", err)
@@ -76,35 +90,33 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 		INSERT INTO user_credentials (user_id, tenant_id, password_hash)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (user_id) DO NOTHING
-	`, SeedUserID, SeedTenantID, string(hash))
+	`, userID, tenantID, string(hash))
 	if err != nil {
 		return fmt.Errorf("seed credentials: %w", err)
 	}
 	logger.Info().Msg("seed credentials ensured")
 
-	// 6. Seed base permissions for the emc tenant (tenant:manage + admin:access).
-	// These are the two built-in permissions that gate admin API access.
-	// All other permissions are created by tenant admins via the API.
+	// 5. Seed base permissions for the emc tenant (tenant:manage + admin:access).
 	_, err = pool.Exec(ctx, `
-		INSERT INTO permissions (id, tenant_id, name, description)
+		INSERT INTO permissions (tenant_id, name, description)
 		VALUES
-		  ($1, $2, 'tenant:manage',  'Create, update, and deactivate tenants (super_admin only)'),
-		  ($3, $2, 'admin:access',   'Access tenant admin operations (roles, permissions, user pool)')
-		ON CONFLICT (id) DO NOTHING
-	`, SeedPermTenantManage, SeedTenantID, SeedPermAdminAccess)
+		  ($1, 'tenant:manage',  'Create, update, and deactivate tenants (super_admin only)'),
+		  ($1, 'admin:access',   'Access tenant admin operations (roles, permissions, user pool)')
+		ON CONFLICT (tenant_id, name) WHERE deleted_at IS NULL DO NOTHING
+	`, tenantID)
 	if err != nil {
 		return fmt.Errorf("seed permissions: %w", err)
 	}
 	logger.Info().Msg("seed permissions ensured")
 
-	// 7. Assign both permissions to the super_admin role (idempotent).
+	// 6. Assign both permissions to the super_admin role (idempotent).
 	_, err = pool.Exec(ctx, `
 		INSERT INTO role_permissions (role_id, permission_id, tenant_id)
-		VALUES
-		  ($1, $2, $4),
-		  ($1, $3, $4)
+		SELECT $1, p.id, $2
+		FROM permissions p
+		WHERE p.tenant_id = $2 AND p.name IN ('tenant:manage', 'admin:access')
 		ON CONFLICT DO NOTHING
-	`, SeedRoleID, SeedPermTenantManage, SeedPermAdminAccess, SeedTenantID)
+	`, roleID, tenantID)
 	if err != nil {
 		return fmt.Errorf("seed role_permissions: %w", err)
 	}

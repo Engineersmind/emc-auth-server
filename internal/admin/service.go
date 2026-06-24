@@ -9,9 +9,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -108,18 +108,20 @@ func (s *Service) CreateTenant(ctx context.Context, name, slug string) (*TenantR
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
 	}
 
+	var id int64
 	var t TenantResult
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO tenants (id, name, slug, jwt_secret, is_active)
-		VALUES (gen_random_uuid(), $1, $2, $3, true)
+		INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		VALUES ($1, $2, $3, true)
 		RETURNING id, name, slug, is_active, created_at
-	`, name, slug, secret).Scan(&t.ID, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt)
+	`, name, slug, secret).Scan(&id, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
 		}
 		return nil, fmt.Errorf("create tenant: %w", err)
 	}
+	t.ID = strconv.FormatInt(id, 10)
 	s.logger.Info().Str("slug", slug).Str("id", t.ID).Msg("admin: tenant created")
 	return &t, nil
 }
@@ -139,9 +141,11 @@ func (s *Service) ListTenants(ctx context.Context) ([]TenantResult, error) {
 	var tenants []TenantResult
 	for rows.Next() {
 		var t TenantResult
-		if err := rows.Scan(&t.ID, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt); err != nil {
+		var id int64
+		if err := rows.Scan(&id, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan tenant: %w", err)
 		}
+		t.ID = strconv.FormatInt(id, 10)
 		tenants = append(tenants, t)
 	}
 	if tenants == nil {
@@ -151,25 +155,26 @@ func (s *Service) ListTenants(ctx context.Context) ([]TenantResult, error) {
 }
 
 // UpdateTenant updates the tenant's display name.
-func (s *Service) UpdateTenant(ctx context.Context, tenantID uuid.UUID, name string) (*TenantResult, error) {
+func (s *Service) UpdateTenant(ctx context.Context, tenantID int64, name string) (*TenantResult, error) {
 	var t TenantResult
+	var id int64
 	err := s.pool.QueryRow(ctx, `
 		UPDATE tenants SET name = $1, updated_at = NOW()
 		WHERE id = $2
 		RETURNING id, name, slug, is_active, created_at
-	`, name, tenantID).Scan(&t.ID, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt)
+	`, name, tenantID).Scan(&id, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("update tenant: %w", err)
 	}
+	t.ID = strconv.FormatInt(id, 10)
 	return &t, nil
 }
 
 // DeactivateTenant soft-deactivates a tenant (sets is_active = false).
-// Does not delete data — the tenant ID is preserved for audit trail purposes.
-func (s *Service) DeactivateTenant(ctx context.Context, tenantID uuid.UUID) error {
+func (s *Service) DeactivateTenant(ctx context.Context, tenantID int64) error {
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE tenants SET is_active = false, updated_at = NOW()
 		WHERE id = $1
@@ -180,13 +185,12 @@ func (s *Service) DeactivateTenant(ctx context.Context, tenantID uuid.UUID) erro
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	s.logger.Info().Str("tenant_id", tenantID.String()).Msg("admin: tenant deactivated")
+	s.logger.Info().Str("tenant_id", strconv.FormatInt(tenantID, 10)).Msg("admin: tenant deactivated")
 	return nil
 }
 
 // UpdateTenantCORSOrigins replaces the allowed CORS origins for a tenant.
-// Pass an empty slice to clear all origins (disables per-tenant CORS enforcement).
-func (s *Service) UpdateTenantCORSOrigins(ctx context.Context, tenantID uuid.UUID, origins []string) error {
+func (s *Service) UpdateTenantCORSOrigins(ctx context.Context, tenantID int64, origins []string) error {
 	if origins == nil {
 		origins = []string{}
 	}
@@ -208,24 +212,27 @@ func (s *Service) UpdateTenantCORSOrigins(ctx context.Context, tenantID uuid.UUI
 // ---------------------------------------------------------------------------
 
 // CreatePermission adds a new permission to the given tenant.
-func (s *Service) CreatePermission(ctx context.Context, tenantID uuid.UUID, name, description string) (*PermissionResult, error) {
+func (s *Service) CreatePermission(ctx context.Context, tenantID int64, name, description string) (*PermissionResult, error) {
 	var p PermissionResult
+	var id, tid int64
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO permissions (id, tenant_id, name, description)
-		VALUES (gen_random_uuid(), $1, $2, $3)
+		INSERT INTO permissions (tenant_id, name, description)
+		VALUES ($1, $2, $3)
 		RETURNING id, tenant_id, name, description, created_at
-	`, tenantID, name, description).Scan(&p.ID, &p.TenantID, &p.Name, &p.Description, &p.CreatedAt)
+	`, tenantID, name, description).Scan(&id, &tid, &p.Name, &p.Description, &p.CreatedAt)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
 		}
 		return nil, fmt.Errorf("create permission: %w", err)
 	}
+	p.ID = strconv.FormatInt(id, 10)
+	p.TenantID = strconv.FormatInt(tid, 10)
 	return &p, nil
 }
 
 // ListPermissions returns all permissions for the given tenant.
-func (s *Service) ListPermissions(ctx context.Context, tenantID uuid.UUID) ([]PermissionResult, error) {
+func (s *Service) ListPermissions(ctx context.Context, tenantID int64) ([]PermissionResult, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tenant_id, name, description, created_at
 		FROM permissions
@@ -240,9 +247,12 @@ func (s *Service) ListPermissions(ctx context.Context, tenantID uuid.UUID) ([]Pe
 	var perms []PermissionResult
 	for rows.Next() {
 		var p PermissionResult
-		if err := rows.Scan(&p.ID, &p.TenantID, &p.Name, &p.Description, &p.CreatedAt); err != nil {
+		var id, tid int64
+		if err := rows.Scan(&id, &tid, &p.Name, &p.Description, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan permission: %w", err)
 		}
+		p.ID = strconv.FormatInt(id, 10)
+		p.TenantID = strconv.FormatInt(tid, 10)
 		perms = append(perms, p)
 	}
 	if perms == nil {
@@ -253,7 +263,7 @@ func (s *Service) ListPermissions(ctx context.Context, tenantID uuid.UUID) ([]Pe
 
 // DeletePermission removes a permission from the tenant.
 // Cascades to role_permissions and user_permissions automatically (FK ON DELETE CASCADE).
-func (s *Service) DeletePermission(ctx context.Context, tenantID uuid.UUID, permissionID uuid.UUID) error {
+func (s *Service) DeletePermission(ctx context.Context, tenantID, permissionID int64) error {
 	ct, err := s.pool.Exec(ctx, `
 		DELETE FROM permissions WHERE id = $1 AND tenant_id = $2
 	`, permissionID, tenantID)
@@ -271,19 +281,18 @@ func (s *Service) DeletePermission(ctx context.Context, tenantID uuid.UUID, perm
 // ---------------------------------------------------------------------------
 
 // CreateRole creates a role and optionally assigns permissions to it.
-// permissionIDs must all belong to the same tenant; any that don't are silently skipped.
-func (s *Service) CreateRole(ctx context.Context, tenantID uuid.UUID, name string, permissionIDs []uuid.UUID) (*RoleResult, error) {
+func (s *Service) CreateRole(ctx context.Context, tenantID int64, name string, permissionIDs []int64) (*RoleResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin create role tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var roleID uuid.UUID
+	var roleID int64
 	var createdAt time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO roles (id, tenant_id, name, is_system, created_at)
-		VALUES (gen_random_uuid(), $1, $2, false, NOW())
+		INSERT INTO roles (tenant_id, name, is_system, created_at)
+		VALUES ($1, $2, false, NOW())
 		RETURNING id, created_at
 	`, tenantID, name).Scan(&roleID, &createdAt)
 	if err != nil {
@@ -293,7 +302,6 @@ func (s *Service) CreateRole(ctx context.Context, tenantID uuid.UUID, name strin
 		return nil, fmt.Errorf("insert role: %w", err)
 	}
 
-	// Assign permissions (tenant-scoped validation via JOIN on tenant_id).
 	for _, permID := range permissionIDs {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO role_permissions (role_id, permission_id)
@@ -313,8 +321,7 @@ func (s *Service) CreateRole(ctx context.Context, tenantID uuid.UUID, name strin
 }
 
 // ListRoles returns all roles for the tenant, each with their assigned permissions.
-func (s *Service) ListRoles(ctx context.Context, tenantID uuid.UUID) ([]RoleResult, error) {
-	// Fetch all roles for tenant.
+func (s *Service) ListRoles(ctx context.Context, tenantID int64) ([]RoleResult, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, tenant_id, name, is_system, created_at
 		FROM roles
@@ -329,9 +336,12 @@ func (s *Service) ListRoles(ctx context.Context, tenantID uuid.UUID) ([]RoleResu
 	var roles []RoleResult
 	for rows.Next() {
 		var r RoleResult
-		if err := rows.Scan(&r.ID, &r.TenantID, &r.Name, &r.IsSystem, &r.CreatedAt); err != nil {
+		var id, tid int64
+		if err := rows.Scan(&id, &tid, &r.Name, &r.IsSystem, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan role: %w", err)
 		}
+		r.ID = strconv.FormatInt(id, 10)
+		r.TenantID = strconv.FormatInt(tid, 10)
 		r.Permissions = []PermissionResult{}
 		roles = append(roles, r)
 	}
@@ -343,10 +353,9 @@ func (s *Service) ListRoles(ctx context.Context, tenantID uuid.UUID) ([]RoleResu
 		return []RoleResult{}, nil
 	}
 
-	// Fetch permissions for each role.
 	for i := range roles {
-		roleID, _ := uuid.Parse(roles[i].ID)
-		perms, err := s.loadRolePermissions(ctx, roleID)
+		roleIDInt, _ := strconv.ParseInt(roles[i].ID, 10, 64)
+		perms, err := s.loadRolePermissions(ctx, roleIDInt)
 		if err != nil {
 			return nil, err
 		}
@@ -357,28 +366,24 @@ func (s *Service) ListRoles(ctx context.Context, tenantID uuid.UUID) ([]RoleResu
 }
 
 // UpdateRolePermissions replaces the permission set on a role.
-// Any permissions not belonging to the same tenant are silently skipped.
-func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID uuid.UUID, permissionIDs []uuid.UUID) error {
+func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID int64, permissionIDs []int64) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin update role perms tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	// Verify role belongs to tenant.
 	var exists bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM roles WHERE id = $1 AND tenant_id = $2)`, roleID, tenantID).Scan(&exists)
 	if err != nil || !exists {
 		return ErrNotFound
 	}
 
-	// Remove all current permission assignments.
 	_, err = tx.Exec(ctx, `DELETE FROM role_permissions WHERE role_id = $1`, roleID)
 	if err != nil {
 		return fmt.Errorf("clear role permissions: %w", err)
 	}
 
-	// Re-assign.
 	for _, permID := range permissionIDs {
 		_, err = tx.Exec(ctx, `
 			INSERT INTO role_permissions (role_id, permission_id)
@@ -394,8 +399,7 @@ func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID uu
 }
 
 // DeleteRole removes a role from the tenant.
-// Users assigned this role will have role_id set to NULL (FK ON DELETE SET NULL).
-func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID uuid.UUID) error {
+func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) error {
 	ct, err := s.pool.Exec(ctx, `
 		DELETE FROM roles WHERE id = $1 AND tenant_id = $2 AND is_system = false
 	`, roleID, tenantID)
@@ -413,8 +417,7 @@ func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID uuid.UUID) er
 // ---------------------------------------------------------------------------
 
 // ListUsers returns a paginated, searchable list of users in the tenant.
-// page is 1-based. limit is clamped to [1, 100].
-func (s *Service) ListUsers(ctx context.Context, tenantID uuid.UUID, search string, page, limit int) (*UsersPage, error) {
+func (s *Service) ListUsers(ctx context.Context, tenantID int64, search string, page, limit int) (*UsersPage, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -428,7 +431,6 @@ func (s *Service) ListUsers(ctx context.Context, tenantID uuid.UUID, search stri
 
 	searchPattern := "%" + search + "%"
 
-	// Count total matching rows.
 	var total int
 	err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(*)
@@ -460,14 +462,17 @@ func (s *Service) ListUsers(ctx context.Context, tenantID uuid.UUID, search stri
 	var users []UserResult
 	for rows.Next() {
 		var u UserResult
-		var roleID *uuid.UUID
-		if err := rows.Scan(&u.ID, &u.TenantID, &u.Email, &u.FirstName, &u.LastName,
+		var id, tid int64
+		var roleID *int64
+		if err := rows.Scan(&id, &tid, &u.Email, &u.FirstName, &u.LastName,
 			&u.Role, &roleID, &u.IsActive, &u.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
+		u.ID = strconv.FormatInt(id, 10)
+		u.TenantID = strconv.FormatInt(tid, 10)
 		if roleID != nil {
-			s := roleID.String()
-			u.RoleID = &s
+			rs := strconv.FormatInt(*roleID, 10)
+			u.RoleID = &rs
 		}
 		users = append(users, u)
 	}
@@ -491,7 +496,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID uuid.UUID, search stri
 }
 
 // CreateUser creates a new user in the tenant with a hashed password.
-func (s *Service) CreateUser(ctx context.Context, tenantID uuid.UUID, email, password, firstName, lastName string, roleID *uuid.UUID) (*UserResult, error) {
+func (s *Service) CreateUser(ctx context.Context, tenantID int64, email, password, firstName, lastName string, roleID *int64) (*UserResult, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), auth.BcryptCost)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
@@ -503,10 +508,10 @@ func (s *Service) CreateUser(ctx context.Context, tenantID uuid.UUID, email, pas
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var userID uuid.UUID
+	var userID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (id, tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, true)
+		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
+		VALUES ($1, $2, $3, $4, $5, true)
 		RETURNING id
 	`, tenantID, email, firstName, lastName, roleID).Scan(&userID)
 	if err != nil {
@@ -532,16 +537,12 @@ func (s *Service) CreateUser(ctx context.Context, tenantID uuid.UUID, email, pas
 }
 
 // GetUser fetches a single user by ID within the tenant.
-func (s *Service) GetUser(ctx context.Context, tenantID, userID uuid.UUID) (*UserResult, error) {
-	u, err := s.getUserByID(ctx, tenantID, userID)
-	if err != nil {
-		return nil, err
-	}
-	return u, nil
+func (s *Service) GetUser(ctx context.Context, tenantID, userID int64) (*UserResult, error) {
+	return s.getUserByID(ctx, tenantID, userID)
 }
 
 // UpdateUser updates a user's profile fields.
-func (s *Service) UpdateUser(ctx context.Context, tenantID, userID uuid.UUID, email, firstName, lastName string) (*UserResult, error) {
+func (s *Service) UpdateUser(ctx context.Context, tenantID, userID int64, email, firstName, lastName string) (*UserResult, error) {
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE users
 		SET email = $1, first_name = $2, last_name = $3, updated_at = NOW()
@@ -560,8 +561,7 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID, userID uuid.UUID, em
 }
 
 // AssignUserRole sets the role for a user within the tenant.
-func (s *Service) AssignUserRole(ctx context.Context, tenantID, userID, roleID uuid.UUID) error {
-	// Validate role belongs to this tenant.
+func (s *Service) AssignUserRole(ctx context.Context, tenantID, userID, roleID int64) error {
 	var roleExists bool
 	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM roles WHERE id = $1 AND tenant_id = $2)`, roleID, tenantID).Scan(&roleExists)
 	if err != nil || !roleExists {
@@ -582,7 +582,7 @@ func (s *Service) AssignUserRole(ctx context.Context, tenantID, userID, roleID u
 }
 
 // DeleteUser soft-deletes a user (sets deleted_at, is_active = false).
-func (s *Service) DeleteUser(ctx context.Context, tenantID, userID uuid.UUID) error {
+func (s *Service) DeleteUser(ctx context.Context, tenantID, userID int64) error {
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE users SET deleted_at = NOW(), is_active = false, updated_at = NOW()
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
@@ -597,7 +597,7 @@ func (s *Service) DeleteUser(ctx context.Context, tenantID, userID uuid.UUID) er
 }
 
 // ForcePasswordReset dispatches a password reset email to the specified user.
-func (s *Service) ForcePasswordReset(ctx context.Context, tenantID, userID uuid.UUID) error {
+func (s *Service) ForcePasswordReset(ctx context.Context, tenantID, userID int64) error {
 	var email, tenantSlug string
 	err := s.pool.QueryRow(ctx, `
 		SELECT u.email, t.slug
@@ -612,7 +612,7 @@ func (s *Service) ForcePasswordReset(ctx context.Context, tenantID, userID uuid.
 		return fmt.Errorf("lookup user for force reset: %w", err)
 	}
 
-	s.logger.Info().Str("user_id", userID.String()).Str("tenant", tenantSlug).Msg("admin: force password reset dispatched")
+	s.logger.Info().Str("user_id", strconv.FormatInt(userID, 10)).Str("tenant", tenantSlug).Msg("admin: force password reset dispatched")
 	return s.resetSvc.ForgotPassword(ctx, tenantSlug, email)
 }
 
@@ -620,9 +620,10 @@ func (s *Service) ForcePasswordReset(ctx context.Context, tenantID, userID uuid.
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-func (s *Service) getUserByID(ctx context.Context, tenantID, userID uuid.UUID) (*UserResult, error) {
+func (s *Service) getUserByID(ctx context.Context, tenantID, userID int64) (*UserResult, error) {
 	var u UserResult
-	var roleID *uuid.UUID
+	var id, tid int64
+	var roleID *int64
 	err := s.pool.QueryRow(ctx, `
 		SELECT u.id, u.tenant_id, u.email, u.first_name, u.last_name,
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at
@@ -630,7 +631,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID, userID uuid.UUID) (
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
 	`, userID, tenantID).Scan(
-		&u.ID, &u.TenantID, &u.Email, &u.FirstName, &u.LastName,
+		&id, &tid, &u.Email, &u.FirstName, &u.LastName,
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 	)
 	if err != nil {
@@ -639,25 +640,30 @@ func (s *Service) getUserByID(ctx context.Context, tenantID, userID uuid.UUID) (
 		}
 		return nil, fmt.Errorf("get user: %w", err)
 	}
+	u.ID = strconv.FormatInt(id, 10)
+	u.TenantID = strconv.FormatInt(tid, 10)
 	if roleID != nil {
-		rs := roleID.String()
+		rs := strconv.FormatInt(*roleID, 10)
 		u.RoleID = &rs
 	}
 	return &u, nil
 }
 
-func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID uuid.UUID) (*RoleResult, error) {
+func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID int64) (*RoleResult, error) {
 	var r RoleResult
+	var id, tid int64
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id, name, is_system, created_at
 		FROM roles WHERE id = $1 AND tenant_id = $2
-	`, roleID, tenantID).Scan(&r.ID, &r.TenantID, &r.Name, &r.IsSystem, &r.CreatedAt)
+	`, roleID, tenantID).Scan(&id, &tid, &r.Name, &r.IsSystem, &r.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, fmt.Errorf("get role: %w", err)
 	}
+	r.ID = strconv.FormatInt(id, 10)
+	r.TenantID = strconv.FormatInt(tid, 10)
 	perms, err := s.loadRolePermissions(ctx, roleID)
 	if err != nil {
 		return nil, err
@@ -666,7 +672,7 @@ func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID uuid.UUID) (
 	return &r, nil
 }
 
-func (s *Service) loadRolePermissions(ctx context.Context, roleID uuid.UUID) ([]PermissionResult, error) {
+func (s *Service) loadRolePermissions(ctx context.Context, roleID int64) ([]PermissionResult, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT p.id, p.tenant_id, p.name, p.description, p.created_at
 		FROM permissions p
@@ -682,9 +688,12 @@ func (s *Service) loadRolePermissions(ctx context.Context, roleID uuid.UUID) ([]
 	var perms []PermissionResult
 	for rows.Next() {
 		var p PermissionResult
-		if err := rows.Scan(&p.ID, &p.TenantID, &p.Name, &p.Description, &p.CreatedAt); err != nil {
+		var id, tid int64
+		if err := rows.Scan(&id, &tid, &p.Name, &p.Description, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan role permission: %w", err)
 		}
+		p.ID = strconv.FormatInt(id, 10)
+		p.TenantID = strconv.FormatInt(tid, 10)
 		perms = append(perms, p)
 	}
 	if perms == nil {
@@ -707,7 +716,6 @@ func isDuplicateErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	// pgx wraps PgError — check by string since pgconn is already in deps.
 	e := err.Error()
 	return containsSubstr(e, "23505") || containsSubstr(e, "duplicate") || containsSubstr(e, "unique")
 }

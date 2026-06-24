@@ -1,9 +1,11 @@
 package middleware
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
+	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
@@ -41,12 +43,26 @@ func JWTRequired(jwtSvc *auth.JWTService) echo.MiddlewareFunc {
 			}
 
 			if !found || tokenString == "" {
-				return c.JSON(http.StatusUnauthorized, map[string]string{"error": "authorization required"})
+				return c.JSON(http.StatusUnauthorized, map[string]string{
+					"error": "authorization required",
+					"code":  "token_missing",
+				})
 			}
 
 			claims, err := jwtSvc.Verify(c.Request().Context(), tokenString)
 			if err != nil {
-				return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired token"})
+				// Distinguish expired tokens from invalid ones.
+				// Clients should refresh on token_expired; redirect to login on token_invalid.
+				if errors.Is(err, gojwt.ErrTokenExpired) {
+					return c.JSON(http.StatusUnauthorized, map[string]string{
+						"error": "access token expired — call /refresh to get a new one",
+						"code":  "token_expired",
+					})
+				}
+				return c.JSON(http.StatusUnauthorized, map[string]string{
+					"error": "invalid token",
+					"code":  "token_invalid",
+				})
 			}
 
 			// Store claims for downstream handlers.
@@ -57,6 +73,7 @@ func JWTRequired(jwtSvc *auth.JWTService) echo.MiddlewareFunc {
 }
 
 // bearerToken extracts the token string from "Authorization: Bearer <token>".
+// Also accepts a raw JWT (no scheme prefix) to support Swagger UI's apiKey flow.
 // Returns ("", false) if the header is absent or malformed.
 func bearerToken(c echo.Context) (string, bool) {
 	header := c.Request().Header.Get("Authorization")
@@ -64,9 +81,13 @@ func bearerToken(c echo.Context) (string, bool) {
 		return "", false
 	}
 	parts := strings.SplitN(header, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
-		return "", false
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		token := strings.TrimSpace(parts[1])
+		return token, token != ""
 	}
-	token := strings.TrimSpace(parts[1])
-	return token, token != ""
+	// Raw JWT (no scheme) — Swagger UI apiKey sends the value as-is.
+	if len(parts) == 1 && strings.HasPrefix(parts[0], "eyJ") {
+		return parts[0], true
+	}
+	return "", false
 }

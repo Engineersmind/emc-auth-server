@@ -1,8 +1,8 @@
 -- +goose Up
 -- +goose StatementBegin
 CREATE TABLE saml_configs (
-    id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id   UUID        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    id          BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id   BIGINT      NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     entity_id   TEXT        NOT NULL,
     sso_url     TEXT        NOT NULL,
     certificate TEXT        NOT NULL,
@@ -12,7 +12,7 @@ CREATE TABLE saml_configs (
     deleted_at  TIMESTAMPTZ
 );
 
--- One SAML config per tenant (partial â€” allows re-creation after soft-delete).
+-- One SAML config per tenant (partial — allows re-creation after soft-delete).
 CREATE UNIQUE INDEX idx_saml_tenant
     ON saml_configs (tenant_id)
     WHERE deleted_at IS NULL;
@@ -22,4 +22,3 @@ CREATE UNIQUE INDEX idx_saml_tenant
 -- +goose StatementBegin
 DROP TABLE IF EXISTS saml_configs;
 -- +goose StatementEnd
-

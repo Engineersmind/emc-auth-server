@@ -106,6 +106,7 @@ func main() {
 			SMTPFrom:          cfg.SMTPFrom,
 			SMTPUsername:      cfg.SMTPUsername,
 			SMTPPassword:      cfg.SMTPPassword,
+			CookieDomain:      cfg.CookieDomain,
 		},
 	})
 

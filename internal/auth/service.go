@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -22,8 +22,9 @@ const BcryptCost = 12
 type AuthService struct {
 	pool     *pgxpool.Pool
 	jwtSvc   *JWTService
-	totpSvc  *TOTPService  // nil when TOTP not configured
-	redisCli *redis.Client // used for OTP session storage
+	totpSvc  *TOTPService        // nil when TOTP not configured
+	redisCli *redis.Client       // used for OTP session storage
+	appSvc   *ApplicationService // nil when application context is not needed
 	logger   zerolog.Logger
 }
 
@@ -40,20 +41,32 @@ func (s *AuthService) WithTOTP(totpSvc *TOTPService, redisCli *redis.Client) *Au
 	return s
 }
 
+// WithApplications attaches an ApplicationService so the auth service can
+// validate X-Client-ID on login and register and stamp app_id into JWTs.
+func (s *AuthService) WithApplications(appSvc *ApplicationService) *AuthService {
+	s.appSvc = appSvc
+	return s
+}
+
 // RegisterInput is the payload for creating a new user.
 type RegisterInput struct {
 	TenantSlug string
-	Email      string
-	Password   string
-	FirstName  string
-	LastName   string
+	// ClientID is the optional X-Client-ID header value. When provided the
+	// service validates it against the tenant and stamps app_id in the JWT.
+	ClientID  string
+	Email     string
+	Password  string
+	FirstName string
+	LastName  string
 }
 
 // LoginInput is the payload for authenticating an existing user.
 type LoginInput struct {
 	TenantSlug string
-	Email      string
-	Password   string
+	// ClientID is the optional X-Client-ID header value. See RegisterInput.
+	ClientID string
+	Email    string
+	Password string
 }
 
 // AuthResult is returned by both Register and Login (when TOTP is not required).
@@ -61,19 +74,21 @@ type AuthResult struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"` // seconds
+	ExpiresIn    int    `json:"expires_in"` // seconds until access token expires
+	ExpiresAt    int64  `json:"expires_at"` // UTC unix timestamp when access token expires
+	// Clients should schedule a proactive refresh at (ExpiresAt - 60) seconds.
+	// On a 401 with code="token_expired", refresh once then retry the original request.
+	// On a 401 with code="token_invalid" or if refresh fails, redirect to login.
 }
 
 // OTPChallenge is returned by Login when the user has active TOTP.
-// The client must call POST /auth/login/otp with this token + the TOTP code.
 type OTPChallenge struct {
 	RequiresOTP     bool   `json:"requires_otp"`
 	OTPSessionToken string `json:"otp_session_token"`
-	ExpiresIn       int    `json:"expires_in"` // seconds until the session token expires
+	ExpiresIn       int    `json:"expires_in"`
 }
 
 // LoginResult wraps either a full token pair or an OTP challenge.
-// Exactly one of Token or OTPChallenge will be non-nil.
 type LoginResult struct {
 	Token        *AuthResult
 	OTPChallenge *OTPChallenge
@@ -89,20 +104,19 @@ type MeResult struct {
 }
 
 // resolveTenant fetches the tenant row by slug. Returns pgx.ErrNoRows if not found.
-func (s *AuthService) resolveTenant(ctx context.Context, slug string) (id uuid.UUID, jwtSecret string, err error) {
+func (s *AuthService) resolveTenant(ctx context.Context, slug string) (id int64, jwtSecret string, err error) {
 	err = s.pool.QueryRow(ctx,
 		`SELECT id, jwt_secret FROM tenants WHERE slug = $1 AND is_active = true`,
 		slug,
 	).Scan(&id, &jwtSecret)
 	if err != nil {
-		return uuid.Nil, "", fmt.Errorf("resolve tenant %q: %w", slug, err)
+		return 0, "", fmt.Errorf("resolve tenant %q: %w", slug, err)
 	}
 	return id, jwtSecret, nil
 }
 
 // loadPermissions returns the list of permission names for a given user.
-// It unions role-based permissions and direct user permissions.
-func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID uuid.UUID) ([]string, error) {
+func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int64) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT p.name
 		FROM permissions p
@@ -130,17 +144,21 @@ func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID uuid
 		perms = append(perms, name)
 	}
 	if perms == nil {
-		perms = []string{} // never return nil — JSON encodes as [] not null
+		perms = []string{}
 	}
 	return perms, rows.Err()
 }
 
-// issueTokenPair signs a JWT access token and generates a refresh token, persisting
-// the refresh token hash in the refresh_tokens table.
-func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID uuid.UUID, email, role string, perms []string) (*AuthResult, error) {
+// issueTokenPair signs a JWT access token and generates a refresh token.
+// sessionFamilyID is nil for new logins (the new token becomes its own family root);
+// for token rotation it carries the existing family id forward.
+// appID is the string-encoded oauth_clients.id when the token is issued through a
+// registered application; pass "" when no application context is present.
+func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sessionFamilyID *int64, appID string) (*AuthResult, error) {
 	claims := &Claims{
-		UserID:      userID.String(),
-		TenantID:    tenantID.String(),
+		UserID:      strconv.FormatInt(userID, 10),
+		TenantID:    strconv.FormatInt(tenantID, 10),
+		AppID:       appID,
 		Email:       email,
 		Role:        role,
 		Permissions: perms,
@@ -157,10 +175,24 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID uuid.
 	}
 	refreshHash := HashToken(rawRefresh)
 
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO refresh_tokens (id, user_id, tenant_id, token_hash, expires_at)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4)
-	`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL))
+	if sessionFamilyID != nil {
+		// Token rotation: inherit the existing session family.
+		_, err = s.pool.Exec(ctx, `
+			INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, session_family_id)
+			VALUES ($1, $2, $3, $4, $5)
+		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL), *sessionFamilyID)
+	} else {
+		// New login: pre-fetch next id from the IDENTITY sequence so we can set
+		// session_family_id = id in a single atomic INSERT.
+		_, err = s.pool.Exec(ctx, `
+			WITH next_id AS (
+				SELECT nextval(pg_get_serial_sequence('refresh_tokens', 'id')) AS id
+			)
+			INSERT INTO refresh_tokens (id, user_id, tenant_id, token_hash, expires_at, session_family_id)
+			OVERRIDING SYSTEM VALUE
+			SELECT id, $1, $2, $3, $4, id FROM next_id
+		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL))
+	}
 	if err != nil {
 		return nil, fmt.Errorf("persist refresh token: %w", err)
 	}
@@ -170,11 +202,11 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID uuid.
 		RefreshToken: rawRefresh,
 		TokenType:    "Bearer",
 		ExpiresIn:    int(AccessTokenTTL.Seconds()),
+		ExpiresAt:    time.Now().UTC().Add(AccessTokenTTL).Unix(),
 	}, nil
 }
 
 // Register creates a new user in the given tenant.
-// Returns AUTH-01 / AUTH-02 compliant token pair on success.
 func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResult, error) {
 	tenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
 	if err != nil {
@@ -184,14 +216,12 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		return nil, err
 	}
 
-	// Hash password at cost 12 (AUTH-02).
 	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), BcryptCost)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
-	// Fetch the default role for this tenant (first non-system role by name asc, or null).
-	var roleID *uuid.UUID
+	var roleID *int64
 	var roleName string
 	err = s.pool.QueryRow(ctx,
 		`SELECT id, name FROM roles WHERE tenant_id = $1 AND is_system = false ORDER BY name LIMIT 1`,
@@ -200,19 +230,17 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("fetch default role: %w", err)
 	}
-	// If no non-system role found, assign no role (roleID stays nil).
 
-	// Insert user and credentials in a transaction.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var userID uuid.UUID
+	var userID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (id, tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, true)
+		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
+		VALUES ($1, $2, $3, $4, $5, true)
 		RETURNING id
 	`, tenantID, in.Email, in.FirstName, in.LastName, roleID).Scan(&userID)
 	if err != nil {
@@ -237,12 +265,19 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		perms = []string{}
 	}
 
-	return s.issueTokenPair(ctx, userID, tenantID, in.Email, roleName, perms)
+	appID := ""
+	if in.ClientID != "" && s.appSvc != nil {
+		id, err := s.appSvc.ValidateClientID(ctx, tenantID, in.ClientID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid client_id")
+		}
+		appID = strconv.FormatInt(id, 10)
+	}
+
+	return s.issueTokenPair(ctx, userID, tenantID, in.Email, roleName, perms, nil, appID)
 }
 
 // Login authenticates an existing user by email and password.
-// If the user has active TOTP, returns a LoginResult with an OTPChallenge instead of tokens.
-// The caller must then call LoginOTP with the challenge token + TOTP code to get tokens.
 func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
 	tenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
 	if err != nil {
@@ -252,11 +287,10 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		return nil, err
 	}
 
-	// Fetch user + role + password hash in a single JOIN.
-	var userID uuid.UUID
+	var userID int64
 	var email, passwordHash string
 	var roleName string
-	var roleID *uuid.UUID
+	var roleID *int64
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.id, u.email, uc.password_hash, COALESCE(r.name, ''), u.role_id
 		FROM users u
@@ -271,7 +305,6 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		return nil, fmt.Errorf("fetch user: %w", err)
 	}
 
-	// Constant-time password comparison (bcrypt).
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)); err != nil {
 		return nil, fmt.Errorf("invalid credentials")
 	}
@@ -282,7 +315,6 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		perms = []string{}
 	}
 
-	// Check for active TOTP enrollment (03-02).
 	if s.totpSvc != nil && s.redisCli != nil {
 		active, err := s.totpSvc.IsActive(ctx, userID)
 		if err != nil {
@@ -296,7 +328,16 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		}
 	}
 
-	tokens, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms)
+	appID := ""
+	if in.ClientID != "" && s.appSvc != nil {
+		id, err := s.appSvc.ValidateClientID(ctx, tenantID, in.ClientID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid client_id")
+		}
+		appID = strconv.FormatInt(id, 10)
+	}
+
+	tokens, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, nil, appID)
 	if err != nil {
 		return nil, err
 	}
@@ -305,12 +346,11 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 
 // LoginOTPInput is the payload for completing a TOTP-gated login.
 type LoginOTPInput struct {
-	OTPSessionToken string // from the OTPChallenge returned by Login
-	Code            string // 6-digit TOTP code or 8-character backup code
+	OTPSessionToken string
+	Code            string
 }
 
-// LoginOTP completes a TOTP-gated login. It validates the code against the
-// pre-auth session stored in Redis, then issues the full JWT token pair.
+// LoginOTP completes a TOTP-gated login.
 func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResult, error) {
 	if s.totpSvc == nil || s.redisCli == nil {
 		return nil, fmt.Errorf("TOTP not configured on this server")
@@ -321,7 +361,6 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 		return nil, fmt.Errorf("invalid or expired OTP session")
 	}
 
-	// Try TOTP code first, then backup code.
 	err = s.totpSvc.Verify(ctx, session.UserID, in.Code)
 	if err != nil {
 		err2 := s.totpSvc.VerifyBackupCode(ctx, session.UserID, in.Code)
@@ -330,19 +369,18 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 		}
 	}
 
-	// Consume the OTP session (single-use).
 	s.redisCli.Del(ctx, otpSessionKey(in.OTPSessionToken)) //nolint:errcheck
 
-	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms)
+	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms, nil, "")
 }
 
 // createOTPSession stores pre-auth user state in Redis and returns a challenge token.
-func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID uuid.UUID, email, roleName string, perms []string) (*OTPChallenge, error) {
-	raw, err := GenerateRefreshToken() // reuse 32-byte random generator
+func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string) (*OTPChallenge, error) {
+	raw, err := GenerateRefreshToken()
 	if err != nil {
 		return nil, err
 	}
-	sessionToken := raw // raw token IS the session key (no need to hash — it's in Redis, not DB)
+	sessionToken := raw
 
 	payload, err := json.Marshal(OTPSession{
 		UserID:   userID,
@@ -384,7 +422,6 @@ func otpSessionKey(token string) string {
 }
 
 // Me returns profile information derived from JWT claims.
-// The claims are injected by the JWTRequired middleware (added in Plan 02-02).
 func (s *AuthService) Me(claims *Claims) *MeResult {
 	return &MeResult{
 		UserID:      claims.UserID,
@@ -398,32 +435,34 @@ func (s *AuthService) Me(claims *Claims) *MeResult {
 // ErrInvalidRefreshToken is returned when a refresh token is invalid, expired, or already used.
 var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
 
+// ErrTokenReplay is returned when a previously-rotated refresh token is presented again.
+// The entire session family is revoked. The caller must clear cookies and force re-login.
+var ErrTokenReplay = errors.New("token replay detected — session family revoked")
+
+// GraceResult is returned by RefreshWithLock when a concurrent request already rotated
+// this token family within the last 10 seconds. The middleware should attach these claims
+// to the context and continue the request without issuing new cookies — the other
+// concurrent request's response already carries the fresh cookies.
+type GraceResult struct {
+	UserID      int64
+	TenantID    int64
+	Email       string
+	Role        string
+	Permissions []string
+}
+
 // Refresh rotates a refresh token pair (AUTH-03).
-//
-// Algorithm:
-//  1. Hash the raw incoming refresh token.
-//  2. Look up the hash in refresh_tokens WHERE revoked_at IS NULL AND expires_at > NOW().
-//     - Not found → return ErrInvalidRefreshToken (401).
-//     - Found but revoked → return ErrInvalidRefreshToken (401). Replay attack blocked.
-//  3. Mark old token revoked (SET revoked_at = NOW()).
-//  4. Load user + role + permissions from DB.
-//  5. Issue new access token + new refresh token (persisted).
-//  6. Return new AuthResult.
-//
-// This is atomic: the old token is revoked BEFORE the new one is issued.
-// If step 5 fails, the old token is already revoked — user must log in again.
 func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*AuthResult, error) {
 	hash := HashToken(rawRefreshToken)
 
-	// Look up token — must be active (revoked_at IS NULL) and not expired.
-	var tokenID, userID, tenantID uuid.UUID
+	var tokenID, userID, tenantID, sessionFamilyID int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, user_id, tenant_id
+		SELECT id, user_id, tenant_id, session_family_id
 		FROM refresh_tokens
 		WHERE token_hash = $1
 		  AND revoked_at IS NULL
 		  AND expires_at > NOW()
-	`, hash).Scan(&tokenID, &userID, &tenantID)
+	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionFamilyID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken
@@ -431,7 +470,6 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("lookup refresh token: %w", err)
 	}
 
-	// Revoke the old token immediately.
 	_, err = s.pool.Exec(ctx, `
 		UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1
 	`, tokenID)
@@ -439,9 +477,8 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
 
-	// Load user details for the new JWT.
 	var email, roleName string
-	var roleID *uuid.UUID
+	var roleID *int64
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, ''), u.role_id
 		FROM users u
@@ -461,12 +498,203 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		perms = []string{}
 	}
 
-	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms)
+	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, "")
+}
+
+// gracePeriod is the window in which a concurrent rotation is not treated as a replay.
+const gracePeriod = 10 // seconds
+
+// revokeFamily marks every non-revoked token in a session family as revoked.
+// Called on replay detection to terminate all tokens an attacker might hold.
+func (s *AuthService) revokeFamily(ctx context.Context, familyID int64) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE refresh_tokens
+		SET revoked_at = NOW()
+		WHERE session_family_id = $1 AND revoked_at IS NULL
+	`, familyID)
+	return err
+}
+
+// checkGraceWindow looks for a valid token in the given family that was issued
+// within the last gracePeriod seconds. Used when concurrent requests arrive on
+// the same expiring access token — one rotates, the other hits the grace path.
+func (s *AuthService) checkGraceWindow(ctx context.Context, familyID int64) (*GraceResult, error) {
+	var userID, tenantID int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT user_id, tenant_id
+		FROM refresh_tokens
+		WHERE session_family_id = $1
+		  AND revoked_at IS NULL
+		  AND expires_at > NOW()
+		  AND created_at > NOW() - ($2 || ' seconds')::interval
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, familyID, gracePeriod).Scan(&userID, &tenantID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrInvalidRefreshToken
+		}
+		return nil, fmt.Errorf("grace window query: %w", err)
+	}
+
+	var email, roleName string
+	var roleID *int64
+	err = s.pool.QueryRow(ctx, `
+		SELECT u.email, COALESCE(r.name, ''), u.role_id
+		FROM users u
+		LEFT JOIN roles r ON r.id = u.role_id
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+	`, userID, tenantID).Scan(&email, &roleName, &roleID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("user not found or inactive")
+		}
+		return nil, fmt.Errorf("fetch user for grace window: %w", err)
+	}
+
+	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("grace window: failed to load permissions")
+		perms = []string{}
+	}
+
+	return &GraceResult{
+		UserID:      userID,
+		TenantID:    tenantID,
+		Email:       email,
+		Role:        roleName,
+		Permissions: perms,
+	}, nil
+}
+
+// RefreshWithLock rotates a refresh token with a distributed Redis lock.
+//
+// Compared with Refresh, it adds three safety layers:
+//  1. Per-family Redis lock (SET NX PX 5000) prevents concurrent double-rotation.
+//  2. Replay detection: if the presented token is already revoked and the family
+//     was not rotated within the grace window, the entire family is revoked and
+//     ErrTokenReplay is returned.
+//  3. Grace window: if the lock is held by another concurrent request that already
+//     rotated this family, the second request returns a GraceResult instead of
+//     issuing new tokens — the browser gets fresh cookies from the first response.
+//
+// Returns (authResult, nil, nil) on a normal rotation,
+// (nil, graceResult, nil) on a concurrent-rotation grace hit,
+// or (nil, nil, err) on failure.
+func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redisCli *redis.Client) (*AuthResult, *GraceResult, error) {
+	hash := HashToken(rawToken)
+
+	// Initial read — fetch token row including revoked ones so we can detect replay.
+	var tokenID, userID, tenantID, sessionFamilyID int64
+	var revokedAt *time.Time
+	var expiresAt time.Time
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, user_id, tenant_id, session_family_id, revoked_at, expires_at
+		FROM refresh_tokens
+		WHERE token_hash = $1
+	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionFamilyID, &revokedAt, &expiresAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, ErrInvalidRefreshToken
+		}
+		return nil, nil, fmt.Errorf("lookup refresh token: %w", err)
+	}
+
+	lockKey := fmt.Sprintf("renewal:lock:family:%d", sessionFamilyID)
+
+	acquired := false
+	if redisCli != nil {
+		var lockErr error
+		acquired, lockErr = redisCli.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
+		if lockErr != nil {
+			// Redis unavailable — log and fall through as if we hold the lock.
+			s.logger.Warn().Err(lockErr).Msg("renewal lock: redis error, proceeding without distributed lock")
+			acquired = true
+		}
+	} else {
+		acquired = true
+	}
+
+	if !acquired {
+		// Another request is currently rotating this family. Wait briefly then
+		// check whether a fresh token was issued within the grace window.
+		time.Sleep(300 * time.Millisecond)
+		grace, err := s.checkGraceWindow(ctx, sessionFamilyID)
+		return nil, grace, err
+	}
+
+	defer func() {
+		if redisCli != nil {
+			redisCli.Del(ctx, lockKey) //nolint:errcheck
+		}
+	}()
+
+	// We hold the lock. A revoked token at this point is a replay — no concurrent
+	// rotation could have done it since we hold the family lock.
+	if revokedAt != nil {
+		if err := s.revokeFamily(ctx, sessionFamilyID); err != nil {
+			s.logger.Error().Err(err).Int64("family_id", sessionFamilyID).Msg("renewal: family revocation failed")
+		}
+		return nil, nil, ErrTokenReplay
+	}
+
+	if expiresAt.Before(time.Now().UTC()) {
+		return nil, nil, ErrInvalidRefreshToken
+	}
+
+	// Revoke the presented token.
+	_, err = s.pool.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1
+	`, tokenID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("revoke old refresh token: %w", err)
+	}
+
+	// Fresh user load from DB — catches suspensions, role changes, or email bans
+	// that occurred during the access token's lifetime (key security gate).
+	var email, roleName string
+	var roleID *int64
+	err = s.pool.QueryRow(ctx, `
+		SELECT u.email, COALESCE(r.name, ''), u.role_id
+		FROM users u
+		LEFT JOIN roles r ON r.id = u.role_id
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+	`, userID, tenantID).Scan(&email, &roleName, &roleID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, fmt.Errorf("user not found or inactive")
+		}
+		return nil, nil, fmt.Errorf("fetch user for refresh: %w", err)
+	}
+
+	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions")
+		perms = []string{}
+	}
+
+	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, "")
+	return result, nil, err
+}
+
+// IssueServiceToken signs a short-lived access token for a machine client using
+// the client_credentials grant. There is no user, no refresh token, and the
+// role is fixed to "service". The appID is the string-encoded oauth_clients.id.
+func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int64) (string, int, error) {
+	claims := &Claims{
+		TenantID:    strconv.FormatInt(tenantID, 10),
+		AppID:       strconv.FormatInt(appID, 10),
+		Role:        "service",
+		Permissions: []string{},
+	}
+	token, err := s.jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
+	if err != nil {
+		return "", 0, fmt.Errorf("sign service token: %w", err)
+	}
+	return token, int(AccessTokenTTL.Seconds()), nil
 }
 
 // Logout revokes a refresh token (AUTH-04).
-// The raw refresh token is hashed and the matching DB row is marked revoked.
-// If the token is already revoked or not found, Logout returns nil (idempotent).
 func (s *AuthService) Logout(ctx context.Context, rawRefreshToken string) error {
 	hash := HashToken(rawRefreshToken)
 	_, err := s.pool.Exec(ctx, `

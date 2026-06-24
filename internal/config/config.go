@@ -30,6 +30,12 @@ type Config struct {
 	// TOTP secrets at rest. Generate with: openssl rand -hex 32
 	// Required when TOTP is used. Must be exactly 64 hex characters.
 	TOTPEncryptionKey string
+
+	// CookieDomain sets the Domain attribute on auth cookies.
+	// Leave empty for localhost development (browser scopes to current host).
+	// In production set to the shared parent domain, e.g. ".engineersmind.com",
+	// so both app.engineersmind.com and auth.engineersmind.com can read the cookies.
+	CookieDomain string
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -49,6 +55,7 @@ func Load() *Config {
 		SMTPPassword: getEnv("SMTP_PASSWORD", ""),
 		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:9090"),
 		TOTPEncryptionKey: getEnv("TOTP_ENCRYPTION_KEY", ""),
+		CookieDomain:      getEnv("COOKIE_DOMAIN", ""),
 	}
 }
 

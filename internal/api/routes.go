@@ -44,6 +44,9 @@ type RoutesConfig struct {
 	SMTPFrom     string
 	SMTPUsername string
 	SMTPPassword string
+	// CookieDomain is the Domain attribute for auth cookies (e.g. ".engineersmind.com").
+	// Leave empty for localhost development.
+	CookieDomain string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -161,6 +164,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// API key service
 	apiKeySvc := auth.NewAPIKeyService(deps.Pool, deps.Logger)
 
+	// Application service — manages OAuth2 clients (client_id + client_secret)
+	appSvc := auth.NewApplicationService(deps.Pool, deps.Logger)
+	authSvc.WithApplications(appSvc)
+
 	// Mailer: dev (console log) or SMTP based on Env
 	m := mailer.NewMailer(mailer.MailerConfig{
 		Env:          deps.Config.Env,
@@ -176,9 +183,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logger — shared by both auth and admin handlers
 	auditLog := audit.New(deps.Pool, deps.Logger)
 
+	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain)
+
 	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
 		WithTOTP(totpSvc).
-		WithAPIKeys(apiKeySvc)
+		WithAPIKeys(apiKeySvc).
+		WithApplications(appSvc).
+		WithCookieConfig(cookieCfg)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
@@ -191,6 +202,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
 		WithAppRateLimits(appLimitSvc).
+		WithApplications(appSvc).
 		WithCORS(corsSvc)
 
 	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
@@ -221,17 +233,26 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/session/refresh", authHandler.SessionRefresh)
 	authGroup.POST("/session/logout", authHandler.SessionLogout)
 
-	// Auth routes — protected by JWTRequired (AUTH-09)
-	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
+	// Client credentials token endpoint — machine-to-machine auth (no user).
+	authGroup.POST("/token", authHandler.Token)
+
+	// jwtRenew is used on all cookie-aware protected routes.
+	// It validates the access token and, when expired, transparently rotates
+	// the refresh token (distributed lock + fresh user DB load) and writes new
+	// cookies onto the response before the handler body is flushed.
+	jwtRenew := mw.JWTRenew(jwtSvc, authSvc, deps.Redis, cookieCfg, auditLog, deps.Logger)
+
+	// Auth routes — protected with transparent renewal (AUTH-09)
+	authGroup.GET("/me", authHandler.Me, jwtRenew)
 
 	// TOTP management — protected (03-01)
-	otpGroup := authGroup.Group("/otp", mw.JWTRequired(jwtSvc))
+	otpGroup := authGroup.Group("/otp", jwtRenew)
 	otpGroup.POST("/enroll", authHandler.TOTPEnroll)
 	otpGroup.POST("/activate", authHandler.TOTPActivate)
 	otpGroup.DELETE("", authHandler.TOTPDisable)
 
-	// Admin routes — all require a valid JWT.
-	adminGroup := apiV1.Group("/admin", mw.JWTRequired(jwtSvc))
+	// Admin routes — all require a valid JWT with transparent renewal.
+	adminGroup := apiV1.Group("/admin", jwtRenew)
 
 	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {
@@ -286,6 +307,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
+
+	// Application management — tenant admin (admin:access)
+	rbacGroup.POST("/applications", adminHandler.CreateApplication)
+	rbacGroup.GET("/applications", adminHandler.ListApplications)
+	rbacGroup.DELETE("/applications/:id", adminHandler.DeactivateApplication)
 
 	// Per-app rate limit management — tenant admin (admin:access) (08-02)
 	rbacGroup.POST("/app-limits", adminHandler.CreateAppLimit)

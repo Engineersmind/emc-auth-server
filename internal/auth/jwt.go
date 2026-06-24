@@ -4,18 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Claims is the full JWT payload for emc-auth tokens.
 // It embeds jwt.RegisteredClaims for standard fields (iss, aud, exp, sub, iat).
+//
+// AppID is set when the token was issued through a registered application
+// (X-Client-ID on login/register, or the client_credentials grant).
+// It is omitted from the JSON payload when empty so existing tokens without
+// it remain valid — the Verify path ignores missing optional claims.
 type Claims struct {
 	UserID      string   `json:"user_id"`
 	TenantID    string   `json:"tenant_id"`
+	AppID       string   `json:"app_id,omitempty"`
 	Email       string   `json:"email"`
 	Role        string   `json:"role"`
 	Permissions []string `json:"permissions"`
@@ -36,8 +42,7 @@ func NewJWTService(pool *pgxpool.Pool, issuer string) *JWTService {
 }
 
 // tenantSecret fetches the jwt_secret for the given tenant from the DB.
-// Result is NOT cached here — callers should use a short-lived context.
-func (s *JWTService) tenantSecret(ctx context.Context, tenantID uuid.UUID) (string, error) {
+func (s *JWTService) tenantSecret(ctx context.Context, tenantID int64) (string, error) {
 	var secret string
 	err := s.pool.QueryRow(ctx,
 		`SELECT jwt_secret FROM tenants WHERE id = $1 AND is_active = true`,
@@ -53,15 +58,15 @@ func (s *JWTService) tenantSecret(ctx context.Context, tenantID uuid.UUID) (stri
 }
 
 // AccessTokenTTL is the lifetime of an access token (AUTH-06).
-const AccessTokenTTL = 1 * time.Hour
+// 15 minutes matches the API contract; transparent middleware renewal keeps
+// browser sessions alive without client-side retry logic.
+const AccessTokenTTL = 15 * time.Minute
 
 // RefreshTokenTTL is the lifetime of a refresh token (AUTH-06).
 const RefreshTokenTTL = 30 * 24 * time.Hour
 
 // Sign creates and signs a JWT for the given claims using the tenant's HS256 secret.
-// The caller must populate all domain fields (UserID, TenantID, Email, Role, Permissions).
-// Sign fills in iss, aud, exp, iat, and sub automatically.
-func (s *JWTService) Sign(ctx context.Context, tenantID uuid.UUID, audience string, c *Claims) (string, error) {
+func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, c *Claims) (string, error) {
 	secret, err := s.tenantSecret(ctx, tenantID)
 	if err != nil {
 		return "", err
@@ -98,12 +103,12 @@ func (s *JWTService) Verify(ctx context.Context, tokenString string) (*Claims, e
 		return nil, errors.New("jwt missing tenant_id claim")
 	}
 
-	tenantUUID, err := uuid.Parse(unverifiedClaims.TenantID)
+	tenantID, err := strconv.ParseInt(unverifiedClaims.TenantID, 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant_id in jwt: %w", err)
 	}
 
-	secret, err := s.tenantSecret(ctx, tenantUUID)
+	secret, err := s.tenantSecret(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}

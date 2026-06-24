@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
@@ -20,6 +19,7 @@ import (
 type AdminHandler struct {
 	svc         *admin.Service
 	appLimitSvc *auth.AppRateLimitService
+	appSvc      *auth.ApplicationService
 	corsSvc     *mw.TenantCORSService
 	audit       *audit.Logger
 	logger      zerolog.Logger
@@ -42,15 +42,21 @@ func (h *AdminHandler) WithCORS(svc *mw.TenantCORSService) *AdminHandler {
 	return h
 }
 
+// WithApplications attaches the ApplicationService for application CRUD handlers.
+func (h *AdminHandler) WithApplications(svc *auth.ApplicationService) *AdminHandler {
+	h.appSvc = svc
+	return h
+}
+
 // claimsFromCtx extracts *auth.Claims injected by JWTRequired middleware.
 func claimsFromCtx(c echo.Context) (*auth.Claims, bool) {
 	claims, ok := c.Get("user").(*auth.Claims)
 	return claims, ok && claims != nil
 }
 
-// tenantIDFromClaims parses the tenant UUID from JWT claims.
-func tenantIDFromClaims(claims *auth.Claims) (uuid.UUID, error) {
-	return uuid.Parse(claims.TenantID)
+// tenantIDFromClaims parses the tenant ID from JWT claims.
+func tenantIDFromClaims(claims *auth.Claims) (int64, error) {
+	return strconv.ParseInt(claims.TenantID, 10, 64)
 }
 
 // ---------------------------------------------------------------------------
@@ -131,14 +137,14 @@ func (h *AdminHandler) ListTenants(c echo.Context) error {
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id    path      string              true  "Tenant ID (UUID)"
+// @Param        id    path      string              true  "Tenant ID"
 // @Param        body  body      UpdateTenantRequest true  "Updated fields"
 // @Success      200   {object}  admin.TenantResult
 // @Failure      400   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
 // @Router       /api/v1/admin/tenants/{id} [put]
 func (h *AdminHandler) UpdateTenant(c echo.Context) error {
-	tenantID, err := uuid.Parse(c.Param("id"))
+	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
@@ -155,7 +161,7 @@ func (h *AdminHandler) UpdateTenant(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update tenant"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminTenantUpdated, "tenant", tenantID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminTenantUpdated, "tenant", strconv.FormatInt(tenantID, 10))
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -166,13 +172,13 @@ func (h *AdminHandler) UpdateTenant(c echo.Context) error {
 // @Tags         admin-tenants
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id   path      string  true  "Tenant ID (UUID)"
+// @Param        id   path      string  true  "Tenant ID"
 // @Success      200  {object}  map[string]string
 // @Failure      400  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/admin/tenants/{id} [delete]
 func (h *AdminHandler) DeactivateTenant(c echo.Context) error {
-	tenantID, err := uuid.Parse(c.Param("id"))
+	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
@@ -184,7 +190,7 @@ func (h *AdminHandler) DeactivateTenant(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to deactivate tenant"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminTenantDeactivated, "tenant", tenantID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminTenantDeactivated, "tenant", strconv.FormatInt(tenantID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "tenant deactivated"})
 }
 
@@ -275,7 +281,7 @@ func (h *AdminHandler) ListPermissions(c echo.Context) error {
 // @Tags         admin-rbac
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id   path      string  true  "Permission ID (UUID)"
+// @Param        id   path      string  true  "Permission ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/admin/permissions/{id} [delete]
@@ -289,7 +295,7 @@ func (h *AdminHandler) DeletePermission(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	permID, err := uuid.Parse(c.Param("id"))
+	permID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission id"})
 	}
@@ -301,7 +307,7 @@ func (h *AdminHandler) DeletePermission(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: delete permission failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete permission"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminPermissionDeleted, "permission", permID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminPermissionDeleted, "permission", strconv.FormatInt(permID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "permission deleted"})
 }
 
@@ -351,12 +357,12 @@ func (h *AdminHandler) CreateRole(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
-	permUUIDs, err := parseUUIDs(req.PermissionIDs)
+	permIDs, err := parseInt64s(req.PermissionIDs)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission_id: " + err.Error()})
 	}
 
-	result, err := h.svc.CreateRole(c.Request().Context(), tenantID, req.Name, permUUIDs)
+	result, err := h.svc.CreateRole(c.Request().Context(), tenantID, req.Name, permIDs)
 	if err != nil {
 		if errors.Is(err, admin.ErrAlreadyExists) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "role name already exists in this tenant"})
@@ -403,7 +409,7 @@ func (h *AdminHandler) ListRoles(c echo.Context) error {
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id    path      string                       true  "Role ID (UUID)"
+// @Param        id    path      string                       true  "Role ID"
 // @Param        body  body      UpdateRolePermissionsRequest true  "Permission IDs to assign"
 // @Success      200   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
@@ -418,7 +424,7 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	roleID, err := uuid.Parse(c.Param("id"))
+	roleID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
@@ -428,19 +434,19 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	permUUIDs, err := parseUUIDs(req.PermissionIDs)
+	permIDs, err := parseInt64s(req.PermissionIDs)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission_id: " + err.Error()})
 	}
 
-	if err := h.svc.UpdateRolePermissions(c.Request().Context(), tenantID, roleID, permUUIDs); err != nil {
+	if err := h.svc.UpdateRolePermissions(c.Request().Context(), tenantID, roleID, permIDs); err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found"})
 		}
 		h.logger.Error().Err(err).Msg("admin: update role permissions failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update role permissions"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminRolePermissionsUpdated, "role", roleID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminRolePermissionsUpdated, "role", strconv.FormatInt(roleID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "role permissions updated"})
 }
 
@@ -451,7 +457,7 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 // @Tags         admin-rbac
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id   path      string  true  "Role ID (UUID)"
+// @Param        id   path      string  true  "Role ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/admin/roles/{id} [delete]
@@ -465,7 +471,7 @@ func (h *AdminHandler) DeleteRole(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	roleID, err := uuid.Parse(c.Param("id"))
+	roleID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
@@ -477,7 +483,7 @@ func (h *AdminHandler) DeleteRole(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: delete role failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", roleID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", strconv.FormatInt(roleID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "role deleted"})
 }
 
@@ -574,9 +580,9 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
 	}
 
-	var roleID *uuid.UUID
+	var roleID *int64
 	if req.RoleID != nil && *req.RoleID != "" {
-		rid, err := uuid.Parse(*req.RoleID)
+		rid, err := strconv.ParseInt(*req.RoleID, 10, 64)
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
 		}
@@ -602,7 +608,7 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 // @Tags         admin-users
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id   path      string  true  "User ID (UUID)"
+// @Param        id   path      string  true  "User ID"
 // @Success      200  {object}  admin.UserResult
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/admin/users/{id} [get]
@@ -616,7 +622,7 @@ func (h *AdminHandler) GetAdminUser(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	userID, err := uuid.Parse(c.Param("id"))
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
@@ -640,7 +646,7 @@ func (h *AdminHandler) GetAdminUser(c echo.Context) error {
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id    path      string                 true  "User ID (UUID)"
+// @Param        id    path      string                 true  "User ID"
 // @Param        body  body      UpdateUserAdminRequest true  "Updated fields"
 // @Success      200   {object}  admin.UserResult
 // @Failure      400   {object}  map[string]string
@@ -656,7 +662,7 @@ func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	userID, err := uuid.Parse(c.Param("id"))
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
@@ -680,7 +686,7 @@ func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: update user failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update user"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminUserUpdated, "user", userID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminUserUpdated, "user", strconv.FormatInt(userID, 10))
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -692,7 +698,7 @@ func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id    path      string            true  "User ID (UUID)"
+// @Param        id    path      string            true  "User ID"
 // @Param        body  body      AssignRoleRequest true  "Role ID to assign"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
@@ -708,7 +714,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	userID, err := uuid.Parse(c.Param("id"))
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
@@ -717,7 +723,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.RoleID == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "role_id is required"})
 	}
-	roleID, err := uuid.Parse(req.RoleID)
+	roleID, err := strconv.ParseInt(req.RoleID, 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
 	}
@@ -729,7 +735,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: assign role failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to assign role"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminUserRoleAssigned, "user", userID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminUserRoleAssigned, "user", strconv.FormatInt(userID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "role assigned"})
 }
 
@@ -740,7 +746,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 // @Tags         admin-users
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id   path      string  true  "User ID (UUID)"
+// @Param        id   path      string  true  "User ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/admin/users/{id} [delete]
@@ -754,7 +760,7 @@ func (h *AdminHandler) DeleteAdminUser(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	userID, err := uuid.Parse(c.Param("id"))
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
@@ -766,7 +772,7 @@ func (h *AdminHandler) DeleteAdminUser(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: delete user failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete user"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminUserDeleted, "user", userID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminUserDeleted, "user", strconv.FormatInt(userID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "user deleted"})
 }
 
@@ -777,7 +783,7 @@ func (h *AdminHandler) DeleteAdminUser(c echo.Context) error {
 // @Tags         admin-users
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id   path      string  true  "User ID (UUID)"
+// @Param        id   path      string  true  "User ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/admin/users/{id}/force-password-reset [post]
@@ -791,7 +797,7 @@ func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
 
-	userID, err := uuid.Parse(c.Param("id"))
+	userID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
@@ -803,7 +809,7 @@ func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: force password reset failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to dispatch password reset"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminForcePasswordReset, "user", userID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminForcePasswordReset, "user", strconv.FormatInt(userID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "password reset email dispatched"})
 }
 
@@ -819,7 +825,7 @@ func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Param        action   query     string  false  "Filter by action (e.g. auth.login)"
-// @Param        user_id  query     string  false  "Filter by user UUID"
+// @Param        user_id  query     string  false  "Filter by user ID"
 // @Param        from     query     string  false  "From datetime (RFC3339, e.g. 2026-01-01T00:00:00Z)"
 // @Param        to       query     string  false  "To datetime (RFC3339)"
 // @Param        page     query     int     false  "Page (default 1)"
@@ -855,7 +861,7 @@ func (h *AdminHandler) GetTenantAuditLogs(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Param        action   query     string  false  "Filter by action"
-// @Param        user_id  query     string  false  "Filter by user UUID"
+// @Param        user_id  query     string  false  "Filter by user ID"
 // @Param        from     query     string  false  "From datetime (RFC3339)"
 // @Param        to       query     string  false  "To datetime (RFC3339)"
 // @Param        page     query     int     false  "Page (default 1)"
@@ -883,8 +889,8 @@ func (h *AdminHandler) auditAdmin(c echo.Context, claims *auth.Claims, action, r
 	if claims == nil {
 		return
 	}
-	tid, _ := uuid.Parse(claims.TenantID)
-	uid, _ := uuid.Parse(claims.UserID)
+	tid, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	uid, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	h.audit.Log(c.Request().Context(), audit.Event{
 		TenantID:     &tid,
 		UserID:       &uid,
@@ -920,11 +926,11 @@ func auditQueryParams(c echo.Context) audit.QueryParams {
 	return p
 }
 
-// parseUUIDs parses a slice of UUID strings into uuid.UUID values.
-func parseUUIDs(strs []string) ([]uuid.UUID, error) {
-	result := make([]uuid.UUID, 0, len(strs))
+// parseInt64s parses a slice of numeric ID strings into int64 values.
+func parseInt64s(strs []string) ([]int64, error) {
+	result := make([]int64, 0, len(strs))
 	for _, s := range strs {
-		id, err := uuid.Parse(s)
+		id, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
 			return nil, err
 		}
@@ -950,7 +956,7 @@ type UpdateCORSOriginsRequest struct {
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        id    path      string                  true  "Tenant ID (UUID)"
+// @Param        id    path      string                  true  "Tenant ID"
 // @Param        body  body      UpdateCORSOriginsRequest true  "Allowed origins"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
@@ -961,7 +967,7 @@ func (h *AdminHandler) UpdateTenantCORSOrigins(c echo.Context) error {
 	if !ok {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
-	tenantID, err := uuid.Parse(c.Param("id"))
+	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
@@ -980,18 +986,13 @@ func (h *AdminHandler) UpdateTenantCORSOrigins(c echo.Context) error {
 	}
 
 	// Invalidate CORS cache for the tenant slug so changes take effect immediately.
-	if h.corsSvc != nil {
-		callerClaims := claims
-		if callerClaims != nil {
-			// We only have the tenant ID here; slug invalidation happens lazily on next miss.
-			// For an exact flush, the caller can pass X-Tenant-Slug as a query param.
-			if slug := c.QueryParam("slug"); slug != "" {
-				h.corsSvc.InvalidateCache(c.Request().Context(), slug)
-			}
+	if h.corsSvc != nil && claims != nil {
+		if slug := c.QueryParam("slug"); slug != "" {
+			h.corsSvc.InvalidateCache(c.Request().Context(), slug)
 		}
 	}
 
-	h.auditAdmin(c, claims, audit.ActionAdminCORSUpdated, "tenant", tenantID.String())
+	h.auditAdmin(c, claims, audit.ActionAdminCORSUpdated, "tenant", strconv.FormatInt(tenantID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "CORS origins updated"})
 }
 
@@ -1161,13 +1162,12 @@ func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 
 // ---------------------------------------------------------------------------
 // Cross-tenant management — super_admin only (tenant:manage permission)
-// All handlers below accept :tid as the target tenant UUID in the path.
-// The caller's own tenant is irrelevant; authority is checked by middleware.
+// All handlers below accept :tid as the target tenant ID in the path.
 // ---------------------------------------------------------------------------
 
 // targetTenantID parses :tid from the request path.
-func targetTenantID(c echo.Context) (uuid.UUID, error) {
-	return uuid.Parse(c.Param("tid"))
+func targetTenantID(c echo.Context) (int64, error) {
+	return strconv.ParseInt(c.Param("tid"), 10, 64)
 }
 
 // --- Permissions under a tenant ---
@@ -1218,7 +1218,7 @@ func (h *AdminHandler) TenantDeletePermission(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
-	pid, err := uuid.Parse(c.Param("pid"))
+	pid, err := strconv.ParseInt(c.Param("pid"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission id"})
 	}
@@ -1230,7 +1230,7 @@ func (h *AdminHandler) TenantDeletePermission(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete permission"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminPermissionDeleted, "permission", pid.String())
+	h.auditAdmin(c, claims, audit.ActionAdminPermissionDeleted, "permission", strconv.FormatInt(pid, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "permission deleted"})
 }
 
@@ -1260,11 +1260,11 @@ func (h *AdminHandler) TenantCreateRole(c echo.Context) error {
 	if err := c.Bind(&req); err != nil || req.Name == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
-	permUUIDs, err := parseUUIDs(req.PermissionIDs)
+	permIDs, err := parseInt64s(req.PermissionIDs)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission_id: " + err.Error()})
 	}
-	result, err := h.svc.CreateRole(c.Request().Context(), tid, req.Name, permUUIDs)
+	result, err := h.svc.CreateRole(c.Request().Context(), tid, req.Name, permIDs)
 	if err != nil {
 		if errors.Is(err, admin.ErrAlreadyExists) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "role name already exists in this tenant"})
@@ -1283,7 +1283,7 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
-	rid, err := uuid.Parse(c.Param("rid"))
+	rid, err := strconv.ParseInt(c.Param("rid"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
@@ -1291,11 +1291,11 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
-	permUUIDs, err := parseUUIDs(req.PermissionIDs)
+	permIDs, err := parseInt64s(req.PermissionIDs)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid permission_id: " + err.Error()})
 	}
-	if err := h.svc.UpdateRolePermissions(c.Request().Context(), tid, rid, permUUIDs); err != nil {
+	if err := h.svc.UpdateRolePermissions(c.Request().Context(), tid, rid, permIDs); err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found"})
 		}
@@ -1303,7 +1303,7 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update role permissions"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminRolePermissionsUpdated, "role", rid.String())
+	h.auditAdmin(c, claims, audit.ActionAdminRolePermissionsUpdated, "role", strconv.FormatInt(rid, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "role permissions updated"})
 }
 
@@ -1313,7 +1313,7 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
-	rid, err := uuid.Parse(c.Param("rid"))
+	rid, err := strconv.ParseInt(c.Param("rid"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
@@ -1325,7 +1325,7 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", rid.String())
+	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", strconv.FormatInt(rid, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "role deleted"})
 }
 
@@ -1364,9 +1364,9 @@ func (h *AdminHandler) TenantCreateUser(c echo.Context) error {
 	if len(req.Password) < 8 {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
 	}
-	var roleID *uuid.UUID
+	var roleID *int64
 	if req.RoleID != nil && *req.RoleID != "" {
-		rid, err := uuid.Parse(*req.RoleID)
+		rid, err := strconv.ParseInt(*req.RoleID, 10, 64)
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
 		}
@@ -1391,7 +1391,7 @@ func (h *AdminHandler) TenantDeleteUser(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
-	uid, err := uuid.Parse(c.Param("uid"))
+	uid, err := strconv.ParseInt(c.Param("uid"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
@@ -1403,6 +1403,125 @@ func (h *AdminHandler) TenantDeleteUser(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete user"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminUserDeleted, "user", uid.String())
+	h.auditAdmin(c, claims, audit.ActionAdminUserDeleted, "user", strconv.FormatInt(uid, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "user deleted"})
 }
+
+// ---------------------------------------------------------------------------
+// Application management (requires admin:access)
+// ---------------------------------------------------------------------------
+
+// CreateApplicationRequest is the body for POST /api/v1/admin/applications.
+type CreateApplicationRequest struct {
+	Name string `json:"name"`
+}
+
+// CreateApplication handles POST /api/v1/admin/applications.
+//
+// @Summary      Create application
+// @Description  Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once.
+// @Tags         admin-applications
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      CreateApplicationRequest  true  "Application name"
+// @Success      201   {object}  auth.AppResult
+// @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string
+// @Router       /api/v1/admin/applications [post]
+func (h *AdminHandler) CreateApplication(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+	}
+
+	var req CreateApplicationRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Name == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
+	}
+
+	result, err := h.appSvc.CreateApplication(c.Request().Context(), tenantID, req.Name)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: create application failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create application"})
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminApplicationCreated, "application", result.ID)
+	return c.JSON(http.StatusCreated, result)
+}
+
+// ListApplications handles GET /api/v1/admin/applications.
+//
+// @Summary      List applications
+// @Description  Returns all active applications for the caller's tenant.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {array}   auth.AppSummary
+// @Failure      403  {object}  map[string]string
+// @Router       /api/v1/admin/applications [get]
+func (h *AdminHandler) ListApplications(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+	}
+
+	apps, err := h.appSvc.ListApplications(c.Request().Context(), tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: list applications failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list applications"})
+	}
+	return c.JSON(http.StatusOK, apps)
+}
+
+// DeactivateApplication handles DELETE /api/v1/admin/applications/:id.
+//
+// @Summary      Deactivate application
+// @Description  Soft-deletes an application. Its client_id is immediately rejected on login and register.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      int  true  "Application ID"
+// @Success      200  {object}  map[string]string
+// @Failure      400  {object}  map[string]string
+// @Failure      403  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/applications/{id} [delete]
+func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+	}
+
+	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid application id"})
+	}
+
+	if err := h.appSvc.DeactivateApplication(c.Request().Context(), tenantID, appID); err != nil {
+		if containsMsg(err, "not found") {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: deactivate application failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to deactivate application"})
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminApplicationDeleted, "application", strconv.FormatInt(appID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "application deactivated"})
+}
+

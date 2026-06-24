@@ -1,8 +1,8 @@
 -- +goose Up
 -- +goose StatementBegin
 CREATE TABLE signing_keys (
-    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       UUID        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    id              BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id       BIGINT      NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     kid             TEXT        NOT NULL,
     algorithm       TEXT        NOT NULL CHECK (algorithm IN ('RS256', 'ES256')),
     public_key      TEXT        NOT NULL,
@@ -27,4 +27,3 @@ CREATE INDEX idx_signing_keys_tenant_active
 -- +goose StatementBegin
 DROP TABLE IF EXISTS signing_keys;
 -- +goose StatementEnd
-

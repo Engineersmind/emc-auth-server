@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 ALTER TABLE role_permissions
-    ADD COLUMN IF NOT EXISTS tenant_id  UUID REFERENCES tenants(id) ON DELETE CASCADE,
+    ADD COLUMN IF NOT EXISTS tenant_id  BIGINT REFERENCES tenants(id) ON DELETE CASCADE,
     ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
 -- Backfill tenant_id from the parent role (denormalized for RLS).
