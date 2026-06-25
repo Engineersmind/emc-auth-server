@@ -374,7 +374,10 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 	result, err := h.svc.Refresh(c.Request().Context(), req.RefreshToken)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("refresh failed")
-		clearAuthCookies(c, h.cookieCfg)
+		if errors.Is(err, auth.ErrTokenReplay) {
+			clearAuthCookies(c, h.cookieCfg)
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
 		}

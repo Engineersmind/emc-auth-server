@@ -252,9 +252,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/management-token", authHandler.ManagementToken)
 
 	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
-	authGroup.POST("/session", authHandler.SessionLogin)
-	authGroup.POST("/session/refresh", authHandler.SessionRefresh)
-	authGroup.POST("/session/logout", authHandler.SessionLogout)
+	// SessionCSRF guards against cross-site form-POST attacks when SameSite=None is
+	// active (staging/production); it is a no-op in development (SameSite=Lax).
+	sessionCSRF := mw.SessionCSRF(cookieCfg)
+	authGroup.POST("/session", authHandler.SessionLogin, sessionCSRF)
+	authGroup.POST("/session/refresh", authHandler.SessionRefresh, sessionCSRF)
+	authGroup.POST("/session/logout", authHandler.SessionLogout, sessionCSRF)
 
 	// Client credentials token endpoint — machine-to-machine auth (no user).
 	authGroup.POST("/token", authHandler.Token, mw.LoginRateLimiter(rlCfg))
@@ -275,8 +278,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	otpGroup.POST("/activate", authHandler.TOTPActivate)
 	otpGroup.DELETE("", authHandler.TOTPDisable)
 
-	// Admin routes — all require a valid JWT with transparent renewal.
-	adminGroup := apiV1.Group("/admin", jwtRenew)
+	// Admin routes — require a valid JWT. JWTRequired (not JWTRenew) is used here
+	// because the refresh cookie is scoped to /api/v1/auth; browsers will not send
+	// it to /api/v1/admin paths, so transparent renewal is impossible. Browser
+	// clients must call /auth/session/refresh when they receive 401 token_expired,
+	// then retry the admin request.
+	adminGroup := apiV1.Group("/admin", mw.JWTRequired(jwtSvc))
 
 	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {

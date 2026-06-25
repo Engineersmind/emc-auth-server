@@ -70,10 +70,14 @@ func New(pool *pgxpool.Pool, baseURL string, logger zerolog.Logger) *Service {
 
 // GetConfig retrieves the SAML IdP configuration for a tenant.
 func (s *Service) GetConfig(ctx context.Context, tenantID string) (*SAMLConfig, error) {
+	tid, err := strconv.ParseInt(tenantID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tenant_id %q: %w", tenantID, err)
+	}
 	var cfg SAMLConfig
-	err := s.pool.QueryRow(ctx, `
+	err = s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id, entity_id, sso_url, certificate, created_at, updated_at
-		FROM saml_configs WHERE tenant_id = $1`, tenantID,
+		FROM saml_configs WHERE tenant_id = $1`, tid,
 	).Scan(&cfg.ID, &cfg.TenantID, &cfg.EntityID, &cfg.SSOURL, &cfg.Certificate,
 		&cfg.CreatedAt, &cfg.UpdatedAt)
 	if err != nil {
@@ -84,15 +88,19 @@ func (s *Service) GetConfig(ctx context.Context, tenantID string) (*SAMLConfig, 
 
 // UpsertConfig creates or updates the SAML IdP configuration for a tenant.
 func (s *Service) UpsertConfig(ctx context.Context, tenantID string, req SAMLConfig) (*SAMLConfig, error) {
+	tid, err := strconv.ParseInt(tenantID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tenant_id %q: %w", tenantID, err)
+	}
 	var cfg SAMLConfig
-	err := s.pool.QueryRow(ctx, `
+	err = s.pool.QueryRow(ctx, `
 		INSERT INTO saml_configs (tenant_id, entity_id, sso_url, certificate)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (tenant_id) DO UPDATE
 		SET entity_id = EXCLUDED.entity_id, sso_url = EXCLUDED.sso_url,
 		    certificate = EXCLUDED.certificate, updated_at = NOW()
 		RETURNING id, tenant_id, entity_id, sso_url, certificate, created_at, updated_at`,
-		tenantID, req.EntityID, req.SSOURL, req.Certificate,
+		tid, req.EntityID, req.SSOURL, req.Certificate,
 	).Scan(&cfg.ID, &cfg.TenantID, &cfg.EntityID, &cfg.SSOURL, &cfg.Certificate,
 		&cfg.CreatedAt, &cfg.UpdatedAt)
 	return &cfg, err

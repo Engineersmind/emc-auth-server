@@ -155,13 +155,15 @@ func (s *AppRateLimitService) DeleteAppLimit(ctx context.Context, tenantID int64
 	return nil
 }
 
-// GetLimit returns the rate limit for an app_id. Uses Redis cache (60s TTL).
-func (s *AppRateLimitService) GetLimit(ctx context.Context, appID string) (rpm, burst int) {
+// GetLimit returns the rate limit for an app_id within a tenant. Uses Redis cache (60s TTL).
+// tenantSlug scopes the lookup so the same app_id used by different tenants does not
+// collide; pass "" to skip tenant filtering (matches the first row — use only in tests).
+func (s *AppRateLimitService) GetLimit(ctx context.Context, appID, tenantSlug string) (rpm, burst int) {
 	if appID == "" {
 		return DefaultRequestsPerMinute, DefaultBurst
 	}
 
-	cacheKey := appLimitCacheKey(appID)
+	cacheKey := appLimitCacheKey(appID, tenantSlug)
 	data, err := s.redisCli.Get(ctx, cacheKey).Bytes()
 	if err == nil {
 		var cached struct {
@@ -174,10 +176,20 @@ func (s *AppRateLimitService) GetLimit(ctx context.Context, appID string) (rpm, 
 	}
 
 	var dbRPM, dbBurst int
-	dbErr := s.pool.QueryRow(ctx, `
-		SELECT requests_per_minute, burst FROM app_rate_limits
-		WHERE app_id = $1 AND deleted_at IS NULL
-	`, appID).Scan(&dbRPM, &dbBurst)
+	var dbErr error
+	if tenantSlug != "" {
+		dbErr = s.pool.QueryRow(ctx, `
+			SELECT arl.requests_per_minute, arl.burst
+			FROM app_rate_limits arl
+			JOIN tenants t ON t.id = arl.tenant_id AND t.slug = $2 AND t.deleted_at IS NULL
+			WHERE arl.app_id = $1 AND arl.deleted_at IS NULL
+		`, appID, tenantSlug).Scan(&dbRPM, &dbBurst)
+	} else {
+		dbErr = s.pool.QueryRow(ctx, `
+			SELECT requests_per_minute, burst FROM app_rate_limits
+			WHERE app_id = $1 AND deleted_at IS NULL
+		`, appID).Scan(&dbRPM, &dbBurst)
+	}
 
 	if dbErr != nil || dbRPM <= 0 {
 		dbRPM = DefaultRequestsPerMinute
@@ -191,12 +203,17 @@ func (s *AppRateLimitService) GetLimit(ctx context.Context, appID string) (rpm, 
 }
 
 func (s *AppRateLimitService) invalidateCache(ctx context.Context, appID string) {
-	if err := s.redisCli.Del(ctx, appLimitCacheKey(appID)).Err(); err != nil {
+	// Invalidate the unscoped key (legacy) and any tenant-scoped keys via pattern.
+	// For simplicity, delete the unscoped key; tenant-scoped keys expire via TTL.
+	if err := s.redisCli.Del(ctx, appLimitCacheKey(appID, "")).Err(); err != nil {
 		s.logger.Warn().Err(err).Str("app_id", appID).Msg("failed to invalidate app rate limit cache")
 	}
 }
 
-func appLimitCacheKey(appID string) string {
+func appLimitCacheKey(appID, tenantSlug string) string {
+	if tenantSlug != "" {
+		return "rate:app:" + tenantSlug + ":" + appID
+	}
 	return "rate:app:" + appID
 }
 

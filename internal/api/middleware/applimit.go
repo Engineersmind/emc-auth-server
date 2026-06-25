@@ -14,6 +14,9 @@ import (
 // AppIDHeader is the request header used to identify the calling application.
 const AppIDHeader = "X-App-ID"
 
+// TenantSlugHeader is the request header used to identify the tenant.
+const TenantSlugHeader = "X-Tenant-Slug"
+
 // AppRateLimiter returns middleware that enforces per-application rate limits.
 // Limits are loaded from the AppRateLimitService (DB-backed, Redis-cached, 60s TTL).
 // Enforcement counters are stored in Redis so the limit is global across all replicas.
@@ -29,9 +32,13 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client) ech
 				return next(c) // no app ID — skip per-app limiting
 			}
 
-			rpm, _ := svc.GetLimit(c.Request().Context(), appID)
+			tenantSlug := c.Request().Header.Get(TenantSlugHeader)
+			rpm, _ := svc.GetLimit(c.Request().Context(), appID, tenantSlug)
 
-			res, err := limiter.Allow(c.Request().Context(), "app:"+appID, redis_rate.PerMinute(rpm))
+			// Rate key includes tenant slug so the same app_id across tenants
+			// does not share a counter.
+			rateKey := "app:" + tenantSlug + ":" + appID
+			res, err := limiter.Allow(c.Request().Context(), rateKey, redis_rate.PerMinute(rpm))
 			if err != nil {
 				// Redis unavailable — fail open to avoid blocking all traffic during an outage.
 				// Log via the handler chain; rate limiting is best-effort when Redis is down.
