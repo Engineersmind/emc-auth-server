@@ -183,14 +183,10 @@ func (h *AuthHandler) Register(c echo.Context) error {
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
-	// TODO(production): remove access_token and refresh_token from response body — tokens are set as HttpOnly cookies.
-	// Kept here temporarily for Swagger UI testing and non-browser API clients.
 	return c.JSON(http.StatusCreated, map[string]interface{}{
-		"message":       "registered",
-		"expires_in":    result.ExpiresIn,
-		"expires_at":    result.ExpiresAt,
-		"access_token":  result.AccessToken,
-		"refresh_token": result.RefreshToken,
+		"message":    "registered",
+		"expires_in": result.ExpiresIn,
+		"expires_at": result.ExpiresAt,
 	})
 }
 
@@ -207,7 +203,10 @@ func (h *AuthHandler) Register(c echo.Context) error {
 // @Failure      401   {object}  map[string]string  "Invalid credentials"
 // @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
-	slug := "emc"
+	slug, _ := tenantSlugFromCtx(c)
+	if slug == "" {
+		slug = "emc"
+	}
 
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
@@ -254,14 +253,10 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	})
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
-	// TODO(production): remove access_token and refresh_token from response body — tokens are set as HttpOnly cookies.
-	// Kept here temporarily for Swagger UI testing and non-browser API clients.
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message":       "logged in",
-		"expires_in":    result.Token.ExpiresIn,
-		"expires_at":    result.Token.ExpiresAt,
-		"access_token":  result.Token.AccessToken,
-		"refresh_token": result.Token.RefreshToken,
+		"message":    "logged in",
+		"expires_in": result.Token.ExpiresIn,
+		"expires_at": result.Token.ExpiresAt,
 	})
 }
 
@@ -315,14 +310,10 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
-	// TODO(production): remove access_token and refresh_token from response body — tokens are set as HttpOnly cookies.
-	// Kept here temporarily for Swagger UI testing and non-browser API clients.
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message":       "logged in",
-		"expires_in":    result.ExpiresIn,
-		"expires_at":    result.ExpiresAt,
-		"access_token":  result.AccessToken,
-		"refresh_token": result.RefreshToken,
+		"message":    "logged in",
+		"expires_in": result.ExpiresIn,
+		"expires_at": result.ExpiresAt,
 	})
 }
 
@@ -401,14 +392,10 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
-	// TODO(production): remove access_token and refresh_token from response body — tokens are set as HttpOnly cookies.
-	// Kept here temporarily for Swagger UI testing and non-browser API clients.
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message":       "session refreshed",
-		"expires_in":    result.ExpiresIn,
-		"expires_at":    result.ExpiresAt,
-		"access_token":  result.AccessToken,
-		"refresh_token": result.RefreshToken,
+		"message":    "session refreshed",
+		"expires_in": result.ExpiresIn,
+		"expires_at": result.ExpiresAt,
 	})
 }
 
@@ -901,7 +888,10 @@ type SessionLoginRequest = LoginRequest
 // @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/session [post]
 func (h *AuthHandler) SessionLogin(c echo.Context) error {
-	slug := "emc"
+	slug, _ := tenantSlugFromCtx(c)
+	if slug == "" {
+		slug = "emc"
+	}
 
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
@@ -973,7 +963,10 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 	result, err := h.svc.Refresh(c.Request().Context(), cookie.Value)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("session refresh failed")
-		clearAuthCookies(c, h.cookieCfg)
+		if errors.Is(err, auth.ErrTokenReplay) {
+			clearAuthCookies(c, h.cookieCfg)
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
 		}
@@ -1075,6 +1068,15 @@ func (h *AuthHandler) Token(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("issue service token failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token generation failed"})
 	}
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &tenantID,
+		Action:       audit.ActionAuthClientCredentials,
+		ResourceType: "oauth_client",
+		ResourceID:   strconv.FormatInt(appID, 10),
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
 		"access_token": token,

@@ -182,16 +182,19 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 			VALUES ($1, $2, $3, $4, $5)
 		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL), *sessionFamilyID)
 	} else {
-		// New login: pre-fetch next id from the IDENTITY sequence so we can set
-		// session_family_id = id in a single atomic INSERT.
-		_, err = s.pool.Exec(ctx, `
-			WITH next_id AS (
-				SELECT nextval(pg_get_serial_sequence('refresh_tokens', 'id')) AS id
-			)
-			INSERT INTO refresh_tokens (id, user_id, tenant_id, token_hash, expires_at, session_family_id)
-			OVERRIDING SYSTEM VALUE
-			SELECT id, $1, $2, $3, $4, id FROM next_id
-		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL))
+		// New login: insert with a zero placeholder, retrieve the generated id,
+		// then stamp session_family_id = id in a second round-trip.
+		// pg_get_serial_sequence returns NULL for GENERATED ALWAYS AS IDENTITY columns,
+		// so the old nextval approach would panic at runtime.
+		var newID int64
+		err = s.pool.QueryRow(ctx, `
+			INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, session_family_id)
+			VALUES ($1, $2, $3, $4, 0) RETURNING id
+		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL)).Scan(&newID)
+		if err == nil {
+			_, err = s.pool.Exec(ctx,
+				`UPDATE refresh_tokens SET session_family_id = $1 WHERE id = $1`, newID)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("persist refresh token: %w", err)
@@ -231,6 +234,16 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		return nil, fmt.Errorf("fetch default role: %w", err)
 	}
 
+	// Validate the client before any writes — a bad client_id must not orphan a committed user row.
+	appID := ""
+	if in.ClientID != "" && s.appSvc != nil {
+		id, err := s.appSvc.ValidateClientID(ctx, tenantID, in.ClientID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid client_id")
+		}
+		appID = strconv.FormatInt(id, 10)
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -263,15 +276,6 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("register: failed to load permissions, continuing with empty set")
 		perms = []string{}
-	}
-
-	appID := ""
-	if in.ClientID != "" && s.appSvc != nil {
-		id, err := s.appSvc.ValidateClientID(ctx, tenantID, in.ClientID)
-		if err != nil {
-			return nil, fmt.Errorf("invalid client_id")
-		}
-		appID = strconv.FormatInt(id, 10)
 	}
 
 	return s.issueTokenPair(ctx, userID, tenantID, in.Email, roleName, perms, nil, appID)
@@ -418,7 +422,7 @@ func (s *AuthService) loadOTPSession(ctx context.Context, token string) (*OTPSes
 }
 
 func otpSessionKey(token string) string {
-	return "otp:session:" + token
+	return "otp:session:" + HashToken(token)
 }
 
 // Me returns profile information derived from JWT claims.
@@ -438,6 +442,10 @@ var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
 // ErrTokenReplay is returned when a previously-rotated refresh token is presented again.
 // The entire session family is revoked. The caller must clear cookies and force re-login.
 var ErrTokenReplay = errors.New("token replay detected — session family revoked")
+
+// ErrServiceUnavailable is returned when a required backing service (e.g. Redis) is
+// unreachable and proceeding without it would violate a security invariant.
+var ErrServiceUnavailable = errors.New("service temporarily unavailable")
 
 // GraceResult is returned by RefreshWithLock when a concurrent request already rotated
 // this token family within the last 10 seconds. The middleware should attach these claims
@@ -526,7 +534,7 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, familyID int64) (*Gr
 		WHERE session_family_id = $1
 		  AND revoked_at IS NULL
 		  AND expires_at > NOW()
-		  AND created_at > NOW() - ($2 || ' seconds')::interval
+		  AND created_at > NOW() - make_interval(secs => $2)
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, familyID, gracePeriod).Scan(&userID, &tenantID)
@@ -607,9 +615,10 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		var lockErr error
 		acquired, lockErr = redisCli.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
 		if lockErr != nil {
-			// Redis unavailable — log and fall through as if we hold the lock.
-			s.logger.Warn().Err(lockErr).Msg("renewal lock: redis error, proceeding without distributed lock")
-			acquired = true
+			// Redis is unavailable. Proceeding without the distributed lock would break the
+			// single-use rotation invariant and could trigger mass logout on all sessions.
+			s.logger.Error().Err(lockErr).Msg("renewal lock: redis unavailable, refusing to proceed without distributed lock")
+			return nil, nil, ErrServiceUnavailable
 		}
 	} else {
 		acquired = true
@@ -629,9 +638,16 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		}
 	}()
 
-	// We hold the lock. A revoked token at this point is a replay — no concurrent
-	// rotation could have done it since we hold the family lock.
-	if revokedAt != nil {
+	// Re-read revoked_at from the DB now that we hold the lock.
+	// The pre-lock read above could have raced with another goroutine that rotated
+	// the token before we acquired the lock, leaving our local revokedAt stale.
+	var currentRevoked *time.Time
+	if err := s.pool.QueryRow(ctx,
+		`SELECT revoked_at FROM refresh_tokens WHERE id = $1`, tokenID,
+	).Scan(&currentRevoked); err != nil {
+		return nil, nil, fmt.Errorf("re-read token after lock: %w", err)
+	}
+	if currentRevoked != nil {
 		if err := s.revokeFamily(ctx, sessionFamilyID); err != nil {
 			s.logger.Error().Err(err).Int64("family_id", sessionFamilyID).Msg("renewal: family revocation failed")
 		}

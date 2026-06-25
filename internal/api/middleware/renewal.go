@@ -114,6 +114,12 @@ func JWTRenew(
 			// ── Step 3: rotate with distributed lock ─────────────────────────
 			result, grace, refreshErr := authSvc.RefreshWithLock(c.Request().Context(), refreshCookie.Value, redisCli)
 			if refreshErr != nil {
+				if errors.Is(refreshErr, auth.ErrServiceUnavailable) {
+					return c.JSON(http.StatusServiceUnavailable, map[string]string{
+						"error": "service temporarily unavailable — please retry",
+						"code":  "service_unavailable",
+					})
+				}
 				ClearAuthCookies(c, cookieCfg)
 				if errors.Is(refreshErr, auth.ErrTokenReplay) {
 					logger.Warn().

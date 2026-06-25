@@ -224,7 +224,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	samlHandler := handlers.NewSAMLHandler(samlService, jwtSvc, deps.Logger)
 
 	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
-	e.Use(mw.AppRateLimiter(appLimitSvc))
+	e.Use(mw.AppRateLimiter(appLimitSvc, deps.Redis))
 
 	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
 	e.Use(mw.TenantCORS(corsSvc))
@@ -257,7 +257,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/session/logout", authHandler.SessionLogout)
 
 	// Client credentials token endpoint — machine-to-machine auth (no user).
-	authGroup.POST("/token", authHandler.Token)
+	authGroup.POST("/token", authHandler.Token, mw.LoginRateLimiter(rlCfg))
 
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates

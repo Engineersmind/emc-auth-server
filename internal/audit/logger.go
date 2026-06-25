@@ -64,6 +64,9 @@ const (
 	// Admin — application (OAuth2 client) management
 	ActionAdminApplicationCreated = "admin.application_created"
 	ActionAdminApplicationDeleted = "admin.application_deleted"
+
+	// Auth — machine-to-machine client_credentials grant
+	ActionAuthClientCredentials = "auth.client_credentials"
 )
 
 // ---------------------------------------------------------------------------
@@ -153,9 +156,9 @@ func New(pool *pgxpool.Pool, logger zerolog.Logger) *Logger {
 func (l *Logger) Log(ctx context.Context, e Event) {
 	_, err := l.pool.Exec(ctx, `
 		INSERT INTO audit_logs
-		  (id, tenant_id, user_id, agent_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
+		  (tenant_id, user_id, agent_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
 		VALUES
-		  (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+		  ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`, e.TenantID, e.UserID, e.AgentID, e.ActorEmail, e.Action,
 		e.ResourceType, e.ResourceID, e.IPAddress, e.UserAgent)
 	if err != nil {
