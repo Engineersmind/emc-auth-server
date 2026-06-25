@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
@@ -18,6 +19,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	samlsvc "github.com/engineersmind/emc-auth-server/internal/saml"
 )
 
 // Deps holds shared dependencies injected into route handlers.
@@ -76,11 +78,18 @@ func securityHeaders() echo.MiddlewareFunc {
 			// Control referrer information leakage.
 			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 			// Content Security Policy — primary browser XSS mitigation (HIGH-03).
+			// Swagger UI (/swagger/*) uses inline <script> blocks for SwaggerUIBundle
+			// initialization, so it requires 'unsafe-inline' in script-src.
+			// All other routes use the stricter policy.
+			scriptSrc := "'self'"
+			if strings.HasPrefix(c.Request().URL.Path, "/swagger/") {
+				scriptSrc = "'self' 'unsafe-inline'"
+			}
 			// style-src includes 'unsafe-inline' because Tailwind CSS injects
 			// inline styles at runtime. All other sources are restricted to 'self'.
 			h.Set("Content-Security-Policy",
 				"default-src 'self'; "+
-					"script-src 'self'; "+
+					"script-src "+scriptSrc+"; "+
 					"style-src 'self' 'unsafe-inline'; "+
 					"img-src 'self' data:; "+
 					"connect-src 'self'; "+
@@ -168,6 +177,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	appSvc := auth.NewApplicationService(deps.Pool, deps.Logger)
 	authSvc.WithApplications(appSvc)
 
+	// Agent service (08-01) — machine-to-machine authentication
+	agentSvc := auth.NewAgentService(deps.Pool, deps.Logger)
+	agentHandler := handlers.NewAgentHandler(agentSvc, jwtSvc, deps.Logger)
+
 	// Mailer: dev (console log) or SMTP based on Env
 	m := mailer.NewMailer(mailer.MailerConfig{
 		Env:          deps.Config.Env,
@@ -189,7 +202,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithTOTP(totpSvc).
 		WithAPIKeys(apiKeySvc).
 		WithApplications(appSvc).
-		WithCookieConfig(cookieCfg)
+		WithCookieConfig(cookieCfg).
+		WithJWT(jwtSvc)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
@@ -204,6 +218,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithAppRateLimits(appLimitSvc).
 		WithApplications(appSvc).
 		WithCORS(corsSvc)
+
+	// SAML service (Phase 4) — lightweight SP, no external dependencies.
+	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
+	samlHandler := handlers.NewSAMLHandler(samlService, jwtSvc, deps.Logger)
 
 	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
 	e.Use(mw.AppRateLimiter(appLimitSvc))
@@ -228,6 +246,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
+	// Management token — exchange an API key for a short-lived admin JWT.
+	// Equivalent to Auth0 client_credentials grant for the Management API.
+	// Usage: POST /api/v1/auth/management-token with X-API-Key: emck_<key>
+	authGroup.POST("/management-token", authHandler.ManagementToken)
+
 	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
 	authGroup.POST("/session", authHandler.SessionLogin)
 	authGroup.POST("/session/refresh", authHandler.SessionRefresh)
@@ -244,6 +267,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Auth routes — protected with transparent renewal (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, jwtRenew)
+	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew)
 
 	// TOTP management — protected (03-01)
 	otpGroup := authGroup.Group("/otp", jwtRenew)
@@ -304,6 +328,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.GET("/api-keys", authHandler.ListAPIKeys)
 	rbacGroup.DELETE("/api-keys/:id", authHandler.RevokeAPIKey)
 
+	// Monitoring stats — tenant-scoped (admin:access) and system-wide (tenant:manage)
+	rbacGroup.GET("/stats", adminHandler.GetStats)
+	tenantMgmt.GET("/stats/system", adminHandler.GetSystemStats)
+
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
@@ -318,6 +346,24 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.GET("/app-limits", adminHandler.ListAppLimits)
 	rbacGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit)
 	rbacGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit)
+
+	// SAML admin config — tenant admin (admin:access) (04-01)
+	rbacGroup.GET("/saml-config", samlHandler.GetSAMLConfig)
+	rbacGroup.PUT("/saml-config", samlHandler.UpsertSAMLConfig)
+
+	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
+	e.GET("/saml/metadata", samlHandler.GetMetadata)
+	e.GET("/saml/login", samlHandler.InitiateLogin)
+	e.POST("/saml/acs", samlHandler.HandleACS)
+
+	// Agent management — tenant admin (admin:access) (08-01, 08-04)
+	rbacGroup.POST("/agents", agentHandler.RegisterAgent)
+	rbacGroup.GET("/agents", agentHandler.ListAgents)
+	rbacGroup.DELETE("/agents/:id", agentHandler.RevokeAgent)
+	rbacGroup.GET("/agents/analysis", agentHandler.GetAgentAnalysis)
+
+	// Agent authentication — public (no JWT required) — issues agent JWT from raw key
+	apiV1.POST("/agents/authenticate", agentHandler.AuthenticateAgent)
 
 	// Unmatched /api/ routes return 404 explicitly.
 	e.GET("/api/*", func(c echo.Context) error {

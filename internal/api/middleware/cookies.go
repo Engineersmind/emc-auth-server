@@ -42,6 +42,9 @@ func BuildCookieConfig(env, domain string) CookieConfig {
 
 // BuildAuthCookies constructs the access and refresh token cookie objects.
 // The caller is responsible for writing them to the response.
+//
+// The refresh cookie is scoped to /api/v1/auth so browsers only transmit
+// the 30-day credential to the auth endpoints that actually need it.
 func BuildAuthCookies(accessToken, refreshToken string, cfg CookieConfig) []*http.Cookie {
 	access := &http.Cookie{
 		Name:     AccessTokenCookie,
@@ -60,21 +63,34 @@ func BuildAuthCookies(accessToken, refreshToken string, cfg CookieConfig) []*htt
 		Secure:   cfg.Secure,
 		SameSite: cfg.SameSite,
 		Domain:   cfg.Domain,
-		Path:     "/api/v1",
+		Path:     "/api/v1/auth",
 		MaxAge:   int(auth.RefreshTokenTTL.Seconds()),
 	}
 	return []*http.Cookie{access, refresh}
 }
 
 // ClearAuthCookies expires both auth cookies immediately on the response.
-func ClearAuthCookies(c echo.Context) {
-	for _, name := range []string{AccessTokenCookie, RefreshTokenCookie} {
-		http.SetCookie(c.Response().Writer, &http.Cookie{
-			Name:     name,
-			Value:    "",
-			HttpOnly: true,
-			Path:     "/api/v1",
-			MaxAge:   -1,
-		})
-	}
+// Domain, Secure, and SameSite must match what was set in BuildAuthCookies;
+// RFC 6265 §5.2.3 treats a missing Domain as a different entry than an explicit one.
+func ClearAuthCookies(c echo.Context, cfg CookieConfig) {
+	http.SetCookie(c.Response().Writer, &http.Cookie{
+		Name:     AccessTokenCookie,
+		Value:    "",
+		HttpOnly: true,
+		Secure:   cfg.Secure,
+		SameSite: cfg.SameSite,
+		Domain:   cfg.Domain,
+		Path:     "/api/v1",
+		MaxAge:   -1,
+	})
+	http.SetCookie(c.Response().Writer, &http.Cookie{
+		Name:     RefreshTokenCookie,
+		Value:    "",
+		HttpOnly: true,
+		Secure:   cfg.Secure,
+		SameSite: cfg.SameSite,
+		Domain:   cfg.Domain,
+		Path:     "/api/v1/auth",
+		MaxAge:   -1,
+	})
 }

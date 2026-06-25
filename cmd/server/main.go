@@ -1,6 +1,6 @@
 // @title           EMC Auth Server
-// @version         1.0
-// @description     Standalone multi-tenant Identity Provider — email/password auth, JWT, refresh tokens, password reset.
+// @version         1.5.0
+// @description     Standalone multi-tenant Identity Provider — email/password auth, JWT, refresh tokens, TOTP 2FA, SAML 2.0, RBAC, Admin UI, and AI/Agent security.
 //
 // @contact.name    EngineersMind
 // @contact.url     https://github.com/engineersmind/emc-auth-server
@@ -76,6 +76,13 @@ func main() {
 		logger.Fatal().Err(err).Msg("seed failed")
 	}
 
+	// Seed demo tenants + users when SEED_DEMO_DATA=true (local dev / QA only)
+	if os.Getenv("SEED_DEMO_DATA") == "true" {
+		if err := store.RunDemoSeed(ctx, pool, logger); err != nil {
+			logger.Fatal().Err(err).Msg("demo seed failed")
+		}
+	}
+
 	// Connect to Redis
 	rdb, err := store.NewRedis(ctx, cfg.RedisURL, logger)
 	if err != nil {
@@ -115,8 +122,9 @@ func main() {
 	defer stop()
 
 	s := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: e,
+		Addr:              ":" + cfg.Port,
+		Handler:           e,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Start server in goroutine

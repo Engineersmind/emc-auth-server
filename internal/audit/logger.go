@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
@@ -75,6 +76,8 @@ type Event struct {
 	TenantID *int64
 	// UserID is the user who performed the action. Nil for unauthenticated events.
 	UserID *int64
+	// AgentID is the agent that performed the action. Nil for human-initiated events (08-03).
+	AgentID *uuid.UUID
 	// ActorEmail is the email of the actor (denormalized at log time).
 	ActorEmail string
 	// Action is one of the Action* constants above.
@@ -99,6 +102,7 @@ type LogEntry struct {
 	TenantID     *string   `json:"tenant_id"`
 	TenantSlug   *string   `json:"tenant_slug"`
 	UserID       *string   `json:"user_id"`
+	AgentID      *string   `json:"agent_id,omitempty"`
 	ActorEmail   string    `json:"actor_email"`
 	Action       string    `json:"action"`
 	ResourceType string    `json:"resource_type"`
@@ -122,6 +126,7 @@ type QueryParams struct {
 	TenantID *int64
 	Action   string
 	UserID   string
+	AgentID  string // optional UUID string; filters to events by a specific agent (08-03)
 	From     *time.Time
 	To       *time.Time
 	Page     int
@@ -148,10 +153,10 @@ func New(pool *pgxpool.Pool, logger zerolog.Logger) *Logger {
 func (l *Logger) Log(ctx context.Context, e Event) {
 	_, err := l.pool.Exec(ctx, `
 		INSERT INTO audit_logs
-		  (tenant_id, user_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
+		  (id, tenant_id, user_id, agent_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
 		VALUES
-		  ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, e.TenantID, e.UserID, e.ActorEmail, e.Action,
+		  (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, e.TenantID, e.UserID, e.AgentID, e.ActorEmail, e.Action,
 		e.ResourceType, e.ResourceID, e.IPAddress, e.UserAgent)
 	if err != nil {
 		l.logger.Error().Err(err).Str("action", e.Action).Msg("audit: failed to write log entry")
@@ -160,6 +165,57 @@ func (l *Logger) Log(ctx context.Context, e Event) {
 
 // ---------------------------------------------------------------------------
 // Query — tenant-scoped (admin:access) and system-wide (tenant:manage)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Stats — aggregated counts for the monitoring dashboard
+// ---------------------------------------------------------------------------
+
+// StatsResult holds aggregated counts for the monitoring dashboard.
+type StatsResult struct {
+	LoginsToday       int        `json:"logins_today"`
+	FailedLoginsToday int        `json:"failed_logins_today"`
+	LogoutsToday      int        `json:"logouts_today"`
+	ActiveUsersWeek   int        `json:"active_users_week"`
+	TotalAuditEvents  int        `json:"total_audit_events"`
+	RecentEvents      []LogEntry `json:"recent_events"`
+}
+
+// Stats returns aggregated counts for the monitoring dashboard.
+// When tenantID is nil, returns system-wide counts.
+func (l *Logger) Stats(ctx context.Context, tenantID *int64) (*StatsResult, error) {
+	where := "WHERE 1=1"
+	args := []any{}
+	if tenantID != nil {
+		args = append(args, *tenantID)
+		where += fmt.Sprintf(" AND tenant_id = $%d", len(args))
+	}
+
+	var s StatsResult
+	err := l.pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT
+			COUNT(*) FILTER (WHERE action = 'auth.login'        AND created_at >= NOW() - INTERVAL '24 hours'),
+			COUNT(*) FILTER (WHERE action = 'auth.login_failed' AND created_at >= NOW() - INTERVAL '24 hours'),
+			COUNT(*) FILTER (WHERE action = 'auth.logout'       AND created_at >= NOW() - INTERVAL '24 hours'),
+			COUNT(DISTINCT user_id) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id IS NOT NULL),
+			COUNT(*)
+		FROM audit_logs %s
+	`, where), args...).Scan(
+		&s.LoginsToday, &s.FailedLoginsToday, &s.LogoutsToday,
+		&s.ActiveUsersWeek, &s.TotalAuditEvents,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit stats: %w", err)
+	}
+
+	page, err := l.Query(ctx, QueryParams{TenantID: tenantID, Page: 1, Limit: 10})
+	if err != nil {
+		return nil, fmt.Errorf("audit stats recent: %w", err)
+	}
+	s.RecentEvents = page.Logs
+	return &s, nil
+}
+
 // ---------------------------------------------------------------------------
 
 // Query returns a paginated, filtered list of audit log entries.
@@ -195,6 +251,13 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 			where += fmt.Sprintf(" AND al.user_id = $%d", len(args))
 		}
 	}
+	if p.AgentID != "" {
+		aid, err := uuid.Parse(p.AgentID)
+		if err == nil {
+			args = append(args, aid)
+			where += fmt.Sprintf(" AND al.agent_id = $%d", len(args))
+		}
+	}
 	if p.From != nil {
 		args = append(args, *p.From)
 		where += fmt.Sprintf(" AND al.created_at >= $%d", len(args))
@@ -215,7 +278,7 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 	offsetArg := len(args)
 
 	querySQL := fmt.Sprintf(`
-		SELECT al.id, al.tenant_id, t.slug, al.user_id,
+		SELECT al.id, al.tenant_id, t.slug, al.user_id, al.agent_id,
 		       al.actor_email, al.action, al.resource_type,
 		       al.resource_id, al.ip_address, al.created_at
 		FROM audit_logs al
@@ -236,10 +299,11 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 		var e LogEntry
 		var tenantID *int64
 		var userID *int64
+		var agentID *uuid.UUID
 		var tenantSlug *string
 		var logID int64
 		if err := rows.Scan(
-			&logID, &tenantID, &tenantSlug, &userID,
+			&logID, &tenantID, &tenantSlug, &userID, &agentID,
 			&e.ActorEmail, &e.Action, &e.ResourceType,
 			&e.ResourceID, &e.IPAddress, &e.CreatedAt,
 		); err != nil {
@@ -253,6 +317,10 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 		if userID != nil {
 			s := strconv.FormatInt(*userID, 10)
 			e.UserID = &s
+		}
+		if agentID != nil {
+			s := agentID.String()
+			e.AgentID = &s
 		}
 		e.TenantSlug = tenantSlug
 		logs = append(logs, e)

@@ -114,7 +114,7 @@ func JWTRenew(
 			// ── Step 3: rotate with distributed lock ─────────────────────────
 			result, grace, refreshErr := authSvc.RefreshWithLock(c.Request().Context(), refreshCookie.Value, redisCli)
 			if refreshErr != nil {
-				ClearAuthCookies(c)
+				ClearAuthCookies(c, cookieCfg)
 				if errors.Is(refreshErr, auth.ErrTokenReplay) {
 					logger.Warn().
 						Str("ip", c.RealIP()).

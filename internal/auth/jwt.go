@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,6 +28,18 @@ type Claims struct {
 	Permissions []string `json:"permissions"`
 	jwt.RegisteredClaims
 }
+
+// AgentClaims is the JWT payload for machine-to-machine agent tokens (08-01).
+type AgentClaims struct {
+	AgentID      string   `json:"agent_id"`
+	TenantID     string   `json:"tenant_id"`
+	AgentType    string   `json:"agent_type"`
+	Capabilities []string `json:"capabilities"`
+	jwt.RegisteredClaims
+}
+
+// AgentTokenTTL is the lifetime of an agent access token.
+const AgentTokenTTL = 1 * time.Hour
 
 // JWTService signs and verifies JWTs using a per-tenant HS256 secret.
 type JWTService struct {
@@ -65,6 +78,10 @@ const AccessTokenTTL = 15 * time.Minute
 // RefreshTokenTTL is the lifetime of a refresh token (AUTH-06).
 const RefreshTokenTTL = 30 * 24 * time.Hour
 
+// ManagementTokenTTL is the lifetime of an API-key-derived management token.
+// Short-lived by design — callers must re-exchange the API key to get a new one.
+const ManagementTokenTTL = 15 * time.Minute
+
 // Sign creates and signs a JWT for the given claims using the tenant's HS256 secret.
 func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, c *Claims) (string, error) {
 	secret, err := s.tenantSecret(ctx, tenantID)
@@ -74,6 +91,7 @@ func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, 
 
 	now := time.Now().UTC()
 	c.RegisteredClaims = jwt.RegisteredClaims{
+		ID:        uuid.New().String(),
 		Issuer:    s.issuer,
 		Audience:  jwt.ClaimStrings{audience},
 		Subject:   c.UserID,
@@ -85,6 +103,71 @@ func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, 
 	signed, err := token.SignedString([]byte(secret))
 	if err != nil {
 		return "", fmt.Errorf("sign jwt: %w", err)
+	}
+	return signed, nil
+}
+
+// SignManagement issues a short-lived management JWT from an API key identity.
+// The token carries the API key's permissions so it can call /admin/* endpoints
+// for the key's tenant — equivalent to Auth0's client_credentials management token.
+func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentity) (string, error) {
+	secret, err := s.tenantSecret(ctx, identity.TenantID)
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC()
+	claims := &Claims{
+		UserID:      "key:" + strconv.FormatInt(identity.KeyID, 10),
+		TenantID:    strconv.FormatInt(identity.TenantID, 10),
+		Email:       identity.Name + "@apikey",
+		Role:        "api_key",
+		Permissions: identity.Permissions,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        uuid.New().String(),
+			Issuer:    s.issuer,
+			Audience:  jwt.ClaimStrings{"emc-auth-management"},
+			Subject:   "key:" + strconv.FormatInt(identity.KeyID, 10),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ManagementTokenTTL)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("sign management token: %w", err)
+	}
+	return signed, nil
+}
+
+// SignAgent creates and signs a JWT for an authenticated agent identity.
+// Uses the tenant's HS256 secret — same trust boundary as user JWTs.
+func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (string, error) {
+	secret, err := s.tenantSecret(ctx, identity.TenantID)
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().UTC()
+	claims := &AgentClaims{
+		AgentID:      identity.AgentID.String(),
+		TenantID:     strconv.FormatInt(identity.TenantID, 10),
+		AgentType:    identity.AgentType,
+		Capabilities: identity.Capabilities,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    s.issuer,
+			Audience:  jwt.ClaimStrings{"emc-auth-agent"},
+			Subject:   identity.AgentID.String(),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ExpiresAt: jwt.NewNumericDate(now.Add(AgentTokenTTL)),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("sign agent jwt: %w", err)
 	}
 	return signed, nil
 }

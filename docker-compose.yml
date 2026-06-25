@@ -40,6 +40,11 @@ services:
       LOG_LEVEL: info
       DATABASE_URL: postgres://emc_auth:password@postgres:5432/emc_auth?sslmode=disable
       REDIS_URL: redis://redis:6379/0
+      SEED_ADMIN_PASSWORD: "ChangeMe123!"
+      JWT_ISSUER: "http://localhost:9090"
+      APP_BASE_URL: "http://localhost:9090"
+      TOTP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      SEED_DEMO_DATA: "true"
     depends_on:
       postgres:
         condition: service_healthy

@@ -680,12 +680,26 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 // IssueServiceToken signs a short-lived access token for a machine client using
 // the client_credentials grant. There is no user, no refresh token, and the
 // role is fixed to "service". The appID is the string-encoded oauth_clients.id.
+// Scopes are loaded from the oauth_clients.scopes column so downstream permission
+// checks receive the correct grants.
 func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int64) (string, int, error) {
+	var scopes []string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT scopes FROM oauth_clients WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		appID, tenantID,
+	).Scan(&scopes); err != nil {
+		return "", 0, fmt.Errorf("load app scopes: %w", err)
+	}
+	if scopes == nil {
+		scopes = []string{}
+	}
+
 	claims := &Claims{
+		UserID:      strconv.FormatInt(appID, 10),
 		TenantID:    strconv.FormatInt(tenantID, 10),
 		AppID:       strconv.FormatInt(appID, 10),
 		Role:        "service",
-		Permissions: []string{},
+		Permissions: scopes,
 	}
 	token, err := s.jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
 	if err != nil {

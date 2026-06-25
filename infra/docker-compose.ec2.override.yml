@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# docker-compose.ec2.override.yml  —  EC2 production overlay
+#
+# Architecture:
+#   app      → ECR image (CI/CD deploys), bound to 127.0.0.1:8080 (nginx proxies)
+#   redis    → local Docker container (REDIS_PASSWORD from Secrets Manager)
+#   postgres → DISABLED — using AWS RDS (DATABASE_URL in Secrets Manager)
+#   prometheus/grafana → DISABLED — monitoring done manually
+#
+# Applied by CI/CD and deploy scripts:
+#   docker compose -f docker-compose.prod.yml -f docker-compose.ec2.override.yml
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  app:
+    image: "${ECR_IMAGE_URI:-emc-auth-server:latest}"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    restart: unless-stopped
+
+  postgres:
+    profiles: ["disabled"]
+
+  prometheus:
+    profiles: ["disabled"]
+
+  grafana:
+    profiles: ["disabled"]

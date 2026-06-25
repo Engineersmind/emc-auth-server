@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>EMC Auth — Platform Design & Role Workflow</title>
+<style>
+  :root {
+    --brand:   #1e3a5f;
+    --brand2:  #2d5f99;
+    --accent:  #0ea5e9;
+    --green:   #16a34a;
+    --amber:   #d97706;
+    --red:     #dc2626;
+    --purple:  #7c3aed;
+    --gray-50: #f8fafc;
+    --gray-100:#f1f5f9;
+    --gray-200:#e2e8f0;
+    --gray-400:#94a3b8;
+    --gray-600:#475569;
+    --gray-700:#334155;
+    --gray-900:#0f172a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--gray-50); color: var(--gray-700); line-height: 1.6; }
+
+  /* ── Layout ── */
+  .container { max-width: 1100px; margin: 0 auto; padding: 40px 24px; }
+  .hero { background: linear-gradient(135deg, var(--brand) 0%, var(--brand2) 100%); color: white; padding: 48px 24px 40px; text-align: center; }
+  .hero h1 { font-size: 2rem; font-weight: 700; margin-bottom: 8px; }
+  .hero p { opacity: 0.8; font-size: 1.05rem; max-width: 600px; margin: 0 auto; }
+  .badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 0.72rem; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+
+  /* ── Section titles ── */
+  .section { margin-top: 48px; }
+  .section-title { font-size: 1.2rem; font-weight: 700; color: var(--brand); border-bottom: 2px solid var(--gray-200); padding-bottom: 8px; margin-bottom: 24px; }
+
+  /* ── Role cards ── */
+  .roles-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  @media(max-width:768px) { .roles-grid { grid-template-columns: 1fr; } }
+  .role-card { border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.07); }
+  .role-card .header { padding: 20px; color: white; }
+  .role-card .header .tier { font-size: 0.7rem; opacity: 0.8; text-transform: uppercase; letter-spacing: .08em; font-weight: 600; }
+  .role-card .header h2 { font-size: 1.15rem; font-weight: 700; margin: 4px 0 2px; }
+  .role-card .header p { font-size: 0.8rem; opacity: 0.85; }
+  .role-card .body { background: white; padding: 20px; border: 1px solid var(--gray-200); border-top: none; border-radius: 0 0 12px 12px; }
+  .role-card .body ul { list-style: none; }
+  .role-card .body ul li { font-size: 0.82rem; padding: 5px 0; border-bottom: 1px solid var(--gray-100); display: flex; align-items: flex-start; gap: 8px; }
+  .role-card .body ul li:last-child { border-bottom: none; }
+  .role-card .body ul li .icon { flex-shrink: 0; width: 16px; text-align: center; }
+  .role-card .creds { margin-top: 16px; background: var(--gray-50); border-radius: 8px; padding: 12px 14px; font-size: 0.78rem; }
+  .role-card .creds .creds-title { font-weight: 600; color: var(--gray-600); margin-bottom: 6px; font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em; }
+  .role-card .creds table { width: 100%; border-collapse: collapse; }
+  .role-card .creds td { padding: 3px 4px; vertical-align: top; }
+  .role-card .creds td:first-child { color: var(--gray-400); width: 70px; font-size: 0.7rem; }
+  .role-card .creds code { font-size: 0.75rem; background: white; border: 1px solid var(--gray-200); padding: 1px 5px; border-radius: 4px; }
+
+  /* Tier colors */
+  .tier-1 .header { background: linear-gradient(135deg, #1e3a5f, #2d5f99); }
+  .tier-2 .header { background: linear-gradient(135deg, #7c3aed, #9333ea); }
+  .tier-3 .header { background: linear-gradient(135deg, #0369a1, #0ea5e9); }
+
+  /* ── Auth Flow diagram ── */
+  .flow { display: flex; gap: 0; align-items: stretch; overflow-x: auto; padding: 8px 0; }
+  .flow-step { display: flex; flex-direction: column; align-items: center; min-width: 140px; }
+  .flow-box { background: white; border: 2px solid var(--gray-200); border-radius: 10px; padding: 14px 12px; text-align: center; width: 130px; font-size: 0.78rem; font-weight: 500; color: var(--gray-700); position: relative; }
+  .flow-box .label { font-size: 0.65rem; color: var(--gray-400); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+  .flow-box.actor { background: var(--brand); color: white; border-color: var(--brand); }
+  .flow-box.actor .label { color: rgba(255,255,255,.6); }
+  .flow-box.api { background: #f0fdf4; border-color: #86efac; color: var(--green); }
+  .flow-box.store { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+  .flow-box.output { background: #f0f9ff; border-color: #7dd3fc; color: #0369a1; }
+  .flow-arrow { display: flex; align-items: center; padding: 0 4px; color: var(--gray-400); font-size: 1.2rem; }
+  .flow-label { font-size: 0.65rem; color: var(--gray-400); text-align: center; margin-top: 6px; max-width: 130px; }
+
+  /* ── Permission matrix ── */
+  .matrix { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .matrix th { background: var(--brand); color: white; padding: 10px 14px; text-align: left; font-weight: 600; font-size: 0.75rem; }
+  .matrix th:first-child { border-radius: 8px 0 0 0; }
+  .matrix th:last-child { border-radius: 0 8px 0 0; }
+  .matrix td { padding: 9px 14px; border-bottom: 1px solid var(--gray-100); vertical-align: middle; }
+  .matrix tr:last-child td { border-bottom: none; }
+  .matrix tr:hover td { background: var(--gray-50); }
+  .yes { color: var(--green); font-weight: 700; }
+  .no  { color: var(--gray-400); }
+  .partial { color: var(--amber); font-weight: 600; }
+
+  /* ── API cards ── */
+  .api-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  @media(max-width:640px) { .api-grid { grid-template-columns: 1fr; } }
+  .api-card { background: white; border: 1px solid var(--gray-200); border-radius: 10px; padding: 18px; }
+  .api-card h3 { font-size: 0.9rem; font-weight: 700; margin-bottom: 10px; color: var(--gray-900); display: flex; align-items: center; gap: 8px; }
+  .api-card pre { background: var(--gray-900); color: #e2e8f0; border-radius: 7px; padding: 12px; font-size: 0.72rem; overflow-x: auto; line-height: 1.7; }
+  .api-card pre .comment { color: #94a3b8; }
+  .api-card pre .method-get  { color: #86efac; font-weight: 700; }
+  .api-card pre .method-post { color: #fcd34d; font-weight: 700; }
+  .api-card pre .url { color: #93c5fd; }
+  .api-card pre .key { color: #f9a8d4; }
+  .api-card pre .val { color: #d1fae5; }
+
+  /* ── Journey ── */
+  .journey-row { display: grid; grid-template-columns: 180px 1fr; gap: 20px; margin-bottom: 20px; align-items: start; }
+  .journey-actor { background: white; border: 1px solid var(--gray-200); border-radius: 8px; padding: 12px; text-align: center; font-size: 0.8rem; font-weight: 600; }
+  .journey-steps { display: flex; flex-direction: column; gap: 8px; }
+  .journey-step { background: white; border: 1px solid var(--gray-200); border-radius: 8px; padding: 10px 14px; font-size: 0.82rem; display: flex; align-items: flex-start; gap: 10px; }
+  .journey-step .num { background: var(--brand); color: white; border-radius: 50%; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; font-weight: 700; flex-shrink: 0; }
+  .journey-step .desc { flex: 1; }
+  .journey-step .desc strong { color: var(--gray-900); }
+  .journey-step .endpoint { font-family: monospace; font-size: 0.72rem; background: var(--gray-100); padding: 2px 6px; border-radius: 4px; color: var(--brand2); }
+
+  /* ── Footer ── */
+  .footer { margin-top: 60px; text-align: center; font-size: 0.8rem; color: var(--gray-400); padding-bottom: 40px; }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>EMC Auth — Platform Design</h1>
+  <p>Role hierarchy, authentication workflows, and API integration guide for the Auth0 replacement</p>
+</div>
+
+<div class="container">
+
+  <!-- ── 1. ROLE HIERARCHY ── -->
+  <div class="section">
+    <div class="section-title">1 — Role Hierarchy (3 Tiers)</div>
+    <div class="roles-grid">
+
+      <!-- Tier 1 -->
+      <div class="role-card tier-1">
+        <div class="header">
+          <div class="tier">Tier 1 · Platform</div>
+          <h2>EMC Super Admin</h2>
+          <p>Manages the entire auth platform — equivalent to Auth0 dashboard owner</p>
+        </div>
+        <div class="body">
+          <ul>
+            <li><span class="icon">🏢</span> Create, manage and deactivate tenants</li>
+            <li><span class="icon">👥</span> View all users across all tenants</li>
+            <li><span class="icon">🔑</span> Manage system-wide permissions</li>
+            <li><span class="icon">📊</span> View system audit logs</li>
+            <li><span class="icon">⚙️</span> Configure SAML, CORS, rate limits</li>
+            <li><span class="icon">🤖</span> Register agents (M2M auth)</li>
+            <li><span class="icon">🔐</span> Issue management API tokens</li>
+          </ul>
+          <div class="creds">
+            <div class="creds-title">Local login</div>
+            <table>
+              <tr><td>Workspace</td><td><code>emc</code></td></tr>
+              <tr><td>Email</td><td><code>admin@emc.local</code></td></tr>
+              <tr><td>Password</td><td><code>ChangeMe123!</code></td></tr>
+              <tr><td>Permissions</td><td><code>tenant:manage</code> + <code>admin:access</code></td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tier 2 -->
+      <div class="role-card tier-2">
+        <div class="header">
+          <div class="tier">Tier 2 · Tenant</div>
+          <h2>Tenant Admin</h2>
+          <p>Manages users and roles inside their own tenant — equivalent to Auth0 Application admin</p>
+        </div>
+        <div class="body">
+          <ul>
+            <li><span class="icon">👤</span> Create and manage users in their tenant</li>
+            <li><span class="icon">🛡️</span> Create roles and assign permissions</li>
+            <li><span class="icon">📋</span> View tenant-scoped audit logs</li>
+            <li><span class="icon">🔑</span> Create API keys for their tenant</li>
+            <li><span class="icon">🔒</span> Force password resets</li>
+            <li><span class="icon">❌</span> Cannot see other tenants</li>
+            <li><span class="icon">❌</span> Cannot create tenants</li>
+          </ul>
+          <div class="creds">
+            <div class="creds-title">Local logins (example: Outreach)</div>
+            <table>
+              <tr><td>Workspace</td><td><code>outreach</code></td></tr>
+              <tr><td>Email</td><td><code>admin@outreach.local</code></td></tr>
+              <tr><td>Password</td><td><code>Demo1234!</code></td></tr>
+              <tr><td>Permission</td><td><code>admin:access</code></td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tier 3 -->
+      <div class="role-card tier-3">
+        <div class="header">
+          <div class="tier">Tier 3 · End User</div>
+          <h2>Application User</h2>
+          <p>Users of applications that delegate auth to EMC — equivalent to Auth0 end users</p>
+        </div>
+        <div class="body">
+          <ul>
+            <li><span class="icon">🔑</span> Login / logout to get JWT tokens</li>
+            <li><span class="icon">👤</span> View and update their own profile</li>
+            <li><span class="icon">🔐</span> Enroll in TOTP 2FA</li>
+            <li><span class="icon">🔄</span> Refresh access tokens</li>
+            <li><span class="icon">📱</span> Reset their own password</li>
+            <li><span class="icon">❌</span> No admin panel access</li>
+            <li><span class="icon">✅</span> Custom roles e.g. account_manager, viewer</li>
+          </ul>
+          <div class="creds">
+            <div class="creds-title">Local logins (Outreach members)</div>
+            <table>
+              <tr><td>Workspace</td><td><code>outreach</code></td></tr>
+              <tr><td>Email</td><td><code>alice@outreach.local</code></td></tr>
+              <tr><td>Password</td><td><code>Demo1234!</code></td></tr>
+              <tr><td>Role</td><td><code>member</code> (custom)</td></tr>
+            </table>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── 2. AUTHENTICATION FLOW ── -->
+  <div class="section">
+    <div class="section-title">2 — Authentication Flow</div>
+
+    <!-- User Login Flow -->
+    <p style="font-size:0.85rem;color:var(--gray-600);margin-bottom:16px;font-weight:600;">A — Standard User Login (JWT)</p>
+    <div class="flow">
+      <div class="flow-step">
+        <div class="flow-box actor"><div class="label">Your App</div>User / Browser</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-box api"><div class="label">EMC Auth API</div>POST /auth/login<br/>X-Tenant-Slug: outreach</div>
+        <div class="flow-label">email + password</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-box store"><div class="label">Database</div>Verify bcrypt hash<br/>Load permissions</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-box output"><div class="label">Response</div>access_token (JWT)<br/>refresh_token<br/>permissions[]</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-box actor"><div class="label">Your App</div>Attach Bearer token<br/>to API requests</div>
+      </div>
+    </div>
+
+    <br/>
+
+    <!-- M2M Flow -->
+    <p style="font-size:0.85rem;color:var(--gray-600);margin-bottom:16px;font-weight:600;">B — Machine-to-Machine (API Key → Management Token)</p>
+    <div class="flow">
+      <div class="flow-step">
+        <div class="flow-box actor"><div class="label">Backend Service</div>Outreach API<br/>Server</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-box api"><div class="label">EMC Auth API</div>POST /auth/management-token<br/>X-API-Key: emck_xxx</div>
+        <div class="flow-label">API key (long-lived)</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-box output"><div class="label">Response</div>access_token (JWT)<br/>expires_in: 900s</div>
+        <div class="flow-label">short-lived JWT</div>
+      </div>
+      <div class="flow-arrow">→</div>
+      <div class="flow-step">
+        <div class="flow-box api"><div class="label">Management API</div>GET /admin/users<br/>POST /admin/users<br/>etc.</div>
+        <div class="flow-label">Authorization: Bearer JWT</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── 3. PERMISSION MATRIX ── -->
+  <div class="section">
+    <div class="section-title">3 — Permission Matrix</div>
+    <table class="matrix">
+      <thead>
+        <tr>
+          <th>Action</th>
+          <th>EMC Super Admin</th>
+          <th>Tenant Admin</th>
+          <th>End User</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>Login / get JWT token</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>View own profile (/auth/me)</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>Refresh token</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>Reset own password</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>Enroll TOTP 2FA</td><td class="yes">✓</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+        <tr><td>List users in own tenant</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td></tr>
+        <tr><td>Create / delete users</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td></tr>
+        <tr><td>Manage roles & permissions</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td></tr>
+        <tr><td>View audit logs (own tenant)</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td></tr>
+        <tr><td>Create API keys</td><td class="yes">✓</td><td class="yes">✓</td><td class="no">✗</td></tr>
+        <tr><td>Issue management tokens</td><td class="yes">✓</td><td class="partial">✓ (own tenant only)</td><td class="no">✗</td></tr>
+        <tr><td>Create / manage tenants</td><td class="yes">✓</td><td class="no">✗</td><td class="no">✗</td></tr>
+        <tr><td>List users across all tenants</td><td class="yes">✓</td><td class="no">✗</td><td class="no">✗</td></tr>
+        <tr><td>View system audit logs</td><td class="yes">✓</td><td class="no">✗</td><td class="no">✗</td></tr>
+        <tr><td>Configure SAML / CORS</td><td class="yes">✓</td><td class="no">✗</td><td class="no">✗</td></tr>
+        <tr><td>Register agents (M2M)</td><td class="yes">✓</td><td class="no">✗</td><td class="no">✗</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ── 4. USER JOURNEYS ── -->
+  <div class="section">
+    <div class="section-title">4 — User Journeys</div>
+
+    <!-- Journey 1: New tenant onboarding -->
+    <p style="font-size:0.85rem;font-weight:700;color:var(--gray-700);margin-bottom:12px;">Journey 1 — Onboard a new application (Outreach)</p>
+    <div class="journey-steps" style="margin-bottom:28px;">
+      <div class="journey-step"><div class="num">1</div><div class="desc"><strong>EMC Super Admin creates the tenant</strong><br/>POST /admin/tenants → slug=outreach, name=Outreach<br/><span class="endpoint">requires: tenant:manage</span></div></div>
+      <div class="journey-step"><div class="num">2</div><div class="desc"><strong>Super Admin defines permissions for Outreach</strong><br/>POST /admin/tenants/:tid/permissions → e.g. campaigns:read, campaigns:write, contacts:manage<br/><span class="endpoint">requires: tenant:manage</span></div></div>
+      <div class="journey-step"><div class="num">3</div><div class="desc"><strong>Super Admin creates roles for Outreach</strong><br/>POST /admin/tenants/:tid/roles → admin (campaigns:*), account_manager (campaigns:read, contacts:manage), viewer (campaigns:read)<br/><span class="endpoint">requires: tenant:manage</span></div></div>
+      <div class="journey-step"><div class="num">4</div><div class="desc"><strong>Super Admin creates the Outreach tenant admin user</strong><br/>POST /admin/tenants/:tid/users → admin@outreach.com, role=admin<br/><span class="endpoint">requires: tenant:manage</span></div></div>
+      <div class="journey-step"><div class="num">5</div><div class="desc"><strong>Outreach Admin logs in and manages their own users</strong><br/>POST /auth/login (X-Tenant-Slug: outreach) → gets admin JWT → creates alice (account_manager), bob (viewer)<br/><span class="endpoint">requires: admin:access</span></div></div>
+      <div class="journey-step"><div class="num">6</div><div class="desc"><strong>Outreach creates an API key for their backend service</strong><br/>POST /admin/api-keys → { name: "outreach-backend", permissions: ["admin:access"] }<br/><span class="endpoint">returns: emck_xxx (save this!)</span></div></div>
+    </div>
+
+    <!-- Journey 2: End user auth in Outreach -->
+    <p style="font-size:0.85rem;font-weight:700;color:var(--gray-700);margin-bottom:12px;">Journey 2 — End user authenticates in Outreach application</p>
+    <div class="journey-steps" style="margin-bottom:28px;">
+      <div class="journey-step"><div class="num">1</div><div class="desc"><strong>Alice (account_manager) logs into Outreach app</strong><br/>POST /auth/login → X-Tenant-Slug: outreach, email: alice@outreach.com<br/><span class="endpoint">returns: access_token (JWT, 1hr) + refresh_token (30d)</span></div></div>
+      <div class="journey-step"><div class="num">2</div><div class="desc"><strong>Outreach app verifies Alice's identity and permissions</strong><br/>GET /auth/me → { user_id, email, role: "account_manager", permissions: ["campaigns:read","contacts:manage"] }<br/><span class="endpoint">Outreach app gates features based on permissions[]</span></div></div>
+      <div class="journey-step"><div class="num">3</div><div class="desc"><strong>Token expires → Outreach app refreshes silently</strong><br/>POST /auth/refresh → { refresh_token } → new access_token<br/><span class="endpoint">No re-login needed for 30 days</span></div></div>
+      <div class="journey-step"><div class="num">4</div><div class="desc"><strong>Alice logs out</strong><br/>POST /auth/logout → refresh token revoked, cookies cleared</div></div>
+    </div>
+
+    <!-- Journey 3: M2M backend -->
+    <p style="font-size:0.85rem;font-weight:700;color:var(--gray-700);margin-bottom:12px;">Journey 3 — Outreach backend manages users programmatically (M2M)</p>
+    <div class="journey-steps">
+      <div class="journey-step"><div class="num">1</div><div class="desc"><strong>Outreach backend exchanges API key for management token</strong><br/>POST /auth/management-token → X-API-Key: emck_xxx<br/><span class="endpoint">returns: access_token (JWT, 15min) with admin:access</span></div></div>
+      <div class="journey-step"><div class="num">2</div><div class="desc"><strong>Backend creates a new user on signup</strong><br/>POST /admin/users → Authorization: Bearer &lt;mgmt-token&gt;, X-Tenant-Slug: outreach<br/><span class="endpoint">{ email, password, role: "viewer" }</span></div></div>
+      <div class="journey-step"><div class="num">3</div><div class="desc"><strong>Token expires (15min) → backend re-exchanges API key</strong><br/>The API key (emck_xxx) is the long-lived credential. The JWT is always short-lived.<br/><span class="endpoint">Same as Auth0's client_credentials grant</span></div></div>
+    </div>
+  </div>
+
+  <!-- ── 5. API QUICK REFERENCE ── -->
+  <div class="section">
+    <div class="section-title">5 — API Quick Reference</div>
+    <div class="api-grid">
+
+      <div class="api-card">
+        <h3>🔑 Login (any user)</h3>
+        <pre><span class="comment"># Works for all 3 tiers</span>
+<span class="method-post">POST</span> <span class="url">/api/v1/auth/login</span>
+<span class="key">X-Tenant-Slug:</span> <span class="val">outreach</span>
+
+{
+  <span class="key">"email":</span>    <span class="val">"alice@outreach.local"</span>,
+  <span class="key">"password":</span> <span class="val">"Demo1234!"</span>
+}
+
+<span class="comment"># Response:</span>
+{
+  <span class="key">"access_token":</span>  <span class="val">"eyJ..."</span>,
+  <span class="key">"refresh_token":</span> <span class="val">"eyJ..."</span>,
+  <span class="key">"permissions":</span>   <span class="val">["campaigns:read"]</span>
+}</pre>
+      </div>
+
+      <div class="api-card">
+        <h3>👤 Verify identity</h3>
+        <pre><span class="comment"># Use in your app to gate features</span>
+<span class="method-get">GET</span> <span class="url">/api/v1/auth/me</span>
+<span class="key">Authorization:</span> <span class="val">Bearer eyJ...</span>
+<span class="key">X-Tenant-Slug:</span> <span class="val">outreach</span>
+
+<span class="comment"># Response:</span>
+{
+  <span class="key">"user_id":</span>     <span class="val">"uuid"</span>,
+  <span class="key">"email":</span>       <span class="val">"alice@outreach.local"</span>,
+  <span class="key">"role":</span>        <span class="val">"account_manager"</span>,
+  <span class="key">"permissions":</span> <span class="val">["campaigns:read","contacts:manage"]</span>
+}</pre>
+      </div>
+
+      <div class="api-card">
+        <h3>🤖 M2M management token</h3>
+        <pre><span class="comment"># Your backend uses this, not users</span>
+<span class="method-post">POST</span> <span class="url">/api/v1/auth/management-token</span>
+<span class="key">X-API-Key:</span> <span class="val">emck_xxxxxxxxxxxx</span>
+
+<span class="comment"># Response:</span>
+{
+  <span class="key">"access_token":</span> <span class="val">"eyJ..."</span>,
+  <span class="key">"expires_in":</span>   <span class="val">900</span>,
+  <span class="key">"permissions":</span>  <span class="val">["admin:access"]</span>
+}
+
+<span class="comment"># Then use this JWT to manage users:</span>
+<span class="method-post">POST</span> <span class="url">/api/v1/admin/users</span>
+<span class="key">Authorization:</span> <span class="val">Bearer eyJ... (mgmt token)</span></pre>
+      </div>
+
+      <div class="api-card">
+        <h3>🛡️ Role-based feature gating</h3>
+        <pre><span class="comment"># In your app backend (e.g. Node.js)</span>
+
+<span class="comment"># 1. Verify JWT from EMC Auth</span>
+GET /api/v1/auth/me → permissions[]
+
+<span class="comment"># 2. Gate your endpoints</span>
+if (!permissions.includes('campaigns:write')) {
+  return 403 Forbidden
+}
+
+<span class="comment"># Custom permissions you define:</span>
+campaigns:read    → viewer
+campaigns:write   → account_manager
+contacts:manage   → account_manager
+billing:access    → admin</pre>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── 6. WHAT'S BUILT vs PENDING ── -->
+  <div class="section">
+    <div class="section-title">6 — What's Built vs Pending</div>
+    <table class="matrix">
+      <thead>
+        <tr><th>Feature</th><th>Status</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Super Admin Portal (full)</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>auth.senie.ai + localhost:9090</td></tr>
+        <tr><td>Email/password auth + JWT</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>All 3 tiers</td></tr>
+        <tr><td>TOTP 2FA</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>Enroll, verify, backup codes</td></tr>
+        <tr><td>RBAC (roles + permissions)</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>Per-tenant, fully customisable</td></tr>
+        <tr><td>Multi-tenant management</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>Create, manage, deactivate</td></tr>
+        <tr><td>API Keys (M2M)</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>emck_ prefix, SHA-256 stored</td></tr>
+        <tr><td>Management Token endpoint</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>POST /auth/management-token</td></tr>
+        <tr><td>Audit Logs</td><td><span class="badge" style="background:#dcfce7;color:#166534;">Built</span></td><td>API only — no UI page yet</td></tr>
+        <tr><td>SAML 2.0 SP</td><td><span class="badge" style="background:#fef3c7;color:#92400e;">Partial</span></td><td>No signature verification — not production-safe</td></tr>
+        <tr><td>Tenant Admin Portal</td><td><span class="badge" style="background:#fee2e2;color:#991b1b;">Pending</span></td><td>admin@outreach.local can't see a scoped admin panel yet</td></tr>
+        <tr><td>Audit Logs UI page</td><td><span class="badge" style="background:#fee2e2;color:#991b1b;">Pending</span></td><td>Backend ready, no frontend page</td></tr>
+        <tr><td>Password reset via email</td><td><span class="badge" style="background:#fef3c7;color:#92400e;">Partial</span></td><td>Token generated, SMTP not wired in dev</td></tr>
+        <tr><td>Social / OAuth login</td><td><span class="badge" style="background:#fee2e2;color:#991b1b;">Not started</span></td><td>Google, GitHub SSO</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer">
+    EMC Auth Server — Internal Platform Design Document · Generated 2026
+  </div>
+
+</div>
+</body>
+</html>
