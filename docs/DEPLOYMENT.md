@@ -164,6 +164,46 @@ SLA thresholds declared in `scripts/load-test.js`:
 - HTTP error rate < 1% (429s from rate limiter are expected and do not count as failures)
 - Zero HTTP 5xx responses
 
+## Upgrading from UUID Schema (Breaking Change)
+
+> **This section applies only when upgrading from a deployment that ran on the `master`
+> branch before the `feat/auth-refactor` merge.**
+
+The `feat/auth-refactor` branch rewrites all primary and foreign key columns from
+PostgreSQL `uuid` to `bigint generated always as identity`.  This change cannot be
+applied to an existing database via `ALTER TABLE` — it touches every table, every
+foreign key, and every index.
+
+The server detects this at startup.  If `tenants.id` is still `uuid`, you will see:
+
+```
+FATAL schema incompatibility: tenants.id is type 'uuid' but this release requires 'bigint identity'.
+```
+
+### Upgrade procedure
+
+1. **Export all application data** from the existing database before taking any further
+   action (use `pg_dump` or your cloud provider's snapshot feature).
+
+2. **Provision a fresh PostgreSQL 16 database** (or drop and recreate the existing one):
+   ```bash
+   psql -U postgres -c "DROP DATABASE emc_auth;"
+   psql -U postgres -c "CREATE DATABASE emc_auth OWNER emc_auth_user;"
+   ```
+
+3. **Start the server** pointing at the empty database.  Goose will apply all 39
+   migrations and the seed script will create the default tenant and super-admin.
+
+4. **Re-import application data** via the Admin API or by replaying events from your
+   audit log.  There is no automated data-migration script because the primary key
+   type changes require reassigning all IDs.
+
+5. **Update `SEED_ADMIN_PASSWORD`** and any client credentials stored in the old
+   database — they were hashed against the old IDs and cannot be reused directly.
+
+> **For net-new deployments** (no existing database) nothing special is required.
+> The server starts, runs all migrations against the empty database, and seeds normally.
+
 ## Troubleshooting
 
 | Symptom | Likely Cause | Fix |

@@ -1,11 +1,22 @@
 -- +goose Up
 -- +goose StatementBegin
 -- Change ip_address from TEXT NOT NULL DEFAULT '' to INET NULL.
--- Empty strings in existing rows become NULL (NULLIF handles the cast safely).
+--
+-- Safety: NULLIF only handles exact empty-string rows. Any row containing a
+-- non-IP string such as "unknown", "localhost", or "N/A" would cause
+-- `invalid input syntax for type inet` and abort the migration.
+--
+-- Guard: the regex whitelist accepts only valid IPv4/IPv6 characters
+-- ([0-9a-fA-F.:] plus an optional /prefix). Everything else becomes NULL,
+-- which is the correct sentinel for "IP address unavailable".
 ALTER TABLE audit_logs
     ALTER COLUMN ip_address DROP DEFAULT,
     ALTER COLUMN ip_address DROP NOT NULL,
-    ALTER COLUMN ip_address TYPE INET USING NULLIF(ip_address, '')::INET;
+    ALTER COLUMN ip_address TYPE INET
+        USING CASE
+            WHEN ip_address ~ '^[0-9a-fA-F.:]+(/[0-9]{1,3})?$' THEN ip_address::INET
+            ELSE NULL
+        END;
 
 -- Replace the B-tree index on created_at with a BRIN (append-only table,
 -- ~100x smaller, still excellent for time-range scans).
