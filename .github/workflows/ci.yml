@@ -10,9 +10,8 @@ name: CI
 #   Cause: install.sh downloads v2.12.2 but embedded hash doesn't match binary
 #   Fix:   Use `go install` with pinned version (bypasses install.sh entirely)
 #
-# [CI-03] dist: no matching files found
-#   Cause: internal/ui/dist gitignored — embed.FS fails without React build
-#   Fix:   Build React SPA (Node 20 + npm ci + npm run build) before go test
+# [CI-03] RESOLVED — SPA removed; frontend moved to separate repo.
+#          setup-node and npm build steps removed from test + lint jobs.
 #
 # [CI-04] TOTP_ENCRYPTION_KEY = "0" (1 char, invalid 32-byte hex)
 #   Cause: CI env had single-char key; AES-256-GCM requires 64 hex chars
@@ -101,18 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # [CI-03] Build React SPA so internal/ui/dist exists for embed.FS
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: ui/package-lock.json
-
-      - name: Build React SPA (required for embed.FS)
-        working-directory: ui
-        run: |
-          npm ci --silent
-          npm run build
+      # SPA removed — frontend lives in separate repo; embed.FS step no longer needed.
 
       - uses: actions/setup-go@v5
         with:
@@ -152,19 +140,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Build React SPA so internal/ui/dist exists — golangci-lint typechecks
-      # embed.FS directives and fails if the dist directory is absent.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: ui/package-lock.json
-
-      - name: Build React SPA (required for embed.FS typecheck)
-        working-directory: ui
-        run: |
-          npm ci --silent
-          npm run build
+      # SPA removed — frontend lives in separate repo; no npm step needed.
 
       - uses: actions/setup-go@v5
         with:
