@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -14,9 +15,18 @@ import (
 // The attacker cannot read the response (CORS blocks that), but rotation still
 // occurs — revoking the victim's in-flight token.
 //
-// Protection: reject requests whose Origin header is present and does not end
-// with the configured trusted domain.  Same-origin and Bearer-only clients
-// (no Origin header) pass through unchanged.
+// Protection: reject requests whose Origin header is present and whose host
+// does not match the trusted domain at a label boundary.  Same-origin and
+// Bearer-only clients (no Origin header) pass through unchanged.
+//
+// Security properties:
+//
+//   - Label-boundary check: "evil-engineersmind.com" does NOT match trusted
+//     domain "engineersmind.com" because HasSuffix(".engineersmind.com") fails.
+//
+//   - Fail-closed on missing domain: if COOKIE_DOMAIN is not set in production
+//     (cfg.Secure=true, cfg.Domain=""), all cross-origin requests are rejected
+//     rather than silently accepted.
 //
 // Apply only to state-mutating session endpoints:
 //   - POST /auth/session (login)
@@ -37,12 +47,36 @@ func SessionCSRF(cfg CookieConfig) echo.MiddlewareFunc {
 				return next(c)
 			}
 
-			// Accept origins that end with the configured cookie domain.
-			// cfg.Domain is set to e.g. ".engineersmind.com"; strip the leading dot
-			// when matching so both "https://app.engineersmind.com" and
-			// "https://engineersmind.com" are accepted.
+			// cfg.Domain is e.g. ".engineersmind.com"; strip the leading dot to get
+			// the bare hostname used for comparison.
 			trusted := strings.TrimPrefix(cfg.Domain, ".")
-			if trusted != "" && !strings.HasSuffix(origin, trusted) {
+
+			// Fail-closed: if ENV=production but COOKIE_DOMAIN is not configured,
+			// reject all cross-origin requests rather than accepting every origin.
+			if trusted == "" {
+				return c.JSON(http.StatusForbidden, map[string]string{
+					"error": "CSRF check misconfigured: COOKIE_DOMAIN must be set in production",
+					"code":  "csrf_misconfigured",
+				})
+			}
+
+			// Parse the Origin header to extract the hostname.
+			// Malformed or opaque origins (e.g. "null") are treated as untrusted.
+			u, parseErr := url.Parse(origin)
+			if parseErr != nil || u.Host == "" {
+				return c.JSON(http.StatusForbidden, map[string]string{
+					"error": "cross-origin request not allowed on session endpoints",
+					"code":  "csrf_check_failed",
+				})
+			}
+
+			// u.Hostname() strips any port suffix so "app.engineersmind.com:443"
+			// is treated the same as "app.engineersmind.com".
+			host := u.Hostname()
+
+			// Label-boundary match: exact equality OR subdomain with a "." separator.
+			// This prevents "evil-engineersmind.com" from matching "engineersmind.com".
+			if host != trusted && !strings.HasSuffix(host, "."+trusted) {
 				return c.JSON(http.StatusForbidden, map[string]string{
 					"error": "cross-origin request not allowed on session endpoints",
 					"code":  "csrf_check_failed",
