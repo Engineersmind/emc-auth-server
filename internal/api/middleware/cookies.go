@@ -63,7 +63,7 @@ func BuildAuthCookies(accessToken, refreshToken string, cfg CookieConfig) []*htt
 		Secure:   cfg.Secure,
 		SameSite: cfg.SameSite,
 		Domain:   cfg.Domain,
-		Path:     "/api/v1/auth",
+		Path:     "/api/v1",
 		MaxAge:   int(auth.RefreshTokenTTL.Seconds()),
 	}
 	return []*http.Cookie{access, refresh}
@@ -90,7 +90,7 @@ func ClearAuthCookies(c echo.Context, cfg CookieConfig) {
 		Secure:   cfg.Secure,
 		SameSite: cfg.SameSite,
 		Domain:   cfg.Domain,
-		Path:     "/api/v1/auth",
+		Path:     "/api/v1",
 		MaxAge:   -1,
 	})
 }

@@ -164,21 +164,16 @@ func (s *ApplicationService) ValidateClientID(ctx context.Context, tenantID int6
 // AuthenticateClient validates client_id + client_secret for the
 // client_credentials grant. Returns the tenant id and application row id.
 func (s *ApplicationService) AuthenticateClient(ctx context.Context, clientID, clientSecret string) (tenantID, appID int64, err error) {
-	var secretHash string
 	err = s.pool.QueryRow(ctx, `
-		SELECT id, tenant_id, client_secret_hash
+		SELECT id, tenant_id
 		FROM   oauth_clients
-		WHERE  client_id = $1 AND deleted_at IS NULL
-	`, clientID).Scan(&appID, &tenantID, &secretHash)
+		WHERE  client_id = $1 AND client_secret_hash = $2 AND deleted_at IS NULL
+	`, clientID, HashToken(clientSecret)).Scan(&appID, &tenantID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, 0, ErrInvalidClient
 		}
 		return 0, 0, fmt.Errorf("authenticate client: %w", err)
-	}
-
-	if HashToken(clientSecret) != secretHash {
-		return 0, 0, ErrInvalidClient
 	}
 	return tenantID, appID, nil
 }

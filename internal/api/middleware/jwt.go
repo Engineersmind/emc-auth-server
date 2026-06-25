@@ -55,7 +55,7 @@ func JWTRequired(jwtSvc *auth.JWTService) echo.MiddlewareFunc {
 				// Clients should refresh on token_expired; redirect to login on token_invalid.
 				if errors.Is(err, gojwt.ErrTokenExpired) {
 					return c.JSON(http.StatusUnauthorized, map[string]string{
-						"error": "access token expired — call /refresh to get a new one",
+						"error": "access token expired",
 						"code":  "token_expired",
 					})
 				}
