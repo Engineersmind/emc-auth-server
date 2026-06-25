@@ -71,8 +71,8 @@ func TestRegister_Success(t *testing.T) {
 	if result.TokenType != "Bearer" {
 		t.Errorf("Register() TokenType = %q, want %q", result.TokenType, "Bearer")
 	}
-	if result.ExpiresIn != 3600 {
-		t.Errorf("Register() ExpiresIn = %d, want 3600", result.ExpiresIn)
+	if result.ExpiresIn != 900 { // AccessTokenTTL = 15 min = 900s
+		t.Errorf("Register() ExpiresIn = %d, want 900", result.ExpiresIn)
 	}
 }
 

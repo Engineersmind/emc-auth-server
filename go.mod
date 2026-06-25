@@ -11,7 +11,7 @@ require (
 	github.com/pquerna/otp v1.5.0
 	github.com/pressly/goose/v3 v3.21.1
 	github.com/prometheus/client_golang v1.19.0
-	github.com/redis/go-redis/v9 v9.5.3
+	github.com/redis/go-redis/v9 v9.6.3
 	github.com/rs/zerolog v1.33.0
 	github.com/swaggo/echo-swagger v1.5.2
 	github.com/swaggo/swag v1.16.2

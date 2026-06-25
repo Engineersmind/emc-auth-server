@@ -147,9 +147,7 @@ func JWTRenew(
 
 			// ── Step 4: wrap response writer — cookies flush before body ──────
 			wrapper := &renewalWriter{ResponseWriter: c.Response().Writer}
-			for _, cookie := range BuildAuthCookies(result.AccessToken, result.RefreshToken, cookieCfg) {
-				wrapper.cookies = append(wrapper.cookies, cookie)
-			}
+			wrapper.cookies = append(wrapper.cookies, BuildAuthCookies(result.AccessToken, result.RefreshToken, cookieCfg)...)
 			c.Response().Writer = wrapper
 
 			// ── Step 5: verify the freshly-signed token to get clean claims ───
