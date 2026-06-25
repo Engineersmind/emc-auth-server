@@ -220,8 +220,8 @@ jobs:
       - name: Smoke test
         run: |
           # [CI-06] Fixed: docker-compose.yml (was "docker compose.yml" with space)
-          docker compose -f docker-compose.yml up -d postgres redis
-          sleep 8
+          # --wait blocks until postgres + redis health checks pass (no fixed sleep needed)
+          docker compose -f docker-compose.yml up -d --wait postgres redis
           docker run --rm --network host \
             -e DATABASE_URL=postgres://emc_auth:password@localhost:5432/emc_auth?sslmode=disable \
             -e REDIS_URL=redis://localhost:6379/0 \
