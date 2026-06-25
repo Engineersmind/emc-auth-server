@@ -41,6 +41,10 @@ name: CI
 #   Cause: Go 1.25.10 has unpatched stdlib vulns; fixed version (1.25.11) not yet released
 #   Fix:   Warn-only mode for govulncheck; block only on NEW non-stdlib findings
 #
+# [CI-11] Docker smoke test health check — server starts on PORT 9090 by default
+#   Cause: docker run missing -e PORT=8080; curl targeted 8080, server was on 9090
+#   Fix:   Add PORT=8080 to docker run env; replace fixed sleep 5 with 30s retry loop
+#
 # [CI-CD-01] ci-cd.yml deploy startup failure — missing AWS secrets/variables
 #   Cause: AWS_CICD_ROLE_ARN secret + AWS_REGION/ECR_REPO/EC2_TAG_NAME/SECRET_ID/DOMAIN
 #          vars not configured in this repo
@@ -222,15 +226,21 @@ jobs:
           # [CI-06] Fixed: docker-compose.yml (was "docker compose.yml" with space)
           # --wait blocks until postgres + redis health checks pass (no fixed sleep needed)
           docker compose -f docker-compose.yml up -d --wait postgres redis
+          # [CI-11] PORT=8080 required — server defaults to 9090; curl must match
           docker run --rm --network host \
             -e DATABASE_URL=postgres://emc_auth:password@localhost:5432/emc_auth?sslmode=disable \
             -e REDIS_URL=redis://localhost:6379/0 \
             -e JWT_ISSUER=https://auth.emc.local \
             -e APP_BASE_URL=http://localhost:8080 \
+            -e PORT=8080 \
             -e SEED_ADMIN_PASSWORD=ChangeMe123! \
             -e TOTP_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 \
             -d --name emc-auth-ci emc-auth-server:ci
-          sleep 5
-          curl -f http://localhost:8080/health || (docker logs emc-auth-ci && exit 1)
+          # Poll instead of fixed sleep — migrations can take >5s on a cold runner
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/health && break
+            sleep 1
+            if [ "$i" -eq 30 ]; then docker logs emc-auth-ci; exit 1; fi
+          done
           docker stop emc-auth-ci
           docker compose down
