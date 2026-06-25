@@ -12,7 +12,7 @@ import (
 
 // Demo seed — recognisable tenants + users for local dev and QA.
 // Triggered when SEED_DEMO_DATA=true is set in the environment.
-// All IDs are deterministic so this is fully idempotent (safe to re-run).
+// All UUID IDs are deterministic so this is fully idempotent (safe to re-run).
 //
 // Login summary after seeding:
 //
@@ -32,32 +32,25 @@ import (
 
 const demoPassword = "Demo1234!"
 
-// Demo tenant IDs
-var (
-	DemoTenantOutreach = uuid.MustParse("00000000-0000-0000-0001-000000000001")
-	DemoTenantSenie    = uuid.MustParse("00000000-0000-0000-0001-000000000002")
-	DemoTenantAcme     = uuid.MustParse("00000000-0000-0000-0001-000000000003")
-)
-
 // demoTenant describes one demo tenant to seed.
+// id is not stored here — tenants.id is GENERATED ALWAYS AS IDENTITY (BIGINT)
+// and is fetched from the DB after the upsert.
 type demoTenant struct {
-	id    uuid.UUID
 	name  string
 	slug  string
 	users []demoUser
 }
 
 type demoUser struct {
-	id         uuid.UUID
-	email      string
-	firstName  string
-	lastName   string
-	isAdmin    bool
+	id        uuid.UUID
+	email     string
+	firstName string
+	lastName  string
+	isAdmin   bool
 }
 
 var demoTenants = []demoTenant{
 	{
-		id:   DemoTenantOutreach,
 		name: "Outreach",
 		slug: "outreach",
 		users: []demoUser{
@@ -67,7 +60,6 @@ var demoTenants = []demoTenant{
 		},
 	},
 	{
-		id:   DemoTenantSenie,
 		name: "Senie",
 		slug: "senie",
 		users: []demoUser{
@@ -77,7 +69,6 @@ var demoTenants = []demoTenant{
 		},
 	},
 	{
-		id:   DemoTenantAcme,
 		name: "Acme Corp",
 		slug: "acme",
 		users: []demoUser{
@@ -109,36 +100,47 @@ func RunDemoSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger)
 }
 
 func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger, t demoTenant, pwHash string) error {
-	// Tenant
+	// Insert tenant without explicit id — tenants.id is GENERATED ALWAYS AS IDENTITY.
+	// ON CONFLICT (slug) makes this idempotent on re-runs.
 	_, err := pool.Exec(ctx, `
-		INSERT INTO tenants (id, name, slug, jwt_secret, is_active)
-		VALUES ($1, $2, $3, gen_random_uuid()::text, true)
-		ON CONFLICT (id) DO NOTHING
-	`, t.id, t.name, t.slug)
+		INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		VALUES ($1, $2, gen_random_uuid()::text, true)
+		ON CONFLICT (slug) DO NOTHING
+	`, t.name, t.slug)
 	if err != nil {
 		return fmt.Errorf("tenant: %w", err)
 	}
 
+	// Fetch the generated (or pre-existing) BIGINT tenant id.
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = $1`, t.slug).Scan(&tenantID); err != nil {
+		return fmt.Errorf("tenant id lookup: %w", err)
+	}
+
+	// Derive a deterministic UUID namespace from the slug so all child UUIDs
+	// are stable across re-runs without relying on the BIGINT tenant id.
+	ns := uuid.NewSHA1(uuid.NameSpaceOID, []byte(t.slug))
+
 	// Permissions: admin:access for this tenant
-	permAdminID := uuid.NewSHA1(t.id, []byte("perm:admin:access"))
+	permAdminID := uuid.NewSHA1(ns, []byte("perm:admin:access"))
 	_, err = pool.Exec(ctx, `
 		INSERT INTO permissions (id, tenant_id, name, description)
 		VALUES ($1, $2, 'admin:access', 'Access tenant admin operations')
 		ON CONFLICT (id) DO NOTHING
-	`, permAdminID, t.id)
+	`, permAdminID, tenantID)
 	if err != nil {
 		return fmt.Errorf("permission: %w", err)
 	}
 
 	// Roles: admin (has admin:access) + member (no permissions)
-	roleAdminID := uuid.NewSHA1(t.id, []byte("role:admin"))
-	roleMemberID := uuid.NewSHA1(t.id, []byte("role:member"))
+	roleAdminID := uuid.NewSHA1(ns, []byte("role:admin"))
+	roleMemberID := uuid.NewSHA1(ns, []byte("role:member"))
 
 	_, err = pool.Exec(ctx, `
 		INSERT INTO roles (id, tenant_id, name, is_system)
 		VALUES ($1, $2, 'admin', false), ($3, $2, 'member', false)
 		ON CONFLICT (id) DO NOTHING
-	`, roleAdminID, t.id, roleMemberID)
+	`, roleAdminID, tenantID, roleMemberID)
 	if err != nil {
 		return fmt.Errorf("roles: %w", err)
 	}
@@ -164,7 +166,7 @@ func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logg
 			INSERT INTO users (id, tenant_id, email, first_name, last_name, role_id, is_active)
 			VALUES ($1, $2, $3, $4, $5, $6, true)
 			ON CONFLICT (tenant_id, email) DO NOTHING
-		`, u.id, t.id, u.email, u.firstName, u.lastName, roleID)
+		`, u.id, tenantID, u.email, u.firstName, u.lastName, roleID)
 		if err != nil {
 			return fmt.Errorf("user %s: %w", u.email, err)
 		}
@@ -173,7 +175,7 @@ func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logg
 			INSERT INTO user_credentials (user_id, tenant_id, password_hash)
 			VALUES ($1, $2, $3)
 			ON CONFLICT (user_id) DO NOTHING
-		`, u.id, t.id, pwHash)
+		`, u.id, tenantID, pwHash)
 		if err != nil {
 			return fmt.Errorf("credentials %s: %w", u.email, err)
 		}
