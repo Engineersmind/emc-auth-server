@@ -1,7 +1,6 @@
 package api
 
 import (
-	"io/fs"
 	"net/http"
 	"strings"
 
@@ -23,7 +22,6 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 	samlsvc "github.com/engineersmind/emc-auth-server/internal/saml"
-	"github.com/engineersmind/emc-auth-server/internal/ui"
 )
 
 // Deps holds shared dependencies injected into route handlers.
@@ -50,6 +48,9 @@ type RoutesConfig struct {
 	SMTPFrom     string
 	SMTPUsername string
 	SMTPPassword string
+	// CookieDomain is the Domain attribute for auth cookies (e.g. ".engineersmind.com").
+	// Leave empty for localhost development.
+	CookieDomain string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -79,11 +80,18 @@ func securityHeaders() echo.MiddlewareFunc {
 			// Control referrer information leakage.
 			h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 			// Content Security Policy — primary browser XSS mitigation (HIGH-03).
+			// Swagger UI (/swagger/*) uses inline <script> blocks for SwaggerUIBundle
+			// initialization, so it requires 'unsafe-inline' in script-src.
+			// All other routes use the stricter policy.
+			scriptSrc := "'self'"
+			if strings.HasPrefix(c.Request().URL.Path, "/swagger/") {
+				scriptSrc = "'self' 'unsafe-inline'"
+			}
 			// style-src includes 'unsafe-inline' because Tailwind CSS injects
 			// inline styles at runtime. All other sources are restricted to 'self'.
 			h.Set("Content-Security-Policy",
 				"default-src 'self'; "+
-					"script-src 'self'; "+
+					"script-src "+scriptSrc+"; "+
 					"style-src 'self' 'unsafe-inline'; "+
 					"img-src 'self' data:; "+
 					"connect-src 'self'; "+
@@ -141,7 +149,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	// Swagger UI — available at /swagger/index.html
-	e.GET("/swagger/*", echoSwagger.WrapHandler)
+	// Override CSP for Swagger: its bundled JS uses inline scripts that require
+	// 'unsafe-inline'; acceptable here since Swagger is a dev/docs-only endpoint.
+	e.GET("/swagger/*", echoSwagger.WrapHandler, func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			c.Response().Header().Set("Content-Security-Policy",
+				"default-src 'self'; "+
+					"script-src 'self' 'unsafe-inline'; "+
+					"style-src 'self' 'unsafe-inline'; "+
+					"img-src 'self' data:; "+
+					"connect-src 'self'; "+
+					"font-src 'self'; "+
+					"frame-ancestors 'none'")
+			return next(c)
+		}
+	})
 
 	// Build shared services
 	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
@@ -156,6 +178,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// API key service
 	apiKeySvc := auth.NewAPIKeyService(deps.Pool, deps.Logger)
+
+	// Application service — manages OAuth2 clients (client_id + client_secret)
+	appSvc := auth.NewApplicationService(deps.Pool, deps.Logger)
+	authSvc.WithApplications(appSvc)
 
 	// Agent service (08-01) — machine-to-machine authentication
 	agentSvc := auth.NewAgentService(deps.Pool, deps.Logger)
@@ -176,9 +202,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logger — shared by both auth and admin handlers
 	auditLog := audit.New(deps.Pool, deps.Logger)
 
+	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain)
+
 	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
 		WithTOTP(totpSvc).
-		WithAPIKeys(apiKeySvc)
+		WithAPIKeys(apiKeySvc).
+		WithApplications(appSvc).
+		WithCookieConfig(cookieCfg).
+		WithJWT(jwtSvc)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
@@ -191,6 +222,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
 		WithAppRateLimits(appLimitSvc).
+		WithApplications(appSvc).
 		WithCORS(corsSvc)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
@@ -198,7 +230,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	samlHandler := handlers.NewSAMLHandler(samlService, jwtSvc, deps.Logger)
 
 	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
-	e.Use(mw.AppRateLimiter(appLimitSvc))
+	e.Use(mw.AppRateLimiter(appLimitSvc, deps.Redis))
 
 	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
 	e.Use(mw.TenantCORS(corsSvc))
@@ -220,21 +252,43 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
-	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
-	authGroup.POST("/session", authHandler.SessionLogin)
-	authGroup.POST("/session/refresh", authHandler.SessionRefresh)
-	authGroup.POST("/session/logout", authHandler.SessionLogout)
+	// Management token — exchange an API key for a short-lived admin JWT.
+	// Equivalent to Auth0 client_credentials grant for the Management API.
+	// Usage: POST /api/v1/auth/management-token with X-API-Key: emck_<key>
+	authGroup.POST("/management-token", authHandler.ManagementToken)
 
-	// Auth routes — protected by JWTRequired (AUTH-09)
-	authGroup.GET("/me", authHandler.Me, mw.JWTRequired(jwtSvc))
+	// Cookie-based session endpoints for browser/SPA clients (sets HttpOnly cookies).
+	// SessionCSRF guards against cross-site form-POST attacks when SameSite=None is
+	// active (staging/production); it is a no-op in development (SameSite=Lax).
+	sessionCSRF := mw.SessionCSRF(cookieCfg)
+	authGroup.POST("/session", authHandler.SessionLogin, sessionCSRF)
+	authGroup.POST("/session/refresh", authHandler.SessionRefresh, sessionCSRF)
+	authGroup.POST("/session/logout", authHandler.SessionLogout, sessionCSRF)
+
+	// Client credentials token endpoint — machine-to-machine auth (no user).
+	authGroup.POST("/token", authHandler.Token, mw.LoginRateLimiter(rlCfg))
+
+	// jwtRenew is used on all cookie-aware protected routes.
+	// It validates the access token and, when expired, transparently rotates
+	// the refresh token (distributed lock + fresh user DB load) and writes new
+	// cookies onto the response before the handler body is flushed.
+	jwtRenew := mw.JWTRenew(jwtSvc, authSvc, deps.Redis, cookieCfg, auditLog, deps.Logger)
+
+	// Auth routes — protected with transparent renewal (AUTH-09)
+	authGroup.GET("/me", authHandler.Me, jwtRenew)
+	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew)
 
 	// TOTP management — protected (03-01)
-	otpGroup := authGroup.Group("/otp", mw.JWTRequired(jwtSvc))
+	otpGroup := authGroup.Group("/otp", jwtRenew)
 	otpGroup.POST("/enroll", authHandler.TOTPEnroll)
 	otpGroup.POST("/activate", authHandler.TOTPActivate)
 	otpGroup.DELETE("", authHandler.TOTPDisable)
 
-	// Admin routes — all require a valid JWT.
+	// Admin routes — require a valid JWT. JWTRequired (not JWTRenew) is used here
+	// because the refresh cookie is scoped to /api/v1/auth; browsers will not send
+	// it to /api/v1/admin paths, so transparent renewal is impossible. Browser
+	// clients must call /auth/session/refresh when they receive 401 token_expired,
+	// then retry the admin request.
 	adminGroup := apiV1.Group("/admin", mw.JWTRequired(jwtSvc))
 
 	// Ping (smoke test — requires admin:access)
@@ -287,9 +341,18 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.GET("/api-keys", authHandler.ListAPIKeys)
 	rbacGroup.DELETE("/api-keys/:id", authHandler.RevokeAPIKey)
 
+	// Monitoring stats — tenant-scoped (admin:access) and system-wide (tenant:manage)
+	rbacGroup.GET("/stats", adminHandler.GetStats)
+	tenantMgmt.GET("/stats/system", adminHandler.GetSystemStats)
+
 	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
 	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
+
+	// Application management — tenant admin (admin:access)
+	rbacGroup.POST("/applications", adminHandler.CreateApplication)
+	rbacGroup.GET("/applications", adminHandler.ListApplications)
+	rbacGroup.DELETE("/applications/:id", adminHandler.DeactivateApplication)
 
 	// Per-app rate limit management — tenant admin (admin:access) (08-02)
 	rbacGroup.POST("/app-limits", adminHandler.CreateAppLimit)
@@ -302,7 +365,6 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	rbacGroup.PUT("/saml-config", samlHandler.UpsertSAMLConfig)
 
 	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
-	// Must be registered before the SPA wildcard catch-all.
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
 	e.GET("/saml/login", samlHandler.InitiateLogin)
 	e.POST("/saml/acs", samlHandler.HandleACS)
@@ -316,45 +378,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Agent authentication — public (no JWT required) — issues agent JWT from raw key
 	apiV1.POST("/agents/authenticate", agentHandler.AuthenticateAgent)
 
-	// Serve the React Admin SPA for all non-API routes.
-	// Must come AFTER all /api/, /metrics, /swagger, /saml, /health routes so it
-	// does not shadow them. Static assets (JS/CSS) use the /assets/* prefix
-	// produced by Vite; everything else falls back to index.html for client-side
-	// routing.
-	distFS := ui.DistFS()
-
-	// /assets/* — serve bundled JS, CSS, fonts directly from embed.FS.
-	e.StaticFS("/assets", mustSubFS(distFS, "assets"))
-
-	// favicon and vite default icon
-	e.GET("/favicon.ico", echo.WrapHandler(http.FileServer(http.FS(distFS))))
-	e.GET("/vite.svg", echo.WrapHandler(http.FileServer(http.FS(distFS))))
-
-	// SPA fallback — serve index.html for all unmatched GET routes so that
-	// React Router can handle client-side navigation.
-	// Guard: /api/ paths return 404 rather than index.html (CRIT-02 review fix).
-	// Guard: if the path starts with /api/, return 404 rather than serving the
-	// SPA. Without this guard, a typo'd or unregistered API route returns HTTP
-	// 200 + text/html, making routing bugs very hard to diagnose.
-	e.GET("/*", func(c echo.Context) error {
-		if strings.HasPrefix(c.Request().URL.Path, "/api/") {
-			return echo.ErrNotFound
-		}
-		f, err := distFS.Open("index.html")
-		if err != nil {
-			return echo.ErrNotFound
-		}
-		defer f.Close()
-		return c.Stream(http.StatusOK, "text/html; charset=utf-8", f)
+	// Unmatched /api/ routes return 404 explicitly.
+	e.GET("/api/*", func(c echo.Context) error {
+		return echo.ErrNotFound
 	})
-}
-
-// mustSubFS returns a sub-filesystem rooted at dir within fsys.
-// Panics on error (programming error — embedded paths must exist at build time).
-func mustSubFS(fsys fs.FS, dir string) fs.FS {
-	sub, err := fs.Sub(fsys, dir)
-	if err != nil {
-		panic("ui: failed to open sub-FS " + dir + ": " + err.Error())
-	}
-	return sub
 }

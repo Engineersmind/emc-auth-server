@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/google/uuid"
-
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 	"github.com/engineersmind/emc-auth-server/internal/store"
@@ -101,8 +99,8 @@ func TestResetPassword_ValidToken(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 
-	// Look up user_id for the registered user.
-	var userID, tenantID uuid.UUID
+	// Look up user_id and tenant_id for the registered user.
+	var userID, tenantID int64
 	err = pool.QueryRow(ctx,
 		`SELECT u.id, u.tenant_id FROM users u WHERE u.email = $1`, email,
 	).Scan(&userID, &tenantID)
@@ -114,8 +112,8 @@ func TestResetPassword_ValidToken(t *testing.T) {
 	const rawToken = "testtoken123abc456def789"
 	tokenHash := auth.HashToken(rawToken)
 	_, err = pool.Exec(ctx, `
-		INSERT INTO password_reset_tokens (id, user_id, tenant_id, token_hash, expires_at)
-		VALUES (gen_random_uuid(), $1, $2, $3, NOW() + interval '15 minutes')
+		INSERT INTO password_reset_tokens (user_id, tenant_id, token_hash, expires_at)
+		VALUES ($1, $2, $3, NOW() + interval '15 minutes')
 	`, userID, tenantID, tokenHash)
 	if err != nil {
 		t.Fatalf("insert reset token: %v", err)

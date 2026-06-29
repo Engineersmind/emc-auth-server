@@ -10,21 +10,19 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION:   ${{ vars.AWS_REGION }}      # e.g. us-east-1
-  ECR_REPO:     ${{ vars.ECR_REPO }}        # e.g. dev-emc-auth-app
-  EC2_TAG_NAME: ${{ vars.EC2_TAG_NAME }}    # e.g. dev-emc-auth-ec2
-  SECRET_NAME:  ${{ vars.SECRET_ID }}        # e.g. dev/EMC_Auth  (repo var name: SECRET_ID)
-  DOMAIN:       ${{ vars.DOMAIN }}          # e.g. auth.senie.ai
-  APP_CONTAINER: emc-auth-app
-  REDIS_CONTAINER: emc-auth-redis
-  NETWORK:      emc-auth-net
+  AWS_REGION:    ${{ vars.AWS_REGION }}
+  ECR_REPO:      ${{ vars.ECR_REPO }}
+  EC2_TAG_NAME:  ${{ vars.EC2_TAG_NAME }}
+  SECRET_NAME:   ${{ vars.SECRET_ID }}
+  DOMAIN:        ${{ vars.DOMAIN }}
 
 jobs:
-
-  # ── 1. Build & push Docker image to ECR ──────────────────────────────────
+  # ── Build & push Docker image to ECR ─────────────────────────────────────
   build:
     name: Build & Push to ECR
     runs-on: ubuntu-latest
+    # Skip gracefully when AWS variables are not configured
+    if: vars.AWS_REGION != '' && vars.ECR_REPO != ''
     outputs:
       image_uri: ${{ steps.uri.outputs.image_uri }}
 
@@ -67,12 +65,11 @@ jobs:
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "Image: ${IMAGE_URI}"
 
-  # ── 2. Deploy to EC2 via SSM (master branch only) ───────────────────────
+  # ── Deploy to EC2 via SSM ─────────────────────────────────────────────────
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
     needs: build
-    if: github.ref == 'refs/heads/master' && github.event_name == 'push'
 
     steps:
       - name: Configure AWS credentials (OIDC)
@@ -90,68 +87,86 @@ jobs:
               "Name=instance-state-name,Values=running" \
             --query "Reservations[0].Instances[0].InstanceId" \
             --output text)
-          [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]] && { echo "EC2 not found"; exit 1; }
+          if [[ -z "$INSTANCE_ID" || "$INSTANCE_ID" == "None" ]]; then
+            echo "EC2 instance not found"; exit 1
+          fi
           echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
           echo "EC2: $INSTANCE_ID"
 
       - name: Deploy via SSM
         id: ssm
+        env:
+          IMAGE_URI: ${{ needs.build.outputs.image_uri }}
+          REGION:    ${{ env.AWS_REGION }}
+          SECRET:    ${{ env.SECRET_NAME }}
+          DOMAIN:    ${{ env.DOMAIN }}
+          INSTANCE:  ${{ steps.ec2.outputs.instance_id }}
         run: |
-          IMAGE_URI="${{ needs.build.outputs.image_uri }}"
-          REGION="${{ env.AWS_REGION }}"
-          SECRET="${{ env.SECRET_NAME }}"
-          DOMAIN="${{ env.DOMAIN }}"
-          INSTANCE="${{ steps.ec2.outputs.instance_id }}"
-          SCRIPT="/opt/emc-auth/src/scripts/deploy-ecr.sh"
-
+          REGISTRY=$(echo "$IMAGE_URI" | cut -d/ -f1)
+          # Build SSM JSON payload — write Python to file first to avoid heredoc quoting issues
+          cat > /tmp/mk.py << 'EOF'
+          import json, os, sys
+          img = os.environ["IMAGE_URI"]
+          secret = os.environ["SECRET"]
+          region = os.environ["REGION"]
+          domain = os.environ["DOMAIN"]
+          instance = os.environ["INSTANCE"]
+          registry = img.split("/")[0]
+          cmds = [
+            f"aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {registry}",
+            f"docker pull {img}",
+            "aws secretsmanager get-secret-value --secret-id " + secret + " --region " + region + " --query SecretString --output text | python3 -c 'import sys,json; [print(k+chr(61)+str(v)) for k,v in json.load(sys.stdin).items()]' > /tmp/app.env",
+            "RPASS=$(grep '^REDIS_PASSWORD=' /tmp/app.env | cut -d= -f2-) && echo \"REDIS_URL=redis://:${RPASS}@emc-auth-redis:6379\" >> /tmp/app.env",
+            "echo ENV=production >> /tmp/app.env && echo PORT=8080 >> /tmp/app.env && echo JWT_ISSUER=https://" + domain + " >> /tmp/app.env && echo APP_BASE_URL=https://" + domain + " >> /tmp/app.env",
+            "docker rm -f emc-auth-app 2>/dev/null || true",
+            f"docker run -d --name emc-auth-app --network emc-auth-net --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file /tmp/app.env {img}",
+            f"echo Deployed: {img}",
+          ]
+          payload = {"DocumentName": "AWS-RunShellScript", "InstanceIds": [instance], "Parameters": {"commands": cmds}}
+          print(json.dumps(payload, indent=2))
+          EOF
+          python3 /tmp/mk.py > /tmp/ssm-input.json
+          cat /tmp/ssm-input.json
           CMD_ID=$(aws ssm send-command \
             --region        "$REGION" \
-            --instance-ids  "$INSTANCE" \
-            --document-name "AWS-RunShellScript" \
-            --comment       "Deploy ${IMAGE_URI}" \
-            --parameters    "commands=[
-              'aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin $(echo ${IMAGE_URI} | cut -d/ -f1)',
-              'docker pull ${IMAGE_URI}',
-              'aws secretsmanager get-secret-value --secret-id ${SECRET} --region ${REGION} --query SecretString --output text | python3 -c \"import sys,json; [print(k+chr(61)+str(v)) for k,v in json.load(sys.stdin).items()]\" > /tmp/app.env',
-              'echo REDIS_URL=redis://:$(grep ^REDIS_PASSWORD= /tmp/app.env | cut -d= -f2-)@emc-auth-redis:6379 >> /tmp/app.env',
-              'echo ENV=production >> /tmp/app.env && echo PORT=8080 >> /tmp/app.env && echo JWT_ISSUER=https://${DOMAIN} >> /tmp/app.env && echo APP_BASE_URL=https://${DOMAIN} >> /tmp/app.env',
-              'docker rm -f emc-auth-app 2>/dev/null || true',
-              'docker run -d --name emc-auth-app --network emc-auth-net --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file /tmp/app.env ${IMAGE_URI}'
-            ]" \
-            --query "Command.CommandId" \
+            --cli-input-json file:///tmp/ssm-input.json \
+            --query         "Command.CommandId" \
             --output text)
-
           echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
           echo "SSM Command ID: $CMD_ID"
 
       - name: Wait for deployment
         run: |
-          REGION="${{ env.AWS_REGION }}"
-          CMD_ID="${{ steps.ssm.outputs.command_id }}"
-          INSTANCE="${{ steps.ec2.outputs.instance_id }}"
-
           for i in $(seq 1 36); do
             STATUS=$(aws ssm get-command-invocation \
-              --region      "$REGION" \
-              --command-id  "$CMD_ID" \
-              --instance-id "$INSTANCE" \
+              --region      "${{ env.AWS_REGION }}" \
+              --command-id  "${{ steps.ssm.outputs.command_id }}" \
+              --instance-id "${{ steps.ec2.outputs.instance_id }}" \
               --query "Status" --output text 2>/dev/null || echo "Pending")
             echo "Attempt $i: $STATUS"
             case "$STATUS" in
-              Success) echo "✅ Deployed"; exit 0 ;;
+              Success) echo "Deployed successfully"; exit 0 ;;
               Failed|Cancelled|TimedOut)
+                echo "--- STDOUT ---"
                 aws ssm get-command-invocation \
-                  --region "$REGION" --command-id "$CMD_ID" --instance-id "$INSTANCE" \
-                  --query "StandardOutputContent" --output text
+                  --region      "${{ env.AWS_REGION }}" \
+                  --command-id  "${{ steps.ssm.outputs.command_id }}" \
+                  --instance-id "${{ steps.ec2.outputs.instance_id }}" \
+                  --query       "StandardOutputContent" --output text
+                echo "--- STDERR ---"
+                aws ssm get-command-invocation \
+                  --region      "${{ env.AWS_REGION }}" \
+                  --command-id  "${{ steps.ssm.outputs.command_id }}" \
+                  --instance-id "${{ steps.ec2.outputs.instance_id }}" \
+                  --query       "StandardErrorContent" --output text
                 exit 1 ;;
             esac
             sleep 10
           done
-          echo "Timed out"; exit 1
+          echo "Timed out waiting for SSM command"; exit 1
 
       - name: Summary
         if: success()
         run: |
-          echo "✅ Deployed ${{ needs.build.outputs.image_uri }}"
-          echo "   EC2: ${{ steps.ec2.outputs.instance_id }}"
-``
+          echo "Deployed ${{ needs.build.outputs.image_uri }}"
+          echo "EC2: ${{ steps.ec2.outputs.instance_id }}"

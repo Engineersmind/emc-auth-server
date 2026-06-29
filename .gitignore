@@ -38,3 +38,18 @@ ui/.env
 
 # Go embed.FS — built by npm run build (or Docker Stage 1)
 internal/ui/dist/
+
+# Coverage / test artifacts
+coverage
+coverage.out
+*.out
+
+# Claude settings & our local planning docs — keep private, never push.
+# (Existing tracked docs like README.md, REVIEW.md, docs/ stay in remote.)
+.claude/
+CLAUDE.md
+PROJECT_PLAN_SUMMARY.md
+GAP_ANALYSIS.md
+ROADMAP.md
+PRODUCTION_READINESS.md
+MEMORY*.md

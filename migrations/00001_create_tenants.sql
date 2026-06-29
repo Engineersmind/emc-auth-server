@@ -3,7 +3,7 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE tenants (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name        TEXT NOT NULL,
     slug        TEXT NOT NULL UNIQUE,
     jwt_secret  TEXT NOT NULL,

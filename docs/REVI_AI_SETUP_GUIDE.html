@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EMC Auth — Revi AI Setup Guide</title>
+  <style>
+    :root {
+      --brand:   #1e3a5f;
+      --brand-lt:#2d5f99;
+      --accent:  #0ea5e9;
+      --green:   #16a34a;
+      --amber:   #d97706;
+      --red:     #dc2626;
+      --purple:  #7c3aed;
+      --gray-50: #f8fafc;
+      --gray-100:#f1f5f9;
+      --gray-200:#e2e8f0;
+      --gray-500:#64748b;
+      --gray-700:#334155;
+      --gray-900:#0f172a;
+    }
+    *, *::before, *::after { box-sizing: border-box; margin:0; padding:0; }
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--gray-50); color:var(--gray-700); line-height:1.6; }
+
+    header { background:linear-gradient(135deg,var(--brand) 0%,var(--brand-lt) 100%); color:#fff; padding:40px 24px 32px; text-align:center; }
+    header h1 { font-size:2rem; font-weight:700; }
+    header p  { margin-top:8px; opacity:.85; font-size:1rem; }
+
+    nav.toc { background:#fff; border-bottom:1px solid var(--gray-200); padding:10px 24px; position:sticky; top:0; z-index:100; display:flex; gap:20px; flex-wrap:wrap; justify-content:center; }
+    nav.toc a { text-decoration:none; font-size:.82rem; font-weight:600; color:var(--brand-lt); }
+    nav.toc a:hover { color:var(--accent); }
+
+    main { max-width:1000px; margin:0 auto; padding:40px 20px 80px; }
+
+    .section-title { font-size:1.4rem; font-weight:700; color:var(--brand); padding-bottom:8px; border-bottom:2px solid var(--accent); margin:52px 0 24px; }
+
+    /* ── Architecture diagram ── */
+    .arch-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-top:8px; }
+    .tenant-card { border-radius:10px; border:2px solid var(--gray-200); overflow:hidden; }
+    .tenant-card.dev  { border-color:#bfdbfe; }
+    .tenant-card.stage{ border-color:#fed7aa; }
+    .tenant-card.prod { border-color:#bbf7d0; }
+    .tenant-header { padding:12px 16px; font-weight:700; font-size:.9rem; display:flex; align-items:center; gap:8px; }
+    .tenant-header.dev  { background:#eff6ff; color:#1d4ed8; }
+    .tenant-header.stage{ background:#fff7ed; color:#c2410c; }
+    .tenant-header.prod { background:#f0fdf4; color:#15803d; }
+    .tenant-body { padding:12px 16px; background:#fff; font-size:.82rem; }
+    .tenant-body ul { list-style:none; }
+    .tenant-body li { padding:3px 0; display:flex; align-items:center; gap:6px; }
+    .tenant-body li::before { content:"·"; color:var(--accent); font-weight:700; }
+
+    /* ── Flow steps ── */
+    .flow { counter-reset:step; }
+    .step { display:flex; gap:20px; margin-bottom:24px; position:relative; }
+    .step::before { counter-increment:step; content:counter(step); width:32px; height:32px; border-radius:50%; background:var(--brand); color:#fff; font-weight:700; font-size:.85rem; display:flex; align-items:center; justify-content:center; flex-shrink:0; margin-top:2px; }
+    .step-content { flex:1; }
+    .step-content h3 { font-size:1rem; font-weight:700; color:var(--gray-900); margin-bottom:6px; }
+    .step-content p  { font-size:.88rem; color:var(--gray-500); margin-bottom:8px; }
+
+    /* ── Screen cards ── */
+    .screen-grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; }
+    .screen-card { background:#fff; border:1px solid var(--gray-200); border-radius:10px; overflow:hidden; }
+    .screen-header { padding:12px 18px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--gray-200); }
+    .screen-header h3 { font-size:.9rem; font-weight:700; color:var(--gray-900); }
+    .screen-url { font-size:.75rem; font-family:monospace; color:var(--accent); }
+    .screen-body { padding:14px 18px; font-size:.83rem; }
+    .screen-body ul { list-style:none; margin-top:6px; }
+    .screen-body li { padding:3px 0; display:flex; gap:8px; align-items:flex-start; }
+    .screen-body li::before { content:"✓"; color:var(--green); font-weight:700; flex-shrink:0; }
+    .screen-body li.missing::before { content:"○"; color:var(--amber); }
+    .status-badge { font-size:.7rem; font-weight:700; padding:2px 8px; border-radius:999px; white-space:nowrap; }
+    .status-built   { background:#dcfce7; color:#166534; }
+    .status-partial { background:#fef9c3; color:#854d0e; }
+    .status-planned { background:#e0f2fe; color:#075985; }
+
+    /* ── API table ── */
+    .api-table { width:100%; border-collapse:collapse; font-size:.82rem; }
+    .api-table th { background:var(--brand); color:#fff; padding:9px 12px; text-align:left; }
+    .api-table td { padding:8px 12px; border-bottom:1px solid var(--gray-200); vertical-align:top; }
+    .api-table tr:last-child td { border-bottom:none; }
+    .api-table tr:nth-child(even) td { background:var(--gray-50); }
+    .method { display:inline-block; font-family:monospace; font-size:.75rem; font-weight:700; padding:1px 7px; border-radius:4px; min-width:50px; text-align:center; }
+    .method.POST   { background:#dbeafe; color:#1e40af; }
+    .method.GET    { background:#dcfce7; color:#166534; }
+    .method.PUT    { background:#fef9c3; color:#854d0e; }
+    .method.DELETE { background:#fee2e2; color:#991b1b; }
+
+    /* ── Info / callout boxes ── */
+    .callout { border-radius:8px; padding:14px 18px; margin:16px 0; font-size:.88rem; }
+    .callout.blue  { background:#eff6ff; border-left:4px solid var(--accent); }
+    .callout.green { background:#f0fdf4; border-left:4px solid var(--green); }
+    .callout.amber { background:#fffbeb; border-left:4px solid var(--amber); }
+    .callout.purple{ background:#f5f3ff; border-left:4px solid var(--purple); }
+    .callout strong { display:block; margin-bottom:4px; font-size:.9rem; }
+    code { font-family:"SF Mono",Menlo,monospace; font-size:.82rem; background:var(--gray-100); padding:1px 6px; border-radius:4px; color:var(--brand); }
+
+    /* ── Persona chips ── */
+    .persona-row { display:flex; gap:12px; flex-wrap:wrap; margin:12px 0; }
+    .persona { border-radius:8px; padding:10px 16px; font-size:.83rem; font-weight:600; border:2px solid; }
+    .persona.super { border-color:#7c3aed; background:#f5f3ff; color:#5b21b6; }
+    .persona.admin { border-color:#1d4ed8; background:#eff6ff; color:#1d4ed8; }
+    .persona.user  { border-color:#15803d; background:#f0fdf4; color:#15803d; }
+
+    /* ── Credentials box ── */
+    .creds { background:var(--gray-900); color:#e2e8f0; border-radius:8px; padding:16px 20px; font-family:monospace; font-size:.83rem; margin:12px 0; }
+    .creds .label { color:#94a3b8; font-size:.75rem; margin-bottom:2px; }
+    .creds .value { color:#7dd3fc; }
+    .creds .val-green { color:#86efac; }
+    .creds .val-amber { color:#fcd34d; }
+
+    footer { text-align:center; padding:32px 20px; font-size:.8rem; color:var(--gray-500); border-top:1px solid var(--gray-200); }
+    footer a { color:var(--brand-lt); text-decoration:none; }
+
+    @media(max-width:640px) {
+      .arch-grid, .screen-grid { grid-template-columns:1fr; }
+      header h1 { font-size:1.5rem; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>EMC Auth — Revi AI Setup Guide</h1>
+  <p>How to use EMC Auth as your Identity Provider for Revi AI (Dev · Stage · Prod)</p>
+</header>
+
+<nav class="toc">
+  <a href="#personas">Personas</a>
+  <a href="#architecture">Architecture</a>
+  <a href="#journey">Step-by-Step Journey</a>
+  <a href="#screens">Screen Inventory</a>
+  <a href="#apis">API Reference</a>
+  <a href="#credentials">Local Credentials</a>
+</nav>
+
+<main>
+
+  <!-- ── What is this ── -->
+  <div class="callout blue" style="margin-top:32px;">
+    <strong>What this document is</strong>
+    EMC Auth is your self-hosted Auth0 replacement. This guide walks you through the exact screens and API calls to set up Revi AI with three separate environments (revi-dev · revi-stage · revi-prod), each with their own isolated users, roles, and permissions — exactly like you would in Auth0.
+  </div>
+
+  <!-- ════════════════════════
+       PERSONAS
+  ═════════════════════════ -->
+  <h2 class="section-title" id="personas">Who Does What</h2>
+
+  <div class="persona-row">
+    <div class="persona super">
+      Super Admin<br/>
+      <span style="font-weight:400;font-size:.78rem;">You — the platform owner<br/>Permission: <code>tenant:manage</code></span>
+    </div>
+    <div class="persona admin">
+      Tenant Admin<br/>
+      <span style="font-weight:400;font-size:.78rem;">Revi Dev/Stage/Prod admin<br/>Permission: <code>admin:access</code></span>
+    </div>
+    <div class="persona user">
+      Tenant User<br/>
+      <span style="font-weight:400;font-size:.78rem;">Developer / end user in a tenant<br/>No admin permission</span>
+    </div>
+  </div>
+
+  <table class="api-table" style="margin-top:16px;">
+    <thead><tr><th>Can do</th><th>Super Admin</th><th>Tenant Admin</th><th>Tenant User</th></tr></thead>
+    <tbody>
+      <tr><td>Create tenants (revi-dev, revi-stage, revi-prod)</td><td>✅</td><td>❌</td><td>❌</td></tr>
+      <tr><td>Manage users inside a tenant</td><td>✅ (cross-tenant)</td><td>✅ (own tenant)</td><td>❌</td></tr>
+      <tr><td>Create roles &amp; permissions</td><td>✅ (cross-tenant)</td><td>✅ (own tenant)</td><td>❌</td></tr>
+      <tr><td>Issue API keys for Revi app</td><td>✅</td><td>✅</td><td>❌</td></tr>
+      <tr><td>View own profile &amp; permissions</td><td>✅</td><td>✅</td><td>✅</td></tr>
+      <tr><td>Login to Revi AI app</td><td>✅</td><td>✅</td><td>✅</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ════════════════════════
+       ARCHITECTURE
+  ═════════════════════════ -->
+  <h2 class="section-title" id="architecture">Multi-Tenant Architecture for Revi AI</h2>
+
+  <div class="callout purple">
+    <strong>How tenants work in EMC Auth</strong>
+    Each tenant is a completely isolated namespace. Users, roles, and permissions in <code>revi-dev</code> are invisible to <code>revi-prod</code>. Every API call includes an <code>X-Tenant-Slug</code> header so the server knows which tenant context to use.
+  </div>
+
+  <div class="arch-grid" style="margin-top:20px;">
+    <div class="tenant-card dev">
+      <div class="tenant-header dev">
+        <span>🔵</span> revi-dev
+      </div>
+      <div class="tenant-body">
+        <ul>
+          <li>Slug: <code>revi-dev</code></li>
+          <li>Users: developers</li>
+          <li>Roles: <code>dev-engineer</code>, <code>dev-admin</code></li>
+          <li>Permissions: <code>feature:*</code>, <code>debug:*</code></li>
+          <li>API Keys: Revi app dev keys</li>
+        </ul>
+      </div>
+    </div>
+    <div class="tenant-card stage">
+      <div class="tenant-header stage">
+        <span>🟠</span> revi-stage
+      </div>
+      <div class="tenant-body">
+        <ul>
+          <li>Slug: <code>revi-stage</code></li>
+          <li>Users: QA + PMs</li>
+          <li>Roles: <code>qa-engineer</code>, <code>product-manager</code></li>
+          <li>Permissions: <code>feature:read</code>, <code>test:*</code></li>
+          <li>API Keys: Revi app staging keys</li>
+        </ul>
+      </div>
+    </div>
+    <div class="tenant-card prod">
+      <div class="tenant-header prod">
+        <span>🟢</span> revi-prod
+      </div>
+      <div class="tenant-body">
+        <ul>
+          <li>Slug: <code>revi-prod</code></li>
+          <li>Users: end users</li>
+          <li>Roles: <code>user</code>, <code>premium-user</code>, <code>admin</code></li>
+          <li>Permissions: <code>reply:read</code>, <code>reply:write</code></li>
+          <li>API Keys: Revi app production keys</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════════════════════════
+       STEP BY STEP JOURNEY
+  ═════════════════════════ -->
+  <h2 class="section-title" id="journey">Step-by-Step Setup Journey</h2>
+
+  <div class="callout green">
+    <strong>Starting point</strong>
+    Login as Super Admin at <a href="http://localhost:5173">http://localhost:5173</a> with <code>admin@emc.local</code> / <code>ChangeMe123!</code>
+  </div>
+
+  <div class="flow" style="margin-top:24px;">
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Create the three Revi AI tenants</h3>
+        <p>Go to <strong>Tenants</strong> in the nav → click <strong>+ New Tenant</strong> → create each one:</p>
+        <div class="creds">
+          <div class="label">Tenant 1 — Development</div>
+          <div class="value">Name: Revi Dev &nbsp;|&nbsp; Slug: <span class="val-green">revi-dev</span></div>
+          <div style="margin-top:8px;" class="label">Tenant 2 — Staging</div>
+          <div class="value">Name: Revi Stage &nbsp;|&nbsp; Slug: <span class="val-amber">revi-stage</span></div>
+          <div style="margin-top:8px;" class="label">Tenant 3 — Production</div>
+          <div class="value">Name: Revi Prod &nbsp;|&nbsp; Slug: <span style="color:#86efac;">revi-prod</span></div>
+        </div>
+        <div class="callout amber" style="margin:8px 0 0;">
+          <strong>Screen:</strong> <code>/tenants</code> → New Tenant button &nbsp;|&nbsp;
+          <strong>API:</strong> <code>POST /api/v1/admin/tenants</code> (requires <code>tenant:manage</code>)
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Open Revi Dev — create permissions</h3>
+        <p>Click <strong>Manage</strong> on revi-dev → go to <strong>Permissions tab</strong> → add the permissions your app will check:</p>
+        <div class="creds">
+          <div class="value">feature:read &nbsp; feature:write &nbsp; debug:access &nbsp; admin:access</div>
+        </div>
+        <div class="callout amber">
+          <strong>Screen:</strong> <code>/tenants/:id</code> → Permissions tab &nbsp;|&nbsp;
+          <strong>API:</strong> <code>POST /api/v1/admin/tenants/:tid/permissions</code>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Create roles and assign permissions</h3>
+        <p>In Revi Dev → <strong>Roles tab</strong> → create roles and pick which permissions each gets:</p>
+        <div class="creds">
+          <div class="label">Role: dev-engineer</div>
+          <div class="value">Permissions: feature:read, feature:write, debug:access</div>
+          <div style="margin-top:8px;" class="label">Role: dev-admin</div>
+          <div class="value">Permissions: feature:read, feature:write, debug:access, admin:access</div>
+        </div>
+        <div class="callout amber">
+          <strong>Screen:</strong> <code>/tenants/:id</code> → Roles tab &nbsp;|&nbsp;
+          <strong>API:</strong> <code>POST /api/v1/admin/tenants/:tid/roles</code>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Add users to Revi Dev</h3>
+        <p>In Revi Dev → <strong>Users tab</strong> → add each developer:</p>
+        <div class="creds">
+          <div class="value">john@revi.ai &nbsp; → &nbsp; dev-engineer</div>
+          <div class="value">shreyash@revi.ai → dev-admin</div>
+        </div>
+        <div class="callout amber">
+          <strong>Screen:</strong> <code>/tenants/:id</code> → Users tab &nbsp;|&nbsp;
+          <strong>API:</strong> <code>POST /api/v1/admin/tenants/:tid/users</code>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Repeat for Revi Stage and Revi Prod</h3>
+        <p>Each environment gets its own isolated permissions, roles, and users. Changes in <code>revi-dev</code> have zero impact on <code>revi-prod</code>.</p>
+        <div class="callout green">
+          <strong>Tip:</strong> In Revi Prod keep permissions minimal (<code>reply:read</code>, <code>reply:write</code>). Add <code>admin:access</code> only to trusted prod admins.
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Create an API key for each Revi environment</h3>
+        <p>Go to <strong>API Keys</strong> → click <strong>+ New API Key</strong> → one per Revi environment. Copy the raw key immediately — it is shown only once.</p>
+        <div class="creds">
+          <div class="label">Key for revi-dev backend</div>
+          <div class="value">emck_••••••••••••••••  (copy and set in Revi .env as EMC_API_KEY)</div>
+        </div>
+        <div class="callout amber">
+          <strong>Screen:</strong> <code>/api-keys</code> &nbsp;|&nbsp;
+          <strong>API:</strong> <code>POST /api/v1/admin/api-keys</code><br/>
+          In Revi AI requests: send as <code>Authorization: ApiKey emck_...</code> or <code>X-API-Key: emck_...</code>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Users log in via Revi AI app</h3>
+        <p>Revi AI frontend calls EMC Auth with the tenant slug in the header. EMC Auth validates credentials, returns JWT with permissions embedded.</p>
+        <div class="creds">
+          <div class="label">Login request from revi-dev frontend</div>
+          <div class="value">POST /api/v1/auth/session</div>
+          <div class="value">X-Tenant-Slug: <span class="val-green">revi-dev</span></div>
+          <div class="value">&#123; "email": "john@revi.ai", "password": "..." &#125;</div>
+          <div style="margin-top:8px;" class="label">JWT payload returned via /auth/me</div>
+          <div class="value">&#123; "role": "dev-engineer", "permissions": ["feature:read","feature:write","debug:access"] &#125;</div>
+        </div>
+        <div class="callout green">
+          Revi AI checks permissions from the JWT. No second round-trip needed — permissions travel in the token.
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-content">
+        <h3>Tenant users see their own account</h3>
+        <p>Non-admin users (e.g., a developer in revi-dev) log in and land on the <strong>My Account</strong> page. They see their role, permissions, and tenant — but cannot access the admin console.</p>
+        <div class="callout amber">
+          <strong>Screen:</strong> <code>/account</code> (auto-redirect for non-admins) &nbsp;|&nbsp;
+          <strong>API:</strong> <code>GET /api/v1/auth/me</code>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ════════════════════════
+       SCREEN INVENTORY
+  ═════════════════════════ -->
+  <h2 class="section-title" id="screens">Screen Inventory</h2>
+
+  <div class="screen-grid">
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>Login</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/login</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Email + password form</li>
+          <li>TOTP second step (if enrolled)</li>
+          <li>Cookie-based session (HttpOnly)</li>
+          <li>Redirects admin → /dashboard, tenant user → /account</li>
+          <li class="missing">Tenant-specific login page URL (/login?tenant=revi-dev) — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>Dashboard</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/dashboard</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Admin only (redirects non-admins)</li>
+          <li>Tenant name, role, permission count</li>
+          <li>Links to Prometheus metrics &amp; Swagger</li>
+          <li class="missing">User count, active sessions stat cards — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>Tenants List</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/tenants</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Super-admin only</li>
+          <li>Lists all tenants (name, slug, status, created date)</li>
+          <li>+ New Tenant button (name + slug)</li>
+          <li>Manage link → detail page</li>
+          <li>Delete (soft) per row</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>Tenant Detail</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/tenants/:id</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>3-tab layout: Permissions | Roles | Users</li>
+          <li>Permissions tab: list, + Add, delete</li>
+          <li>Roles tab: list, + Create (pick permissions), delete</li>
+          <li>Users tab: list, + Add user (email/password/role), delete</li>
+          <li class="missing">Edit user role inline — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>Users</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/users</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Admin only — own tenant's users</li>
+          <li>Search, paginate</li>
+          <li>+ New User (name, email, password, role)</li>
+          <li>Delete user per row</li>
+          <li>Click row → User Detail page</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>User Detail</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/users/:id</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Profile (name, email, tenant, role)</li>
+          <li>Reassign role via dropdown</li>
+          <li>Force password reset button</li>
+          <li>Delete user</li>
+          <li class="missing">Audit activity timeline — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>Roles</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/roles</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Admin only — own tenant's roles</li>
+          <li>Lists roles with permission badges</li>
+          <li>+ New Role (name + pick permissions)</li>
+          <li>Edit role permissions</li>
+          <li>Delete role</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>API Keys</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/api-keys</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Admin only</li>
+          <li>List keys (name, created, last used)</li>
+          <li>+ Generate key — raw shown once in modal</li>
+          <li>Revoke key</li>
+          <li class="missing">Key expiry / rotation policy — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>SAML Config</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/saml</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>Admin only</li>
+          <li>Configure IdP metadata (entity ID, SSO URL, certificate)</li>
+          <li>Test SP-initiated login flow</li>
+          <li class="missing">IdP-initiated login — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>My Account</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/account</span>
+          <span class="status-badge status-built">Built</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li>All authenticated users (non-admin default landing)</li>
+          <li>Profile: name, email, role, tenant ID</li>
+          <li>Permission badges</li>
+          <li>Contact admin notice</li>
+          <li class="missing">Change own password — planned</li>
+          <li class="missing">TOTP enroll/disable self-service — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>Audit Logs</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/audit (planned)</span>
+          <span class="status-badge status-planned">API only</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li class="missing">UI screen not built yet</li>
+          <li>API ready: <code>GET /api/v1/admin/audit-logs</code></li>
+          <li>21 event types (login, create user, delete role, etc.)</li>
+          <li>Filter by action, user, date range</li>
+          <li class="missing">Filterable table UI — planned</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="screen-card">
+      <div class="screen-header">
+        <h3>OAuth / OIDC Apps</h3>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="screen-url">/apps (planned)</span>
+          <span class="status-badge status-planned">Planned</span>
+        </div>
+      </div>
+      <div class="screen-body">
+        <ul>
+          <li class="missing">Register Revi AI as an OAuth client</li>
+          <li class="missing">Auth Code + PKCE flow (Phase 9)</li>
+          <li class="missing">JWKS endpoint for token verification</li>
+          <li class="missing">OIDC discovery document</li>
+          <li class="missing">Scopes management UI</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ════════════════════════
+       API REFERENCE
+  ═════════════════════════ -->
+  <h2 class="section-title" id="apis">Key APIs for Revi AI Integration</h2>
+
+  <h3 style="margin:20px 0 10px;color:var(--brand);">Auth Flow (Revi AI frontend → EMC Auth)</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Endpoint</th><th>Header</th><th>When to call</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method POST">POST</span></td><td><code>/api/v1/auth/session</code></td><td><code>X-Tenant-Slug: revi-dev</code></td><td>User logs in — sets HttpOnly cookie</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td><code>/api/v1/auth/me</code></td><td><code>X-Tenant-Slug: revi-dev</code></td><td>On app load — get user + permissions from cookie</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td><code>/api/v1/auth/session/refresh</code></td><td><code>X-Tenant-Slug: revi-dev</code></td><td>Every 55 min — rotate access token before 1h expiry</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td><code>/api/v1/auth/session/logout</code></td><td><code>X-Tenant-Slug: revi-dev</code></td><td>User logs out — clears cookies</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:20px 0 10px;color:var(--brand);">Tenant Setup (Super Admin)</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Endpoint</th><th>Body</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method POST">POST</span></td><td><code>/api/v1/admin/tenants</code></td><td><code>{"name":"Revi Dev","slug":"revi-dev"}</code></td><td>Create tenant</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td><code>/api/v1/admin/tenants</code></td><td>—</td><td>List all tenants</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td><code>/api/v1/admin/tenants/:tid/permissions</code></td><td><code>{"name":"feature:write"}</code></td><td>Add permission to tenant</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td><code>/api/v1/admin/tenants/:tid/roles</code></td><td><code>{"name":"dev-engineer","permission_ids":["..."]}</code></td><td>Create role in tenant</td></tr>
+      <tr><td><span class="method POST">POST</span></td><td><code>/api/v1/admin/tenants/:tid/users</code></td><td><code>{"email":"john@revi.ai","password":"...","role_id":"..."}</code></td><td>Add user to tenant</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:20px 0 10px;color:var(--brand);">Machine-to-Machine (Revi AI backend → EMC Auth)</h3>
+  <table class="api-table">
+    <thead><tr><th>Method</th><th>Endpoint</th><th>Auth Header</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><span class="method GET">GET</span></td><td><code>/api/v1/auth/me</code></td><td><code>Authorization: ApiKey emck_...</code></td><td>Verify user session from Revi backend</td></tr>
+      <tr><td><span class="method GET">GET</span></td><td><code>/api/v1/admin/users</code></td><td><code>Authorization: ApiKey emck_...</code></td><td>List users from Revi backend (e.g. for billing)</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ════════════════════════
+       CREDENTIALS
+  ═════════════════════════ -->
+  <h2 class="section-title" id="credentials">Local Development Credentials</h2>
+
+  <div class="callout amber">
+    <strong>For developers joining the project</strong>
+    These are local development credentials only. Never use these in staging or production. Share via a secure channel (1Password, Bitwarden, etc.) — never in Slack or email.
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px;">
+
+    <div>
+      <p style="font-size:.85rem;font-weight:700;color:var(--brand);margin-bottom:8px;">Super Admin (EMC Auth Console)</p>
+      <div class="creds">
+        <div class="label">URL</div>
+        <div class="value">http://localhost:5173</div>
+        <div class="label" style="margin-top:8px;">Email</div>
+        <div class="value">admin@emc.local</div>
+        <div class="label" style="margin-top:8px;">Password</div>
+        <div class="val-amber">ChangeMe123!</div>
+        <div class="label" style="margin-top:8px;">Access</div>
+        <div class="value">Full — all tenants, all admin screens</div>
+      </div>
+    </div>
+
+    <div>
+      <p style="font-size:.85rem;font-weight:700;color:var(--brand);margin-bottom:8px;">Test Tenant User</p>
+      <div class="creds">
+        <div class="label">URL</div>
+        <div class="value">http://localhost:5173</div>
+        <div class="label" style="margin-top:8px;">Email</div>
+        <div class="value">tenant@emc.local</div>
+        <div class="label" style="margin-top:8px;">Password</div>
+        <div class="val-amber">Tenant123!</div>
+        <div class="label" style="margin-top:8px;">Access</div>
+        <div class="value">My Account page only (billing_admin role)</div>
+      </div>
+    </div>
+
+    <div>
+      <p style="font-size:.85rem;font-weight:700;color:var(--brand);margin-bottom:8px;">API (Direct)</p>
+      <div class="creds">
+        <div class="label">Go backend</div>
+        <div class="value">http://localhost:9090</div>
+        <div class="label" style="margin-top:8px;">Swagger UI</div>
+        <div class="value">http://localhost:9090/swagger/index.html</div>
+        <div class="label" style="margin-top:8px;">Health check</div>
+        <div class="value">http://localhost:9090/health</div>
+        <div class="label" style="margin-top:8px;">Metrics</div>
+        <div class="value">http://localhost:9090/metrics</div>
+      </div>
+    </div>
+
+    <div>
+      <p style="font-size:.85rem;font-weight:700;color:var(--brand);margin-bottom:8px;">Database</p>
+      <div class="creds">
+        <div class="label">Host</div>
+        <div class="value">localhost:5432</div>
+        <div class="label" style="margin-top:8px;">Database</div>
+        <div class="value">emc_auth</div>
+        <div class="label" style="margin-top:8px;">User / Password</div>
+        <div class="value">emc_auth / password</div>
+        <div class="label" style="margin-top:8px;">Redis</div>
+        <div class="value">localhost:6379</div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="callout blue" style="margin-top:32px;">
+    <strong>How Revi AI should integrate</strong>
+    Set <code>VITE_TENANT_SLUG=revi-dev</code> (or revi-stage / revi-prod) in Revi's <code>.env</code> file. Every API call from Revi's axios client must include <code>X-Tenant-Slug: revi-dev</code>. EMC Auth then scopes all auth operations to that tenant automatically.
+  </div>
+
+  <h3 style="margin:24px 0 10px;color:var(--brand);">Quick curl — Test any tenant login</h3>
+  <div class="creds">
+    <div class="label"># Login to revi-dev</div>
+    <div class="value">curl -X POST http://localhost:9090/api/v1/auth/session \</div>
+    <div class="value">&nbsp;&nbsp;-H "Content-Type: application/json" \</div>
+    <div class="value">&nbsp;&nbsp;-H "X-Tenant-Slug: <span class="val-green">revi-dev</span>" \</div>
+    <div class="value">&nbsp;&nbsp;-d '&#123;"email":"john@revi.ai","password":"..."&#125;'</div>
+    <div style="margin-top:12px;" class="label"># Get user + permissions</div>
+    <div class="value">curl http://localhost:9090/api/v1/auth/me \</div>
+    <div class="value">&nbsp;&nbsp;-H "X-Tenant-Slug: <span class="val-green">revi-dev</span>" \</div>
+    <div class="value">&nbsp;&nbsp;--cookie "emc_access_token=&lt;from login&gt;"</div>
+  </div>
+
+</main>
+
+<footer>
+  <p>EMC Auth Server &nbsp;·&nbsp; <a href="http://localhost:5173">Admin Console</a> &nbsp;·&nbsp; <a href="http://localhost:9090/swagger/index.html">Swagger UI</a> &nbsp;·&nbsp; <a href="https://github.com/Engineersmind/emc-auth-server">GitHub</a> &nbsp;·&nbsp; MIT License &copy; 2026 EngineersMind</p>
+</footer>
+
+</body>
+</html>

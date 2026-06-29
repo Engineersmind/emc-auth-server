@@ -1,6 +1,6 @@
 -- +goose Up
 -- +goose StatementBegin
-ALTER TABLE users ADD COLUMN role_id UUID REFERENCES roles(id) ON DELETE SET NULL;
+ALTER TABLE users ADD COLUMN role_id BIGINT REFERENCES roles(id) ON DELETE SET NULL;
 -- +goose StatementEnd
 
 -- +goose Down
