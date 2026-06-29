@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -18,11 +19,22 @@ const defaultSeedPassword = "ChangeMe123!"
 // to retrieve the generated value for use in subsequent inserts.
 // The admin password is read from SEED_ADMIN_PASSWORD env var; falls back to "ChangeMe123!"
 // with a prominent warning log.
+// CORS origins are seeded from SEED_CORS_ORIGINS (comma-separated, e.g.
+// "https://auth.senie.ai,https://app.senie.ai,http://localhost:3000").
 func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) error {
 	seedPassword := os.Getenv("SEED_ADMIN_PASSWORD")
 	if seedPassword == "" {
 		seedPassword = defaultSeedPassword
 		logger.Warn().Msg("SEED_ADMIN_PASSWORD not set — using default password. Override this in production!")
+	}
+
+	var corsOrigins []string
+	if raw := os.Getenv("SEED_CORS_ORIGINS"); raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			if trimmed := strings.TrimSpace(o); trimmed != "" {
+				corsOrigins = append(corsOrigins, trimmed)
+			}
+		}
 	}
 
 	// 1. Seed default tenant (idempotent via slug unique index).
@@ -42,6 +54,18 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 		return fmt.Errorf("seed: fetch tenant id: %w", err)
 	}
 	logger.Info().Str("tenant", "emc").Int64("id", tenantID).Msg("seed tenant ensured")
+
+	// 1b. Seed CORS origins from SEED_CORS_ORIGINS env var (idempotent — only sets if provided).
+	if len(corsOrigins) > 0 {
+		_, err = pool.Exec(ctx,
+			`UPDATE tenants SET cors_origins = $1 WHERE id = $2`,
+			corsOrigins, tenantID,
+		)
+		if err != nil {
+			return fmt.Errorf("seed cors_origins: %w", err)
+		}
+		logger.Info().Strs("cors_origins", corsOrigins).Msg("seed cors_origins set")
+	}
 
 	// 2. Seed super_admin role (idempotent via name+tenant unique index).
 	_, err = pool.Exec(ctx, `
