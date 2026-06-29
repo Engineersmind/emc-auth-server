@@ -86,6 +86,12 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			slug := c.Request().Header.Get(tenantSlugHeader)
+			// Browser preflight (OPTIONS) does not echo back header values —
+			// only lists them in Access-Control-Request-Headers. Default to
+			// "emc" so preflight requests resolve the correct tenant origins.
+			if slug == "" {
+				slug = "emc"
+			}
 			origins := svc.GetOrigins(c.Request().Context(), slug)
 
 			// No configured origins — skip CORS handling entirely.
