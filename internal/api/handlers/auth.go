@@ -183,11 +183,7 @@ func (h *AuthHandler) Register(c echo.Context) error {
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
-	return c.JSON(http.StatusCreated, map[string]interface{}{
-		"message":    "registered",
-		"expires_in": result.ExpiresIn,
-		"expires_at": result.ExpiresAt,
-	})
+	return c.JSON(http.StatusCreated, result)
 }
 
 // Login handles POST /api/v1/auth/login.
@@ -253,11 +249,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	})
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
-	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message":    "logged in",
-		"expires_in": result.Token.ExpiresIn,
-		"expires_at": result.Token.ExpiresAt,
-	})
+	return c.JSON(http.StatusOK, result.Token)
 }
 
 // LoginOTPRequest is the JSON body for POST /api/v1/auth/login/otp.
