@@ -6,6 +6,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 
 	"go.opentelemetry.io/otel"
@@ -43,10 +44,20 @@ func Init(ctx context.Context) (ShutdownFunc, error) {
 		return nil, fmt.Errorf("otel resource: %w", err)
 	}
 
+	// Parse endpoint to extract host:port — the otlphttp exporters take host:port
+	// without a scheme; WithInsecure() sets HTTP transport explicitly.
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		return nil, fmt.Errorf("invalid OTEL_EXPORTER_OTLP_ENDPOINT %q: %w", endpoint, err)
+	}
+	hostPort := u.Host // e.g. "32.197.242.183:5000"
+
 	// ── Traces ──────────────────────────────────────────────────────────────
-	// otlptracehttp reads OTEL_EXPORTER_OTLP_ENDPOINT automatically and appends
-	// /v1/traces.  WithInsecure() is needed because devops-copilot is HTTP-only.
-	traceExp, err := otlptracehttp.New(ctx, otlptracehttp.WithInsecure())
+	traceExp, err := otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpoint(hostPort),
+		otlptracehttp.WithInsecure(),
+		otlptracehttp.WithURLPath("/v1/traces"),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("otel trace exporter: %w", err)
 	}
@@ -57,9 +68,12 @@ func Init(ctx context.Context) (ShutdownFunc, error) {
 	otel.SetTracerProvider(tp)
 
 	// ── Logs ────────────────────────────────────────────────────────────────
-	// otlploghttp reads OTEL_EXPORTER_OTLP_ENDPOINT automatically and appends
-	// /v1/logs.  ERROR+ zerolog events are forwarded here via OTelHook.
-	logExp, err := otlploghttp.New(ctx, otlploghttp.WithInsecure())
+	// ERROR+ zerolog events are forwarded here via OTelHook.
+	logExp, err := otlploghttp.New(ctx,
+		otlploghttp.WithEndpoint(hostPort),
+		otlploghttp.WithInsecure(),
+		otlploghttp.WithURLPath("/v1/logs"),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("otel log exporter: %w", err)
 	}
