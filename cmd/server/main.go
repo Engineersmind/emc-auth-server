@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -96,8 +97,16 @@ func main() {
 	}
 	defer store.CloseRedis(rdb)
 
-	// Set Swagger host dynamically so "Try it out" points to this server's address
-	docs.SwaggerInfo.Host = "localhost:" + cfg.Port
+	// Set Swagger host dynamically so "Try it out" points to this server's address.
+	// In production APP_BASE_URL is e.g. "https://auth.senie.ai" — strip the scheme.
+	if cfg.AppBaseURL != "" && cfg.AppBaseURL != "http://localhost:9090" {
+		host := cfg.AppBaseURL
+		host = strings.TrimPrefix(host, "https://")
+		host = strings.TrimPrefix(host, "http://")
+		docs.SwaggerInfo.Host = strings.TrimRight(host, "/")
+	} else {
+		docs.SwaggerInfo.Host = "localhost:" + cfg.Port
+	}
 
 	// Echo instance
 	e := echo.New()
