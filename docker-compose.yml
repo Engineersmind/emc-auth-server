@@ -45,6 +45,7 @@ services:
       APP_BASE_URL: "http://localhost:9090"
       TOTP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       SEED_DEMO_DATA: "true"
+      SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
     depends_on:
       postgres:
         condition: service_healthy
