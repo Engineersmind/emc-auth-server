@@ -44,13 +44,16 @@ func Init(ctx context.Context) (ShutdownFunc, error) {
 		return nil, fmt.Errorf("otel resource: %w", err)
 	}
 
-	// Parse endpoint to extract host:port — the otlphttp exporters take host:port
-	// without a scheme; WithInsecure() sets HTTP transport explicitly.
-	u, err := url.Parse(endpoint)
-	if err != nil || u.Host == "" {
-		return nil, fmt.Errorf("invalid OTEL_EXPORTER_OTLP_ENDPOINT %q: %w", endpoint, err)
+	// Resolve host:port for the otlphttp exporters.
+	// Accept both "http://host:port" (url.Parse yields u.Host) and bare "host:port"
+	// (url.Parse treats it as a path; fall back to using the raw value).
+	hostPort := endpoint
+	if u, parseErr := url.Parse(endpoint); parseErr == nil && u.Host != "" {
+		hostPort = u.Host
 	}
-	hostPort := u.Host // e.g. "32.197.242.183:5000"
+	if hostPort == "" {
+		return nil, fmt.Errorf("invalid OTEL_EXPORTER_OTLP_ENDPOINT %q: cannot determine host:port", endpoint)
+	}
 
 	// ── Traces ──────────────────────────────────────────────────────────────
 	traceExp, err := otlptracehttp.New(ctx,
