@@ -1,9 +1,9 @@
 -- +goose Up
 -- +goose StatementBegin
 CREATE TABLE audit_logs (
-    id            UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id     UUID        REFERENCES tenants(id) ON DELETE SET NULL,
-    user_id       UUID        REFERENCES users(id)   ON DELETE SET NULL,
+    id            BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tenant_id     BIGINT      REFERENCES tenants(id) ON DELETE SET NULL,
+    user_id       BIGINT      REFERENCES users(id)   ON DELETE SET NULL,
     actor_email   TEXT        NOT NULL DEFAULT '',
     action        TEXT        NOT NULL,
     resource_type TEXT        NOT NULL DEFAULT '',

@@ -77,7 +77,7 @@ type AgentAnalysis struct {
 // AgentIdentity is resolved by AuthenticateAgent — acts like a machine identity.
 type AgentIdentity struct {
 	AgentID      uuid.UUID
-	TenantID     uuid.UUID
+	TenantID     int64
 	Name         string
 	AgentType    string
 	Capabilities []string
@@ -89,7 +89,7 @@ type AgentIdentity struct {
 //   - Rate-limit hits: >10 rate_limit events/24h   → +25
 //   - Unique IPs:      >5 distinct IPs/24h         → +25
 //   - Off-hours:       >20% requests off-hours     → +20
-func (s *AgentService) AnalyzeAgents(ctx context.Context, tenantID uuid.UUID) ([]AgentAnalysis, error) {
+func (s *AgentService) AnalyzeAgents(ctx context.Context, tenantID int64) ([]AgentAnalysis, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 		    a.id,
@@ -165,7 +165,7 @@ func (s *AgentService) AnalyzeAgents(ctx context.Context, tenantID uuid.UUID) ([
 
 // RegisterAgent creates a new agent registration for the given tenant.
 // The raw key is returned exactly once and is never stored — only its SHA-256 hash.
-func (s *AgentService) RegisterAgent(ctx context.Context, tenantID uuid.UUID, name, agentType string, capabilities []string) (*AgentRegistrationResult, error) {
+func (s *AgentService) RegisterAgent(ctx context.Context, tenantID int64, name, agentType string, capabilities []string) (*AgentRegistrationResult, error) {
 	if name == "" {
 		return nil, fmt.Errorf("agent name is required")
 	}
@@ -213,7 +213,7 @@ func (s *AgentService) RegisterAgent(ctx context.Context, tenantID uuid.UUID, na
 }
 
 // ListAgents returns all active (not revoked) agent registrations for a tenant.
-func (s *AgentService) ListAgents(ctx context.Context, tenantID uuid.UUID) ([]AgentSummary, error) {
+func (s *AgentService) ListAgents(ctx context.Context, tenantID int64) ([]AgentSummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, agent_type, capabilities, key_prefix, last_used_at, created_at
 		FROM agent_registrations
@@ -246,7 +246,7 @@ func (s *AgentService) ListAgents(ctx context.Context, tenantID uuid.UUID) ([]Ag
 
 // ListAgentsWithStats returns all active agent registrations with audit-derived metrics (08-03).
 // request_count and last_active are pulled from audit_logs.agent_id associations.
-func (s *AgentService) ListAgentsWithStats(ctx context.Context, tenantID uuid.UUID) ([]AgentWithStats, error) {
+func (s *AgentService) ListAgentsWithStats(ctx context.Context, tenantID int64) ([]AgentWithStats, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 		    a.id, a.name, a.agent_type, a.capabilities, a.key_prefix, a.last_used_at, a.created_at,
@@ -287,7 +287,7 @@ func (s *AgentService) ListAgentsWithStats(ctx context.Context, tenantID uuid.UU
 
 // RevokeAgent marks an agent registration as revoked. Only agents belonging to the given
 // tenant can be revoked (tenant isolation).
-func (s *AgentService) RevokeAgent(ctx context.Context, tenantID uuid.UUID, agentID uuid.UUID) error {
+func (s *AgentService) RevokeAgent(ctx context.Context, tenantID int64, agentID uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE agent_registrations
 		SET revoked_at = NOW()
@@ -311,7 +311,8 @@ func (s *AgentService) AuthenticateAgent(ctx context.Context, rawKey string) (*A
 
 	keyHash := HashToken(rawKey)
 
-	var agentID, tenantID uuid.UUID
+	var agentID uuid.UUID
+	var tenantID int64
 	var name, agentType string
 	var capabilities []string
 	err := s.pool.QueryRow(ctx, `

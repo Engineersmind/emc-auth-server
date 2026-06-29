@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 	"github.com/engineersmind/emc-auth-server/internal/store"
@@ -201,7 +199,7 @@ func TestTOTPBypass_InvalidCode(t *testing.T) {
 	}
 
 	// Fetch the userID and tenantID.
-	var userID, tenantID uuid.UUID
+	var userID, tenantID int64
 	err = pool.QueryRow(ctx, `
 		SELECT u.id, u.tenant_id
 		FROM users u

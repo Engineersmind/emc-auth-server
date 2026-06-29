@@ -2,17 +2,18 @@ package auth_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/store"
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
+
 
 func TestJWTService_SignAndVerify(t *testing.T) {
 	pool := testhelper.NewTestDB(t)
@@ -21,22 +22,32 @@ func TestJWTService_SignAndVerify(t *testing.T) {
 	ctx := context.Background()
 	logger := testhelper.TestLogger()
 
-	// Ensure seed data exists.
 	if err := store.RunSeed(ctx, pool, logger); err != nil {
 		t.Fatalf("RunSeed: %v", err)
 	}
 
+	var tenantID, userID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE email = 'admin@emc.local' AND deleted_at IS NULL`).Scan(&userID); err != nil {
+		t.Fatalf("fetch seed user id: %v", err)
+	}
+
 	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
 
+	userIDStr := strconv.FormatInt(userID, 10)
+	tenantIDStr := strconv.FormatInt(tenantID, 10)
+
 	claims := &auth.Claims{
-		UserID:      store.SeedUserID.String(),
-		TenantID:    store.SeedTenantID.String(),
+		UserID:      userIDStr,
+		TenantID:    tenantIDStr,
 		Email:       "admin@emc.local",
 		Role:        "super_admin",
 		Permissions: []string{"admin:access"},
 	}
 
-	token, err := jwtSvc.Sign(ctx, store.SeedTenantID, "emc-auth-server", claims)
+	token, err := jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
@@ -48,8 +59,8 @@ func TestJWTService_SignAndVerify(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
-	if verified.UserID != store.SeedUserID.String() {
-		t.Errorf("Verify() UserID = %q, want %q", verified.UserID, store.SeedUserID.String())
+	if verified.UserID != userIDStr {
+		t.Errorf("Verify() UserID = %q, want %q", verified.UserID, userIDStr)
 	}
 	if verified.Email != "admin@emc.local" {
 		t.Errorf("Verify() Email = %q, want %q", verified.Email, "admin@emc.local")
@@ -67,25 +78,35 @@ func TestJWTService_Verify_ExpiredToken(t *testing.T) {
 		t.Fatalf("RunSeed: %v", err)
 	}
 
-	// Fetch the tenant's jwt_secret directly to build a manually-crafted expired token.
+	var tenantID, userID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE email = 'admin@emc.local' AND deleted_at IS NULL`).Scan(&userID); err != nil {
+		t.Fatalf("fetch seed user id: %v", err)
+	}
+
 	var jwtSecret string
 	err := pool.QueryRow(ctx,
 		`SELECT jwt_secret FROM tenants WHERE id = $1 AND is_active = true`,
-		store.SeedTenantID,
+		tenantID,
 	).Scan(&jwtSecret)
 	if err != nil {
 		t.Fatalf("fetch jwt_secret: %v", err)
 	}
 
+	userIDStr := strconv.FormatInt(userID, 10)
+	tenantIDStr := strconv.FormatInt(tenantID, 10)
+
 	past := time.Now().Add(-2 * time.Hour)
 	expiredClaims := &auth.Claims{
-		UserID:   store.SeedUserID.String(),
-		TenantID: store.SeedTenantID.String(),
+		UserID:   userIDStr,
+		TenantID: tenantIDStr,
 		Email:    "admin@emc.local",
 		Role:     "super_admin",
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    "https://auth.emc.local",
-			Subject:   store.SeedUserID.String(),
+			Subject:   userIDStr,
 			IssuedAt:  jwt.NewNumericDate(past),
 			ExpiresAt: jwt.NewNumericDate(past.Add(time.Minute)),
 		},
@@ -118,32 +139,41 @@ func TestJWTService_Verify_WrongTenant(t *testing.T) {
 		t.Fatalf("RunSeed: %v", err)
 	}
 
-	// First sign a token using seed tenant.
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
-	claims := &auth.Claims{
-		UserID:      store.SeedUserID.String(),
-		TenantID:    uuid.New().String(), // random UUID not in DB
-		Email:       "admin@emc.local",
-		Role:        "super_admin",
-		Permissions: []string{},
+	var tenantID, userID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE email = 'admin@emc.local' AND deleted_at IS NULL`).Scan(&userID); err != nil {
+		t.Fatalf("fetch seed user id: %v", err)
 	}
 
-	// Build a token with a non-existent tenant ID manually.
-	// We need SOME secret to sign with. Use seed tenant's secret but embed wrong TenantID in claims.
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+
+	// Build a token with a non-existent tenant ID in claims.
+	// Use seed tenant's secret for signing but embed wrong TenantID in claims.
 	var jwtSecret string
 	err := pool.QueryRow(ctx,
 		`SELECT jwt_secret FROM tenants WHERE id = $1`,
-		store.SeedTenantID,
+		tenantID,
 	).Scan(&jwtSecret)
 	if err != nil {
 		t.Fatalf("fetch jwt_secret: %v", err)
 	}
 
-	claims.RegisteredClaims = jwt.RegisteredClaims{
-		Issuer:    "https://auth.emc.local",
-		Subject:   store.SeedUserID.String(),
-		IssuedAt:  jwt.NewNumericDate(time.Now()),
-		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	userIDStr := strconv.FormatInt(userID, 10)
+
+	claims := &auth.Claims{
+		UserID:      userIDStr,
+		TenantID:    "999999", // non-existent tenant ID
+		Email:       "admin@emc.local",
+		Role:        "super_admin",
+		Permissions: []string{},
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "https://auth.emc.local",
+			Subject:   userIDStr,
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
 	}
 
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)

@@ -2,7 +2,7 @@
 -- +goose StatementBegin
 CREATE TABLE app_rate_limits (
     app_id              TEXT        PRIMARY KEY,
-    tenant_id           UUID        NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    tenant_id           BIGINT      NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     requests_per_minute INT         NOT NULL DEFAULT 60,
     burst               INT         NOT NULL DEFAULT 10,
     description         TEXT        NOT NULL DEFAULT '',

@@ -8,6 +8,7 @@ package audit
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,13 +23,14 @@ import (
 
 const (
 	// Auth events
-	ActionAuthRegister            = "auth.register"
-	ActionAuthLogin               = "auth.login"
-	ActionAuthLoginFailed         = "auth.login_failed"
-	ActionAuthLogout              = "auth.logout"
-	ActionAuthTokenRefresh        = "auth.token_refresh"
-	ActionAuthPasswordResetReq    = "auth.password_reset_requested"
-	ActionAuthPasswordResetDone   = "auth.password_reset_completed"
+	ActionAuthRegister          = "auth.register"
+	ActionAuthLogin             = "auth.login"
+	ActionAuthLoginFailed       = "auth.login_failed"
+	ActionAuthLogout            = "auth.logout"
+	ActionAuthTokenRefresh      = "auth.token_refresh"
+	ActionAuthPasswordResetReq  = "auth.password_reset_requested"
+	ActionAuthPasswordResetDone = "auth.password_reset_completed"
+	ActionAuthReplayDetected    = "auth.replay_detected"
 
 	// Admin — tenant management
 	ActionAdminTenantCreated     = "admin.tenant_created"
@@ -40,16 +42,16 @@ const (
 	ActionAdminPermissionDeleted = "admin.permission_deleted"
 
 	// Admin — role management
-	ActionAdminRoleCreated          = "admin.role_created"
+	ActionAdminRoleCreated            = "admin.role_created"
 	ActionAdminRolePermissionsUpdated = "admin.role_permissions_updated"
-	ActionAdminRoleDeleted          = "admin.role_deleted"
+	ActionAdminRoleDeleted            = "admin.role_deleted"
 
 	// Admin — user pool management
-	ActionAdminUserCreated          = "admin.user_created"
-	ActionAdminUserUpdated          = "admin.user_updated"
-	ActionAdminUserDeleted          = "admin.user_deleted"
-	ActionAdminUserRoleAssigned     = "admin.user_role_assigned"
-	ActionAdminForcePasswordReset   = "admin.force_password_reset"
+	ActionAdminUserCreated        = "admin.user_created"
+	ActionAdminUserUpdated        = "admin.user_updated"
+	ActionAdminUserDeleted        = "admin.user_deleted"
+	ActionAdminUserRoleAssigned   = "admin.user_role_assigned"
+	ActionAdminForcePasswordReset = "admin.force_password_reset"
 
 	// Admin — per-app rate limit management (08-02)
 	ActionAdminAppLimitCreated = "admin.app_limit_created"
@@ -58,6 +60,13 @@ const (
 
 	// Admin — tenant CORS configuration
 	ActionAdminCORSUpdated = "admin.cors_origins_updated"
+
+	// Admin — application (OAuth2 client) management
+	ActionAdminApplicationCreated = "admin.application_created"
+	ActionAdminApplicationDeleted = "admin.application_deleted"
+
+	// Auth — machine-to-machine client_credentials grant
+	ActionAuthClientCredentials = "auth.client_credentials"
 )
 
 // ---------------------------------------------------------------------------
@@ -67,9 +76,9 @@ const (
 // Event describes a single auditable action.
 type Event struct {
 	// TenantID is the tenant the action occurred in. Nil for system-level events.
-	TenantID *uuid.UUID
+	TenantID *int64
 	// UserID is the user who performed the action. Nil for unauthenticated events.
-	UserID *uuid.UUID
+	UserID *int64
 	// AgentID is the agent that performed the action. Nil for human-initiated events (08-03).
 	AgentID *uuid.UUID
 	// ActorEmail is the email of the actor (denormalized at log time).
@@ -78,7 +87,7 @@ type Event struct {
 	Action string
 	// ResourceType is the kind of resource affected (tenant, user, role, permission).
 	ResourceType string
-	// ResourceID is the UUID (as string) of the affected resource.
+	// ResourceID is the ID (as string) of the affected resource.
 	ResourceID string
 	// IPAddress is the caller's remote IP.
 	IPAddress string
@@ -117,7 +126,7 @@ type LogsPage struct {
 type QueryParams struct {
 	// TenantID restricts results to one tenant (used for tenant-scoped endpoint).
 	// Nil means no restriction (system-wide endpoint).
-	TenantID *uuid.UUID
+	TenantID *int64
 	Action   string
 	UserID   string
 	AgentID  string // optional UUID string; filters to events by a specific agent (08-03)
@@ -147,9 +156,9 @@ func New(pool *pgxpool.Pool, logger zerolog.Logger) *Logger {
 func (l *Logger) Log(ctx context.Context, e Event) {
 	_, err := l.pool.Exec(ctx, `
 		INSERT INTO audit_logs
-		  (id, tenant_id, user_id, agent_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
+		  (tenant_id, user_id, agent_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
 		VALUES
-		  (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+		  ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 	`, e.TenantID, e.UserID, e.AgentID, e.ActorEmail, e.Action,
 		e.ResourceType, e.ResourceID, e.IPAddress, e.UserAgent)
 	if err != nil {
@@ -177,7 +186,7 @@ type StatsResult struct {
 
 // Stats returns aggregated counts for the monitoring dashboard.
 // When tenantID is nil, returns system-wide counts.
-func (l *Logger) Stats(ctx context.Context, tenantID *uuid.UUID) (*StatsResult, error) {
+func (l *Logger) Stats(ctx context.Context, tenantID *int64) (*StatsResult, error) {
 	where := "WHERE 1=1"
 	args := []any{}
 	if tenantID != nil {
@@ -227,8 +236,6 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 	}
 	offset := (p.Page - 1) * p.Limit
 
-	// Build dynamic WHERE clause.
-	// We use positional args to avoid SQL injection.
 	args := []any{}
 	where := "WHERE 1=1"
 
@@ -241,7 +248,7 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 		where += fmt.Sprintf(" AND al.action = $%d", len(args))
 	}
 	if p.UserID != "" {
-		uid, err := uuid.Parse(p.UserID)
+		uid, err := strconv.ParseInt(p.UserID, 10, 64)
 		if err == nil {
 			args = append(args, uid)
 			where += fmt.Sprintf(" AND al.user_id = $%d", len(args))
@@ -263,16 +270,12 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 		where += fmt.Sprintf(" AND al.created_at <= $%d", len(args))
 	}
 
-	// Count total.
 	var total int
-	countSQL := fmt.Sprintf(`
-		SELECT COUNT(*) FROM audit_logs al %s
-	`, where)
+	countSQL := fmt.Sprintf(`SELECT COUNT(*) FROM audit_logs al %s`, where)
 	if err := l.pool.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
 		return nil, fmt.Errorf("audit count: %w", err)
 	}
 
-	// Fetch page — JOIN tenants for slug (left join so system events with NULL tenant_id still appear).
 	args = append(args, p.Limit, offset)
 	limitArg := len(args) - 1
 	offsetArg := len(args)
@@ -297,23 +300,25 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 	var logs []LogEntry
 	for rows.Next() {
 		var e LogEntry
-		var tenantID *uuid.UUID
-		var userID *uuid.UUID
+		var tenantID *int64
+		var userID *int64
 		var agentID *uuid.UUID
 		var tenantSlug *string
+		var logID int64
 		if err := rows.Scan(
-			&e.ID, &tenantID, &tenantSlug, &userID, &agentID,
+			&logID, &tenantID, &tenantSlug, &userID, &agentID,
 			&e.ActorEmail, &e.Action, &e.ResourceType,
 			&e.ResourceID, &e.IPAddress, &e.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("audit scan: %w", err)
 		}
+		e.ID = strconv.FormatInt(logID, 10)
 		if tenantID != nil {
-			s := tenantID.String()
+			s := strconv.FormatInt(*tenantID, 10)
 			e.TenantID = &s
 		}
 		if userID != nil {
-			s := userID.String()
+			s := strconv.FormatInt(*userID, 10)
 			e.UserID = &s
 		}
 		if agentID != nil {

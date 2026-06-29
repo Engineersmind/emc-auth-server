@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pquerna/otp/totp"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
@@ -27,7 +28,8 @@ func totpEnvKey() string {
 }
 
 // newTOTPService creates a real TOTPService with DB + dev encryption key.
-func newTOTPService(t *testing.T) (*auth.TOTPService, context.Context) {
+// Returns the service, a background context, the pool, and the seed tenant ID.
+func newTOTPService(t *testing.T) (*auth.TOTPService, context.Context, *pgxpool.Pool, int64) {
 	t.Helper()
 	pool := testhelper.NewTestDB(t)
 	testhelper.CleanupTables(t, pool)
@@ -38,11 +40,40 @@ func newTOTPService(t *testing.T) (*auth.TOTPService, context.Context) {
 		t.Fatalf("RunSeed: %v", err)
 	}
 
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
 	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
-	return svc, ctx
+	return svc, ctx, pool, tenantID
+}
+
+// insertTOTPTestUser registers a real user via AuthService and returns their int64 ID.
+// TOTP secrets have a FK on users.id, so a real row is required.
+func insertTOTPTestUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, email string) int64 {
+	t.Helper()
+	logger := testhelper.TestLogger()
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
+	_, err := authSvc.Register(ctx, auth.RegisterInput{
+		TenantSlug: "emc",
+		Email:      email,
+		Password:   "TestPass123!",
+		FirstName:  "TOTP",
+		LastName:   "Test",
+	})
+	if err != nil {
+		t.Fatalf("insertTOTPTestUser Register(%q): %v", email, err)
+	}
+	var userID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL`, email).Scan(&userID); err != nil {
+		t.Fatalf("insertTOTPTestUser fetch id for %q: %v", email, err)
+	}
+	return userID
 }
 
 // secretFromOTPURI extracts the TOTP secret from an otpauth:// URI.
@@ -60,12 +91,11 @@ func secretFromOTPURI(t *testing.T, uri string) string {
 }
 
 func TestTOTPService_Enroll_ReturnsURIAndCodes(t *testing.T) {
-	svc, ctx := newTOTPService(t)
+	svc, ctx, pool, tenantID := newTOTPService(t)
 
-	userID := store.SeedUserID
-	tenantID := store.SeedTenantID
+	userID := insertTOTPTestUser(t, ctx, pool, "enroll-uri@emc.local")
 
-	result, err := svc.Enroll(ctx, userID, tenantID, "test@emc.local")
+	result, err := svc.Enroll(ctx, userID, tenantID, "enroll-uri@emc.local")
 	if err != nil {
 		t.Fatalf("Enroll() error = %v", err)
 	}
@@ -91,13 +121,18 @@ func TestTOTPService_VerifyAndActivate(t *testing.T) {
 	if err := store.RunSeed(ctx, pool, logger); err != nil {
 		t.Fatalf("RunSeed: %v", err)
 	}
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
 	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := store.SeedUserID
-	tenantID := store.SeedTenantID
+	userID := insertTOTPTestUser(t, ctx, pool, "activate@emc.local")
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "activate@emc.local")
 	if err != nil {
@@ -133,13 +168,18 @@ func TestTOTPService_Verify_InvalidCode(t *testing.T) {
 	if err := store.RunSeed(ctx, pool, logger); err != nil {
 		t.Fatalf("RunSeed: %v", err)
 	}
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
 	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := store.SeedUserID
-	tenantID := store.SeedTenantID
+	userID := insertTOTPTestUser(t, ctx, pool, "verify-invalid@emc.local")
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "verify-invalid@emc.local")
 	if err != nil {
@@ -172,13 +212,18 @@ func TestTOTPService_VerifyBackupCode_ConsumesCode(t *testing.T) {
 	if err := store.RunSeed(ctx, pool, logger); err != nil {
 		t.Fatalf("RunSeed: %v", err)
 	}
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
 	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := store.SeedUserID
-	tenantID := store.SeedTenantID
+	userID := insertTOTPTestUser(t, ctx, pool, "backupcode@emc.local")
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "backupcode@emc.local")
 	if err != nil {
@@ -213,13 +258,18 @@ func TestTOTPService_Disable(t *testing.T) {
 	if err := store.RunSeed(ctx, pool, logger); err != nil {
 		t.Fatalf("RunSeed: %v", err)
 	}
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
 	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	userID := store.SeedUserID
-	tenantID := store.SeedTenantID
+	userID := insertTOTPTestUser(t, ctx, pool, "disable@emc.local")
 
 	result, err := svc.Enroll(ctx, userID, tenantID, "disable@emc.local")
 	if err != nil {

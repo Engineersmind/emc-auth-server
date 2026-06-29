@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
@@ -23,9 +22,11 @@ type AuthHandler struct {
 	resetSvc  *auth.ResetService
 	totpSvc   *auth.TOTPService // nil when TOTP not configured
 	apiKeySvc *auth.APIKeyService
+	appSvc    *auth.ApplicationService // nil until WithApplications is called
 	jwtSvc    *auth.JWTService
 	audit     *audit.Logger
 	logger    zerolog.Logger
+	cookieCfg mw.CookieConfig
 }
 
 // NewAuthHandler creates an AuthHandler.
@@ -33,15 +34,28 @@ func NewAuthHandler(svc *auth.AuthService, resetSvc *auth.ResetService, auditLog
 	return &AuthHandler{svc: svc, resetSvc: resetSvc, audit: auditLog, logger: logger}
 }
 
-// WithTOTP attaches a TOTPService to the handler (called from routes.go after init).
+// WithTOTP attaches a TOTPService to the handler.
 func (h *AuthHandler) WithTOTP(totpSvc *auth.TOTPService) *AuthHandler {
 	h.totpSvc = totpSvc
 	return h
 }
 
-// WithAPIKeys attaches an APIKeyService to the handler (called from routes.go after init).
+// WithAPIKeys attaches an APIKeyService to the handler.
 func (h *AuthHandler) WithAPIKeys(apiKeySvc *auth.APIKeyService) *AuthHandler {
 	h.apiKeySvc = apiKeySvc
+	return h
+}
+
+// WithCookieConfig sets the cookie security policy for this handler.
+func (h *AuthHandler) WithCookieConfig(cfg mw.CookieConfig) *AuthHandler {
+	h.cookieCfg = cfg
+	return h
+}
+
+// WithApplications attaches the ApplicationService so Register, Login, and Token
+// handlers can validate X-Client-ID and issue client_credentials tokens.
+func (h *AuthHandler) WithApplications(appSvc *auth.ApplicationService) *AuthHandler {
+	h.appSvc = appSvc
 	return h
 }
 
@@ -51,6 +65,11 @@ func (h *AuthHandler) WithJWT(jwtSvc *auth.JWTService) *AuthHandler {
 	return h
 }
 
+// clientIDFromCtx extracts the optional X-Client-ID header value.
+func clientIDFromCtx(c echo.Context) string {
+	return c.Request().Header.Get("X-Client-ID")
+}
+
 // MyActivity handles GET /api/v1/auth/my-activity.
 // Returns the current user's own audit log entries (any logged-in user).
 func (h *AuthHandler) MyActivity(c echo.Context) error {
@@ -58,7 +77,7 @@ func (h *AuthHandler) MyActivity(c echo.Context) error {
 	if !ok || claims == nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
-	tenantID, err := uuid.Parse(claims.TenantID)
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant"})
 	}
@@ -106,7 +125,7 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 //
 // @Summary      Register a new user
 // @Description  Creates a user account in the specified tenant and returns a token pair.
-// @Tags         auth
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        X-Tenant-Slug  header    string          true  "Tenant slug (e.g. emc)"
@@ -135,6 +154,7 @@ func (h *AuthHandler) Register(c echo.Context) error {
 
 	result, err := h.svc.Register(c.Request().Context(), auth.RegisterInput{
 		TenantSlug: slug,
+		ClientID:   clientIDFromCtx(c),
 		Email:      req.Email,
 		Password:   req.Password,
 		FirstName:  req.FirstName,
@@ -151,7 +171,6 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
 
-	// Audit: new user registered.
 	tid, uid := claimsFromToken(result.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
 		TenantID:     tid,
@@ -163,14 +182,19 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		UserAgent:    c.Request().UserAgent(),
 	})
 
-	return c.JSON(http.StatusCreated, result)
+	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusCreated, map[string]interface{}{
+		"message":    "registered",
+		"expires_in": result.ExpiresIn,
+		"expires_at": result.ExpiresAt,
+	})
 }
 
 // Login handles POST /api/v1/auth/login.
 //
 // @Summary      Login
 // @Description  Authenticates an existing user and returns a JWT access token + refresh token pair.
-// @Tags         auth
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        body  body      LoginRequest  true  "Login credentials"
@@ -179,7 +203,10 @@ func (h *AuthHandler) Register(c echo.Context) error {
 // @Failure      401   {object}  map[string]string  "Invalid credentials"
 // @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
-	slug := "emc"
+	slug, _ := tenantSlugFromCtx(c)
+	if slug == "" {
+		slug = "emc"
+	}
 
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
@@ -191,6 +218,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
 		TenantSlug: slug,
+		ClientID:   clientIDFromCtx(c),
 		Email:      req.Email,
 		Password:   req.Password,
 	})
@@ -209,12 +237,10 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
 
-	// TOTP required — return challenge, not token pair.
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
 	}
 
-	// Full login — audit and return token pair.
 	tid, uid := claimsFromToken(result.Token.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
 		TenantID:     tid,
@@ -226,26 +252,31 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		UserAgent:    c.Request().UserAgent(),
 	})
 
-	return c.JSON(http.StatusOK, result.Token)
+	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message":    "logged in",
+		"expires_in": result.Token.ExpiresIn,
+		"expires_at": result.Token.ExpiresAt,
+	})
 }
 
 // LoginOTPRequest is the JSON body for POST /api/v1/auth/login/otp.
 type LoginOTPRequest struct {
 	OTPSessionToken string `json:"otp_session_token"`
-	Code            string `json:"code"` // 6-digit TOTP code or 8-char backup code
+	Code            string `json:"code"`
 }
 
 // LoginOTP handles POST /api/v1/auth/login/otp — completes a TOTP-gated login.
 //
 // @Summary      Complete TOTP login
-// @Description  Submit the TOTP code (or backup code) to complete a two-step login. Use the otp_session_token from the login response.
-// @Tags         auth
+// @Description  Submit the TOTP code (or backup code) to complete a two-step login.
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        body  body      LoginOTPRequest  true  "OTP session token + TOTP code"
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
-// @Failure      401   {object}  map[string]string  "Invalid or expired OTP code"
+// @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/login/otp [post]
 func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	var req LoginOTPRequest
@@ -278,23 +309,25 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 		UserAgent:    c.Request().UserAgent(),
 	})
 
-	return c.JSON(http.StatusOK, result)
+	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message":    "logged in",
+		"expires_in": result.ExpiresIn,
+		"expires_at": result.ExpiresAt,
+	})
 }
 
 // Me handles GET /api/v1/auth/me.
 //
 // @Summary      Get current user profile
 // @Description  Returns the authenticated user's profile decoded from the JWT.
-// @Tags         auth
+// @Tags         AUTH
 // @Produce      json
 // @Security     BearerAuth
 // @Success      200  {object}  auth.MeResult
 // @Failure      401  {object}  map[string]string
 // @Router       /api/v1/auth/me [get]
 func (h *AuthHandler) Me(c echo.Context) error {
-	// Claims are injected by JWTRequired middleware.
-	// Until Plan 02-02 wires the middleware, this handler extracts from context manually
-	// using the same context key ("user") the middleware will set.
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -315,34 +348,42 @@ type LogoutRequest struct {
 // Refresh handles POST /api/v1/auth/refresh (AUTH-03).
 //
 // @Summary      Refresh token rotation
-// @Description  Issues a new access + refresh token pair and immediately invalidates the old refresh token. Replaying the old token returns 401.
-// @Tags         auth
+// @Description  Issues a new access + refresh token pair and immediately invalidates the old refresh token.
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        body  body      RefreshRequest  true  "Refresh token"
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
-// @Failure      401   {object}  map[string]string  "Invalid or expired refresh token"
+// @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/refresh [post]
 func (h *AuthHandler) Refresh(c echo.Context) error {
 	var req RefreshRequest
-	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	_ = c.Bind(&req) // body is optional — cookie is the fallback
+
+	// Accept refresh token from cookie when the body doesn't supply one.
+	if req.RefreshToken == "" {
+		if cookie, err := c.Cookie(mw.RefreshTokenCookie); err == nil && cookie.Value != "" {
+			req.RefreshToken = cookie.Value
+		}
 	}
 	if req.RefreshToken == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "refresh_token is required"})
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "refresh token missing"})
 	}
 
 	result, err := h.svc.Refresh(c.Request().Context(), req.RefreshToken)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("refresh failed")
+		if errors.Is(err, auth.ErrTokenReplay) {
+			clearAuthCookies(c, h.cookieCfg)
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token refresh failed"})
 	}
 
-	// Audit: token refreshed.
 	tid, uid := claimsFromToken(result.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
 		TenantID:     tid,
@@ -353,14 +394,19 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		UserAgent:    c.Request().UserAgent(),
 	})
 
-	return c.JSON(http.StatusOK, result)
+	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"message":    "session refreshed",
+		"expires_in": result.ExpiresIn,
+		"expires_at": result.ExpiresAt,
+	})
 }
 
 // Logout handles POST /api/v1/auth/logout (AUTH-04).
 //
 // @Summary      Logout
 // @Description  Revokes the supplied refresh token. Idempotent — calling twice is safe.
-// @Tags         auth
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        body  body      LogoutRequest  true  "Refresh token to revoke"
@@ -369,19 +415,25 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 // @Router       /api/v1/auth/logout [post]
 func (h *AuthHandler) Logout(c echo.Context) error {
 	var req LogoutRequest
-	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	_ = c.Bind(&req) // body is optional — cookie is the fallback
+
+	// Accept refresh token from cookie when the body doesn't supply one.
+	if req.RefreshToken == "" {
+		if cookie, err := c.Cookie(mw.RefreshTokenCookie); err == nil && cookie.Value != "" {
+			req.RefreshToken = cookie.Value
+		}
 	}
+
 	if req.RefreshToken == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "refresh_token is required"})
 	}
 
 	if err := h.svc.Logout(c.Request().Context(), req.RefreshToken); err != nil {
 		h.logger.Error().Err(err).Msg("logout failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "logout failed"})
 	}
 
-	// Audit: logout (no access token available — tenant_id is nil).
+	clearAuthCookies(c, h.cookieCfg)
+
 	h.audit.Log(c.Request().Context(), audit.Event{
 		Action:    audit.ActionAuthLogout,
 		IPAddress: c.RealIP(),
@@ -399,8 +451,8 @@ type ForgotPasswordRequest struct {
 // ForgotPassword handles POST /api/v1/auth/forgot-password (RESET-01, RESET-03).
 //
 // @Summary      Request password reset
-// @Description  Sends a reset link to the email address. ALWAYS returns 200 regardless of whether the email is registered (prevents email enumeration). In development the link is logged to the server console instead of being emailed.
-// @Tags         password-reset
+// @Description  Sends a reset link to the email address. ALWAYS returns 200 regardless of whether the email is registered (prevents email enumeration).
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        X-Tenant-Slug  header    string                 true  "Tenant slug"
@@ -410,8 +462,6 @@ type ForgotPasswordRequest struct {
 func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 	slug, ok := tenantSlugFromCtx(c)
 	if !ok {
-		// Even for missing tenant slug, return generic success to prevent enumeration.
-		// Log at debug so we can diagnose misconfigured clients without leaking to callers.
 		h.logger.Debug().Msg("forgot-password: missing X-Tenant-Slug header")
 		return c.JSON(http.StatusOK, map[string]string{
 			"message": "if that email address is registered, a password reset link has been sent",
@@ -420,20 +470,15 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 
 	var req ForgotPasswordRequest
 	if err := c.Bind(&req); err != nil || req.Email == "" {
-		// Return generic 200 even on bad body (RESET-03).
 		return c.JSON(http.StatusOK, map[string]string{
 			"message": "if that email address is registered, a password reset link has been sent",
 		})
 	}
 
-	// Errors from ForgotPassword are swallowed here — the service itself returns nil
-	// for "user not found" cases (RESET-03). Any infrastructure errors are logged by the service.
 	if err := h.resetSvc.ForgotPassword(c.Request().Context(), slug, req.Email); err != nil {
 		h.logger.Error().Err(err).Msg("forgot-password: unexpected service error")
-		// Still return generic 200 (RESET-03 — do not leak error details).
 	}
 
-	// Audit: reset requested (always logged regardless of whether email exists — RESET-03 preserved).
 	h.audit.Log(c.Request().Context(), audit.Event{
 		ActorEmail:   req.Email,
 		Action:       audit.ActionAuthPasswordResetReq,
@@ -449,7 +494,6 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 
 // ResetPasswordRequest is the JSON body for POST /api/v1/auth/reset-password.
 type ResetPasswordRequest struct {
-	// Token is the raw reset token from the email link query parameter.
 	Token       string `json:"token"`
 	NewPassword string `json:"new_password"`
 }
@@ -457,13 +501,13 @@ type ResetPasswordRequest struct {
 // ResetPassword handles POST /api/v1/auth/reset-password (RESET-02).
 //
 // @Summary      Reset password
-// @Description  Validates the reset token, updates the user's password, and revokes all active refresh tokens (logs out all sessions). Token is single-use and expires in 15 minutes.
-// @Tags         password-reset
+// @Description  Validates the reset token, updates the user's password, and revokes all active refresh tokens.
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        body  body      ResetPasswordRequest  true  "Token + new password"
 // @Success      200   {object}  map[string]string
-// @Failure      400   {object}  map[string]string  "Invalid/expired token or weak password"
+// @Failure      400   {object}  map[string]string
 // @Router       /api/v1/auth/reset-password [post]
 func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	var req ResetPasswordRequest
@@ -492,7 +536,6 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "password reset failed"})
 	}
 
-	// Audit: password reset completed.
 	h.audit.Log(c.Request().Context(), audit.Event{
 		Action:       audit.ActionAuthPasswordResetDone,
 		ResourceType: "user",
@@ -505,20 +548,15 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 
 // ─── TOTP Handlers ───────────────────────────────────────────────────────────
 
-// TOTPEnrollRequest is the JSON body for POST /api/v1/auth/otp/enroll.
-// No body needed — user identity comes from the JWT claims.
-type TOTPEnrollRequest struct{}
-
 // TOTPEnroll handles POST /api/v1/auth/otp/enroll.
 //
 // @Summary      Enroll in TOTP 2FA
-// @Description  Generates a TOTP secret, encrypts it, and returns an otpauth:// URI for QR code scanning plus one-time backup codes. The TOTP is inactive until POST /auth/otp/activate is called with a valid code.
-// @Tags         auth
+// @Description  Generates a TOTP secret and returns an otpauth:// URI plus backup codes.
+// @Tags         AUTH
 // @Produce      json
 // @Security     BearerAuth
 // @Success      200  {object}  auth.EnrollResult
 // @Failure      401  {object}  map[string]string
-// @Failure      500  {object}  map[string]string
 // @Router       /api/v1/auth/otp/enroll [post]
 func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 	if h.totpSvc == nil {
@@ -529,11 +567,11 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
 
-	userID, err := uuid.Parse(claims.UserID)
+	userID, err := strconv.ParseInt(claims.UserID, 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid user_id in token"})
 	}
-	tenantID, err := uuid.Parse(claims.TenantID)
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant_id in token"})
 	}
@@ -549,21 +587,20 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 
 // TOTPActivateRequest is the JSON body for POST /api/v1/auth/otp/activate.
 type TOTPActivateRequest struct {
-	Code string `json:"code"` // 6-digit TOTP code from authenticator app
+	Code string `json:"code"`
 }
 
-// TOTPActivate handles POST /api/v1/auth/otp/activate — confirms enrollment.
+// TOTPActivate handles POST /api/v1/auth/otp/activate.
 //
 // @Summary      Activate TOTP 2FA
-// @Description  Verifies the first TOTP code from the authenticator app and marks the enrollment active. Must be called after /otp/enroll.
-// @Tags         auth
+// @Description  Verifies the first TOTP code and marks the enrollment active.
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
 // @Param        body  body      TOTPActivateRequest  true  "First TOTP code"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
-// @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/otp/activate [post]
 func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 	if h.totpSvc == nil {
@@ -579,7 +616,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required"})
 	}
 
-	userID, _ := uuid.Parse(claims.UserID)
+	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
 		if containsMsg(err, "invalid TOTP") {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid TOTP code — check your authenticator app"})
@@ -592,21 +629,20 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 
 // TOTPDisableRequest is the JSON body for DELETE /api/v1/auth/otp.
 type TOTPDisableRequest struct {
-	Code string `json:"code"` // current TOTP code or backup code
+	Code string `json:"code"`
 }
 
-// TOTPDisable handles DELETE /api/v1/auth/otp — disables TOTP for the authenticated user.
+// TOTPDisable handles DELETE /api/v1/auth/otp.
 //
 // @Summary      Disable TOTP 2FA
-// @Description  Disables TOTP for the current user. Requires a valid TOTP code or backup code as confirmation.
-// @Tags         auth
+// @Description  Disables TOTP for the current user. Requires a valid TOTP code or backup code.
+// @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
 // @Param        body  body      TOTPDisableRequest  true  "Current TOTP or backup code"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
-// @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/otp [delete]
 func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 	if h.totpSvc == nil {
@@ -622,7 +658,7 @@ func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required to disable 2FA"})
 	}
 
-	userID, _ := uuid.Parse(claims.UserID)
+	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	if err := h.totpSvc.Disable(c.Request().Context(), userID, req.Code); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
@@ -664,7 +700,7 @@ func (h *AuthHandler) CreateAPIKey(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
-	tenantID, _ := uuid.Parse(claims.TenantID)
+	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
 	result, err := h.apiKeySvc.CreateAPIKey(c.Request().Context(), tenantID, req.Name, req.Permissions)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("create API key failed")
@@ -693,7 +729,7 @@ func (h *AuthHandler) ListAPIKeys(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
 
-	tenantID, _ := uuid.Parse(claims.TenantID)
+	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
 	keys, err := h.apiKeySvc.ListAPIKeys(c.Request().Context(), tenantID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("list API keys failed")
@@ -712,7 +748,6 @@ func (h *AuthHandler) ListAPIKeys(c echo.Context) error {
 // @Security     BearerAuth
 // @Param        id   path      string  true  "API key ID"
 // @Success      200  {object}  map[string]string
-// @Failure      400  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/admin/api-keys/{id} [delete]
 func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
@@ -724,12 +759,12 @@ func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
 
-	keyID, err := uuid.Parse(c.Param("id"))
+	keyID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid key ID"})
 	}
 
-	tenantID, _ := uuid.Parse(claims.TenantID)
+	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err := h.apiKeySvc.RevokeAPIKey(c.Request().Context(), tenantID, keyID); err != nil {
 		if containsMsg(err, "not found") || containsMsg(err, "already revoked") {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -785,12 +820,11 @@ func (h *AuthHandler) ManagementToken(c echo.Context) error {
 		"token_type":   "Bearer",
 		"expires_in":   int(auth.ManagementTokenTTL.Seconds()),
 		"permissions":  identity.Permissions,
-		"tenant_id":    identity.TenantID.String(),
+		"tenant_id":    strconv.FormatInt(identity.TenantID, 10),
 	})
 }
 
 // containsMsg is a simple substring check for error classification.
-// Avoids importing strings for a trivial helper.
 func containsMsg(err error, substr string) bool {
 	if err == nil {
 		return false
@@ -810,10 +844,9 @@ func includesSubstr(s, sub string) bool {
 	return false
 }
 
-// claimsFromToken decodes the JWT payload (base64, not encrypted) without
-// signature verification to extract tenant_id and user_id for audit logging.
-// Safe to call on tokens we just generated — JWT payloads are always readable.
-func claimsFromToken(tokenStr string) (tenantID, userID *uuid.UUID) {
+// claimsFromToken decodes the JWT payload without signature verification to extract
+// tenant_id and user_id for audit logging. Safe on tokens we just generated.
+func claimsFromToken(tokenStr string) (tenantID, userID *int64) {
 	parts := strings.Split(tokenStr, ".")
 	if len(parts) != 3 {
 		return nil, nil
@@ -829,10 +862,10 @@ func claimsFromToken(tokenStr string) (tenantID, userID *uuid.UUID) {
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, nil
 	}
-	if tid, err := uuid.Parse(c.TenantID); err == nil {
+	if tid, err := strconv.ParseInt(c.TenantID, 10, 64); err == nil {
 		tenantID = &tid
 	}
-	if uid, err := uuid.Parse(c.UserID); err == nil {
+	if uid, err := strconv.ParseInt(c.UserID, 10, 64); err == nil {
 		userID = &uid
 	}
 	return tenantID, userID
@@ -841,22 +874,14 @@ func claimsFromToken(tokenStr string) (tenantID, userID *uuid.UUID) {
 // ---------------------------------------------------------------------------
 // Cookie-based session endpoints (browser / SPA integration)
 // ---------------------------------------------------------------------------
-//
-// These endpoints mirror the Bearer token flow but store tokens in
-// HttpOnly + SameSite=Lax cookies so that browser clients never need to
-// manage tokens in JavaScript:
-//
-//   POST /api/v1/auth/session          — login, sets access + refresh cookies
-//   POST /api/v1/auth/session/refresh  — rotate tokens, refresh cookie required
-//   POST /api/v1/auth/session/logout   — clear both cookies
 
 // SessionLoginRequest is the body for POST /api/v1/auth/session.
-type SessionLoginRequest = LoginRequest // same fields
+type SessionLoginRequest = LoginRequest
 
 // SessionLogin handles POST /api/v1/auth/session.
 //
 // @Summary      Cookie-based login
-// @Description  Authenticates the user and stores the access token + refresh token in HttpOnly SameSite=Lax cookies. The response body contains only metadata — no raw tokens.
+// @Description  Authenticates the user and stores tokens in HttpOnly SameSite=Lax cookies.
 // @Tags         auth-session
 // @Accept       json
 // @Produce      json
@@ -866,7 +891,10 @@ type SessionLoginRequest = LoginRequest // same fields
 // @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/session [post]
 func (h *AuthHandler) SessionLogin(c echo.Context) error {
-	slug := "emc"
+	slug, _ := tenantSlugFromCtx(c)
+	if slug == "" {
+		slug = "emc"
+	}
 
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
@@ -878,6 +906,7 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
 		TenantSlug: slug,
+		ClientID:   clientIDFromCtx(c),
 		Email:      req.Email,
 		Password:   req.Password,
 	})
@@ -896,13 +925,11 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
 
-	// TOTP required — cannot issue cookies yet, return challenge for client to handle.
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
 	}
 
-	secure := c.Request().TLS != nil || c.Request().Header.Get("X-Forwarded-Proto") == "https"
-	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, secure)
+	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
 
 	tid, uid := claimsFromToken(result.Token.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
@@ -924,11 +951,11 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 // SessionRefresh handles POST /api/v1/auth/session/refresh.
 //
 // @Summary      Cookie session refresh
-// @Description  Rotates the access and refresh tokens using the refresh cookie. Old refresh cookie is invalidated immediately.
+// @Description  Rotates the access and refresh tokens using the refresh cookie.
 // @Tags         auth-session
 // @Produce      json
 // @Success      200  {object}  map[string]string
-// @Failure      401  {object}  map[string]string  "Missing or expired refresh cookie"
+// @Failure      401  {object}  map[string]string
 // @Router       /api/v1/auth/session/refresh [post]
 func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 	cookie, err := c.Cookie(mw.RefreshTokenCookie)
@@ -939,15 +966,17 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 	result, err := h.svc.Refresh(c.Request().Context(), cookie.Value)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("session refresh failed")
-		clearAuthCookies(c)
+		if errors.Is(err, auth.ErrTokenReplay) {
+			clearAuthCookies(c, h.cookieCfg)
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token refresh failed"})
 	}
 
-	secure := c.Request().TLS != nil || c.Request().Header.Get("X-Forwarded-Proto") == "https"
-	setAuthCookies(c, result.AccessToken, result.RefreshToken, secure)
+	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
 
 	tid, uid := claimsFromToken(result.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
@@ -975,10 +1004,9 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 // @Router       /api/v1/auth/session/logout [post]
 func (h *AuthHandler) SessionLogout(c echo.Context) error {
 	if cookie, err := c.Cookie(mw.RefreshTokenCookie); err == nil && cookie.Value != "" {
-		// Best-effort revocation — ignore errors (cookie may be expired or already revoked).
 		_ = h.svc.Logout(c.Request().Context(), cookie.Value)
 	}
-	clearAuthCookies(c)
+	clearAuthCookies(c, h.cookieCfg)
 
 	h.audit.Log(c.Request().Context(), audit.Event{
 		Action:    audit.ActionAuthLogout,
@@ -990,44 +1018,86 @@ func (h *AuthHandler) SessionLogout(c echo.Context) error {
 }
 
 // ---------------------------------------------------------------------------
+// Client credentials token endpoint
+// ---------------------------------------------------------------------------
+
+// TokenRequest is the JSON body for POST /api/v1/auth/token.
+type TokenRequest struct {
+	GrantType    string `json:"grant_type"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+}
+
+// Token handles POST /api/v1/auth/token.
+//
+// @Summary      Client credentials token
+// @Description  Issues a service-level access token using client_id + client_secret. No user involved, no refresh token issued.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        body  body      TokenRequest  true  "Client credentials"
+// @Success      200   {object}  map[string]interface{}
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string
+// @Router       /api/v1/auth/token [post]
+func (h *AuthHandler) Token(c echo.Context) error {
+	var req TokenRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.GrantType != "client_credentials" {
+		return c.JSON(http.StatusBadRequest, map[string]string{
+			"error": "unsupported grant_type — only client_credentials is accepted",
+		})
+	}
+	if req.ClientID == "" || req.ClientSecret == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "client_id and client_secret are required"})
+	}
+	if h.appSvc == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "application service not configured"})
+	}
+
+	tenantID, appID, err := h.appSvc.AuthenticateClient(c.Request().Context(), req.ClientID, req.ClientSecret)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidClient) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
+		}
+		h.logger.Error().Err(err).Msg("client credentials auth failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "authentication failed"})
+	}
+
+	token, expiresIn, err := h.svc.IssueServiceToken(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("issue service token failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token generation failed"})
+	}
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &tenantID,
+		Action:       audit.ActionAuthClientCredentials,
+		ResourceType: "oauth_client",
+		ResourceID:   strconv.FormatInt(appID, 10),
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"access_token": token,
+		"token_type":   "Bearer",
+		"expires_in":   expiresIn,
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Cookie helpers
 // ---------------------------------------------------------------------------
 
-// setAuthCookies writes the access + refresh tokens as HttpOnly cookies.
-// The refresh token has a restricted path to reduce its attack surface.
-func setAuthCookies(c echo.Context, accessToken, refreshToken string, secure bool) {
-	ac := new(http.Cookie)
-	ac.Name = mw.AccessTokenCookie
-	ac.Value = accessToken
-	ac.HttpOnly = true
-	ac.SameSite = http.SameSiteLaxMode
-	ac.Secure = secure
-	ac.Path = "/api/v1"
-	ac.MaxAge = 3600 // 1 hour — matches JWT access token lifetime
-
-	rc := new(http.Cookie)
-	rc.Name = mw.RefreshTokenCookie
-	rc.Value = refreshToken
-	rc.HttpOnly = true
-	rc.SameSite = http.SameSiteLaxMode
-	rc.Secure = secure
-	rc.Path = "/api/v1/auth/session/refresh"
-	rc.MaxAge = 30 * 24 * 3600 // 30 days — matches refresh token lifetime
-
-	http.SetCookie(c.Response().Writer, ac)
-	http.SetCookie(c.Response().Writer, rc)
+func setAuthCookies(c echo.Context, accessToken, refreshToken string, cfg mw.CookieConfig) {
+	for _, cookie := range mw.BuildAuthCookies(accessToken, refreshToken, cfg) {
+		http.SetCookie(c.Response().Writer, cookie)
+	}
 }
 
-// clearAuthCookies expires both auth cookies immediately.
-func clearAuthCookies(c echo.Context) {
-	for _, name := range []string{mw.AccessTokenCookie, mw.RefreshTokenCookie} {
-		expired := &http.Cookie{
-			Name:     name,
-			Value:    "",
-			HttpOnly: true,
-			MaxAge:   -1,
-			Path:     "/api/v1",
-		}
-		http.SetCookie(c.Response().Writer, expired)
-	}
+func clearAuthCookies(c echo.Context, cfg mw.CookieConfig) {
+	mw.ClearAuthCookies(c, cfg)
 }

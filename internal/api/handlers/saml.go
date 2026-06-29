@@ -2,8 +2,8 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
 
-	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
@@ -60,11 +60,24 @@ func (h *SAMLHandler) InitiateLogin(c echo.Context) error {
 }
 
 // HandleACS handles POST /saml/acs — Assertion Consumer Service.
-// Parses the IdP POST response, JIT-provisions the user if needed, and issues a JWT.
 //
-// Security note: This implementation does NOT verify the IdP XML signature.
-// Signature verification must be added before production use with a real IdP.
+// SECURITY GATE: This endpoint is intentionally disabled until IdP XML signature
+// verification is implemented via crewjam/saml or an equivalent library.
+// The current ParseACSResponse does not verify the SAMLResponse signature, meaning
+// any caller can craft a response asserting any NameID and authenticate as that user.
+// Until the gate is lifted, 501 is returned so the risk surface is zero.
 func (h *SAMLHandler) HandleACS(c echo.Context) error {
+	return echo.NewHTTPError(
+		http.StatusNotImplemented,
+		"SAML ACS is not yet available: IdP XML signature verification is pending implementation",
+	)
+}
+
+// handleACSImpl is the deferred full implementation — wired in once crewjam/saml
+// validates the IdP signature on every assertion.
+//
+//nolint:unused
+func (h *SAMLHandler) handleACSImpl(c echo.Context) error {
 	// Tenant comes from RelayState (set in the AuthnRequest redirect) or query param fallback.
 	tenantID := c.FormValue("RelayState")
 	if tenantID == "" {
@@ -93,7 +106,7 @@ func (h *SAMLHandler) HandleACS(c echo.Context) error {
 	}
 
 	// Issue JWT using the per-tenant secret.
-	tenantUUID, err := uuid.Parse(user.TenantID)
+	tenantIDInt, err := strconv.ParseInt(user.TenantID, 10, 64)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "invalid tenant_id")
 	}
@@ -106,7 +119,7 @@ func (h *SAMLHandler) HandleACS(c echo.Context) error {
 		Permissions: []string{},
 	}
 
-	accessToken, err := h.jwtSvc.Sign(c.Request().Context(), tenantUUID, "emc-auth-server", claims)
+	accessToken, err := h.jwtSvc.Sign(c.Request().Context(), tenantIDInt, "emc-auth-server", claims)
 	if err != nil {
 		h.logger.Error().Err(err).Str("user_id", user.ID).Msg("saml: JWT sign failed")
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to issue token")

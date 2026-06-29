@@ -30,14 +30,20 @@ type Config struct {
 	// TOTP secrets at rest. Generate with: openssl rand -hex 32
 	// Required when TOTP is used. Must be exactly 64 hex characters.
 	TOTPEncryptionKey string
+
+	// CookieDomain sets the Domain attribute on auth cookies.
+	// Leave empty for localhost development (browser scopes to current host).
+	// In production set to the shared parent domain, e.g. ".engineersmind.com",
+	// so both app.engineersmind.com and auth.engineersmind.com can read the cookies.
+	CookieDomain string
 }
 
 // Load reads configuration from environment variables with sensible defaults.
 func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
-		Port:         getEnv("PORT", "8080"),
-		DatabaseURL:  getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5432/emc_auth?sslmode=disable"),
+		Port:         getEnv("PORT", "9090"),
+		DatabaseURL:  getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
 		RedisURL:     getEnv("REDIS_URL", "redis://localhost:6379/0"),
 		LogLevel:     getEnv("LOG_LEVEL", "info"),
 		Env:          getEnv("ENV", "development"),
@@ -47,8 +53,9 @@ func Load() *Config {
 		SMTPFrom:     getEnv("SMTP_FROM", "no-reply@emc.local"),
 		SMTPUsername: getEnv("SMTP_USERNAME", ""),
 		SMTPPassword: getEnv("SMTP_PASSWORD", ""),
-		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:8080"),
+		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:9090"),
 		TOTPEncryptionKey: getEnv("TOTP_ENCRYPTION_KEY", ""),
+		CookieDomain:      getEnv("COOKIE_DOMAIN", ""),
 	}
 }
 
