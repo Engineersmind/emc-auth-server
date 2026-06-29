@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
@@ -43,7 +44,7 @@ func (h *AgentHandler) RegisterAgent(c echo.Context) error {
 		return echo.ErrUnauthorized
 	}
 
-	tenantID, err := uuid.Parse(claims.TenantID)
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err != nil {
 		return echo.ErrUnauthorized
 	}
@@ -76,7 +77,7 @@ func (h *AgentHandler) ListAgents(c echo.Context) error {
 		return echo.ErrUnauthorized
 	}
 
-	tenantID, err := uuid.Parse(claims.TenantID)
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err != nil {
 		return echo.ErrUnauthorized
 	}
@@ -98,7 +99,7 @@ func (h *AgentHandler) RevokeAgent(c echo.Context) error {
 		return echo.ErrUnauthorized
 	}
 
-	tenantID, err := uuid.Parse(claims.TenantID)
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err != nil {
 		return echo.ErrUnauthorized
 	}
@@ -124,7 +125,7 @@ func (h *AgentHandler) GetAgentAnalysis(c echo.Context) error {
 		return echo.ErrUnauthorized
 	}
 
-	tenantID, err := uuid.Parse(claims.TenantID)
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err != nil {
 		return echo.ErrUnauthorized
 	}

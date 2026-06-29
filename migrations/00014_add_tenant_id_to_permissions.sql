@@ -10,7 +10,7 @@
 ALTER TABLE permissions DROP CONSTRAINT IF EXISTS permissions_name_key;
 
 -- Step 2: add tenant_id column (nullable first so ALTER is safe on any existing rows)
-ALTER TABLE permissions ADD COLUMN IF NOT EXISTS tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE;
+ALTER TABLE permissions ADD COLUMN IF NOT EXISTS tenant_id BIGINT REFERENCES tenants(id) ON DELETE CASCADE;
 
 -- Step 3: remove any orphaned rows that predate this migration (dev-only seed rows)
 DELETE FROM permissions WHERE tenant_id IS NULL;

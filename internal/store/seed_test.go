@@ -47,16 +47,15 @@ func TestSeed_TenantExists(t *testing.T) {
 		t.Fatalf("RunSeed() error = %v", err)
 	}
 
-	var id string
+	var id int64
 	err := pool.QueryRow(ctx,
-		`SELECT id::text FROM tenants WHERE id = $1`,
-		store.SeedTenantID,
+		`SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`,
 	).Scan(&id)
 	if err != nil {
 		t.Fatalf("query seed tenant: %v", err)
 	}
-	if id != store.SeedTenantID.String() {
-		t.Errorf("seed tenant ID = %q, want %q", id, store.SeedTenantID.String())
+	if id == 0 {
+		t.Error("seed tenant ID should be non-zero")
 	}
 }
 
@@ -71,15 +70,14 @@ func TestSeed_AdminUserExists(t *testing.T) {
 		t.Fatalf("RunSeed() error = %v", err)
 	}
 
-	var id string
+	var id int64
 	err := pool.QueryRow(ctx,
-		`SELECT id::text FROM users WHERE id = $1`,
-		store.SeedUserID,
+		`SELECT id FROM users WHERE email = 'admin@emc.local' AND deleted_at IS NULL`,
 	).Scan(&id)
 	if err != nil {
 		t.Fatalf("query seed user: %v", err)
 	}
-	if id != store.SeedUserID.String() {
-		t.Errorf("seed user ID = %q, want %q", id, store.SeedUserID.String())
+	if id == 0 {
+		t.Error("seed user ID should be non-zero")
 	}
 }

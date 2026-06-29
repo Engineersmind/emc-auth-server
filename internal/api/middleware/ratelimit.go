@@ -44,7 +44,6 @@ type limiterEntry struct {
 // and behaviour contract remain the same — only the Allow() implementation changes.
 // Redis client can be injected via RateLimitConfig.RedisClient field (add it then).
 type limiterStore struct {
-	mu    sync.Mutex
 	store sync.Map
 }
 
@@ -56,7 +55,7 @@ func (s *limiterStore) getOrCreate(key string, r int) *rate.Limiter {
 		limiter:  rate.NewLimiter(ratePerSecond, r),
 		lastSeen: time.Now(),
 	})
-	e := entry.(*limiterEntry)
+	e, _ := entry.(*limiterEntry)
 	if loaded {
 		e.lastSeen = time.Now()
 	}
@@ -68,7 +67,7 @@ func (s *limiterStore) getOrCreate(key string, r int) *rate.Limiter {
 func (s *limiterStore) cleanup(ttl time.Duration) {
 	cutoff := time.Now().Add(-ttl)
 	s.store.Range(func(key, value any) bool {
-		e := value.(*limiterEntry)
+		e, _ := value.(*limiterEntry)
 		if e.lastSeen.Before(cutoff) {
 			s.store.Delete(key)
 		}

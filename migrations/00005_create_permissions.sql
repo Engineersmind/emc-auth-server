@@ -1,7 +1,7 @@
 -- +goose Up
 -- +goose StatementBegin
 CREATE TABLE permissions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
     description TEXT NOT NULL DEFAULT ''
 );

@@ -14,9 +14,9 @@ services:
     image: ghcr.io/engineersmind/emc-auth-server:latest
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "9090:9090"
     environment:
-      PORT: "8080"
+      PORT: "9090"
       ENV: production
       DATABASE_URL: ${DATABASE_URL}
       REDIS_URL: ${REDIS_URL}
@@ -34,7 +34,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/health"]
       interval: 10s
       timeout: 5s
       retries: 5

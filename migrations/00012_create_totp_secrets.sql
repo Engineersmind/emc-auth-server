@@ -1,8 +1,8 @@
 -- +goose Up
 -- +goose StatementBegin
 CREATE TABLE totp_secrets (
-    user_id      UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    tenant_id    UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id      BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    tenant_id    BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     secret_enc   TEXT NOT NULL,
     is_active    BOOLEAN NOT NULL DEFAULT false,
     backup_codes TEXT[] NOT NULL DEFAULT '{}',

@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>EMC Auth — Application Roles & Feature Matrix</title>
+<style>
+:root {
+  --brand:#1e3a5f; --brand2:#2d5f99; --accent:#0ea5e9;
+  --green:#16a34a; --amber:#d97706; --red:#dc2626; --purple:#7c3aed; --indigo:#4f46e5;
+  --teal:#0d9488; --rose:#e11d48; --orange:#ea580c;
+  --gray-50:#f8fafc; --gray-100:#f1f5f9; --gray-200:#e2e8f0;
+  --gray-400:#94a3b8; --gray-500:#64748b; --gray-600:#475569;
+  --gray-700:#334155; --gray-900:#0f172a;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--gray-50);color:var(--gray-700);}
+
+.hero{background:linear-gradient(135deg,var(--brand) 0%,var(--brand2) 100%);color:white;padding:48px 24px 36px;text-align:center;}
+.hero h1{font-size:2rem;font-weight:700;margin-bottom:8px;}
+.hero p{opacity:.8;max-width:640px;margin:0 auto;font-size:1rem;}
+.hero-tabs{display:flex;justify-content:center;gap:8px;margin-top:28px;flex-wrap:wrap;}
+.hero-tabs button{background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.3);color:white;padding:7px 18px;border-radius:99px;font-size:.8rem;cursor:pointer;transition:all .2s;}
+.hero-tabs button:hover,.hero-tabs button.active{background:white;color:var(--brand);font-weight:600;}
+
+.container{max-width:1200px;margin:0 auto;padding:36px 24px;}
+.section{margin-bottom:48px;}
+.section-title{font-size:1.15rem;font-weight:700;color:var(--brand);border-bottom:2px solid var(--gray-200);padding-bottom:10px;margin-bottom:24px;display:flex;align-items:center;gap:10px;}
+
+/* Role cards */
+.roles-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px;}
+.role-card{background:white;border-radius:12px;border:2px solid var(--gray-200);overflow:hidden;transition:box-shadow .2s;}
+.role-card:hover{box-shadow:0 4px 20px rgba(0,0,0,.1);}
+.role-card .rc-head{padding:16px 18px;color:white;}
+.role-card .rc-head .rc-tier{font-size:.65rem;opacity:.75;text-transform:uppercase;letter-spacing:.07em;font-weight:600;}
+.role-card .rc-head .rc-name{font-size:1.05rem;font-weight:700;margin:4px 0 2px;}
+.role-card .rc-head .rc-slug{font-size:.72rem;opacity:.8;font-family:monospace;}
+.role-card .rc-body{padding:16px 18px;}
+.role-card .rc-tag{display:inline-block;font-size:.65rem;font-weight:600;padding:2px 8px;border-radius:99px;margin-bottom:10px;}
+.role-card .rc-perms{list-style:none;margin:10px 0 0;}
+.role-card .rc-perms li{font-size:.78rem;padding:4px 0;display:flex;align-items:flex-start;gap:7px;border-bottom:1px solid var(--gray-100);}
+.role-card .rc-perms li:last-child{border-bottom:none;}
+.role-card .rc-perms li .icon{width:14px;flex-shrink:0;text-align:center;}
+
+/* Feature matrix */
+.matrix-wrap{overflow-x:auto;}
+.matrix{width:100%;border-collapse:collapse;font-size:.78rem;min-width:700px;}
+.matrix th{background:var(--brand);color:white;padding:9px 12px;text-align:center;font-weight:600;font-size:.72rem;white-space:nowrap;}
+.matrix th:first-child{text-align:left;min-width:200px;}
+.matrix td{padding:8px 12px;border-bottom:1px solid var(--gray-100);text-align:center;vertical-align:middle;}
+.matrix td:first-child{text-align:left;font-weight:500;color:var(--gray-700);}
+.matrix tr:nth-child(even) td{background:var(--gray-50);}
+.matrix tr:hover td{background:#eff6ff;}
+.matrix .section-row td{background:var(--gray-100);color:var(--brand);font-weight:700;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;padding:6px 12px;}
+.y{color:var(--green);font-size:1rem;}
+.n{color:var(--gray-300);font-size:1rem;}
+.p{color:var(--amber);font-size:.8rem;font-weight:600;}
+.na{color:var(--gray-300);font-size:.8rem;}
+
+/* Permission chips */
+.perm-section{margin-bottom:28px;}
+.perm-section h3{font-size:.85rem;font-weight:700;color:var(--gray-700);margin-bottom:12px;padding:6px 0;border-bottom:1px solid var(--gray-200);}
+.perm-grid{display:flex;flex-wrap:wrap;gap:8px;}
+.perm-chip{border-radius:8px;padding:10px 14px;font-size:.78rem;}
+.perm-chip .perm-name{font-family:monospace;font-weight:700;margin-bottom:3px;}
+.perm-chip .perm-desc{font-size:.7rem;opacity:.75;}
+
+/* Comparison table */
+.compare{display:grid;grid-template-columns:repeat(7,1fr);gap:0;border:1px solid var(--gray-200);border-radius:12px;overflow:hidden;}
+.compare-head{background:var(--gray-900);color:white;padding:12px 10px;text-align:center;font-size:.72rem;font-weight:700;}
+.compare-head:first-child{text-align:left;padding-left:14px;}
+.compare-cell{padding:8px 10px;text-align:center;border-bottom:1px solid var(--gray-100);font-size:.75rem;background:white;}
+.compare-cell:first-child{text-align:left;padding-left:14px;font-weight:500;background:var(--gray-50);}
+.compare-row:hover .compare-cell{background:#eff6ff;}
+.compare-row:hover .compare-cell:first-child{background:#dbeafe;}
+
+/* Role color themes */
+.super-admin .rc-head{background:linear-gradient(135deg,#1e3a5f,#2d5f99);}
+.super-admin .rc-tag{background:#dbeafe;color:#1e3a5f;}
+.tenant-admin .rc-head{background:linear-gradient(135deg,#7c3aed,#9333ea);}
+.tenant-admin .rc-tag{background:#ede9fe;color:#5b21b6;}
+.developer .rc-head{background:linear-gradient(135deg,#0369a1,#0ea5e9);}
+.developer .rc-tag{background:#e0f2fe;color:#0369a1;}
+.account-mgr .rc-head{background:linear-gradient(135deg,#0d9488,#14b8a6);}
+.account-mgr .rc-tag{background:#ccfbf1;color:#115e59;}
+.support .rc-head{background:linear-gradient(135deg,#d97706,#f59e0b);}
+.support .rc-tag{background:#fef3c7;color:#92400e;}
+.auditor .rc-head{background:linear-gradient(135deg,#4f46e5,#6366f1);}
+.auditor .rc-tag{background:#e0e7ff;color:#3730a3;}
+.member .rc-head{background:linear-gradient(135deg,#475569,#64748b);}
+.member .rc-tag{background:#f1f5f9;color:#334155;}
+
+/* Legend */
+.legend{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:16px;font-size:.75rem;align-items:center;}
+.legend-item{display:flex;align-items:center;gap:6px;}
+
+/* Tab pages */
+.tab-page{display:none;}
+.tab-page.active{display:block;}
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <h1>Application Roles & Feature Matrix</h1>
+  <p>Complete role definitions, permissions, and feature access for every user type in the EMC Auth platform</p>
+  <div class="hero-tabs">
+    <button class="active" onclick="showTab('roles')">All Roles</button>
+    <button onclick="showTab('matrix')">Feature Matrix</button>
+    <button onclick="showTab('permissions')">Permission Definitions</button>
+    <button onclick="showTab('setup')">How to Set Up</button>
+  </div>
+</div>
+
+<div class="container">
+
+<!-- ══════════════════════════════════════════════
+     TAB 1 — ALL ROLES
+════════════════════════════════════════════════ -->
+<div id="tab-roles" class="tab-page active">
+
+  <!-- PLATFORM ROLES -->
+  <div class="section">
+    <div class="section-title">🏛️ Platform-Level Roles (EMC Tenant)</div>
+    <div class="roles-row">
+
+      <div class="role-card super-admin">
+        <div class="rc-head">
+          <div class="rc-tier">Tier 1 · Platform</div>
+          <div class="rc-name">Super Admin</div>
+          <div class="rc-slug">role: super_admin</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag">tenant:manage + admin:access</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Owns the entire auth platform. Creates and manages all tenants and their users.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> Create / deactivate any tenant</li>
+            <li><span class="icon">✅</span> View all users across all tenants</li>
+            <li><span class="icon">✅</span> Manage permissions & roles for any tenant</li>
+            <li><span class="icon">✅</span> View system-wide audit logs</li>
+            <li><span class="icon">✅</span> Configure SAML, CORS, rate limits</li>
+            <li><span class="icon">✅</span> Issue management API tokens</li>
+            <li><span class="icon">✅</span> Register M2M agents</li>
+          </ul>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- TENANT ROLES -->
+  <div class="section">
+    <div class="section-title">🏢 Tenant-Level Roles (e.g. Outreach, Senie, Acme)</div>
+    <p style="font-size:.82rem;color:var(--gray-500);margin-bottom:20px;">These roles live inside a tenant. A Tenant Admin defines which permissions each role gets. The names below are recommended — they can be renamed to fit any application.</p>
+    <div class="roles-row">
+
+      <!-- Tenant Admin -->
+      <div class="role-card tenant-admin">
+        <div class="rc-head">
+          <div class="rc-tier">Tier 2 · Tenant</div>
+          <div class="rc-name">Tenant Admin</div>
+          <div class="rc-slug">role: admin</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag">admin:access</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Manages everything inside their own tenant. Cannot see other tenants.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> Create, edit, delete users in their tenant</li>
+            <li><span class="icon">✅</span> Create and assign roles</li>
+            <li><span class="icon">✅</span> Define custom permissions</li>
+            <li><span class="icon">✅</span> View tenant audit logs</li>
+            <li><span class="icon">✅</span> Create API keys</li>
+            <li><span class="icon">✅</span> Force password resets</li>
+            <li><span class="icon">❌</span> Cannot manage other tenants</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Developer -->
+      <div class="role-card developer">
+        <div class="rc-head">
+          <div class="rc-tier">Tier 2 · Tenant</div>
+          <div class="rc-name">Developer</div>
+          <div class="rc-slug">role: developer</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag">api:manage + users:read</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Technical integration role. Can create API keys and access M2M tokens but cannot manage users.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> Create and revoke API keys</li>
+            <li><span class="icon">✅</span> Get management tokens (read scope)</li>
+            <li><span class="icon">✅</span> View users (read-only)</li>
+            <li><span class="icon">✅</span> View roles and permissions</li>
+            <li><span class="icon">✅</span> View audit logs</li>
+            <li><span class="icon">❌</span> Cannot create or delete users</li>
+            <li><span class="icon">❌</span> Cannot assign roles</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Account Manager -->
+      <div class="role-card account-mgr">
+        <div class="rc-head">
+          <div class="rc-tier">Tier 2 · Tenant</div>
+          <div class="rc-name">Account Manager</div>
+          <div class="rc-slug">role: account_manager</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag">users:write + contacts:manage</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Manages client accounts. Can onboard and manage end users but cannot touch roles or system settings.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> Create and manage end users</li>
+            <li><span class="icon">✅</span> Assign end-user roles (member, viewer)</li>
+            <li><span class="icon">✅</span> View user activity</li>
+            <li><span class="icon">✅</span> App-specific: contacts:manage, deals:write</li>
+            <li><span class="icon">❌</span> Cannot create roles or permissions</li>
+            <li><span class="icon">❌</span> Cannot access API keys</li>
+            <li><span class="icon">❌</span> Cannot view audit logs</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Support Agent -->
+      <div class="role-card support">
+        <div class="rc-head">
+          <div class="rc-tier">Tier 2 · Tenant</div>
+          <div class="rc-name">Support Agent</div>
+          <div class="rc-slug">role: support</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag">users:read + password:reset</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Handles user support tickets. Can look up users and trigger password resets. Read-only otherwise.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> Look up users by email</li>
+            <li><span class="icon">✅</span> Trigger password reset for a user</li>
+            <li><span class="icon">✅</span> View user login history</li>
+            <li><span class="icon">❌</span> Cannot create or delete users</li>
+            <li><span class="icon">❌</span> Cannot change roles</li>
+            <li><span class="icon">❌</span> Cannot see passwords or tokens</li>
+            <li><span class="icon">❌</span> No API key access</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Auditor -->
+      <div class="role-card auditor">
+        <div class="rc-head">
+          <div class="rc-tier">Tier 2 · Tenant</div>
+          <div class="rc-name">Auditor</div>
+          <div class="rc-slug">role: auditor</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag">logs:read + users:read</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Compliance and security review role. Read-only access to everything for reporting purposes.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> View all audit logs</li>
+            <li><span class="icon">✅</span> View all users (read-only)</li>
+            <li><span class="icon">✅</span> View roles and permissions</li>
+            <li><span class="icon">✅</span> Export reports</li>
+            <li><span class="icon">❌</span> Cannot create or modify anything</li>
+            <li><span class="icon">❌</span> No API key access</li>
+            <li><span class="icon">❌</span> No user management</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Member / End User -->
+      <div class="role-card member">
+        <div class="rc-head">
+          <div class="rc-tier">Tier 3 · End User</div>
+          <div class="rc-name">Member</div>
+          <div class="rc-slug">role: member</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag">auth only</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Standard end user of the application. Can only authenticate and manage their own account.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> Login and get JWT token</li>
+            <li><span class="icon">✅</span> View their own profile</li>
+            <li><span class="icon">✅</span> Reset their own password</li>
+            <li><span class="icon">✅</span> Enroll TOTP 2FA</li>
+            <li><span class="icon">✅</span> App-specific permissions (e.g. campaigns:read)</li>
+            <li><span class="icon">❌</span> No admin panel access</li>
+            <li><span class="icon">❌</span> Cannot see other users</li>
+          </ul>
+        </div>
+      </div>
+
+      <!-- Viewer -->
+      <div class="role-card" style="border-color:var(--gray-300);">
+        <div class="rc-head" style="background:linear-gradient(135deg,#374151,#4b5563);">
+          <div class="rc-tier">Tier 3 · End User</div>
+          <div class="rc-name">Viewer</div>
+          <div class="rc-slug">role: viewer</div>
+        </div>
+        <div class="rc-body">
+          <span class="rc-tag" style="background:#f1f5f9;color:#374151;">read-only app access</span>
+          <p style="font-size:.78rem;color:var(--gray-500);margin-bottom:10px;">Restricted end user. Can only view content — no creation or editing in the app.</p>
+          <ul class="rc-perms">
+            <li><span class="icon">✅</span> Login and get JWT token</li>
+            <li><span class="icon">✅</span> View their own profile</li>
+            <li><span class="icon">✅</span> App: read-only permissions only</li>
+            <li><span class="icon">❌</span> No write permissions in app</li>
+            <li><span class="icon">❌</span> No admin access</li>
+          </ul>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     TAB 2 — FEATURE MATRIX
+════════════════════════════════════════════════ -->
+<div id="tab-matrix" class="tab-page">
+
+  <div class="section">
+    <div class="section-title">📊 Complete Feature Access Matrix</div>
+    <div class="legend">
+      <span style="font-weight:600;color:var(--gray-600);">Legend:</span>
+      <span class="legend-item"><span style="color:var(--green);font-size:1rem;">✓</span> Full access</span>
+      <span class="legend-item"><span style="color:var(--amber);font-weight:700;font-size:.8rem;">OWN</span> Own data only</span>
+      <span class="legend-item"><span style="color:var(--indigo);font-weight:700;font-size:.8rem;">READ</span> Read only</span>
+      <span class="legend-item"><span style="color:var(--gray-300);font-size:1rem;">—</span> No access</span>
+    </div>
+    <div class="matrix-wrap">
+    <table class="matrix">
+      <thead>
+        <tr>
+          <th style="text-align:left">Feature / Action</th>
+          <th>Super Admin</th>
+          <th>Tenant Admin</th>
+          <th>Developer</th>
+          <th>Acct Mgr</th>
+          <th>Support</th>
+          <th>Auditor</th>
+          <th>Member</th>
+        </tr>
+      </thead>
+      <tbody>
+        <!-- Authentication -->
+        <tr class="section-row"><td colspan="8">Authentication</td></tr>
+        <tr><td>Login (email + password)</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Get JWT access token</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Refresh token</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Enroll TOTP 2FA</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>Reset own password</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>View own profile (/auth/me)</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td></tr>
+
+        <!-- User Management -->
+        <tr class="section-row"><td colspan="8">User Management</td></tr>
+        <tr><td>View users in own tenant</td><td class="y">✓</td><td class="y">✓</td><td class="p">READ</td><td class="y">✓</td><td class="p">READ</td><td class="p">READ</td><td class="n">—</td></tr>
+        <tr><td>View users across all tenants</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Create new users</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Edit user details</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="p">OWN</td></tr>
+        <tr><td>Delete / deactivate user</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Assign role to user</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="p">Limited</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Force password reset</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td></tr>
+
+        <!-- Roles & Permissions -->
+        <tr class="section-row"><td colspan="8">Roles &amp; Permissions</td></tr>
+        <tr><td>View roles</td><td class="y">✓</td><td class="y">✓</td><td class="p">READ</td><td class="p">READ</td><td class="n">—</td><td class="p">READ</td><td class="n">—</td></tr>
+        <tr><td>Create / edit roles</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Delete roles</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>View permissions</td><td class="y">✓</td><td class="y">✓</td><td class="p">READ</td><td class="p">READ</td><td class="n">—</td><td class="p">READ</td><td class="n">—</td></tr>
+        <tr><td>Create / delete permissions</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+
+        <!-- Tenant Management -->
+        <tr class="section-row"><td colspan="8">Tenant Management</td></tr>
+        <tr><td>View own tenant details</td><td class="y">✓</td><td class="y">✓</td><td class="p">READ</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Create new tenant</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Manage all tenants</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Configure CORS origins</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Configure SAML</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+
+        <!-- API & Integrations -->
+        <tr class="section-row"><td colspan="8">API &amp; Integrations</td></tr>
+        <tr><td>Create API keys</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Revoke API keys</td><td class="y">✓</td><td class="y">✓</td><td class="p">OWN</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Get management token (M2M)</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Register agents</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>View app rate limits</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+
+        <!-- Audit & Compliance -->
+        <tr class="section-row"><td colspan="8">Audit &amp; Compliance</td></tr>
+        <tr><td>View own tenant audit logs</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="p">Limited</td><td class="y">✓</td><td class="n">—</td></tr>
+        <tr><td>View system-wide audit logs</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>Filter logs by action/user/date</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     TAB 3 — PERMISSION DEFINITIONS
+════════════════════════════════════════════════ -->
+<div id="tab-permissions" class="tab-page">
+
+  <div class="section">
+    <div class="section-title">🔑 System Permissions (Built-in)</div>
+    <p style="font-size:.82rem;color:var(--gray-500);margin-bottom:20px;">These permissions are created automatically by the seed and gate access to the admin API. Do not rename or delete them.</p>
+    <div class="perm-section">
+      <div class="perm-grid">
+        <div class="perm-chip" style="background:#dbeafe;border:1px solid #93c5fd;">
+          <div class="perm-name" style="color:#1e3a5f;">tenant:manage</div>
+          <div class="perm-desc" style="color:#1e40af;">Create, update, deactivate tenants. Super Admin only.</div>
+        </div>
+        <div class="perm-chip" style="background:#ede9fe;border:1px solid #c4b5fd;">
+          <div class="perm-name" style="color:#5b21b6;">admin:access</div>
+          <div class="perm-desc" style="color:#6d28d9;">Access all /admin/* endpoints for own tenant (users, roles, permissions, API keys, audit logs).</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title">🛡️ Recommended App Permissions (create per tenant)</div>
+    <p style="font-size:.82rem;color:var(--gray-500);margin-bottom:20px;">These are examples for a CRM / outreach application. Tenant Admins create these for their own tenant via the Roles page.</p>
+
+    <div class="perm-section">
+      <h3>User Management</h3>
+      <div class="perm-grid">
+        <div class="perm-chip" style="background:#f0fdf4;border:1px solid #86efac;">
+          <div class="perm-name" style="color:#166534;">users:read</div>
+          <div class="perm-desc" style="color:#15803d;">View list of users in the tenant</div>
+        </div>
+        <div class="perm-chip" style="background:#f0fdf4;border:1px solid #86efac;">
+          <div class="perm-name" style="color:#166534;">users:write</div>
+          <div class="perm-desc" style="color:#15803d;">Create and edit users</div>
+        </div>
+        <div class="perm-chip" style="background:#f0fdf4;border:1px solid #86efac;">
+          <div class="perm-name" style="color:#166534;">users:delete</div>
+          <div class="perm-desc" style="color:#15803d;">Deactivate or remove users</div>
+        </div>
+        <div class="perm-chip" style="background:#f0fdf4;border:1px solid #86efac;">
+          <div class="perm-name" style="color:#166534;">password:reset</div>
+          <div class="perm-desc" style="color:#15803d;">Trigger password reset for other users</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="perm-section">
+      <h3>Campaigns (example app feature)</h3>
+      <div class="perm-grid">
+        <div class="perm-chip" style="background:#fef3c7;border:1px solid #fcd34d;">
+          <div class="perm-name" style="color:#92400e;">campaigns:read</div>
+          <div class="perm-desc" style="color:#b45309;">View campaigns — Viewer and above</div>
+        </div>
+        <div class="perm-chip" style="background:#fef3c7;border:1px solid #fcd34d;">
+          <div class="perm-name" style="color:#92400e;">campaigns:write</div>
+          <div class="perm-desc" style="color:#b45309;">Create and edit campaigns — Account Manager and above</div>
+        </div>
+        <div class="perm-chip" style="background:#fef3c7;border:1px solid #fcd34d;">
+          <div class="perm-name" style="color:#92400e;">campaigns:delete</div>
+          <div class="perm-desc" style="color:#b45309;">Delete campaigns — Admin only</div>
+        </div>
+        <div class="perm-chip" style="background:#fef3c7;border:1px solid #fcd34d;">
+          <div class="perm-name" style="color:#92400e;">campaigns:publish</div>
+          <div class="perm-desc" style="color:#b45309;">Publish / activate campaigns</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="perm-section">
+      <h3>Contacts / CRM</h3>
+      <div class="perm-grid">
+        <div class="perm-chip" style="background:#e0f2fe;border:1px solid #7dd3fc;">
+          <div class="perm-name" style="color:#0369a1;">contacts:read</div>
+          <div class="perm-desc" style="color:#0284c7;">View contact list</div>
+        </div>
+        <div class="perm-chip" style="background:#e0f2fe;border:1px solid #7dd3fc;">
+          <div class="perm-name" style="color:#0369a1;">contacts:write</div>
+          <div class="perm-desc" style="color:#0284c7;">Create and update contacts</div>
+        </div>
+        <div class="perm-chip" style="background:#e0f2fe;border:1px solid #7dd3fc;">
+          <div class="perm-name" style="color:#0369a1;">contacts:manage</div>
+          <div class="perm-desc" style="color:#0284c7;">Full contact management including delete and merge</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="perm-section">
+      <h3>Reporting & Compliance</h3>
+      <div class="perm-grid">
+        <div class="perm-chip" style="background:#e0e7ff;border:1px solid #a5b4fc;">
+          <div class="perm-name" style="color:#3730a3;">logs:read</div>
+          <div class="perm-desc" style="color:#4338ca;">View audit logs — Auditor and above</div>
+        </div>
+        <div class="perm-chip" style="background:#e0e7ff;border:1px solid #a5b4fc;">
+          <div class="perm-name" style="color:#3730a3;">reports:read</div>
+          <div class="perm-desc" style="color:#4338ca;">View analytics and reports</div>
+        </div>
+        <div class="perm-chip" style="background:#e0e7ff;border:1px solid #a5b4fc;">
+          <div class="perm-name" style="color:#3730a3;">billing:access</div>
+          <div class="perm-desc" style="color:#4338ca;">View billing and subscription — Admin only</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="perm-section">
+      <h3>API / Integration</h3>
+      <div class="perm-grid">
+        <div class="perm-chip" style="background:#fce7f3;border:1px solid #f9a8d4;">
+          <div class="perm-name" style="color:#9d174d;">api:manage</div>
+          <div class="perm-desc" style="color:#be185d;">Create and manage API keys</div>
+        </div>
+        <div class="perm-chip" style="background:#fce7f3;border:1px solid #f9a8d4;">
+          <div class="perm-name" style="color:#9d174d;">webhooks:manage</div>
+          <div class="perm-desc" style="color:#be185d;">Configure webhook endpoints</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-title" style="margin-top:32px;">🗂️ Role → Permission Mapping (Recommended)</div>
+    <div class="matrix-wrap">
+    <table class="matrix">
+      <thead>
+        <tr>
+          <th style="text-align:left">Permission</th>
+          <th>Tenant Admin</th>
+          <th>Developer</th>
+          <th>Acct Mgr</th>
+          <th>Support</th>
+          <th>Auditor</th>
+          <th>Member</th>
+          <th>Viewer</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>admin:access</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>users:read</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>users:write</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>users:delete</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>password:reset</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>campaigns:read</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>campaigns:write</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>campaigns:delete</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>contacts:manage</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>contacts:read</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="y">✓</td><td class="y">✓</td></tr>
+        <tr><td>logs:read</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>api:manage</td><td class="y">✓</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>reports:read</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td></tr>
+        <tr><td>billing:access</td><td class="y">✓</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td><td class="n">—</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════
+     TAB 4 — HOW TO SET UP
+════════════════════════════════════════════════ -->
+<div id="tab-setup" class="tab-page">
+  <div class="section">
+    <div class="section-title">🚀 How to Set Up Roles for Your Application</div>
+    <p style="font-size:.85rem;color:var(--gray-600);margin-bottom:24px;">Follow these steps as the Super Admin to fully configure a new tenant (e.g. Outreach) with all roles and users.</p>
+
+    <div style="display:flex;flex-direction:column;gap:16px;">
+
+      <div style="background:white;border:1px solid var(--gray-200);border-left:4px solid var(--brand);border-radius:8px;padding:16px 20px;">
+        <div style="font-weight:700;color:var(--brand);margin-bottom:8px;">Step 1 — Create the tenant</div>
+        <pre style="background:var(--gray-900);color:#e2e8f0;border-radius:6px;padding:10px 14px;font-size:.75rem;overflow-x:auto;">POST /api/v1/admin/tenants
+Authorization: Bearer &lt;super-admin-jwt&gt;
+X-Tenant-Slug: emc
+
+{ "name": "Outreach", "slug": "outreach" }</pre>
+      </div>
+
+      <div style="background:white;border:1px solid var(--gray-200);border-left:4px solid var(--purple);border-radius:8px;padding:16px 20px;">
+        <div style="font-weight:700;color:var(--purple);margin-bottom:8px;">Step 2 — Create permissions for the tenant</div>
+        <pre style="background:var(--gray-900);color:#e2e8f0;border-radius:6px;padding:10px 14px;font-size:.75rem;overflow-x:auto;">POST /api/v1/admin/tenants/:tid/permissions
+<span style="color:#86efac;">// repeat for each permission</span>
+{ "name": "campaigns:read",   "description": "View campaigns" }
+{ "name": "campaigns:write",  "description": "Create/edit campaigns" }
+{ "name": "contacts:manage",  "description": "Manage contacts" }
+{ "name": "users:read",       "description": "View users" }
+{ "name": "password:reset",   "description": "Reset user passwords" }
+{ "name": "logs:read",        "description": "View audit logs" }
+{ "name": "api:manage",       "description": "Manage API keys" }</pre>
+      </div>
+
+      <div style="background:white;border:1px solid var(--gray-200);border-left:4px solid var(--teal);border-radius:8px;padding:16px 20px;">
+        <div style="font-weight:700;color:var(--teal);margin-bottom:8px;">Step 3 — Create roles and assign permissions</div>
+        <pre style="background:var(--gray-900);color:#e2e8f0;border-radius:6px;padding:10px 14px;font-size:.75rem;overflow-x:auto;"><span style="color:#94a3b8;"># 1. Create role</span>
+POST /api/v1/admin/tenants/:tid/roles
+{ "name": "account_manager", "permission_ids": ["&lt;campaigns:read&gt;","&lt;campaigns:write&gt;","&lt;contacts:manage&gt;","&lt;users:read&gt;"] }
+
+{ "name": "support",         "permission_ids": ["&lt;users:read&gt;","&lt;password:reset&gt;"] }
+
+{ "name": "auditor",         "permission_ids": ["&lt;users:read&gt;","&lt;logs:read&gt;"] }
+
+{ "name": "developer",       "permission_ids": ["&lt;users:read&gt;","&lt;api:manage&gt;"] }
+
+{ "name": "viewer",          "permission_ids": ["&lt;campaigns:read&gt;"] }
+
+{ "name": "member",          "permission_ids": ["&lt;campaigns:read&gt;","&lt;contacts:read&gt;"] }</pre>
+      </div>
+
+      <div style="background:white;border:1px solid var(--gray-200);border-left:4px solid var(--amber);border-radius:8px;padding:16px 20px;">
+        <div style="font-weight:700;color:var(--amber);margin-bottom:8px;">Step 4 — Create users and assign roles</div>
+        <pre style="background:var(--gray-900);color:#e2e8f0;border-radius:6px;padding:10px 14px;font-size:.75rem;overflow-x:auto;">POST /api/v1/admin/tenants/:tid/users
+{ "email": "alice@outreach.com", "password": "Temp1234!", "role": "account_manager", ... }
+{ "email": "bob@outreach.com",   "password": "Temp1234!", "role": "support", ... }
+{ "email": "dave@outreach.com",  "password": "Temp1234!", "role": "developer", ... }
+{ "email": "jane@outreach.com",  "password": "Temp1234!", "role": "viewer", ... }</pre>
+      </div>
+
+      <div style="background:white;border:1px solid var(--gray-200);border-left:4px solid var(--green);border-radius:8px;padding:16px 20px;">
+        <div style="font-weight:700;color:var(--green);margin-bottom:8px;">Step 5 — Your app verifies permissions on every request</div>
+        <pre style="background:var(--gray-900);color:#e2e8f0;border-radius:6px;padding:10px 14px;font-size:.75rem;overflow-x:auto;"><span style="color:#94a3b8;"># User logs in → gets JWT with their permissions embedded</span>
+GET /api/v1/auth/me → {
+  "email": "alice@outreach.com",
+  "role": "account_manager",
+  "permissions": ["campaigns:read","campaigns:write","contacts:manage","users:read"]
+}
+
+<span style="color:#94a3b8;"># In your Outreach app backend:</span>
+if (!user.permissions.includes('campaigns:write')) {
+  return 403  <span style="color:#94a3b8;">// alice can write, bob (support) cannot</span>
+}</pre>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+</div><!-- /container -->
+
+<script>
+function showTab(name) {
+  document.querySelectorAll('.tab-page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.hero-tabs button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  event.target.classList.add('active');
+}
+</script>
+</body>
+</html>

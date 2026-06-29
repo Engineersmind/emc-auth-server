@@ -6,18 +6,16 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
 
 const (
-	// APIKeyPrefix is prepended to every raw API key for easy identification.
-	APIKeyPrefix = "emck_"
-	// apiKeyRawBytes is the number of random bytes before base64 encoding.
+	APIKeyPrefix   = "emck_"
 	apiKeyRawBytes = 32
 )
 
@@ -36,7 +34,7 @@ func NewAPIKeyService(pool *pgxpool.Pool, logger zerolog.Logger) *APIKeyService 
 type APIKeyResult struct {
 	ID          string    `json:"id"`
 	Name        string    `json:"name"`
-	RawKey      string    `json:"key"`           // shown once — never stored
+	RawKey      string    `json:"key"`
 	Permissions []string  `json:"permissions"`
 	CreatedAt   time.Time `json:"created_at"`
 }
@@ -50,17 +48,16 @@ type APIKeySummary struct {
 	CreatedAt   time.Time  `json:"created_at"`
 }
 
-// APIKeyIdentity is resolved by AuthenticateAPIKey — acts like a user identity.
+// APIKeyIdentity is resolved by AuthenticateAPIKey.
 type APIKeyIdentity struct {
-	KeyID       uuid.UUID
-	TenantID    uuid.UUID
+	KeyID       int64
+	TenantID    int64
 	Name        string
 	Permissions []string
 }
 
 // CreateAPIKey generates a new API key for the given tenant.
-// The raw key is returned exactly once and is never stored — only its SHA-256 hash.
-func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID uuid.UUID, name string, permissions []string) (*APIKeyResult, error) {
+func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID int64, name string, permissions []string) (*APIKeyResult, error) {
 	if name == "" {
 		return nil, fmt.Errorf("API key name is required")
 	}
@@ -68,21 +65,19 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID uuid.UUID, na
 		permissions = []string{}
 	}
 
-	// Generate raw key: "emck_" + base64url(32 random bytes)
 	buf := make([]byte, apiKeyRawBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return nil, fmt.Errorf("generate API key: %w", err)
 	}
 	rawKey := APIKeyPrefix + base64.RawURLEncoding.EncodeToString(buf)
 
-	// Store SHA-256 hash — never the raw key.
-	keyHash := HashToken(rawKey) // reuse existing SHA-256 helper from tokens.go
+	keyHash := HashToken(rawKey)
 
-	var keyID uuid.UUID
+	var keyID int64
 	var createdAt time.Time
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO api_keys (id, tenant_id, name, key_hash, permissions, created_at)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, NOW())
+		INSERT INTO api_keys (tenant_id, name, key_hash, permissions, created_at)
+		VALUES ($1, $2, $3, $4, NOW())
 		RETURNING id, created_at
 	`, tenantID, name, keyHash, permissions).Scan(&keyID, &createdAt)
 	if err != nil {
@@ -90,7 +85,7 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID uuid.UUID, na
 	}
 
 	return &APIKeyResult{
-		ID:          keyID.String(),
+		ID:          strconv.FormatInt(keyID, 10),
 		Name:        name,
 		RawKey:      rawKey,
 		Permissions: permissions,
@@ -98,9 +93,8 @@ func (s *APIKeyService) CreateAPIKey(ctx context.Context, tenantID uuid.UUID, na
 	}, nil
 }
 
-// ListAPIKeys returns all active (not revoked) API keys for a tenant.
-// The raw key is never included in the response.
-func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID uuid.UUID) ([]APIKeySummary, error) {
+// ListAPIKeys returns all active API keys for a tenant.
+func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID int64) ([]APIKeySummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, name, permissions, last_used_at, created_at
 		FROM api_keys
@@ -115,11 +109,11 @@ func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID uuid.UUID) ([]
 	var keys []APIKeySummary
 	for rows.Next() {
 		var k APIKeySummary
-		var id uuid.UUID
+		var id int64
 		if err := rows.Scan(&id, &k.Name, &k.Permissions, &k.LastUsedAt, &k.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan api_key: %w", err)
 		}
-		k.ID = id.String()
+		k.ID = strconv.FormatInt(id, 10)
 		if k.Permissions == nil {
 			k.Permissions = []string{}
 		}
@@ -131,9 +125,8 @@ func (s *APIKeyService) ListAPIKeys(ctx context.Context, tenantID uuid.UUID) ([]
 	return keys, rows.Err()
 }
 
-// RevokeAPIKey marks an API key as revoked. Only keys belonging to the given
-// tenant can be revoked (tenant isolation).
-func (s *APIKeyService) RevokeAPIKey(ctx context.Context, tenantID uuid.UUID, keyID uuid.UUID) error {
+// RevokeAPIKey marks an API key as revoked.
+func (s *APIKeyService) RevokeAPIKey(ctx context.Context, tenantID, keyID int64) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE api_keys
 		SET revoked_at = NOW()
@@ -149,7 +142,6 @@ func (s *APIKeyService) RevokeAPIKey(ctx context.Context, tenantID uuid.UUID, ke
 }
 
 // AuthenticateAPIKey validates a raw API key and returns the key identity.
-// It also updates last_used_at atomically (best-effort — failure does not block auth).
 func (s *APIKeyService) AuthenticateAPIKey(ctx context.Context, rawKey string) (*APIKeyIdentity, error) {
 	if rawKey == "" {
 		return nil, fmt.Errorf("API key required")
@@ -157,7 +149,7 @@ func (s *APIKeyService) AuthenticateAPIKey(ctx context.Context, rawKey string) (
 
 	keyHash := HashToken(rawKey)
 
-	var keyID, tenantID uuid.UUID
+	var keyID, tenantID int64
 	var name string
 	var permissions []string
 	err := s.pool.QueryRow(ctx, `
@@ -176,11 +168,10 @@ func (s *APIKeyService) AuthenticateAPIKey(ctx context.Context, rawKey string) (
 		permissions = []string{}
 	}
 
-	// Best-effort last_used_at update — don't fail auth if this errors.
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE api_keys SET last_used_at = NOW() WHERE id = $1
 	`, keyID); err != nil {
-		s.logger.Warn().Err(err).Str("key_id", keyID.String()).Msg("failed to update last_used_at")
+		s.logger.Warn().Err(err).Str("key_id", strconv.FormatInt(keyID, 10)).Msg("failed to update last_used_at")
 	}
 
 	return &APIKeyIdentity{

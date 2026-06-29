@@ -2,10 +2,9 @@ package auth_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
-
-	"github.com/google/uuid"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/store"
@@ -13,7 +12,7 @@ import (
 )
 
 // newAPIKeyService creates an APIKeyService backed by a real DB with seed data.
-func newAPIKeyService(t *testing.T) (*auth.APIKeyService, context.Context, uuid.UUID) {
+func newAPIKeyService(t *testing.T) (*auth.APIKeyService, context.Context, int64) {
 	t.Helper()
 	pool := testhelper.NewTestDB(t)
 	testhelper.CleanupTables(t, pool)
@@ -24,8 +23,13 @@ func newAPIKeyService(t *testing.T) (*auth.APIKeyService, context.Context, uuid.
 		t.Fatalf("RunSeed: %v", err)
 	}
 
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
 	svc := auth.NewAPIKeyService(pool, logger)
-	return svc, ctx, store.SeedTenantID
+	return svc, ctx, tenantID
 }
 
 func TestAPIKeyService_CreateAndAuthenticate(t *testing.T) {
@@ -88,8 +92,6 @@ func TestAPIKeyService_ListKeys(t *testing.T) {
 		t.Errorf("ListAPIKeys() len = %d, want 2", len(keys))
 	}
 
-	// APIKeySummary must not include a raw key field.
-	// (Verified by type — no RawKey field exists on APIKeySummary.)
 	for _, k := range keys {
 		if k.ID == "" {
 			t.Error("ListAPIKeys() returned key with empty ID")
@@ -108,7 +110,7 @@ func TestAPIKeyService_RevokeKey(t *testing.T) {
 		t.Fatalf("CreateAPIKey() error = %v", err)
 	}
 	rawKey := result.RawKey
-	keyID, err := uuid.Parse(result.ID)
+	keyID, err := strconv.ParseInt(result.ID, 10, 64)
 	if err != nil {
 		t.Fatalf("parse key ID: %v", err)
 	}

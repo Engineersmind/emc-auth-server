@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pquerna/otp/totp"
@@ -22,25 +21,21 @@ import (
 )
 
 const (
-	// TOTPIssuer is the issuer shown in authenticator apps.
-	TOTPIssuer = "EMC Auth"
-	// BackupCodeCount is the number of one-time backup codes generated at enrollment.
-	BackupCodeCount = 8
-	// BackupCodeLength is the character length of each backup code.
+	TOTPIssuer       = "EMC Auth"
+	BackupCodeCount  = 8
 	BackupCodeLength = 8
 )
 
 // TOTPService handles TOTP enrollment, verification, and management.
 type TOTPService struct {
-	pool      *pgxpool.Pool
-	encKey    []byte // 32-byte AES-256 key decoded from hex config
-	logger    zerolog.Logger
+	pool   *pgxpool.Pool
+	encKey []byte
+	logger zerolog.Logger
 }
 
 // NewTOTPService creates a TOTPService. encKeyHex must be a 64-character hex string (32 bytes).
 func NewTOTPService(pool *pgxpool.Pool, encKeyHex string, logger zerolog.Logger) (*TOTPService, error) {
 	if encKeyHex == "" {
-		// Dev fallback: all-zero key — logs a warning, never allowed in production.
 		logger.Warn().Msg("TOTP_ENCRYPTION_KEY not set — using insecure zero key (dev only)")
 		encKeyHex = strings.Repeat("0", 64)
 	}
@@ -51,17 +46,14 @@ func NewTOTPService(pool *pgxpool.Pool, encKeyHex string, logger zerolog.Logger)
 	return &TOTPService{pool: pool, encKey: key, logger: logger}, nil
 }
 
-// EnrollResult is returned by Enroll — contains the QR URI and one-time backup codes.
+// EnrollResult is returned by Enroll.
 type EnrollResult struct {
-	OTPURI      string   `json:"otp_uri"`      // otpauth:// URI for QR code generation
-	BackupCodes []string `json:"backup_codes"` // plaintext codes shown once
+	OTPURI      string   `json:"otp_uri"`
+	BackupCodes []string `json:"backup_codes"`
 }
 
-// Enroll generates a new TOTP secret for the user, encrypts it, and persists it.
-// The secret is inactive until the user calls VerifyAndActivate.
-// If a previous enrollment exists it is overwritten (re-enrollment).
-func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID uuid.UUID, email string) (*EnrollResult, error) {
-	// Generate a new TOTP key.
+// Enroll generates a new TOTP secret for the user.
+func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID int64, email string) (*EnrollResult, error) {
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      TOTPIssuer,
 		AccountName: email,
@@ -71,27 +63,24 @@ func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID uuid.UUID, em
 		return nil, fmt.Errorf("generate TOTP key: %w", err)
 	}
 
-	// Encrypt the base32 secret with AES-256-GCM.
 	encSecret, err := s.encrypt(key.Secret())
 	if err != nil {
 		return nil, fmt.Errorf("encrypt TOTP secret: %w", err)
 	}
 
-	// Generate backup codes: plaintext for display, SHA-256 hashes for storage.
 	plainCodes, hashedCodes, err := generateBackupCodes(BackupCodeCount, BackupCodeLength)
 	if err != nil {
 		return nil, fmt.Errorf("generate backup codes: %w", err)
 	}
 
-	// Upsert into totp_secrets (is_active=false until verified).
 	_, err = s.pool.Exec(ctx, `
 		INSERT INTO totp_secrets (user_id, tenant_id, secret_enc, is_active, backup_codes, updated_at)
 		VALUES ($1, $2, $3, false, $4, NOW())
 		ON CONFLICT (user_id) DO UPDATE
-		SET secret_enc = EXCLUDED.secret_enc,
-		    is_active   = false,
+		SET secret_enc   = EXCLUDED.secret_enc,
+		    is_active    = false,
 		    backup_codes = EXCLUDED.backup_codes,
-		    updated_at  = NOW()
+		    updated_at   = NOW()
 	`, userID, tenantID, encSecret, hashedCodes)
 	if err != nil {
 		return nil, fmt.Errorf("upsert totp_secrets: %w", err)
@@ -104,8 +93,7 @@ func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID uuid.UUID, em
 }
 
 // VerifyAndActivate validates the user's first TOTP code and marks the secret active.
-// Must be called after Enroll to confirm the authenticator app is properly set up.
-func (s *TOTPService) VerifyAndActivate(ctx context.Context, userID uuid.UUID, code string) error {
+func (s *TOTPService) VerifyAndActivate(ctx context.Context, userID int64, code string) error {
 	secret, isActive, err := s.loadSecret(ctx, userID)
 	if err != nil {
 		return err
@@ -129,8 +117,7 @@ func (s *TOTPService) VerifyAndActivate(ctx context.Context, userID uuid.UUID, c
 }
 
 // Verify checks a TOTP code for an already-active TOTP enrollment.
-// Returns nil if valid, error if invalid or not enrolled.
-func (s *TOTPService) Verify(ctx context.Context, userID uuid.UUID, code string) error {
+func (s *TOTPService) Verify(ctx context.Context, userID int64, code string) error {
 	secret, isActive, err := s.loadSecret(ctx, userID)
 	if err != nil {
 		return err
@@ -145,11 +132,9 @@ func (s *TOTPService) Verify(ctx context.Context, userID uuid.UUID, code string)
 }
 
 // VerifyBackupCode checks if the provided code matches any stored backup code hash.
-// On success the used code is atomically removed (single-use).
-func (s *TOTPService) VerifyBackupCode(ctx context.Context, userID uuid.UUID, code string) error {
+func (s *TOTPService) VerifyBackupCode(ctx context.Context, userID int64, code string) error {
 	codeHash := hashBackupCode(code)
 
-	// Load backup codes.
 	var storedHashes []string
 	err := s.pool.QueryRow(ctx, `
 		SELECT backup_codes FROM totp_secrets
@@ -162,12 +147,11 @@ func (s *TOTPService) VerifyBackupCode(ctx context.Context, userID uuid.UUID, co
 		return fmt.Errorf("load backup codes: %w", err)
 	}
 
-	// Find and remove the matching code.
 	found := false
 	remaining := make([]string, 0, len(storedHashes))
 	for _, h := range storedHashes {
 		if h == codeHash && !found {
-			found = true // consume this one — do not add to remaining
+			found = true
 		} else {
 			remaining = append(remaining, h)
 		}
@@ -176,7 +160,6 @@ func (s *TOTPService) VerifyBackupCode(ctx context.Context, userID uuid.UUID, co
 		return fmt.Errorf("invalid backup code")
 	}
 
-	// Persist updated (shorter) list.
 	_, err = s.pool.Exec(ctx, `
 		UPDATE totp_secrets SET backup_codes = $2, updated_at = NOW()
 		WHERE user_id = $1
@@ -188,9 +171,7 @@ func (s *TOTPService) VerifyBackupCode(ctx context.Context, userID uuid.UUID, co
 }
 
 // Disable removes the TOTP enrollment for the user.
-// Requires a valid TOTP code or backup code as confirmation.
-func (s *TOTPService) Disable(ctx context.Context, userID uuid.UUID, code string) error {
-	// Try TOTP code first, then backup code.
+func (s *TOTPService) Disable(ctx context.Context, userID int64, code string) error {
 	err := s.Verify(ctx, userID, code)
 	if err != nil {
 		err2 := s.VerifyBackupCode(ctx, userID, code)
@@ -209,7 +190,7 @@ func (s *TOTPService) Disable(ctx context.Context, userID uuid.UUID, code string
 }
 
 // IsActive returns true if the user has an active TOTP enrollment.
-func (s *TOTPService) IsActive(ctx context.Context, userID uuid.UUID) (bool, error) {
+func (s *TOTPService) IsActive(ctx context.Context, userID int64) (bool, error) {
 	var active bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT is_active FROM totp_secrets WHERE user_id = $1
@@ -267,7 +248,7 @@ func (s *TOTPService) decrypt(encrypted string) (string, error) {
 }
 
 // loadSecret fetches and decrypts the TOTP secret from DB.
-func (s *TOTPService) loadSecret(ctx context.Context, userID uuid.UUID) (secret string, isActive bool, err error) {
+func (s *TOTPService) loadSecret(ctx context.Context, userID int64) (secret string, isActive bool, err error) {
 	var encSecret string
 	err = s.pool.QueryRow(ctx, `
 		SELECT secret_enc, is_active FROM totp_secrets WHERE user_id = $1
@@ -287,9 +268,8 @@ func (s *TOTPService) loadSecret(ctx context.Context, userID uuid.UUID) (secret 
 
 // ─── Backup code helpers ─────────────────────────────────────────────────────
 
-// generateBackupCodes returns (plaintext codes, SHA-256 hashes) for storage.
 func generateBackupCodes(count, length int) (plain []string, hashed []string, err error) {
-	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // unambiguous characters
+	const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	plain = make([]string, count)
 	hashed = make([]string, count)
 	buf := make([]byte, length)
@@ -316,8 +296,8 @@ func hashBackupCode(code string) string {
 
 // OTPSession holds pre-authentication state while waiting for the TOTP code.
 type OTPSession struct {
-	UserID   uuid.UUID
-	TenantID uuid.UUID
+	UserID   int64
+	TenantID int64
 	Email    string
 	RoleName string
 	Perms    []string

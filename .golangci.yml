@@ -1,37 +1,36 @@
+version: "2"
+
 run:
   timeout: 5m
-  go: "1.23"
 
 linters:
   enable:
     - errcheck        # unchecked errors
-    - gosimple        # simplification suggestions
     - govet           # go vet checks
     - ineffassign     # unused assignments
-    - staticcheck     # advanced static analysis
-    - unused          # unused code
-    - gofmt           # formatting
-    - goimports       # import ordering
+    - staticcheck     # advanced static analysis (includes gosimple + unused in v2)
     - gosec           # security checks
     - misspell        # typos
     - noctx           # http calls without context
     - bodyclose       # http response body not closed
-    - sqlcloserows    # sql rows not closed
+    - sqlclosecheck   # sql rows/stmt not closed (renamed from sqlcloserows in v1.64+)
     - revive          # general linter (replaces golint)
   disable:
     - depguard        # dependency restrictions (not needed here)
 
-linters-settings:
-  gosec:
-    excludes:
-      - G401   # use of weak cryptographic primitive (MD5 allowed in non-security contexts)
-      - G501   # import of unsafe crypto (we use bcrypt + AES-GCM explicitly)
-  errcheck:
-    check-type-assertions: true
-  revive:
-    rules:
-      - name: exported
-        disabled: true  # don't require godoc on all exported symbols
+  settings:
+    gosec:
+      excludes:
+        - G401   # use of weak cryptographic primitive (MD5 allowed in non-security contexts)
+        - G501   # import of unsafe crypto (we use bcrypt + AES-GCM explicitly)
+        - G101   # false positive: string constants used as context keys, not hardcoded credentials
+        - G117   # false positive: Password/Token/RefreshToken fields in API request/response DTOs
+    errcheck:
+      check-type-assertions: true
+    revive:
+      rules:
+        - name: exported
+          disabled: true  # don't require godoc on all exported symbols
 
 issues:
   exclude-rules:

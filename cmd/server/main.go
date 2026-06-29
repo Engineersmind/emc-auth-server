@@ -81,6 +81,12 @@ func main() {
 	}
 	defer store.CloseDB(pool)
 
+	// Detect legacy UUID-schema databases before any migration runs.
+	// Fresh databases (tenants table absent) pass through silently.
+	if err := store.CheckSchemaCompatibility(ctx, pool); err != nil {
+		logger.Fatal().Err(err).Msg("schema incompatibility — cannot proceed")
+	}
+
 	// Run migrations from embedded SQL files (idempotent)
 	if err := store.RunMigrations(ctx, pool, migrations.FS, logger); err != nil {
 		logger.Fatal().Err(err).Msg("migrations failed")
@@ -89,6 +95,13 @@ func main() {
 	// Seed default tenant and super-admin (idempotent)
 	if err := store.RunSeed(ctx, pool, logger); err != nil {
 		logger.Fatal().Err(err).Msg("seed failed")
+	}
+
+	// Seed demo tenants + users when SEED_DEMO_DATA=true (local dev / QA only)
+	if os.Getenv("SEED_DEMO_DATA") == "true" {
+		if err := store.RunDemoSeed(ctx, pool, logger); err != nil {
+			logger.Fatal().Err(err).Msg("demo seed failed")
+		}
 	}
 
 	// Connect to Redis
@@ -121,6 +134,7 @@ func main() {
 			SMTPFrom:          cfg.SMTPFrom,
 			SMTPUsername:      cfg.SMTPUsername,
 			SMTPPassword:      cfg.SMTPPassword,
+			CookieDomain:      cfg.CookieDomain,
 		},
 	})
 
@@ -129,8 +143,9 @@ func main() {
 	defer stop()
 
 	s := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: e,
+		Addr:              ":" + cfg.Port,
+		Handler:           e,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Start server in goroutine

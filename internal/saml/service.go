@@ -9,7 +9,8 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/google/uuid"
+	"strconv"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -69,10 +70,14 @@ func New(pool *pgxpool.Pool, baseURL string, logger zerolog.Logger) *Service {
 
 // GetConfig retrieves the SAML IdP configuration for a tenant.
 func (s *Service) GetConfig(ctx context.Context, tenantID string) (*SAMLConfig, error) {
+	tid, err := strconv.ParseInt(tenantID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tenant_id %q: %w", tenantID, err)
+	}
 	var cfg SAMLConfig
-	err := s.pool.QueryRow(ctx, `
+	err = s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id, entity_id, sso_url, certificate, created_at, updated_at
-		FROM saml_configs WHERE tenant_id = $1`, tenantID,
+		FROM saml_configs WHERE tenant_id = $1`, tid,
 	).Scan(&cfg.ID, &cfg.TenantID, &cfg.EntityID, &cfg.SSOURL, &cfg.Certificate,
 		&cfg.CreatedAt, &cfg.UpdatedAt)
 	if err != nil {
@@ -83,15 +88,19 @@ func (s *Service) GetConfig(ctx context.Context, tenantID string) (*SAMLConfig, 
 
 // UpsertConfig creates or updates the SAML IdP configuration for a tenant.
 func (s *Service) UpsertConfig(ctx context.Context, tenantID string, req SAMLConfig) (*SAMLConfig, error) {
+	tid, err := strconv.ParseInt(tenantID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid tenant_id %q: %w", tenantID, err)
+	}
 	var cfg SAMLConfig
-	err := s.pool.QueryRow(ctx, `
+	err = s.pool.QueryRow(ctx, `
 		INSERT INTO saml_configs (tenant_id, entity_id, sso_url, certificate)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (tenant_id) DO UPDATE
 		SET entity_id = EXCLUDED.entity_id, sso_url = EXCLUDED.sso_url,
 		    certificate = EXCLUDED.certificate, updated_at = NOW()
 		RETURNING id, tenant_id, entity_id, sso_url, certificate, created_at, updated_at`,
-		tenantID, req.EntityID, req.SSOURL, req.Certificate,
+		tid, req.EntityID, req.SSOURL, req.Certificate,
 	).Scan(&cfg.ID, &cfg.TenantID, &cfg.EntityID, &cfg.SSOURL, &cfg.Certificate,
 		&cfg.CreatedAt, &cfg.UpdatedAt)
 	return &cfg, err
@@ -196,23 +205,22 @@ func (s *Service) ParseACSResponse(samlResponse string) (email string, attrs map
 // FindOrCreateUser performs JIT provisioning: looks up a user by tenant+email,
 // creating one if not found. The created user has no usable password (SAML-only login).
 func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) (*User, error) {
-	tenantUUID, err := uuid.Parse(tenantID)
+	tenantIDInt, err := strconv.ParseInt(tenantID, 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant_id: %w", err)
 	}
 
 	// Try to find existing user.
-	var userID uuid.UUID
+	var userID int64
 	var roleName string
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.id, COALESCE(r.name, '')
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.tenant_id = $1 AND u.email = $2 AND u.is_active = true AND u.is_deleted = false
-	`, tenantUUID, email).Scan(&userID, &roleName)
+		WHERE u.tenant_id = $1 AND u.email = $2 AND u.is_active = true AND u.deleted_at IS NULL
+	`, tenantIDInt, email).Scan(&userID, &roleName)
 	if err == nil {
-		// User found.
-		return &User{ID: userID.String(), Email: email, TenantID: tenantID, Role: roleName}, nil
+		return &User{ID: strconv.FormatInt(userID, 10), Email: email, TenantID: tenantID, Role: roleName}, nil
 	}
 	if err != pgx.ErrNoRows {
 		return nil, fmt.Errorf("lookup user: %w", err)
@@ -220,16 +228,20 @@ func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) 
 
 	// User not found — JIT provision.
 	// Fetch default (non-system) role for the tenant.
-	var roleID *uuid.UUID
+	var roleID *int64
+	var tempRoleID int64
 	err = s.pool.QueryRow(ctx,
-		`SELECT id, name FROM roles WHERE tenant_id = $1 AND is_system = false ORDER BY name LIMIT 1`,
-		tenantUUID,
-	).Scan(&roleID, &roleName)
-	if err != nil && err != pgx.ErrNoRows {
+		`SELECT id, name FROM roles WHERE tenant_id = $1 AND is_system = false AND deleted_at IS NULL ORDER BY name LIMIT 1`,
+		tenantIDInt,
+	).Scan(&tempRoleID, &roleName)
+	if err == nil {
+		roleID = &tempRoleID
+	} else if err != pgx.ErrNoRows {
 		return nil, fmt.Errorf("fetch default role: %w", err)
 	}
 
 	// Insert user + a locked credential row (random bytes — cannot be used for password login).
+	// users.id is GENERATED ALWAYS AS IDENTITY — do not supply an explicit value.
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -237,10 +249,10 @@ func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) 
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (id, tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES (gen_random_uuid(), $1, $2, '', '', $3, true)
+		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
+		VALUES ($1, $2, '', '', $3, true)
 		RETURNING id
-	`, tenantUUID, email, roleID).Scan(&userID)
+	`, tenantIDInt, email, roleID).Scan(&userID)
 	if err != nil {
 		return nil, fmt.Errorf("insert JIT user: %w", err)
 	}
@@ -256,7 +268,7 @@ func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO user_credentials (user_id, tenant_id, password_hash)
 		VALUES ($1, $2, $3)
-	`, userID, tenantUUID, lockedHash)
+	`, userID, tenantIDInt, lockedHash)
 	if err != nil {
 		return nil, fmt.Errorf("insert JIT credentials: %w", err)
 	}
@@ -265,8 +277,9 @@ func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) 
 		return nil, fmt.Errorf("commit JIT provision: %w", err)
 	}
 
-	s.logger.Info().Str("user_id", userID.String()).Str("email", email).
+	userIDStr := strconv.FormatInt(userID, 10)
+	s.logger.Info().Str("user_id", userIDStr).Str("email", email).
 		Str("tenant_id", tenantID).Msg("saml: JIT provisioned new user")
 
-	return &User{ID: userID.String(), Email: email, TenantID: tenantID, Role: roleName}, nil
+	return &User{ID: userIDStr, Email: email, TenantID: tenantID, Role: roleName}, nil
 }
