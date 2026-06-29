@@ -35,9 +35,9 @@ func Init(ctx context.Context) (ShutdownFunc, error) {
 		serviceName = "emc-auth-server"
 	}
 
-	res, err := resource.New(ctx,
-		resource.WithDefaults(),
-		resource.WithAttributes(semconv.ServiceName(serviceName)),
+	res, err := resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(semconv.SchemaURL, semconv.ServiceName(serviceName)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("otel resource: %w", err)

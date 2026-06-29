@@ -4,7 +4,6 @@ go 1.25.0
 
 require (
 	github.com/getsentry/sentry-go v0.47.0
-	github.com/getsentry/sentry-go/echo v0.47.0
 	github.com/go-redis/redis_rate/v10 v10.0.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
@@ -47,7 +46,6 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
 	github.com/jackc/puddle/v2 v2.2.1 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
-	github.com/labstack/echo/v5 v5.0.3 // indirect
 	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect

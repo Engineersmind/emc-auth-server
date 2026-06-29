@@ -11,7 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
-	sentryecho "github.com/getsentry/sentry-go/echo"
+	"github.com/getsentry/sentry-go"
 	echoSwagger "github.com/swaggo/echo-swagger"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
 
@@ -121,6 +121,26 @@ func httpsRedirect(env string) echo.MiddlewareFunc {
 	}
 }
 
+// sentryMiddleware captures panics and reports them to Sentry, then re-panics so
+// Echo's Recover middleware can still return HTTP 500. Uses echo/v4 MiddlewareFunc
+// directly to avoid the sentry-go/echo sub-package which requires echo/v5.
+func sentryMiddleware() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			hub := sentry.CurrentHub().Clone()
+			hub.Scope().SetRequest(c.Request())
+			c.Set("sentry_hub", hub)
+			defer func() {
+				if r := recover(); r != nil {
+					hub.RecoverWithContext(c.Request().Context(), r)
+					panic(r)
+				}
+			}()
+			return next(c)
+		}
+	}
+}
+
 // RegisterRoutes configures all route groups and middleware on the Echo instance.
 func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Middleware stack — order matters:
@@ -131,9 +151,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// 5. Recover — catches panics from all subsequent handlers
 	e.Use(echoMiddleware.RequestID())
 	e.Use(otelecho.Middleware("emc-auth-server")) // traces every HTTP request
-	// Sentry: must be before Recover so panics reach Sentry before being swallowed.
-	// Repanic:true re-raises after capture so Recover can still return 500.
-	e.Use(sentryecho.New(sentryecho.Options{Repanic: true}))
+	// Sentry: before Recover so panics reach Sentry first; re-panics so Recover returns 500.
+	e.Use(sentryMiddleware())
 	e.Use(securityHeaders())
 	e.Use(httpsRedirect(deps.Config.Env))
 	e.Use(mw.RequestLogger(deps.Logger))
