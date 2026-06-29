@@ -3,8 +3,7 @@ name: CI/CD
 on:
   push:
     branches: [master]
-  pull_request:
-    branches: [master]
+
 
 permissions:
   id-token: write

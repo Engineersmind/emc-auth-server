@@ -1,43 +1,9 @@
-## Prometheus configuration for EMC Auth Server
-## Scrapes the /metrics endpoint once it is exposed (Phase 7 — 07-05)
-
 global:
-  scrape_interval: 15s
+  scrape_interval:     15s
   evaluation_interval: 15s
-  external_labels:
-    service: emc-auth-server
-    environment: production
-
-# Alerting rules (loaded from rules/ directory)
-rule_files:
-  - "rules/*.yml"
-
-# Alertmanager (configure endpoint when available)
-# alerting:
-#   alertmanagers:
-#     - static_configs:
-#         - targets: ["alertmanager:9093"]
 
 scrape_configs:
-  # EMC Auth Server — primary metrics endpoint
-  - job_name: emc-auth-server
+  - job_name: "emc-auth-server"
     static_configs:
       - targets: ["app:8080"]
     metrics_path: /metrics
-    scrape_interval: 10s
-    scrape_timeout: 5s
-
-  # PostgreSQL exporter (optional — add postgres-exporter container to docker-compose.prod.yml)
-  # - job_name: postgres
-  #   static_configs:
-  #     - targets: ["postgres-exporter:9187"]
-
-  # Redis exporter (optional — add redis-exporter container)
-  # - job_name: redis
-  #   static_configs:
-  #     - targets: ["redis-exporter:9121"]
-
-  # Prometheus self-monitoring
-  - job_name: prometheus
-    static_configs:
-      - targets: ["localhost:9090"]

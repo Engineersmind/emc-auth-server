@@ -12,7 +12,9 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
+	sentryecho "github.com/getsentry/sentry-go/echo"
 	echoSwagger "github.com/swaggo/echo-swagger"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
 	"github.com/engineersmind/emc-auth-server/internal/api/handlers"
@@ -120,6 +122,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// 4. RequestLogger — structured zerolog request logging
 	// 5. Recover — catches panics from all subsequent handlers
 	e.Use(echoMiddleware.RequestID())
+	e.Use(otelecho.Middleware("emc-auth-server")) // traces every HTTP request
+	// Sentry: must be before Recover so panics reach Sentry before being swallowed.
+	// Repanic:true re-raises after capture so Recover can still return 500.
+	e.Use(sentryecho.New(sentryecho.Options{Repanic: true}))
 	e.Use(securityHeaders())
 	e.Use(httpsRedirect(deps.Config.Env))
 	e.Use(mw.RequestLogger(deps.Logger))

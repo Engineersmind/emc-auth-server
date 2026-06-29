@@ -34,6 +34,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/api"
 	"github.com/engineersmind/emc-auth-server/internal/config"
 	"github.com/engineersmind/emc-auth-server/internal/store"
+	"github.com/engineersmind/emc-auth-server/internal/telemetry"
 	"github.com/engineersmind/emc-auth-server/migrations"
 )
 
@@ -58,6 +59,20 @@ func main() {
 		Logger()
 
 	ctx := context.Background()
+
+	// Initialise OpenTelemetry (no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset)
+	otelShutdown, err := telemetry.Init(ctx)
+	if err != nil {
+		logger.Warn().Err(err).Msg("otel init failed — continuing without telemetry")
+	} else {
+		// Attach hook after Init so the global log provider is already set
+		logger = logger.Hook(telemetry.NewOTelHook())
+	}
+
+	// Initialise Sentry (no-op when SENTRY_DSN is unset)
+	if err := telemetry.InitSentry(cfg.Env); err != nil {
+		logger.Warn().Err(err).Msg("sentry init failed — continuing without sentry")
+	}
 
 	// Connect to PostgreSQL
 	pool, err := store.NewDB(ctx, cfg.DatabaseURL, logger)
@@ -135,5 +150,10 @@ func main() {
 	if err := s.Shutdown(timeoutCtx); err != nil {
 		logger.Error().Err(err).Msg("shutdown error")
 	}
+	// Flush OTel exporters and Sentry buffer before exit
+	if err := otelShutdown(timeoutCtx); err != nil {
+		logger.Warn().Err(err).Msg("otel shutdown error")
+	}
+	telemetry.FlushSentry()
 	logger.Info().Msg("server stopped")
 }
