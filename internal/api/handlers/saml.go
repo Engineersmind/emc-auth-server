@@ -25,7 +25,16 @@ func NewSAMLHandler(svc *samlsvc.Service, jwtSvc *auth.JWTService, logger zerolo
 }
 
 // GetMetadata handles GET /saml/metadata?tenant=<tenant_id>
-// Returns SP metadata XML so IdPs can configure the service provider.
+//
+// @Summary      Get SP metadata XML
+// @Description  Returns SAML Service Provider metadata XML for the given tenant. Used by IdPs to configure the SP.
+// @Tags         saml
+// @Produce      application/xml
+// @Param        tenant  query     string  true  "Tenant ID"
+// @Success      200     {string}  string  "SP metadata XML"
+// @Failure      400     {object}  map[string]string
+// @Failure      500     {object}  map[string]string
+// @Router       /saml/metadata [get]
 func (h *SAMLHandler) GetMetadata(c echo.Context) error {
 	tenantID := c.QueryParam("tenant")
 	if tenantID == "" {
@@ -40,7 +49,15 @@ func (h *SAMLHandler) GetMetadata(c echo.Context) error {
 }
 
 // InitiateLogin handles GET /saml/login?tenant=<tenant_id>
-// Redirects the browser to the IdP with a SAMLRequest (SP-initiated SSO).
+//
+// @Summary      Initiate SP-initiated SAML SSO
+// @Description  Redirects the browser to the configured IdP with a signed SAMLRequest.
+// @Tags         saml
+// @Param        tenant  query  string  true  "Tenant ID"
+// @Success      302  "Redirect to IdP"
+// @Failure      400  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /saml/login [get]
 func (h *SAMLHandler) InitiateLogin(c echo.Context) error {
 	tenantID := c.QueryParam("tenant")
 	if tenantID == "" {
@@ -60,6 +77,14 @@ func (h *SAMLHandler) InitiateLogin(c echo.Context) error {
 }
 
 // HandleACS handles POST /saml/acs — Assertion Consumer Service.
+//
+// @Summary      SAML Assertion Consumer Service (disabled)
+// @Description  Receives IdP SAMLResponse. Currently returns 501 — disabled until IdP XML signature verification is implemented.
+// @Tags         saml
+// @Accept       application/x-www-form-urlencoded
+// @Produce      json
+// @Success      501  {object}  map[string]string  "Not yet implemented"
+// @Router       /saml/acs [post]
 //
 // SECURITY GATE: This endpoint is intentionally disabled until IdP XML signature
 // verification is implemented via crewjam/saml or an equivalent library.
@@ -134,6 +159,16 @@ func (h *SAMLHandler) handleACSImpl(c echo.Context) error {
 }
 
 // GetSAMLConfig handles GET /api/v1/admin/saml-config (tenant-scoped, admin:access required).
+//
+// @Summary      Get tenant SAML configuration
+// @Description  Returns the SAML IdP configuration for the requesting tenant. Requires admin:access.
+// @Tags         saml
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  saml.SAMLConfig
+// @Failure      401  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/saml-config [get]
 func (h *SAMLHandler) GetSAMLConfig(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -147,6 +182,18 @@ func (h *SAMLHandler) GetSAMLConfig(c echo.Context) error {
 }
 
 // UpsertSAMLConfig handles PUT /api/v1/admin/saml-config (tenant-scoped, admin:access required).
+//
+// @Summary      Create or update tenant SAML configuration
+// @Description  Upserts the SAML IdP configuration for the requesting tenant. Requires admin:access.
+// @Tags         saml
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      saml.SAMLConfig  true  "SAML config"
+// @Success      200   {object}  saml.SAMLConfig
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string
+// @Router       /api/v1/admin/saml-config [put]
 func (h *SAMLHandler) UpsertSAMLConfig(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {

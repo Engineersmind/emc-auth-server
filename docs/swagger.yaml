@@ -170,6 +170,23 @@ definitions:
       total_pages:
         type: integer
     type: object
+  audit.StatsResult:
+    properties:
+      active_users_week:
+        type: integer
+      failed_logins_today:
+        type: integer
+      logins_today:
+        type: integer
+      logouts_today:
+        type: integer
+      recent_events:
+        items:
+          $ref: '#/definitions/audit.LogEntry'
+        type: array
+      total_audit_events:
+        type: integer
+    type: object
   auth.APIKeyResult:
     properties:
       created_at:
@@ -199,6 +216,80 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  auth.AgentAnalysis:
+    properties:
+      agent_id:
+        type: string
+      agent_name:
+        type: string
+      agent_type:
+        type: string
+      off_hours_count_24h:
+        description: requests outside 08:00–20:00 UTC
+        type: integer
+      rate_limit_hits_24h:
+        description: events with action containing "rate_limit"
+        type: integer
+      request_count_24h:
+        description: total audit events in last 24h
+        type: integer
+      risk_factors:
+        description: human-readable reasons for elevated score
+        items:
+          type: string
+        type: array
+      risk_score:
+        description: 0–100 composite score
+        type: integer
+      unique_ips_24h:
+        description: distinct IP addresses seen
+        type: integer
+    type: object
+  auth.AgentRegistrationResult:
+    properties:
+      agent_type:
+        type: string
+      capabilities:
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      id:
+        type: string
+      key:
+        description: shown once — never stored
+        type: string
+      key_prefix:
+        type: string
+      name:
+        type: string
+    type: object
+  auth.AgentWithStats:
+    properties:
+      agent_type:
+        type: string
+      capabilities:
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      id:
+        type: string
+      key_prefix:
+        type: string
+      last_active:
+        description: most recent audit event timestamp
+        type: string
+      last_used_at:
+        type: string
+      name:
+        type: string
+      request_count:
+        description: total audit events attributed to this agent
+        type: integer
     type: object
   auth.AppRateLimit:
     properties:
@@ -294,6 +385,13 @@ definitions:
   handlers.AssignRoleRequest:
     properties:
       role_id:
+        type: string
+    type: object
+  handlers.AuthenticateAgentRequest:
+    properties:
+      key:
+        type: string
+      tenant_id:
         type: string
     type: object
   handlers.CreateAPIKeyRequest:
@@ -395,6 +493,17 @@ definitions:
       refresh_token:
         type: string
     type: object
+  handlers.RegisterAgentRequest:
+    properties:
+      agent_type:
+        type: string
+      capabilities:
+        items:
+          type: string
+        type: array
+      name:
+        type: string
+    type: object
   handlers.RegisterRequest:
     properties:
       email:
@@ -492,6 +601,23 @@ definitions:
       last_name:
         type: string
     type: object
+  saml.SAMLConfig:
+    properties:
+      certificate:
+        type: string
+      created_at:
+        type: string
+      entity_id:
+        type: string
+      id:
+        type: string
+      sso_url:
+        type: string
+      tenant_id:
+        type: string
+      updated_at:
+        type: string
+    type: object
 host: localhost:8082
 info:
   contact:
@@ -504,6 +630,114 @@ info:
   title: EMC Auth Server
   version: 1.5.0
 paths:
+  /api/v1/admin/agents:
+    get:
+      description: Returns all active agent registrations for the requesting tenant.
+        Requires admin:access.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.AgentWithStats'
+            type: array
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List agent registrations
+      tags:
+      - agent-management
+    post:
+      consumes:
+      - application/json
+      description: Creates an agent registration and returns the raw API key once.
+        Requires admin:access.
+      parameters:
+      - description: Agent details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.RegisterAgentRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.AgentRegistrationResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Register a new agent
+      tags:
+      - agent-management
+  /api/v1/admin/agents/{id}:
+    delete:
+      description: Revokes an agent registration belonging to the requesting tenant.
+        Requires admin:access.
+      parameters:
+      - description: Agent UUID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke an agent registration
+      tags:
+      - agent-management
+  /api/v1/admin/agents/analysis:
+    get:
+      description: Returns risk-scored analysis for all active agents in the tenant.
+        Requires admin:access.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AgentAnalysis'
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get 24h agent risk analysis
+      tags:
+      - agent-management
   /api/v1/admin/api-keys:
     get:
       description: Returns all active API keys for the caller's tenant. The raw key
@@ -1092,6 +1326,114 @@ paths:
       summary: Update role permissions
       tags:
       - admin-rbac
+  /api/v1/admin/saml-config:
+    get:
+      description: Returns the SAML IdP configuration for the requesting tenant. Requires
+        admin:access.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/saml.SAMLConfig'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get tenant SAML configuration
+      tags:
+      - saml
+    put:
+      consumes:
+      - application/json
+      description: Upserts the SAML IdP configuration for the requesting tenant. Requires
+        admin:access.
+      parameters:
+      - description: SAML config
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/saml.SAMLConfig'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/saml.SAMLConfig'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create or update tenant SAML configuration
+      tags:
+      - saml
+  /api/v1/admin/stats:
+    get:
+      description: Returns audit-log-based activity counts scoped to the caller's
+        tenant. Requires admin:access.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.StatsResult'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Tenant activity stats
+      tags:
+      - admin-audit
+  /api/v1/admin/stats/system:
+    get:
+      description: Returns audit-log-based activity counts across all tenants. Requires
+        tenant:manage permission.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.StatsResult'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: System-wide activity stats
+      tags:
+      - admin-audit
   /api/v1/admin/tenants:
     get:
       description: Returns a paginated, filtered list of tenants. Requires tenant:manage
@@ -1369,6 +1711,381 @@ paths:
       summary: Update tenant CORS origins
       tags:
       - admin-tenants
+  /api/v1/admin/tenants/{tid}/permissions:
+    get:
+      description: Returns all permissions belonging to the specified tenant. Requires
+        tenant:manage permission.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.PermissionResult'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List permissions for a target tenant
+      tags:
+      - admin-cross-tenant
+    post:
+      consumes:
+      - application/json
+      description: Adds a new permission to the specified tenant. Requires tenant:manage
+        permission.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Permission details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreatePermissionRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.PermissionResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Permission name already exists
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create permission in a target tenant
+      tags:
+      - admin-cross-tenant
+  /api/v1/admin/tenants/{tid}/permissions/{pid}:
+    delete:
+      description: Removes a permission from the specified tenant. Requires tenant:manage
+        permission.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Permission ID
+        in: path
+        name: pid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete permission from a target tenant
+      tags:
+      - admin-cross-tenant
+  /api/v1/admin/tenants/{tid}/roles:
+    get:
+      description: Returns all roles (with permissions) belonging to the specified
+        tenant. Requires tenant:manage permission.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.RoleResult'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List roles for a target tenant
+      tags:
+      - admin-cross-tenant
+    post:
+      consumes:
+      - application/json
+      description: Creates a role and optionally assigns permissions to it. Requires
+        tenant:manage permission.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Role details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateRoleRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.RoleResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Role name already exists
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create role in a target tenant
+      tags:
+      - admin-cross-tenant
+  /api/v1/admin/tenants/{tid}/roles/{rid}:
+    delete:
+      description: Permanently deletes a role from the target tenant. Requires tenant:manage.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Role ID
+        in: path
+        name: rid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete a role from a target tenant
+      tags:
+      - admin-cross-tenant
+  /api/v1/admin/tenants/{tid}/roles/{rid}/permissions:
+    put:
+      consumes:
+      - application/json
+      description: Replaces the full permission set on a role in the target tenant.
+        Requires tenant:manage.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Role ID
+        in: path
+        name: rid
+        required: true
+        type: string
+      - description: Permission IDs
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateRolePermissionsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Replace permissions on a target-tenant role
+      tags:
+      - admin-cross-tenant
+  /api/v1/admin/tenants/{tid}/users:
+    get:
+      description: Returns paginated users for the specified tenant. Requires tenant:manage.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Page number (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Items per page (default 20)
+        in: query
+        name: limit
+        type: integer
+      - description: Search by email or name
+        in: query
+        name: search
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.UserResult'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List users in a target tenant
+      tags:
+      - admin-cross-tenant
+    post:
+      consumes:
+      - application/json
+      description: Creates a new user in the specified tenant. Requires tenant:manage.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: User details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateUserAdminRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.UserResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Email already registered
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create a user in a target tenant
+      tags:
+      - admin-cross-tenant
+  /api/v1/admin/tenants/{tid}/users/{uid}:
+    delete:
+      description: Marks the user as deleted (is_deleted=true). Requires tenant:manage.
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: User ID
+        in: path
+        name: uid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Soft-delete a user from a target tenant
+      tags:
+      - admin-cross-tenant
   /api/v1/admin/tenants/check-slug:
     get:
       description: Returns whether a tenant slug is available. Always responds 200.
@@ -1652,6 +2369,42 @@ paths:
       summary: Assign role to user
       tags:
       - admin-users
+  /api/v1/agents/authenticate:
+    post:
+      consumes:
+      - application/json
+      description: Validates an agent API key and returns a signed short-lived JWT.
+        Public — no prior auth required.
+      parameters:
+      - description: Agent key and tenant ID
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AuthenticateAgentRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Authenticate an agent and issue a JWT
+      tags:
+      - agent-auth
   /api/v1/auth/forgot-password:
     post:
       consumes:
@@ -1782,6 +2535,39 @@ paths:
       summary: Logout
       tags:
       - AUTH
+  /api/v1/auth/management-token:
+    post:
+      description: 'Authenticates an API key (X-API-Key or Authorization: ApiKey)
+        and returns a short-lived management JWT valid for 15 minutes. Use the returned
+        token as Bearer auth on admin endpoints.'
+      parameters:
+      - description: 'API key (emck_…). Alternative: Authorization: ApiKey <key>'
+        in: header
+        name: X-API-Key
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: access_token, expires_in, token_type
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "501":
+          description: Management tokens not configured
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Exchange API key for management JWT
+      tags:
+      - AUTH
   /api/v1/auth/me:
     get:
       description: Returns the authenticated user's profile decoded from the JWT.
@@ -1801,6 +2587,36 @@ paths:
       security:
       - BearerAuth: []
       summary: Get current user profile
+      tags:
+      - AUTH
+  /api/v1/auth/my-activity:
+    get:
+      description: Returns the authenticated user's own recent audit log entries.
+      parameters:
+      - description: Page number (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Rows per page (default 20, max 100)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.LogsPage'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: My activity log
       tags:
       - AUTH
   /api/v1/auth/otp:
@@ -2124,6 +2940,83 @@ paths:
       summary: Health check
       tags:
       - system
+  /saml/acs:
+    post:
+      consumes:
+      - application/x-www-form-urlencoded
+      description: Receives IdP SAMLResponse. Currently returns 501 — disabled until
+        IdP XML signature verification is implemented.
+      produces:
+      - application/json
+      responses:
+        "501":
+          description: Not yet implemented
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: SAML Assertion Consumer Service (disabled)
+      tags:
+      - saml
+  /saml/login:
+    get:
+      description: Redirects the browser to the configured IdP with a signed SAMLRequest.
+      parameters:
+      - description: Tenant ID
+        in: query
+        name: tenant
+        required: true
+        type: string
+      responses:
+        "302":
+          description: Redirect to IdP
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Initiate SP-initiated SAML SSO
+      tags:
+      - saml
+  /saml/metadata:
+    get:
+      description: Returns SAML Service Provider metadata XML for the given tenant.
+        Used by IdPs to configure the SP.
+      parameters:
+      - description: Tenant ID
+        in: query
+        name: tenant
+        required: true
+        type: string
+      produces:
+      - application/xml
+      responses:
+        "200":
+          description: SP metadata XML
+          schema:
+            type: string
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get SP metadata XML
+      tags:
+      - saml
 securityDefinitions:
   BearerAuth:
     description: 'Enter: Bearer <your_access_token>'

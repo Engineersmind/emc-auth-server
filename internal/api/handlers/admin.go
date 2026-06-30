@@ -982,7 +982,16 @@ func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 // Monitoring stats endpoints
 // ---------------------------------------------------------------------------
 
-// GetStats handles GET /api/v1/admin/stats — tenant-scoped summary for admins.
+// GetStats handles GET /api/v1/admin/stats.
+//
+// @Summary      Tenant activity stats
+// @Description  Returns audit-log-based activity counts scoped to the caller's tenant. Requires admin:access.
+// @Tags         admin-audit
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  audit.StatsResult
+// @Failure      401  {object}  map[string]string
+// @Router       /api/v1/admin/stats [get]
 func (h *AdminHandler) GetStats(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1000,7 +1009,16 @@ func (h *AdminHandler) GetStats(c echo.Context) error {
 	return c.JSON(http.StatusOK, result)
 }
 
-// GetSystemStats handles GET /api/v1/admin/stats/system — system-wide, super_admin only.
+// GetSystemStats handles GET /api/v1/admin/stats/system.
+//
+// @Summary      System-wide activity stats
+// @Description  Returns audit-log-based activity counts across all tenants. Requires tenant:manage permission.
+// @Tags         admin-audit
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  audit.StatsResult
+// @Failure      403  {object}  map[string]string
+// @Router       /api/v1/admin/stats/system [get]
 func (h *AdminHandler) GetSystemStats(c echo.Context) error {
 	result, err := h.audit.Stats(c.Request().Context(), nil)
 	if err != nil {
@@ -1371,6 +1389,16 @@ func targetTenantID(c echo.Context) (int64, error) {
 // --- Permissions under a tenant ---
 
 // TenantListPermissions handles GET /api/v1/admin/tenants/:tid/permissions.
+//
+// @Summary      List permissions for a target tenant
+// @Description  Returns all permissions belonging to the specified tenant. Requires tenant:manage permission.
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid  path      string  true  "Target tenant ID"
+// @Success      200  {array}   admin.PermissionResult
+// @Failure      400  {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{tid}/permissions [get]
 func (h *AdminHandler) TenantListPermissions(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1385,6 +1413,19 @@ func (h *AdminHandler) TenantListPermissions(c echo.Context) error {
 }
 
 // TenantCreatePermission handles POST /api/v1/admin/tenants/:tid/permissions.
+//
+// @Summary      Create permission in a target tenant
+// @Description  Adds a new permission to the specified tenant. Requires tenant:manage permission.
+// @Tags         admin-cross-tenant
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid   path      string                   true  "Target tenant ID"
+// @Param        body  body      CreatePermissionRequest  true  "Permission details"
+// @Success      201   {object}  admin.PermissionResult
+// @Failure      400   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "Permission name already exists"
+// @Router       /api/v1/admin/tenants/{tid}/permissions [post]
 func (h *AdminHandler) TenantCreatePermission(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1411,6 +1452,17 @@ func (h *AdminHandler) TenantCreatePermission(c echo.Context) error {
 }
 
 // TenantDeletePermission handles DELETE /api/v1/admin/tenants/:tid/permissions/:pid.
+//
+// @Summary      Delete permission from a target tenant
+// @Description  Removes a permission from the specified tenant. Requires tenant:manage permission.
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid  path      string  true  "Target tenant ID"
+// @Param        pid  path      string  true  "Permission ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{tid}/permissions/{pid} [delete]
 func (h *AdminHandler) TenantDeletePermission(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1435,6 +1487,16 @@ func (h *AdminHandler) TenantDeletePermission(c echo.Context) error {
 // --- Roles under a tenant ---
 
 // TenantListRoles handles GET /api/v1/admin/tenants/:tid/roles.
+//
+// @Summary      List roles for a target tenant
+// @Description  Returns all roles (with permissions) belonging to the specified tenant. Requires tenant:manage permission.
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid  path      string  true  "Target tenant ID"
+// @Success      200  {array}   admin.RoleResult
+// @Failure      400  {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{tid}/roles [get]
 func (h *AdminHandler) TenantListRoles(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1449,6 +1511,19 @@ func (h *AdminHandler) TenantListRoles(c echo.Context) error {
 }
 
 // TenantCreateRole handles POST /api/v1/admin/tenants/:tid/roles.
+//
+// @Summary      Create role in a target tenant
+// @Description  Creates a role and optionally assigns permissions to it. Requires tenant:manage permission.
+// @Tags         admin-cross-tenant
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid   path      string             true  "Target tenant ID"
+// @Param        body  body      CreateRoleRequest  true  "Role details"
+// @Success      201   {object}  admin.RoleResult
+// @Failure      400   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "Role name already exists"
+// @Router       /api/v1/admin/tenants/{tid}/roles [post]
 func (h *AdminHandler) TenantCreateRole(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1476,6 +1551,20 @@ func (h *AdminHandler) TenantCreateRole(c echo.Context) error {
 }
 
 // TenantUpdateRolePermissions handles PUT /api/v1/admin/tenants/:tid/roles/:rid/permissions.
+//
+// @Summary      Replace permissions on a target-tenant role
+// @Description  Replaces the full permission set on a role in the target tenant. Requires tenant:manage.
+// @Tags         admin-cross-tenant
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid   path      string                        true  "Target tenant ID"
+// @Param        rid   path      string                        true  "Role ID"
+// @Param        body  body      UpdateRolePermissionsRequest  true  "Permission IDs"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      404   {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{tid}/roles/{rid}/permissions [put]
 func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1506,6 +1595,17 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 }
 
 // TenantDeleteRole handles DELETE /api/v1/admin/tenants/:tid/roles/:rid.
+//
+// @Summary      Delete a role from a target tenant
+// @Description  Permanently deletes a role from the target tenant. Requires tenant:manage.
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid  path      string  true  "Target tenant ID"
+// @Param        rid  path      string  true  "Role ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{tid}/roles/{rid} [delete]
 func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1530,6 +1630,19 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 // --- Users under a tenant ---
 
 // TenantListUsers handles GET /api/v1/admin/tenants/:tid/users.
+//
+// @Summary      List users in a target tenant
+// @Description  Returns paginated users for the specified tenant. Requires tenant:manage.
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid     path      string  true   "Target tenant ID"
+// @Param        page    query     int     false  "Page number (default 1)"
+// @Param        limit   query     int     false  "Items per page (default 20)"
+// @Param        search  query     string  false  "Search by email or name"
+// @Success      200     {array}   admin.UserResult
+// @Failure      400     {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{tid}/users [get]
 func (h *AdminHandler) TenantListUsers(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1547,6 +1660,19 @@ func (h *AdminHandler) TenantListUsers(c echo.Context) error {
 }
 
 // TenantCreateUser handles POST /api/v1/admin/tenants/:tid/users.
+//
+// @Summary      Create a user in a target tenant
+// @Description  Creates a new user in the specified tenant. Requires tenant:manage.
+// @Tags         admin-cross-tenant
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid   path      string                true  "Target tenant ID"
+// @Param        body  body      CreateUserAdminRequest  true  "User details"
+// @Success      201   {object}  admin.UserResult
+// @Failure      400   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "Email already registered"
+// @Router       /api/v1/admin/tenants/{tid}/users [post]
 func (h *AdminHandler) TenantCreateUser(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1584,6 +1710,17 @@ func (h *AdminHandler) TenantCreateUser(c echo.Context) error {
 }
 
 // TenantDeleteUser handles DELETE /api/v1/admin/tenants/:tid/users/:uid.
+//
+// @Summary      Soft-delete a user from a target tenant
+// @Description  Marks the user as deleted (is_deleted=true). Requires tenant:manage.
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid  path      string  true  "Target tenant ID"
+// @Param        uid  path      string  true  "User ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{tid}/users/{uid} [delete]
 func (h *AdminHandler) TenantDeleteUser(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {

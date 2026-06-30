@@ -37,7 +37,17 @@ type AuthenticateAgentRequest struct {
 }
 
 // RegisterAgent handles POST /api/v1/admin/agents.
-// Requires admin:access permission. Creates an agent registration and returns the raw key once.
+//
+// @Summary      Register a new agent
+// @Description  Creates an agent registration and returns the raw API key once. Requires admin:access.
+// @Tags         agent-management
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      RegisterAgentRequest  true  "Agent details"
+// @Success      201   {object}  auth.AgentRegistrationResult
+// @Failure      400   {object}  map[string]string
+// @Router       /api/v1/admin/agents [post]
 func (h *AgentHandler) RegisterAgent(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -70,7 +80,15 @@ func (h *AgentHandler) RegisterAgent(c echo.Context) error {
 }
 
 // ListAgents handles GET /api/v1/admin/agents.
-// Returns all active agent registrations for the requesting tenant.
+//
+// @Summary      List agent registrations
+// @Description  Returns all active agent registrations for the requesting tenant. Requires admin:access.
+// @Tags         agent-management
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {array}   auth.AgentWithStats
+// @Failure      500  {object}  map[string]string
+// @Router       /api/v1/admin/agents [get]
 func (h *AgentHandler) ListAgents(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -92,7 +110,17 @@ func (h *AgentHandler) ListAgents(c echo.Context) error {
 }
 
 // RevokeAgent handles DELETE /api/v1/admin/agents/:id.
-// Revokes an agent registration belonging to the requesting tenant.
+//
+// @Summary      Revoke an agent registration
+// @Description  Revokes an agent registration belonging to the requesting tenant. Requires admin:access.
+// @Tags         agent-management
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id  path  string  true  "Agent UUID"
+// @Success      204  "No Content"
+// @Failure      400  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/agents/{id} [delete]
 func (h *AgentHandler) RevokeAgent(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -118,7 +146,15 @@ func (h *AgentHandler) RevokeAgent(c echo.Context) error {
 }
 
 // GetAgentAnalysis handles GET /api/v1/admin/agents/analysis.
-// Returns 24h risk-scored analysis for all active agents in the tenant (08-04).
+//
+// @Summary      Get 24h agent risk analysis
+// @Description  Returns risk-scored analysis for all active agents in the tenant. Requires admin:access.
+// @Tags         agent-management
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  auth.AgentAnalysis
+// @Failure      500  {object}  map[string]string
+// @Router       /api/v1/admin/agents/analysis [get]
 func (h *AgentHandler) GetAgentAnalysis(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -140,7 +176,17 @@ func (h *AgentHandler) GetAgentAnalysis(c echo.Context) error {
 }
 
 // AuthenticateAgent handles POST /api/v1/agents/authenticate.
-// Validates an agent key and returns a signed JWT. Public endpoint — no prior auth required.
+//
+// @Summary      Authenticate an agent and issue a JWT
+// @Description  Validates an agent API key and returns a signed short-lived JWT. Public — no prior auth required.
+// @Tags         agent-auth
+// @Accept       json
+// @Produce      json
+// @Param        body  body      AuthenticateAgentRequest  true  "Agent key and tenant ID"
+// @Success      200   {object}  map[string]interface{}
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string
+// @Router       /api/v1/agents/authenticate [post]
 func (h *AgentHandler) AuthenticateAgent(c echo.Context) error {
 	var req AuthenticateAgentRequest
 	if err := c.Bind(&req); err != nil {

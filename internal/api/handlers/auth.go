@@ -71,7 +71,17 @@ func clientIDFromCtx(c echo.Context) string {
 }
 
 // MyActivity handles GET /api/v1/auth/my-activity.
-// Returns the current user's own audit log entries (any logged-in user).
+//
+// @Summary      My activity log
+// @Description  Returns the authenticated user's own recent audit log entries.
+// @Tags         AUTH
+// @Produce      json
+// @Security     BearerAuth
+// @Param        page   query     int  false  "Page number (default 1)"
+// @Param        limit  query     int  false  "Rows per page (default 20, max 100)"
+// @Success      200    {object}  audit.LogsPage
+// @Failure      401    {object}  map[string]string
+// @Router       /api/v1/auth/my-activity [get]
 func (h *AuthHandler) MyActivity(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -771,13 +781,17 @@ func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 // The JWT carries the API key's permissions so it can call /admin/* endpoints
 // for the key's tenant — equivalent to Auth0's client_credentials grant.
 //
-// Usage:
+// ManagementToken handles POST /api/v1/auth/management-token.
 //
-//	POST /api/v1/auth/management-token
-//	X-API-Key: emck_<key>
-//	→ { "access_token": "<jwt>", "expires_in": 900, "token_type": "Bearer" }
-//
-// Then use the returned token as: Authorization: Bearer <jwt>
+// @Summary      Exchange API key for management JWT
+// @Description  Authenticates an API key (X-API-Key or Authorization: ApiKey) and returns a short-lived management JWT valid for 15 minutes. Use the returned token as Bearer auth on admin endpoints.
+// @Tags         AUTH
+// @Produce      json
+// @Param        X-API-Key  header    string  false  "API key (emck_…). Alternative: Authorization: ApiKey <key>"
+// @Success      200        {object}  map[string]interface{}  "access_token, expires_in, token_type"
+// @Failure      401        {object}  map[string]string
+// @Failure      501        {object}  map[string]string  "Management tokens not configured"
+// @Router       /api/v1/auth/management-token [post]
 func (h *AuthHandler) ManagementToken(c echo.Context) error {
 	if h.apiKeySvc == nil || h.jwtSvc == nil {
 		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "management tokens not configured"})
