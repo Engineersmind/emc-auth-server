@@ -63,15 +63,34 @@ func tenantIDFromClaims(claims *auth.Claims) (int64, error) {
 // Tenant management (requires "tenant:manage" permission)
 // ---------------------------------------------------------------------------
 
+// validPlans is the allowed set of plan values.
+var validPlans = map[string]bool{"free": true, "pro": true, "enterprise": true}
+
 // CreateTenantRequest is the body for POST /api/v1/admin/tenants.
 type CreateTenantRequest struct {
-	Name string `json:"name"`
-	Slug string `json:"slug"`
+	Name        string `json:"name"`
+	Slug        string `json:"slug"`
+	DisplayName string `json:"display_name"`
+	Domain      string `json:"domain"`
+	Region      string `json:"region"`
+	Description string `json:"description"`
+	Plan        string `json:"plan"`
 }
 
 // UpdateTenantRequest is the body for PUT /api/v1/admin/tenants/:id.
 type UpdateTenantRequest struct {
-	Name string `json:"name"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Domain      string `json:"domain"`
+	Region      string `json:"region"`
+	Description string `json:"description"`
+	Plan        string `json:"plan"`
+}
+
+// SlugCheckResponse is returned by GET /api/v1/admin/tenants/check-slug.
+type SlugCheckResponse struct {
+	Slug      string `json:"slug"`
+	Available bool   `json:"available"`
 }
 
 // CreateTenant handles POST /api/v1/admin/tenants.
@@ -82,7 +101,7 @@ type UpdateTenantRequest struct {
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      CreateTenantRequest         true  "Tenant details"
+// @Param        body  body      CreateTenantRequest  true  "Tenant details"
 // @Success      201   {object}  admin.TenantResult
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
@@ -96,9 +115,20 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 	if req.Name == "" || req.Slug == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name and slug are required"})
 	}
+	if req.Plan != "" && !validPlans[req.Plan] {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "plan must be one of: free, pro, enterprise"})
+	}
 
 	claims, _ := claimsFromCtx(c)
-	result, err := h.svc.CreateTenant(c.Request().Context(), req.Name, req.Slug)
+	result, err := h.svc.CreateTenant(c.Request().Context(), admin.CreateTenantInput{
+		Name:        req.Name,
+		Slug:        req.Slug,
+		DisplayName: req.DisplayName,
+		Domain:      req.Domain,
+		Region:      req.Region,
+		Description: req.Description,
+		Plan:        req.Plan,
+	})
 	if err != nil {
 		if errors.Is(err, admin.ErrAlreadyExists) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "slug already taken"})
@@ -113,26 +143,70 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 // ListTenants handles GET /api/v1/admin/tenants.
 //
 // @Summary      List tenants
-// @Description  Returns all tenants. Requires tenant:manage permission.
+// @Description  Returns a paginated, filtered list of tenants. Requires tenant:manage permission.
 // @Tags         admin-tenants
 // @Produce      json
 // @Security     BearerAuth
-// @Success      200  {array}   admin.TenantResult
-// @Failure      403  {object}  map[string]string
+// @Param        search  query     string  false  "Search by name, display name, or domain"
+// @Param        status  query     string  false  "Filter by status: active or inactive"
+// @Param        region  query     string  false  "Filter by region (exact match)"
+// @Param        page    query     int     false  "Page number (default 1)"
+// @Param        limit   query     int     false  "Rows per page (default 25, max 100)"
+// @Success      200     {object}  admin.TenantsPage
+// @Failure      403     {object}  map[string]string
 // @Router       /api/v1/admin/tenants [get]
 func (h *AdminHandler) ListTenants(c echo.Context) error {
-	tenants, err := h.svc.ListTenants(c.Request().Context())
+	page, _ := strconv.Atoi(c.QueryParam("page"))
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+
+	filter := admin.TenantFilter{
+		Search: c.QueryParam("search"),
+		Status: c.QueryParam("status"),
+		Region: c.QueryParam("region"),
+		Page:   page,
+		Limit:  limit,
+	}
+
+	result, err := h.svc.ListTenantsPaginated(c.Request().Context(), filter)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: list tenants failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list tenants"})
 	}
-	return c.JSON(http.StatusOK, tenants)
+	return c.JSON(http.StatusOK, result)
+}
+
+// GetTenant handles GET /api/v1/admin/tenants/:id.
+//
+// @Summary      Get tenant
+// @Description  Returns a single tenant by ID. Requires tenant:manage permission.
+// @Tags         admin-tenants
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "Tenant ID"
+// @Success      200  {object}  admin.TenantResult
+// @Failure      400  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/admin/tenants/{id} [get]
+func (h *AdminHandler) GetTenant(c echo.Context) error {
+	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	result, err := h.svc.GetTenantByID(c.Request().Context(), tenantID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: get tenant failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get tenant"})
+	}
+	return c.JSON(http.StatusOK, result)
 }
 
 // UpdateTenant handles PUT /api/v1/admin/tenants/:id.
 //
 // @Summary      Update tenant
-// @Description  Updates the tenant's display name. Requires tenant:manage permission.
+// @Description  Updates editable fields on a tenant. Requires tenant:manage permission.
 // @Tags         admin-tenants
 // @Accept       json
 // @Produce      json
@@ -149,10 +223,24 @@ func (h *AdminHandler) UpdateTenant(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
 	var req UpdateTenantRequest
-	if err := c.Bind(&req); err != nil || req.Name == "" {
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Name == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
-	result, err := h.svc.UpdateTenant(c.Request().Context(), tenantID, req.Name)
+	if req.Plan != "" && !validPlans[req.Plan] {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "plan must be one of: free, pro, enterprise"})
+	}
+
+	result, err := h.svc.UpdateTenant(c.Request().Context(), tenantID, admin.UpdateTenantInput{
+		Name:        req.Name,
+		DisplayName: req.DisplayName,
+		Domain:      req.Domain,
+		Region:      req.Region,
+		Description: req.Description,
+		Plan:        req.Plan,
+	})
 	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
@@ -162,6 +250,83 @@ func (h *AdminHandler) UpdateTenant(c echo.Context) error {
 	}
 	claims, _ := claimsFromCtx(c)
 	h.auditAdmin(c, claims, audit.ActionAdminTenantUpdated, "tenant", strconv.FormatInt(tenantID, 10))
+	return c.JSON(http.StatusOK, result)
+}
+
+// ActivateTenant handles PUT /api/v1/admin/tenants/:id/activate.
+//
+// @Summary      Activate tenant
+// @Description  Sets is_active=true for a previously deactivated tenant. Requires tenant:manage permission.
+// @Tags         admin-tenants
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "Tenant ID"
+// @Success      200  {object}  admin.TenantResult
+// @Failure      400  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Failure      409  {object}  map[string]string  "Tenant already active"
+// @Router       /api/v1/admin/tenants/{id}/activate [put]
+func (h *AdminHandler) ActivateTenant(c echo.Context) error {
+	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	result, err := h.svc.ActivateTenant(c.Request().Context(), tenantID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
+		}
+		if errors.Is(err, admin.ErrAlreadyActive) {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "tenant already active"})
+		}
+		h.logger.Error().Err(err).Msg("admin: activate tenant failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to activate tenant"})
+	}
+	claims, _ := claimsFromCtx(c)
+	h.auditAdmin(c, claims, audit.ActionAdminTenantUpdated, "tenant", strconv.FormatInt(tenantID, 10))
+	return c.JSON(http.StatusOK, result)
+}
+
+// CheckSlug handles GET /api/v1/admin/tenants/check-slug.
+//
+// @Summary      Check slug availability
+// @Description  Returns whether a tenant slug is available. Always responds 200. Requires tenant:manage permission.
+// @Tags         admin-tenants
+// @Produce      json
+// @Security     BearerAuth
+// @Param        slug  query     string  true  "Slug to check"
+// @Success      200   {object}  SlugCheckResponse
+// @Failure      400   {object}  map[string]string
+// @Router       /api/v1/admin/tenants/check-slug [get]
+func (h *AdminHandler) CheckSlug(c echo.Context) error {
+	slug := c.QueryParam("slug")
+	if slug == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "slug is required"})
+	}
+	available, err := h.svc.CheckSlugAvailable(c.Request().Context(), slug)
+	if err != nil {
+		h.logger.Error().Err(err).Str("slug", slug).Msg("admin: check slug failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to check slug"})
+	}
+	return c.JSON(http.StatusOK, SlugCheckResponse{Slug: slug, Available: available})
+}
+
+// GetTenantDashboardStats handles GET /api/v1/admin/stats/tenants.
+//
+// @Summary      Tenant dashboard stats
+// @Description  Returns system-wide tenant, application, and user counts with month-over-month deltas. Requires tenant:manage permission.
+// @Tags         admin-tenants
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  admin.TenantDashboardStats
+// @Failure      403  {object}  map[string]string
+// @Router       /api/v1/admin/stats/tenants [get]
+func (h *AdminHandler) GetTenantDashboardStats(c echo.Context) error {
+	result, err := h.svc.GetTenantDashboardStats(c.Request().Context())
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: tenant dashboard stats failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to retrieve dashboard stats"})
+	}
 	return c.JSON(http.StatusOK, result)
 }
 

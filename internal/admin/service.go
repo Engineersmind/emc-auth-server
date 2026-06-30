@@ -26,6 +26,8 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrAlreadyExists is returned when a unique constraint would be violated.
 	ErrAlreadyExists = errors.New("already exists")
+	// ErrAlreadyActive is returned when ActivateTenant is called on an already-active tenant.
+	ErrAlreadyActive = errors.New("tenant already active")
 )
 
 // ---------------------------------------------------------------------------
@@ -34,11 +36,74 @@ var (
 
 // TenantResult is the public representation of a tenant (jwt_secret is never exposed).
 type TenantResult struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Slug      string    `json:"slug"`
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Slug        string   `json:"slug"`
+	DisplayName *string  `json:"display_name"`
+	Domain      *string  `json:"domain"`
+	Region      *string  `json:"region"`
+	Description *string  `json:"description"`
+	Plan        string   `json:"plan"`
+	IsActive    bool     `json:"is_active"`
+	CORSOrigins []string `json:"cors_origins"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// TenantFilter holds optional filter and pagination params for ListTenantsPaginated.
+type TenantFilter struct {
+	Search string // ILIKE match on name, display_name, domain; empty = no filter
+	Status string // "active", "inactive", or "" for all
+	Region string // exact match on region column; empty = no filter
+	Page   int    // 1-based; defaults to 1
+	Limit  int    // rows per page; defaults to 25, max 100
+}
+
+// TenantsPage wraps a paginated tenant list.
+type TenantsPage struct {
+	Tenants    []TenantResult `json:"tenants"`
+	Total      int            `json:"total"`
+	Page       int            `json:"page"`
+	TotalPages int            `json:"total_pages"`
+	Limit      int            `json:"limit"`
+}
+
+// TenantDashboardDelta holds month-over-month percentage changes.
+type TenantDashboardDelta struct {
+	TotalTenantsPct      float64 `json:"total_tenants_pct"`
+	ActiveTenantsPct     float64 `json:"active_tenants_pct"`
+	TotalApplicationsPct float64 `json:"total_applications_pct"`
+	TotalUsersPct        float64 `json:"total_users_pct"`
+}
+
+// TenantDashboardStats is the system-wide aggregate returned by GetTenantDashboardStats.
+type TenantDashboardStats struct {
+	TotalTenants      int                  `json:"total_tenants"`
+	ActiveTenants     int                  `json:"active_tenants"`
+	TotalApplications int                  `json:"total_applications"`
+	TotalUsers        int                  `json:"total_users"`
+	Delta             TenantDashboardDelta `json:"delta"`
+}
+
+// CreateTenantInput carries all fields accepted by CreateTenant.
+type CreateTenantInput struct {
+	Name        string
+	Slug        string
+	DisplayName string
+	Domain      string
+	Region      string
+	Description string
+	Plan        string // defaults to "free" when empty
+}
+
+// UpdateTenantInput carries all fields accepted by UpdateTenant.
+type UpdateTenantInput struct {
+	Name        string
+	DisplayName string
+	Domain      string
+	Region      string
+	Description string
+	Plan        string
 }
 
 // PermissionResult is the public representation of a tenant-scoped permission.
@@ -102,37 +167,75 @@ func New(pool *pgxpool.Pool, resetSvc *auth.ResetService, logger zerolog.Logger)
 // ---------------------------------------------------------------------------
 
 // CreateTenant creates a new tenant with a freshly generated JWT secret.
-func (s *Service) CreateTenant(ctx context.Context, name, slug string) (*TenantResult, error) {
+func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*TenantResult, error) {
 	secret, err := generateSecret()
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
 	}
 
+	plan := in.Plan
+	if plan == "" {
+		plan = "free"
+	}
+
 	var id int64
-	var t TenantResult
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO tenants (name, slug, jwt_secret, is_active)
-		VALUES ($1, $2, $3, true)
-		RETURNING id, name, slug, is_active, created_at
-	`, name, slug, secret).Scan(&id, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt)
+		INSERT INTO tenants (name, slug, jwt_secret, display_name, domain, region, description, plan, is_active)
+		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8, true)
+		RETURNING id
+	`, in.Name, in.Slug, secret,
+		in.DisplayName, in.Domain, in.Region, in.Description, plan,
+	).Scan(&id)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
 		}
 		return nil, fmt.Errorf("create tenant: %w", err)
 	}
-	t.ID = strconv.FormatInt(id, 10)
-	s.logger.Info().Str("slug", slug).Str("id", t.ID).Msg("admin: tenant created")
-	return &t, nil
+
+	s.logger.Info().Str("slug", in.Slug).Str("id", strconv.FormatInt(id, 10)).Msg("admin: tenant created")
+	return s.getTenantByID(ctx, id)
 }
 
-// ListTenants returns all tenants (active and inactive).
-func (s *Service) ListTenants(ctx context.Context) ([]TenantResult, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, slug, is_active, created_at
+// ListTenantsPaginated returns a filtered, paginated list of tenants.
+func (s *Service) ListTenantsPaginated(ctx context.Context, f TenantFilter) (*TenantsPage, error) {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.Limit < 1 {
+		f.Limit = 25
+	}
+	if f.Limit > 100 {
+		f.Limit = 100
+	}
+
+	// Build the search pattern. When f.Search is empty the pattern is "%%",
+	// which matches the literal sentinel used in the SQL guard below.
+	searchPattern := "%" + f.Search + "%"
+
+	var total int
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
 		FROM tenants
+		WHERE ($1 = '%%' OR name ILIKE $1 OR display_name ILIKE $1 OR domain ILIKE $1)
+		  AND ($2 = ''  OR is_active = ($2 = 'active'))
+		  AND ($3 = ''  OR region = $3)
+	`, searchPattern, f.Status, f.Region).Scan(&total)
+	if err != nil {
+		return nil, fmt.Errorf("count tenants: %w", err)
+	}
+
+	offset := (f.Page - 1) * f.Limit
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, name, slug, display_name, domain, region, description, plan,
+		       is_active, cors_origins, created_at, updated_at
+		FROM tenants
+		WHERE ($1 = '%%' OR name ILIKE $1 OR display_name ILIKE $1 OR domain ILIKE $1)
+		  AND ($2 = ''  OR is_active = ($2 = 'active'))
+		  AND ($3 = ''  OR region = $3)
 		ORDER BY created_at DESC
-	`)
+		LIMIT $4 OFFSET $5
+	`, searchPattern, f.Status, f.Region, f.Limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list tenants: %w", err)
 	}
@@ -140,37 +243,168 @@ func (s *Service) ListTenants(ctx context.Context) ([]TenantResult, error) {
 
 	var tenants []TenantResult
 	for rows.Next() {
-		var t TenantResult
-		var id int64
-		if err := rows.Scan(&id, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt); err != nil {
-			return nil, fmt.Errorf("scan tenant: %w", err)
+		t, scanErr := scanTenantRow(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan tenant: %w", scanErr)
 		}
-		t.ID = strconv.FormatInt(id, 10)
 		tenants = append(tenants, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	if tenants == nil {
 		tenants = []TenantResult{}
 	}
-	return tenants, rows.Err()
+
+	totalPages := (total + f.Limit - 1) / f.Limit
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	return &TenantsPage{
+		Tenants:    tenants,
+		Total:      total,
+		Page:       f.Page,
+		TotalPages: totalPages,
+		Limit:      f.Limit,
+	}, nil
 }
 
-// UpdateTenant updates the tenant's display name.
-func (s *Service) UpdateTenant(ctx context.Context, tenantID int64, name string) (*TenantResult, error) {
-	var t TenantResult
-	var id int64
+// GetTenantByID returns a single tenant by its ID.
+func (s *Service) GetTenantByID(ctx context.Context, tenantID int64) (*TenantResult, error) {
+	t, err := s.getTenantByID(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// UpdateTenant replaces the editable fields on a tenant.
+func (s *Service) UpdateTenant(ctx context.Context, tenantID int64, in UpdateTenantInput) (*TenantResult, error) {
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE tenants
+		SET name         = $1,
+		    display_name = NULLIF($2, ''),
+		    domain       = NULLIF($3, ''),
+		    region       = NULLIF($4, ''),
+		    description  = NULLIF($5, ''),
+		    plan         = $6,
+		    updated_at   = NOW()
+		WHERE id = $7
+	`, in.Name, in.DisplayName, in.Domain, in.Region, in.Description, in.Plan, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("update tenant: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return s.getTenantByID(ctx, tenantID)
+}
+
+// ActivateTenant sets is_active = true for a tenant that was previously deactivated.
+func (s *Service) ActivateTenant(ctx context.Context, tenantID int64) (*TenantResult, error) {
+	var isActive bool
 	err := s.pool.QueryRow(ctx, `
-		UPDATE tenants SET name = $1, updated_at = NOW()
-		WHERE id = $2
-		RETURNING id, name, slug, is_active, created_at
-	`, name, tenantID).Scan(&id, &t.Name, &t.Slug, &t.IsActive, &t.CreatedAt)
+		SELECT is_active FROM tenants WHERE id = $1
+	`, tenantID).Scan(&isActive)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
-		return nil, fmt.Errorf("update tenant: %w", err)
+		return nil, fmt.Errorf("activate tenant: lookup: %w", err)
 	}
-	t.ID = strconv.FormatInt(id, 10)
-	return &t, nil
+	if isActive {
+		return nil, ErrAlreadyActive
+	}
+
+	_, err = s.pool.Exec(ctx, `
+		UPDATE tenants SET is_active = true, updated_at = NOW() WHERE id = $1
+	`, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("activate tenant: update: %w", err)
+	}
+
+	s.logger.Info().Str("tenant_id", strconv.FormatInt(tenantID, 10)).Msg("admin: tenant activated")
+	return s.getTenantByID(ctx, tenantID)
+}
+
+// CheckSlugAvailable reports whether a slug is not yet taken.
+func (s *Service) CheckSlugAvailable(ctx context.Context, slug string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM tenants WHERE slug = $1)
+	`, slug).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check slug: %w", err)
+	}
+	return !exists, nil
+}
+
+// GetTenantDashboardStats returns system-wide aggregate counts with month-over-month deltas.
+func (s *Service) GetTenantDashboardStats(ctx context.Context) (*TenantDashboardStats, error) {
+	// Single query: current totals + count of entities created this calendar month
+	// vs the prior calendar month — used to compute MoM growth %.
+	var (
+		totalTenants      int
+		activeTenants     int
+		tenantsThisMonth  int
+		tenantsLastMonth  int
+		totalApps         int
+		appsThisMonth     int
+		appsLastMonth     int
+		totalUsers        int
+		usersThisMonth    int
+		usersLastMonth    int
+	)
+
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+		    (SELECT COUNT(*)                                                                    FROM tenants)                                     AS total_tenants,
+		    (SELECT COUNT(*) FILTER (WHERE is_active = true)                                   FROM tenants)                                     AS active_tenants,
+		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW()))             FROM tenants)               AS tenants_this_month,
+		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')) FROM tenants)      AS tenants_last_month,
+		    (SELECT COUNT(*)                                                                    FROM oauth_clients WHERE deleted_at IS NULL)      AS total_apps,
+		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW()))             FROM oauth_clients WHERE deleted_at IS NULL) AS apps_this_month,
+		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')) FROM oauth_clients WHERE deleted_at IS NULL) AS apps_last_month,
+		    (SELECT COUNT(*)                                                                    FROM users WHERE deleted_at IS NULL)              AS total_users,
+		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW()))             FROM users WHERE deleted_at IS NULL) AS users_this_month,
+		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')) FROM users WHERE deleted_at IS NULL) AS users_last_month
+	`).Scan(
+		&totalTenants, &activeTenants, &tenantsThisMonth, &tenantsLastMonth,
+		&totalApps, &appsThisMonth, &appsLastMonth,
+		&totalUsers, &usersThisMonth, &usersLastMonth,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("tenant dashboard stats: %w", err)
+	}
+
+	// active-tenants delta: compare active now vs active last month
+	// (active last month approximated as activeTenants - tenantsThisMonth + tenantsLastMonth)
+	activePrior := activeTenants - tenantsThisMonth + tenantsLastMonth
+
+	return &TenantDashboardStats{
+		TotalTenants:      totalTenants,
+		ActiveTenants:     activeTenants,
+		TotalApplications: totalApps,
+		TotalUsers:        totalUsers,
+		Delta: TenantDashboardDelta{
+			TotalTenantsPct:      momPct(tenantsThisMonth, tenantsLastMonth),
+			ActiveTenantsPct:     momPct(activeTenants, activePrior),
+			TotalApplicationsPct: momPct(appsThisMonth, appsLastMonth),
+			TotalUsersPct:        momPct(usersThisMonth, usersLastMonth),
+		},
+	}, nil
+}
+
+// momPct returns the month-over-month percentage change.
+// Returns 0 when there is no prior-month baseline to avoid division by zero.
+func momPct(current, prior int) float64 {
+	if prior == 0 {
+		if current > 0 {
+			return 100.0
+		}
+		return 0.0
+	}
+	return float64(current-prior) / float64(prior) * 100.0
 }
 
 // DeactivateTenant soft-deactivates a tenant (sets is_active = false).
@@ -619,6 +853,46 @@ func (s *Service) ForcePasswordReset(ctx context.Context, tenantID, userID int64
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+// getTenantByID fetches a single tenant row by primary key.
+func (s *Service) getTenantByID(ctx context.Context, tenantID int64) (*TenantResult, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, name, slug, display_name, domain, region, description, plan,
+		       is_active, cors_origins, created_at, updated_at
+		FROM tenants
+		WHERE id = $1
+	`, tenantID)
+	t, err := scanTenantRow(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get tenant by id: %w", err)
+	}
+	return &t, nil
+}
+
+// pgxScanner is satisfied by both *pgx.Row and pgx.Rows so scanTenantRow works for both.
+type pgxScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanTenantRow scans a tenant row from a pgx.Row or pgx.Rows into a TenantResult.
+func scanTenantRow(row pgxScanner) (TenantResult, error) {
+	var t TenantResult
+	var id int64
+	if err := row.Scan(
+		&id, &t.Name, &t.Slug, &t.DisplayName, &t.Domain, &t.Region,
+		&t.Description, &t.Plan, &t.IsActive, &t.CORSOrigins, &t.CreatedAt, &t.UpdatedAt,
+	); err != nil {
+		return TenantResult{}, err
+	}
+	t.ID = strconv.FormatInt(id, 10)
+	if t.CORSOrigins == nil {
+		t.CORSOrigins = []string{}
+	}
+	return t, nil
+}
 
 func (s *Service) getUserByID(ctx context.Context, tenantID, userID int64) (*UserResult, error) {
 	var u UserResult

@@ -319,7 +319,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt := adminGroup.Group("", mw.RequirePermission("tenant:manage"))
 	tenantMgmt.POST("/tenants", adminHandler.CreateTenant)
 	tenantMgmt.GET("/tenants", adminHandler.ListTenants)
+	// Static sub-paths registered before /:id so Echo does not treat them as ID params.
+	tenantMgmt.GET("/tenants/check-slug", adminHandler.CheckSlug)
+	tenantMgmt.GET("/tenants/stats", adminHandler.GetTenantDashboardStats)
+	tenantMgmt.GET("/tenants/:id", adminHandler.GetTenant)
 	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
+	tenantMgmt.PUT("/tenants/:id/activate", adminHandler.ActivateTenant)
 	tenantMgmt.DELETE("/tenants/:id", adminHandler.DeactivateTenant)
 	tenantMgmt.PUT("/tenants/:id/cors-origins", adminHandler.UpdateTenantCORSOrigins)
 
