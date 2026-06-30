@@ -199,14 +199,15 @@ func (h *AuthHandler) Register(c echo.Context) error {
 // Login handles POST /api/v1/auth/login.
 //
 // @Summary      Login
-// @Description  Authenticates an existing user and returns a JWT access token + refresh token pair.
+// @Description  Authenticates an existing user and returns a JWT access token + refresh token pair. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
-// @Param        body  body      LoginRequest  true  "Login credentials"
-// @Success      200   {object}  auth.AuthResult
-// @Failure      400   {object}  map[string]string
-// @Failure      401   {object}  map[string]string  "Invalid credentials"
+// @Param        X-Tenant-Slug  header    string        false  "Tenant slug (default: emc)"
+// @Param        body           body      LoginRequest  true   "Login credentials"
+// @Success      200            {object}  auth.AuthResult
+// @Failure      400            {object}  map[string]string
+// @Failure      401            {object}  map[string]string  "Invalid credentials"
 // @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
 	slug, _ := tenantSlugFromCtx(c)
@@ -887,14 +888,15 @@ type SessionLoginRequest = LoginRequest
 // SessionLogin handles POST /api/v1/auth/session.
 //
 // @Summary      Cookie-based login
-// @Description  Authenticates the user and stores tokens in HttpOnly SameSite=Lax cookies.
+// @Description  Authenticates the user and stores tokens in HttpOnly SameSite=Lax cookies. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
 // @Tags         auth-session
 // @Accept       json
 // @Produce      json
-// @Param        body  body      SessionLoginRequest true  "Credentials"
-// @Success      200   {object}  map[string]string
-// @Failure      400   {object}  map[string]string
-// @Failure      401   {object}  map[string]string
+// @Param        X-Tenant-Slug  header    string              false  "Tenant slug (default: emc)"
+// @Param        body           body      SessionLoginRequest true   "Credentials"
+// @Success      200            {object}  map[string]string
+// @Failure      400            {object}  map[string]string
+// @Failure      401            {object}  map[string]string
 // @Router       /api/v1/auth/session [post]
 func (h *AuthHandler) SessionLogin(c echo.Context) error {
 	slug, _ := tenantSlugFromCtx(c)

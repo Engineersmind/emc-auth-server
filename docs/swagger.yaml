@@ -2440,8 +2440,12 @@ paths:
       consumes:
       - application/json
       description: Authenticates an existing user and returns a JWT access token +
-        refresh token pair.
+        refresh token pair. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
       parameters:
+      - description: 'Tenant slug (default: emc)'
+        in: header
+        name: X-Tenant-Slug
+        type: string
       - description: Login credentials
         in: body
         name: body
@@ -2823,8 +2827,12 @@ paths:
       consumes:
       - application/json
       description: Authenticates the user and stores tokens in HttpOnly SameSite=Lax
-        cookies.
+        cookies. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
       parameters:
+      - description: 'Tenant slug (default: emc)'
+        in: header
+        name: X-Tenant-Slug
+        type: string
       - description: Credentials
         in: body
         name: body

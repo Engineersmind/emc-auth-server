@@ -2800,7 +2800,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/login": {
             "post": {
-                "description": "Authenticates an existing user and returns a JWT access token + refresh token pair.",
+                "description": "Authenticates an existing user and returns a JWT access token + refresh token pair. Defaults to tenant \"emc\" when X-Tenant-Slug is omitted.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2812,6 +2812,12 @@ const docTemplate = `{
                 ],
                 "summary": "Login",
                 "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug (default: emc)",
+                        "name": "X-Tenant-Slug",
+                        "in": "header"
+                    },
                     {
                         "description": "Login credentials",
                         "name": "body",
@@ -3381,7 +3387,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/session": {
             "post": {
-                "description": "Authenticates the user and stores tokens in HttpOnly SameSite=Lax cookies.",
+                "description": "Authenticates the user and stores tokens in HttpOnly SameSite=Lax cookies. Defaults to tenant \"emc\" when X-Tenant-Slug is omitted.",
                 "consumes": [
                     "application/json"
                 ],
@@ -3393,6 +3399,12 @@ const docTemplate = `{
                 ],
                 "summary": "Cookie-based login",
                 "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug (default: emc)",
+                        "name": "X-Tenant-Slug",
+                        "in": "header"
+                    },
                     {
                         "description": "Credentials",
                         "name": "body",
