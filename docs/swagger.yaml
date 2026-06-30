@@ -30,9 +30,43 @@ definitions:
       tenant_id:
         type: string
     type: object
+  admin.TenantDashboardDelta:
+    properties:
+      active_tenants_pct:
+        type: number
+      total_applications_pct:
+        type: number
+      total_tenants_pct:
+        type: number
+      total_users_pct:
+        type: number
+    type: object
+  admin.TenantDashboardStats:
+    properties:
+      active_tenants:
+        type: integer
+      delta:
+        $ref: '#/definitions/admin.TenantDashboardDelta'
+      total_applications:
+        type: integer
+      total_tenants:
+        type: integer
+      total_users:
+        type: integer
+    type: object
   admin.TenantResult:
     properties:
+      cors_origins:
+        items:
+          type: string
+        type: array
       created_at:
+        type: string
+      description:
+        type: string
+      display_name:
+        type: string
+      domain:
         type: string
       id:
         type: string
@@ -40,8 +74,29 @@ definitions:
         type: boolean
       name:
         type: string
+      plan:
+        type: string
+      region:
+        type: string
       slug:
         type: string
+      updated_at:
+        type: string
+    type: object
+  admin.TenantsPage:
+    properties:
+      limit:
+        type: integer
+      page:
+        type: integer
+      tenants:
+        items:
+          $ref: '#/definitions/admin.TenantResult'
+        type: array
+      total:
+        type: integer
+      total_pages:
+        type: integer
     type: object
   admin.UserResult:
     properties:
@@ -77,16 +132,137 @@ definitions:
           $ref: '#/definitions/admin.UserResult'
         type: array
     type: object
+  audit.LogEntry:
+    properties:
+      action:
+        type: string
+      actor_email:
+        type: string
+      agent_id:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      ip_address:
+        type: string
+      resource_id:
+        type: string
+      resource_type:
+        type: string
+      tenant_id:
+        type: string
+      tenant_slug:
+        type: string
+      user_id:
+        type: string
+    type: object
+  audit.LogsPage:
+    properties:
+      logs:
+        items:
+          $ref: '#/definitions/audit.LogEntry'
+        type: array
+      page:
+        type: integer
+      total:
+        type: integer
+      total_pages:
+        type: integer
+    type: object
+  auth.APIKeyResult:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      key:
+        type: string
+      name:
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    type: object
+  auth.APIKeySummary:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      last_used_at:
+        type: string
+      name:
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    type: object
+  auth.AppRateLimit:
+    properties:
+      app_id:
+        type: string
+      burst:
+        type: integer
+      created_at:
+        type: string
+      description:
+        type: string
+      requests_per_minute:
+        type: integer
+      tenant_id:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  auth.AppResult:
+    properties:
+      client_id:
+        type: string
+      client_secret:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+    type: object
+  auth.AppSummary:
+    properties:
+      client_id:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+    type: object
   auth.AuthResult:
     properties:
       access_token:
         type: string
+      expires_at:
+        description: UTC unix timestamp when access token expires
+        type: integer
       expires_in:
-        description: seconds
+        description: seconds until access token expires
         type: integer
       refresh_token:
         type: string
       token_type:
+        type: string
+    type: object
+  auth.EnrollResult:
+    properties:
+      backup_codes:
+        items:
+          type: string
+        type: array
+      otp_uri:
         type: string
     type: object
   auth.MeResult:
@@ -104,9 +280,34 @@ definitions:
       user_id:
         type: string
     type: object
+  handlers.AppLimitRequest:
+    properties:
+      app_id:
+        type: string
+      burst:
+        type: integer
+      description:
+        type: string
+      requests_per_minute:
+        type: integer
+    type: object
   handlers.AssignRoleRequest:
     properties:
       role_id:
+        type: string
+    type: object
+  handlers.CreateAPIKeyRequest:
+    properties:
+      name:
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    type: object
+  handlers.CreateApplicationRequest:
+    properties:
+      name:
         type: string
     type: object
   handlers.CreatePermissionRequest:
@@ -127,7 +328,17 @@ definitions:
     type: object
   handlers.CreateTenantRequest:
     properties:
+      description:
+        type: string
+      display_name:
+        type: string
+      domain:
+        type: string
       name:
+        type: string
+      plan:
+        type: string
+      region:
         type: string
       slug:
         type: string
@@ -155,6 +366,13 @@ definitions:
       service:
         type: string
       status:
+        type: string
+    type: object
+  handlers.LoginOTPRequest:
+    properties:
+      code:
+        type: string
+      otp_session_token:
         type: string
     type: object
   handlers.LoginRequest:
@@ -197,8 +415,51 @@ definitions:
       new_password:
         type: string
       token:
-        description: Token is the raw reset token from the email link query parameter.
         type: string
+    type: object
+  handlers.SessionLoginRequest:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  handlers.SlugCheckResponse:
+    properties:
+      available:
+        type: boolean
+      slug:
+        type: string
+    type: object
+  handlers.TOTPActivateRequest:
+    properties:
+      code:
+        type: string
+    type: object
+  handlers.TOTPDisableRequest:
+    properties:
+      code:
+        type: string
+    type: object
+  handlers.TokenRequest:
+    properties:
+      client_id:
+        type: string
+      client_secret:
+        type: string
+      grant_type:
+        type: string
+    type: object
+  handlers.UpdateCORSOriginsRequest:
+    properties:
+      origins:
+        description: e.g. ["https://app.example.com"]
+        items:
+          type: string
+        type: array
     type: object
   handlers.UpdateRolePermissionsRequest:
     properties:
@@ -209,7 +470,17 @@ definitions:
     type: object
   handlers.UpdateTenantRequest:
     properties:
+      description:
+        type: string
+      display_name:
+        type: string
+      domain:
+        type: string
       name:
+        type: string
+      plan:
+        type: string
+      region:
         type: string
     type: object
   handlers.UpdateUserAdminRequest:
@@ -227,12 +498,397 @@ info:
     name: EngineersMind
     url: https://github.com/engineersmind/emc-auth-server
   description: Standalone multi-tenant Identity Provider — email/password auth, JWT,
-    refresh tokens, password reset.
+    refresh tokens, TOTP 2FA, SAML 2.0, RBAC, Admin UI, and AI/Agent security.
   license:
     name: MIT
   title: EMC Auth Server
-  version: "1.0"
+  version: 1.5.0
 paths:
+  /api/v1/admin/api-keys:
+    get:
+      description: Returns all active API keys for the caller's tenant. The raw key
+        is never included.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.APIKeySummary'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List API keys
+      tags:
+      - api-keys
+    post:
+      consumes:
+      - application/json
+      description: Creates a new API key for machine-to-machine auth. The raw key
+        is returned exactly once.
+      parameters:
+      - description: Key name and permissions
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateAPIKeyRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.APIKeyResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create API key
+      tags:
+      - api-keys
+  /api/v1/admin/api-keys/{id}:
+    delete:
+      description: Permanently revokes an API key. The key is immediately invalid.
+      parameters:
+      - description: API key ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke API key
+      tags:
+      - api-keys
+  /api/v1/admin/app-limits:
+    get:
+      description: Returns all per-app rate limit configs for the caller's tenant.
+        Requires admin:access.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.AppRateLimit'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List app rate limits
+      tags:
+      - admin-rate-limits
+    post:
+      consumes:
+      - application/json
+      description: Sets a custom per-minute request limit for an application identified
+        by X-App-ID. Requires admin:access.
+      parameters:
+      - description: App limit config
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AppLimitRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: app_id already has a rate limit config
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create app rate limit
+      tags:
+      - admin-rate-limits
+  /api/v1/admin/app-limits/{app_id}:
+    delete:
+      description: Removes the custom rate limit for an app_id; it falls back to the
+        default limit. Requires admin:access.
+      parameters:
+      - description: App ID
+        in: path
+        name: app_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete app rate limit
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: Updates the rate limit config for an existing app_id in the tenant.
+        Requires admin:access.
+      parameters:
+      - description: App ID
+        in: path
+        name: app_id
+        required: true
+        type: string
+      - description: Updated limit config
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AppLimitRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update app rate limit
+      tags:
+      - admin-rate-limits
+  /api/v1/admin/applications:
+    get:
+      description: Returns all active applications for the caller's tenant.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.AppSummary'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List applications
+      tags:
+      - admin-applications
+    post:
+      consumes:
+      - application/json
+      description: Registers a new application for the tenant. Returns client_id and
+        client_secret — secret is shown exactly once.
+      parameters:
+      - description: Application name
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateApplicationRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.AppResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Create application
+      tags:
+      - admin-applications
+  /api/v1/admin/applications/{id}:
+    delete:
+      description: Soft-deletes an application. Its client_id is immediately rejected
+        on login and register.
+      parameters:
+      - description: Application ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Deactivate application
+      tags:
+      - admin-applications
+  /api/v1/admin/audit-logs:
+    get:
+      description: Returns paginated audit events scoped to the caller's tenant. Requires
+        admin:access.
+      parameters:
+      - description: Filter by action (e.g. auth.login)
+        in: query
+        name: action
+        type: string
+      - description: Filter by user ID
+        in: query
+        name: user_id
+        type: string
+      - description: From datetime (RFC3339, e.g. 2026-01-01T00:00:00Z)
+        in: query
+        name: from
+        type: string
+      - description: To datetime (RFC3339)
+        in: query
+        name: to
+        type: string
+      - description: Page (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Page size (default 50, max 200)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.LogsPage'
+      security:
+      - BearerAuth: []
+      summary: Tenant audit log
+      tags:
+      - admin-audit
+  /api/v1/admin/audit-logs/system:
+    get:
+      description: Returns paginated audit events across ALL tenants. Requires tenant:manage
+        (super_admin only).
+      parameters:
+      - description: Filter by action
+        in: query
+        name: action
+        type: string
+      - description: Filter by user ID
+        in: query
+        name: user_id
+        type: string
+      - description: From datetime (RFC3339)
+        in: query
+        name: from
+        type: string
+      - description: To datetime (RFC3339)
+        in: query
+        name: to
+        type: string
+      - description: Page (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Page size (default 50, max 200)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.LogsPage'
+      security:
+      - BearerAuth: []
+      summary: System-wide audit log
+      tags:
+      - admin-audit
   /api/v1/admin/permissions:
     get:
       description: Returns all permissions for the caller's tenant. Requires admin:access.
@@ -290,7 +946,7 @@ paths:
       description: Deletes a permission from the caller's tenant. Cascades to roles
         and users. Requires admin:access.
       parameters:
-      - description: Permission ID (UUID)
+      - description: Permission ID
         in: path
         name: id
         required: true
@@ -374,7 +1030,7 @@ paths:
       description: Deletes a non-system role from the tenant. Users assigned this
         role will have their role cleared. Requires admin:access.
       parameters:
-      - description: Role ID (UUID)
+      - description: Role ID
         in: path
         name: id
         required: true
@@ -405,7 +1061,7 @@ paths:
       - application/json
       description: Replaces the permission set on a role. Requires admin:access.
       parameters:
-      - description: Role ID (UUID)
+      - description: Role ID
         in: path
         name: id
         required: true
@@ -438,16 +1094,36 @@ paths:
       - admin-rbac
   /api/v1/admin/tenants:
     get:
-      description: Returns all tenants. Requires tenant:manage permission.
+      description: Returns a paginated, filtered list of tenants. Requires tenant:manage
+        permission.
+      parameters:
+      - description: Search by name, display name, or domain
+        in: query
+        name: search
+        type: string
+      - description: 'Filter by status: active or inactive'
+        in: query
+        name: status
+        type: string
+      - description: Filter by region (exact match)
+        in: query
+        name: region
+        type: string
+      - description: Page number (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Rows per page (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            items:
-              $ref: '#/definitions/admin.TenantResult'
-            type: array
+            $ref: '#/definitions/admin.TenantsPage'
         "403":
           description: Forbidden
           schema:
@@ -506,7 +1182,7 @@ paths:
       description: Soft-deactivates a tenant (sets is_active=false). Requires tenant:manage
         permission.
       parameters:
-      - description: Tenant ID (UUID)
+      - description: Tenant ID
         in: path
         name: id
         required: true
@@ -537,12 +1213,44 @@ paths:
       summary: Deactivate tenant
       tags:
       - admin-tenants
+    get:
+      description: Returns a single tenant by ID. Requires tenant:manage permission.
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.TenantResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get tenant
+      tags:
+      - admin-tenants
     put:
       consumes:
       - application/json
-      description: Updates the tenant's display name. Requires tenant:manage permission.
+      description: Updates editable fields on a tenant. Requires tenant:manage permission.
       parameters:
-      - description: Tenant ID (UUID)
+      - description: Tenant ID
         in: path
         name: id
         required: true
@@ -575,6 +1283,140 @@ paths:
       security:
       - BearerAuth: []
       summary: Update tenant
+      tags:
+      - admin-tenants
+  /api/v1/admin/tenants/{id}/activate:
+    put:
+      description: Sets is_active=true for a previously deactivated tenant. Requires
+        tenant:manage permission.
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.TenantResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Tenant already active
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Activate tenant
+      tags:
+      - admin-tenants
+  /api/v1/admin/tenants/{id}/cors-origins:
+    put:
+      consumes:
+      - application/json
+      description: Replaces the list of allowed CORS origins for a tenant. Pass an
+        empty array to disable CORS enforcement. Requires tenant:manage.
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Allowed origins
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateCORSOriginsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update tenant CORS origins
+      tags:
+      - admin-tenants
+  /api/v1/admin/tenants/check-slug:
+    get:
+      description: Returns whether a tenant slug is available. Always responds 200.
+        Requires tenant:manage permission.
+      parameters:
+      - description: Slug to check
+        in: query
+        name: slug
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.SlugCheckResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Check slug availability
+      tags:
+      - admin-tenants
+  /api/v1/admin/tenants/stats:
+    get:
+      description: Returns system-wide tenant, application, and user counts with month-over-month
+        deltas. Requires tenant:manage permission.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.TenantDashboardStats'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Tenant dashboard stats
       tags:
       - admin-tenants
   /api/v1/admin/users:
@@ -647,7 +1489,7 @@ paths:
       description: Soft-deletes a user (is_deleted=true, is_active=false). ID preserved
         for audit. Requires admin:access.
       parameters:
-      - description: User ID (UUID)
+      - description: User ID
         in: path
         name: id
         required: true
@@ -675,7 +1517,7 @@ paths:
     get:
       description: Returns a user's details. Requires admin:access.
       parameters:
-      - description: User ID (UUID)
+      - description: User ID
         in: path
         name: id
         required: true
@@ -703,7 +1545,7 @@ paths:
       - application/json
       description: Updates a user's profile (email, name). Requires admin:access.
       parameters:
-      - description: User ID (UUID)
+      - description: User ID
         in: path
         name: id
         required: true
@@ -742,7 +1584,7 @@ paths:
     post:
       description: Sends a password reset email to the specified user. Requires admin:access.
       parameters:
-      - description: User ID (UUID)
+      - description: User ID
         in: path
         name: id
         required: true
@@ -773,7 +1615,7 @@ paths:
       - application/json
       description: Sets the user's role within the tenant. Requires admin:access.
       parameters:
-      - description: User ID (UUID)
+      - description: User ID
         in: path
         name: id
         required: true
@@ -815,8 +1657,7 @@ paths:
       consumes:
       - application/json
       description: Sends a reset link to the email address. ALWAYS returns 200 regardless
-        of whether the email is registered (prevents email enumeration). In development
-        the link is logged to the server console instead of being emailed.
+        of whether the email is registered (prevents email enumeration).
       parameters:
       - description: Tenant slug
         in: header
@@ -840,7 +1681,7 @@ paths:
             type: object
       summary: Request password reset
       tags:
-      - password-reset
+      - AUTH
   /api/v1/auth/login:
     post:
       consumes:
@@ -848,11 +1689,6 @@ paths:
       description: Authenticates an existing user and returns a JWT access token +
         refresh token pair.
       parameters:
-      - description: Tenant slug (e.g. emc)
-        in: header
-        name: X-Tenant-Slug
-        required: true
-        type: string
       - description: Login credentials
         in: body
         name: body
@@ -880,7 +1716,41 @@ paths:
             type: object
       summary: Login
       tags:
-      - auth
+      - AUTH
+  /api/v1/auth/login/otp:
+    post:
+      consumes:
+      - application/json
+      description: Submit the TOTP code (or backup code) to complete a two-step login.
+      parameters:
+      - description: OTP session token + TOTP code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.LoginOTPRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Complete TOTP login
+      tags:
+      - AUTH
   /api/v1/auth/logout:
     post:
       consumes:
@@ -911,7 +1781,7 @@ paths:
             type: object
       summary: Logout
       tags:
-      - auth
+      - AUTH
   /api/v1/auth/me:
     get:
       description: Returns the authenticated user's profile decoded from the JWT.
@@ -932,13 +1802,100 @@ paths:
       - BearerAuth: []
       summary: Get current user profile
       tags:
-      - auth
+      - AUTH
+  /api/v1/auth/otp:
+    delete:
+      consumes:
+      - application/json
+      description: Disables TOTP for the current user. Requires a valid TOTP code
+        or backup code.
+      parameters:
+      - description: Current TOTP or backup code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.TOTPDisableRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Disable TOTP 2FA
+      tags:
+      - AUTH
+  /api/v1/auth/otp/activate:
+    post:
+      consumes:
+      - application/json
+      description: Verifies the first TOTP code and marks the enrollment active.
+      parameters:
+      - description: First TOTP code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.TOTPActivateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Activate TOTP 2FA
+      tags:
+      - AUTH
+  /api/v1/auth/otp/enroll:
+    post:
+      description: Generates a TOTP secret and returns an otpauth:// URI plus backup
+        codes.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EnrollResult'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Enroll in TOTP 2FA
+      tags:
+      - AUTH
   /api/v1/auth/refresh:
     post:
       consumes:
       - application/json
       description: Issues a new access + refresh token pair and immediately invalidates
-        the old refresh token. Replaying the old token returns 401.
+        the old refresh token.
       parameters:
       - description: Refresh token
         in: body
@@ -960,14 +1917,14 @@ paths:
               type: string
             type: object
         "401":
-          description: Invalid or expired refresh token
+          description: Unauthorized
           schema:
             additionalProperties:
               type: string
             type: object
       summary: Refresh token rotation
       tags:
-      - auth
+      - AUTH
   /api/v1/auth/register:
     post:
       consumes:
@@ -1013,14 +1970,13 @@ paths:
             type: object
       summary: Register a new user
       tags:
-      - auth
+      - AUTH
   /api/v1/auth/reset-password:
     post:
       consumes:
       - application/json
       description: Validates the reset token, updates the user's password, and revokes
-        all active refresh tokens (logs out all sessions). Token is single-use and
-        expires in 15 minutes.
+        all active refresh tokens.
       parameters:
       - description: Token + new password
         in: body
@@ -1038,14 +1994,124 @@ paths:
               type: string
             type: object
         "400":
-          description: Invalid/expired token or weak password
+          description: Bad Request
           schema:
             additionalProperties:
               type: string
             type: object
       summary: Reset password
       tags:
-      - password-reset
+      - AUTH
+  /api/v1/auth/session:
+    post:
+      consumes:
+      - application/json
+      description: Authenticates the user and stores tokens in HttpOnly SameSite=Lax
+        cookies.
+      parameters:
+      - description: Credentials
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SessionLoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Cookie-based login
+      tags:
+      - auth-session
+  /api/v1/auth/session/logout:
+    post:
+      description: Revokes the refresh token stored in the cookie and clears both
+        auth cookies.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Cookie session logout
+      tags:
+      - auth-session
+  /api/v1/auth/session/refresh:
+    post:
+      description: Rotates the access and refresh tokens using the refresh cookie.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Cookie session refresh
+      tags:
+      - auth-session
+  /api/v1/auth/token:
+    post:
+      consumes:
+      - application/json
+      description: Issues a service-level access token using client_id + client_secret.
+        No user involved, no refresh token issued.
+      parameters:
+      - description: Client credentials
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.TokenRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Client credentials token
+      tags:
+      - AUTH
   /health:
     get:
       produces:

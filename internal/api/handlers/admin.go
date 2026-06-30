@@ -320,7 +320,7 @@ func (h *AdminHandler) CheckSlug(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {object}  admin.TenantDashboardStats
 // @Failure      403  {object}  map[string]string
-// @Router       /api/v1/admin/stats/tenants [get]
+// @Router       /api/v1/admin/tenants/stats [get]
 func (h *AdminHandler) GetTenantDashboardStats(c echo.Context) error {
 	result, err := h.svc.GetTenantDashboardStats(c.Request().Context())
 	if err != nil {
