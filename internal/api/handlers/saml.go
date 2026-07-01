@@ -1,4 +1,4 @@
-package handlers
+﻿package handlers
 
 import (
 	"net/http"
@@ -76,10 +76,10 @@ func (h *SAMLHandler) InitiateLogin(c echo.Context) error {
 	return c.Redirect(http.StatusFound, redirectURL)
 }
 
-// HandleACS handles POST /saml/acs — Assertion Consumer Service.
+// HandleACS handles POST /saml/acs â€” Assertion Consumer Service.
 //
 // @Summary      SAML Assertion Consumer Service (disabled)
-// @Description  Receives IdP SAMLResponse. Currently returns 501 — disabled until IdP XML signature verification is implemented.
+// @Description  Receives IdP SAMLResponse. Currently returns 501 â€” disabled until IdP XML signature verification is implemented.
 // @Tags         saml
 // @Accept       application/x-www-form-urlencoded
 // @Produce      json
@@ -98,7 +98,7 @@ func (h *SAMLHandler) HandleACS(c echo.Context) error {
 	)
 }
 
-// handleACSImpl is the deferred full implementation — wired in once crewjam/saml
+// handleACSImpl is the deferred full implementation â€” wired in once crewjam/saml
 // validates the IdP signature on every assertion.
 //
 //nolint:unused
@@ -168,7 +168,7 @@ func (h *SAMLHandler) handleACSImpl(c echo.Context) error {
 // @Success      200  {object}  saml.SAMLConfig
 // @Failure      401  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/saml-config [get]
+// @Router       /api/v1/saml-config [get]
 func (h *SAMLHandler) GetSAMLConfig(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -193,7 +193,7 @@ func (h *SAMLHandler) GetSAMLConfig(c echo.Context) error {
 // @Success      200   {object}  saml.SAMLConfig
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
-// @Router       /api/v1/admin/saml-config [put]
+// @Router       /api/v1/saml-config [put]
 func (h *SAMLHandler) UpsertSAMLConfig(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {

@@ -1,4 +1,4 @@
-package handlers
+﻿package handlers
 
 import (
 	"net/http"
@@ -47,7 +47,7 @@ type AuthenticateAgentRequest struct {
 // @Param        body  body      RegisterAgentRequest  true  "Agent details"
 // @Success      201   {object}  auth.AgentRegistrationResult
 // @Failure      400   {object}  map[string]string
-// @Router       /api/v1/admin/agents [post]
+// @Router       /api/v1/agents [post]
 func (h *AgentHandler) RegisterAgent(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -88,7 +88,7 @@ func (h *AgentHandler) RegisterAgent(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {array}   auth.AgentWithStats
 // @Failure      500  {object}  map[string]string
-// @Router       /api/v1/admin/agents [get]
+// @Router       /api/v1/agents [get]
 func (h *AgentHandler) ListAgents(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -120,7 +120,7 @@ func (h *AgentHandler) ListAgents(c echo.Context) error {
 // @Success      204  "No Content"
 // @Failure      400  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/agents/{id} [delete]
+// @Router       /api/v1/agents/{id} [delete]
 func (h *AgentHandler) RevokeAgent(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -154,7 +154,7 @@ func (h *AgentHandler) RevokeAgent(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {object}  auth.AgentAnalysis
 // @Failure      500  {object}  map[string]string
-// @Router       /api/v1/admin/agents/analysis [get]
+// @Router       /api/v1/agents/analysis [get]
 func (h *AgentHandler) GetAgentAnalysis(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -178,7 +178,7 @@ func (h *AgentHandler) GetAgentAnalysis(c echo.Context) error {
 // AuthenticateAgent handles POST /api/v1/agents/authenticate.
 //
 // @Summary      Authenticate an agent and issue a JWT
-// @Description  Validates an agent API key and returns a signed short-lived JWT. Public — no prior auth required.
+// @Description  Validates an agent API key and returns a signed short-lived JWT. Public â€” no prior auth required.
 // @Tags         agent-auth
 // @Accept       json
 // @Produce      json

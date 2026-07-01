@@ -1,4 +1,4 @@
-package handlers
+﻿package handlers
 
 import (
 	"errors"
@@ -93,20 +93,20 @@ type SlugCheckResponse struct {
 	Available bool   `json:"available"`
 }
 
-// CreateTenant handles POST /api/v1/admin/tenants.
+// CreateTenant handles POST /api/v1/tenants.
 //
 // @Summary      Create tenant
-// @Description  Creates a new isolated tenant. Requires tenant:manage permission (super_admin only).
+// @Description  Creates a new isolated tenant and auto-seeds an owner role with 8 default permissions and an owner user (owner@emc.<slug>). The owner.temp_password in the response is shown once and never stored — hand it to the tenant owner. Requires tenant:manage permission (super_admin only).
 // @Tags         admin-tenants
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      CreateTenantRequest  true  "Tenant details"
-// @Success      201   {object}  admin.TenantResult
+// @Param        body  body      CreateTenantRequest      true  "Tenant details"
+// @Success      201   {object}  admin.CreateTenantResult
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Slug already taken"
-// @Router       /api/v1/admin/tenants [post]
+// @Router       /api/v1/tenants [post]
 func (h *AdminHandler) CreateTenant(c echo.Context) error {
 	var req CreateTenantRequest
 	if err := c.Bind(&req); err != nil {
@@ -136,7 +136,7 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: create tenant failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create tenant"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminTenantCreated, "tenant", result.ID)
+	h.auditAdmin(c, claims, audit.ActionAdminTenantCreated, "tenant", result.Tenant.ID)
 	return c.JSON(http.StatusCreated, result)
 }
 
@@ -147,24 +147,33 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 // @Tags         admin-tenants
 // @Produce      json
 // @Security     BearerAuth
-// @Param        search  query     string  false  "Search by name, display name, or domain"
-// @Param        status  query     string  false  "Filter by status: active or inactive"
-// @Param        region  query     string  false  "Filter by region (exact match)"
-// @Param        page    query     int     false  "Page number (default 1)"
-// @Param        limit   query     int     false  "Rows per page (default 25, max 100)"
-// @Success      200     {object}  admin.TenantsPage
-// @Failure      403     {object}  map[string]string
-// @Router       /api/v1/admin/tenants [get]
+// @Param        search    query     string  false  "Search by name, display name, or domain"
+// @Param        status    query     string  false  "Filter by status: active | inactive | suspended (suspended maps to inactive)"
+// @Param        region    query     string  false  "Filter by region (exact match)"
+// @Param        page      query     int     false  "Page number (default 1)"
+// @Param        per_page  query     int     false  "Rows per page (default 25, max 100); alias: limit"
+// @Success      200       {object}  admin.TenantsPage
+// @Failure      403       {object}  map[string]string
+// @Router       /api/v1/tenants [get]
 func (h *AdminHandler) ListTenants(c echo.Context) error {
 	page, _ := strconv.Atoi(c.QueryParam("page"))
-	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+
+	perPage, _ := strconv.Atoi(c.QueryParam("per_page"))
+	if perPage == 0 {
+		perPage, _ = strconv.Atoi(c.QueryParam("limit"))
+	}
+
+	status := c.QueryParam("status")
+	if status == "suspended" {
+		status = "inactive"
+	}
 
 	filter := admin.TenantFilter{
 		Search: c.QueryParam("search"),
-		Status: c.QueryParam("status"),
+		Status: status,
 		Region: c.QueryParam("region"),
 		Page:   page,
-		Limit:  limit,
+		Limit:  perPage,
 	}
 
 	result, err := h.svc.ListTenantsPaginated(c.Request().Context(), filter)
@@ -186,7 +195,7 @@ func (h *AdminHandler) ListTenants(c echo.Context) error {
 // @Success      200  {object}  admin.TenantResult
 // @Failure      400  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{id} [get]
+// @Router       /api/v1/tenants/{id} [get]
 func (h *AdminHandler) GetTenant(c echo.Context) error {
 	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -216,7 +225,7 @@ func (h *AdminHandler) GetTenant(c echo.Context) error {
 // @Success      200   {object}  admin.TenantResult
 // @Failure      400   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{id} [put]
+// @Router       /api/v1/tenants/{id} [put]
 func (h *AdminHandler) UpdateTenant(c echo.Context) error {
 	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -265,7 +274,7 @@ func (h *AdminHandler) UpdateTenant(c echo.Context) error {
 // @Failure      400  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
 // @Failure      409  {object}  map[string]string  "Tenant already active"
-// @Router       /api/v1/admin/tenants/{id}/activate [put]
+// @Router       /api/v1/tenants/{id}/activate [put]
 func (h *AdminHandler) ActivateTenant(c echo.Context) error {
 	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -297,7 +306,7 @@ func (h *AdminHandler) ActivateTenant(c echo.Context) error {
 // @Param        slug  query     string  true  "Slug to check"
 // @Success      200   {object}  SlugCheckResponse
 // @Failure      400   {object}  map[string]string
-// @Router       /api/v1/admin/tenants/check-slug [get]
+// @Router       /api/v1/tenants/check-slug [get]
 func (h *AdminHandler) CheckSlug(c echo.Context) error {
 	slug := c.QueryParam("slug")
 	if slug == "" {
@@ -320,7 +329,7 @@ func (h *AdminHandler) CheckSlug(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {object}  admin.TenantDashboardStats
 // @Failure      403  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/stats [get]
+// @Router       /api/v1/tenants/stats [get]
 func (h *AdminHandler) GetTenantDashboardStats(c echo.Context) error {
 	result, err := h.svc.GetTenantDashboardStats(c.Request().Context())
 	if err != nil {
@@ -338,10 +347,10 @@ func (h *AdminHandler) GetTenantDashboardStats(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Param        id   path      string  true  "Tenant ID"
-// @Success      200  {object}  map[string]string
+// @Success      204  "No Content"
 // @Failure      400  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{id} [delete]
+// @Router       /api/v1/tenants/{id} [delete]
 func (h *AdminHandler) DeactivateTenant(c echo.Context) error {
 	tenantID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -356,7 +365,7 @@ func (h *AdminHandler) DeactivateTenant(c echo.Context) error {
 	}
 	claims, _ := claimsFromCtx(c)
 	h.auditAdmin(c, claims, audit.ActionAdminTenantDeactivated, "tenant", strconv.FormatInt(tenantID, 10))
-	return c.JSON(http.StatusOK, map[string]string{"message": "tenant deactivated"})
+	return c.NoContent(http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +390,7 @@ type CreatePermissionRequest struct {
 // @Success      201   {object}  admin.PermissionResult
 // @Failure      400   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Permission name already exists in this tenant"
-// @Router       /api/v1/admin/permissions [post]
+// @Router       /api/v1/permissions [post]
 func (h *AdminHandler) CreatePermission(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -420,7 +429,7 @@ func (h *AdminHandler) CreatePermission(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Success      200  {array}   admin.PermissionResult
-// @Router       /api/v1/admin/permissions [get]
+// @Router       /api/v1/permissions [get]
 func (h *AdminHandler) ListPermissions(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -449,7 +458,7 @@ func (h *AdminHandler) ListPermissions(c echo.Context) error {
 // @Param        id   path      string  true  "Permission ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/permissions/{id} [delete]
+// @Router       /api/v1/permissions/{id} [delete]
 func (h *AdminHandler) DeletePermission(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -503,7 +512,7 @@ type UpdateRolePermissionsRequest struct {
 // @Success      201   {object}  admin.RoleResult
 // @Failure      400   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Role name already exists"
-// @Router       /api/v1/admin/roles [post]
+// @Router       /api/v1/roles [post]
 func (h *AdminHandler) CreateRole(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -547,7 +556,7 @@ func (h *AdminHandler) CreateRole(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Success      200  {array}   admin.RoleResult
-// @Router       /api/v1/admin/roles [get]
+// @Router       /api/v1/roles [get]
 func (h *AdminHandler) ListRoles(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -578,7 +587,7 @@ func (h *AdminHandler) ListRoles(c echo.Context) error {
 // @Param        body  body      UpdateRolePermissionsRequest true  "Permission IDs to assign"
 // @Success      200   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
-// @Router       /api/v1/admin/roles/{id}/permissions [put]
+// @Router       /api/v1/roles/{id}/permissions [put]
 func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -625,7 +634,7 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 // @Param        id   path      string  true  "Role ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/roles/{id} [delete]
+// @Router       /api/v1/roles/{id} [delete]
 func (h *AdminHandler) DeleteRole(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -688,7 +697,7 @@ type AssignRoleRequest struct {
 // @Param        page    query     int     false  "Page number (default: 1)"
 // @Param        limit   query     int     false  "Page size (default: 20, max: 100)"
 // @Success      200     {object}  admin.UsersPage
-// @Router       /api/v1/admin/users [get]
+// @Router       /api/v1/users [get]
 func (h *AdminHandler) ListUsers(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -723,7 +732,7 @@ func (h *AdminHandler) ListUsers(c echo.Context) error {
 // @Success      201   {object}  admin.UserResult
 // @Failure      400   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Email already registered"
-// @Router       /api/v1/admin/users [post]
+// @Router       /api/v1/users [post]
 func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -776,7 +785,7 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 // @Param        id   path      string  true  "User ID"
 // @Success      200  {object}  admin.UserResult
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/users/{id} [get]
+// @Router       /api/v1/users/{id} [get]
 func (h *AdminHandler) GetAdminUser(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -816,7 +825,7 @@ func (h *AdminHandler) GetAdminUser(c echo.Context) error {
 // @Success      200   {object}  admin.UserResult
 // @Failure      400   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
-// @Router       /api/v1/admin/users/{id} [put]
+// @Router       /api/v1/users/{id} [put]
 func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -868,7 +877,7 @@ func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
-// @Router       /api/v1/admin/users/{id}/role [put]
+// @Router       /api/v1/users/{id}/role [put]
 func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -914,7 +923,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 // @Param        id   path      string  true  "User ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/users/{id} [delete]
+// @Router       /api/v1/users/{id} [delete]
 func (h *AdminHandler) DeleteAdminUser(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -951,7 +960,7 @@ func (h *AdminHandler) DeleteAdminUser(c echo.Context) error {
 // @Param        id   path      string  true  "User ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/users/{id}/force-password-reset [post]
+// @Router       /api/v1/users/{id}/force-password-reset [post]
 func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -991,7 +1000,7 @@ func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {object}  audit.StatsResult
 // @Failure      401  {object}  map[string]string
-// @Router       /api/v1/admin/stats [get]
+// @Router       /api/v1/stats [get]
 func (h *AdminHandler) GetStats(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1018,7 +1027,7 @@ func (h *AdminHandler) GetStats(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {object}  audit.StatsResult
 // @Failure      403  {object}  map[string]string
-// @Router       /api/v1/admin/stats/system [get]
+// @Router       /api/v1/stats/system [get]
 func (h *AdminHandler) GetSystemStats(c echo.Context) error {
 	result, err := h.audit.Stats(c.Request().Context(), nil)
 	if err != nil {
@@ -1046,7 +1055,7 @@ func (h *AdminHandler) GetSystemStats(c echo.Context) error {
 // @Param        page     query     int     false  "Page (default 1)"
 // @Param        limit    query     int     false  "Page size (default 50, max 200)"
 // @Success      200      {object}  audit.LogsPage
-// @Router       /api/v1/admin/audit-logs [get]
+// @Router       /api/v1/audit-logs [get]
 func (h *AdminHandler) GetTenantAuditLogs(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1082,10 +1091,10 @@ func (h *AdminHandler) GetTenantAuditLogs(c echo.Context) error {
 // @Param        page     query     int     false  "Page (default 1)"
 // @Param        limit    query     int     false  "Page size (default 50, max 200)"
 // @Success      200      {object}  audit.LogsPage
-// @Router       /api/v1/admin/audit-logs/system [get]
+// @Router       /api/v1/audit-logs/system [get]
 func (h *AdminHandler) GetSystemAuditLogs(c echo.Context) error {
 	p := auditQueryParams(c)
-	// No TenantID filter — returns all tenants.
+	// No TenantID filter â€” returns all tenants.
 
 	result, err := h.audit.Query(c.Request().Context(), p)
 	if err != nil {
@@ -1177,7 +1186,7 @@ type UpdateCORSOriginsRequest struct {
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{id}/cors-origins [put]
+// @Router       /api/v1/tenants/{id}/cors-origins [put]
 func (h *AdminHandler) UpdateTenantCORSOrigins(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1236,7 +1245,7 @@ type AppLimitRequest struct {
 // @Success      201   {object}  auth.AppRateLimit
 // @Failure      400   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "app_id already has a rate limit config"
-// @Router       /api/v1/admin/app-limits [post]
+// @Router       /api/v1/app-limits [post]
 func (h *AdminHandler) CreateAppLimit(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1275,7 +1284,7 @@ func (h *AdminHandler) CreateAppLimit(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Success      200  {array}   auth.AppRateLimit
-// @Router       /api/v1/admin/app-limits [get]
+// @Router       /api/v1/app-limits [get]
 func (h *AdminHandler) ListAppLimits(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1306,7 +1315,7 @@ func (h *AdminHandler) ListAppLimits(c echo.Context) error {
 // @Param        body    body      AppLimitRequest true  "Updated limit config"
 // @Success      200     {object}  auth.AppRateLimit
 // @Failure      404     {object}  map[string]string
-// @Router       /api/v1/admin/app-limits/{app_id} [put]
+// @Router       /api/v1/app-limits/{app_id} [put]
 func (h *AdminHandler) UpdateAppLimit(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1349,7 +1358,7 @@ func (h *AdminHandler) UpdateAppLimit(c echo.Context) error {
 // @Param        app_id  path      string  true  "App ID"
 // @Success      200     {object}  map[string]string
 // @Failure      404     {object}  map[string]string
-// @Router       /api/v1/admin/app-limits/{app_id} [delete]
+// @Router       /api/v1/app-limits/{app_id} [delete]
 func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1377,7 +1386,7 @@ func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-tenant management — super_admin only (tenant:manage permission)
+// Cross-tenant management â€” super_admin only (tenant:manage permission)
 // All handlers below accept :tid as the target tenant ID in the path.
 // ---------------------------------------------------------------------------
 
@@ -1398,7 +1407,7 @@ func targetTenantID(c echo.Context) (int64, error) {
 // @Param        tid  path      string  true  "Target tenant ID"
 // @Success      200  {array}   admin.PermissionResult
 // @Failure      400  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{tid}/permissions [get]
+// @Router       /api/v1/tenants/{tid}/permissions [get]
 func (h *AdminHandler) TenantListPermissions(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1425,7 +1434,7 @@ func (h *AdminHandler) TenantListPermissions(c echo.Context) error {
 // @Success      201   {object}  admin.PermissionResult
 // @Failure      400   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Permission name already exists"
-// @Router       /api/v1/admin/tenants/{tid}/permissions [post]
+// @Router       /api/v1/tenants/{tid}/permissions [post]
 func (h *AdminHandler) TenantCreatePermission(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1462,7 +1471,7 @@ func (h *AdminHandler) TenantCreatePermission(c echo.Context) error {
 // @Param        pid  path      string  true  "Permission ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{tid}/permissions/{pid} [delete]
+// @Router       /api/v1/tenants/{tid}/permissions/{pid} [delete]
 func (h *AdminHandler) TenantDeletePermission(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1496,7 +1505,7 @@ func (h *AdminHandler) TenantDeletePermission(c echo.Context) error {
 // @Param        tid  path      string  true  "Target tenant ID"
 // @Success      200  {array}   admin.RoleResult
 // @Failure      400  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{tid}/roles [get]
+// @Router       /api/v1/tenants/{tid}/roles [get]
 func (h *AdminHandler) TenantListRoles(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1523,7 +1532,7 @@ func (h *AdminHandler) TenantListRoles(c echo.Context) error {
 // @Success      201   {object}  admin.RoleResult
 // @Failure      400   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Role name already exists"
-// @Router       /api/v1/admin/tenants/{tid}/roles [post]
+// @Router       /api/v1/tenants/{tid}/roles [post]
 func (h *AdminHandler) TenantCreateRole(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1564,7 +1573,7 @@ func (h *AdminHandler) TenantCreateRole(c echo.Context) error {
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
 // @Failure      404   {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{tid}/roles/{rid}/permissions [put]
+// @Router       /api/v1/tenants/{tid}/roles/{rid}/permissions [put]
 func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1605,7 +1614,7 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 // @Param        rid  path      string  true  "Role ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{tid}/roles/{rid} [delete]
+// @Router       /api/v1/tenants/{tid}/roles/{rid} [delete]
 func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1642,7 +1651,7 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 // @Param        search  query     string  false  "Search by email or name"
 // @Success      200     {array}   admin.UserResult
 // @Failure      400     {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{tid}/users [get]
+// @Router       /api/v1/tenants/{tid}/users [get]
 func (h *AdminHandler) TenantListUsers(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1672,7 +1681,7 @@ func (h *AdminHandler) TenantListUsers(c echo.Context) error {
 // @Success      201   {object}  admin.UserResult
 // @Failure      400   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Email already registered"
-// @Router       /api/v1/admin/tenants/{tid}/users [post]
+// @Router       /api/v1/tenants/{tid}/users [post]
 func (h *AdminHandler) TenantCreateUser(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1720,7 +1729,7 @@ func (h *AdminHandler) TenantCreateUser(c echo.Context) error {
 // @Param        uid  path      string  true  "User ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/tenants/{tid}/users/{uid} [delete]
+// @Router       /api/v1/tenants/{tid}/users/{uid} [delete]
 func (h *AdminHandler) TenantDeleteUser(c echo.Context) error {
 	tid, err := targetTenantID(c)
 	if err != nil {
@@ -1754,7 +1763,7 @@ type CreateApplicationRequest struct {
 // CreateApplication handles POST /api/v1/admin/applications.
 //
 // @Summary      Create application
-// @Description  Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once.
+// @Description  Registers a new application for the tenant. Returns client_id and client_secret â€” secret is shown exactly once.
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
@@ -1763,7 +1772,7 @@ type CreateApplicationRequest struct {
 // @Success      201   {object}  auth.AppResult
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
-// @Router       /api/v1/admin/applications [post]
+// @Router       /api/v1/applications [post]
 func (h *AdminHandler) CreateApplication(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1801,7 +1810,7 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {array}   auth.AppSummary
 // @Failure      403  {object}  map[string]string
-// @Router       /api/v1/admin/applications [get]
+// @Router       /api/v1/applications [get]
 func (h *AdminHandler) ListApplications(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {
@@ -1832,7 +1841,7 @@ func (h *AdminHandler) ListApplications(c echo.Context) error {
 // @Failure      400  {object}  map[string]string
 // @Failure      403  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/applications/{id} [delete]
+// @Router       /api/v1/applications/{id} [delete]
 func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 	claims, ok := claimsFromCtx(c)
 	if !ok {

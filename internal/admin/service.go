@@ -61,11 +61,27 @@ type TenantFilter struct {
 
 // TenantsPage wraps a paginated tenant list.
 type TenantsPage struct {
-	Tenants    []TenantResult `json:"tenants"`
+	Data       []TenantResult `json:"data"`
 	Total      int            `json:"total"`
 	Page       int            `json:"page"`
 	TotalPages int            `json:"total_pages"`
-	Limit      int            `json:"limit"`
+	PerPage    int            `json:"per_page"`
+}
+
+// OwnerResult carries the auto-created owner user returned once on tenant creation.
+// TempPassword is the plaintext password — it is never stored and is shown only this once.
+type OwnerResult struct {
+	ID           string `json:"id"`
+	Email        string `json:"email"`
+	TempPassword string `json:"temp_password"`
+	Role         string `json:"role"`
+}
+
+// CreateTenantResult is returned by CreateTenant; it combines the new tenant with
+// the auto-seeded owner user.
+type CreateTenantResult struct {
+	Tenant TenantResult `json:"tenant"`
+	Owner  OwnerResult  `json:"owner"`
 }
 
 // TenantDashboardDelta holds month-over-month percentage changes.
@@ -166,8 +182,26 @@ func New(pool *pgxpool.Pool, resetSvc *auth.ResetService, logger zerolog.Logger)
 // Tenant management (super_admin only — caller must hold "tenant:manage" perm)
 // ---------------------------------------------------------------------------
 
-// CreateTenant creates a new tenant with a freshly generated JWT secret.
-func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*TenantResult, error) {
+// defaultPermissions lists the 8 permissions seeded into every new tenant.
+var defaultPermissions = []struct{ name, description string }{
+	{"users:read", "Read users in the tenant"},
+	{"users:write", "Create and update users in the tenant"},
+	{"roles:read", "Read roles in the tenant"},
+	{"roles:write", "Create and update roles in the tenant"},
+	{"permissions:read", "Read permissions in the tenant"},
+	{"permissions:write", "Create and update permissions in the tenant"},
+	{"apps:read", "Read applications in the tenant"},
+	{"apps:write", "Create and update applications in the tenant"},
+}
+
+// CreateTenant creates a new tenant inside a single transaction that also seeds:
+//   - 8 default permissions
+//   - an "owner" system role with all 8 permissions
+//   - an owner user (email: owner@emc.<slug>) with a one-time temp password
+//
+// The plaintext temp password is returned in CreateTenantResult.Owner.TempPassword
+// and is never stored anywhere — only the bcrypt hash is persisted.
+func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*CreateTenantResult, error) {
 	secret, err := generateSecret()
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
@@ -178,14 +212,31 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Tena
 		plan = "free"
 	}
 
-	var id int64
-	err = s.pool.QueryRow(ctx, `
+	tempPassword, err := generateTempPassword()
+	if err != nil {
+		return nil, fmt.Errorf("generate temp password: %w", err)
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(tempPassword), auth.BcryptCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash owner password: %w", err)
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin create tenant tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Step 1: insert tenant row.
+	var tenantID int64
+	err = tx.QueryRow(ctx, `
 		INSERT INTO tenants (name, slug, jwt_secret, display_name, domain, region, description, plan, is_active)
 		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8, true)
 		RETURNING id
 	`, in.Name, in.Slug, secret,
 		in.DisplayName, in.Domain, in.Region, in.Description, plan,
-	).Scan(&id)
+	).Scan(&tenantID)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
@@ -193,8 +244,87 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Tena
 		return nil, fmt.Errorf("create tenant: %w", err)
 	}
 
-	s.logger.Info().Str("slug", in.Slug).Str("id", strconv.FormatInt(id, 10)).Msg("admin: tenant created")
-	return s.getTenantByID(ctx, id)
+	// Step 2: seed default permissions.
+	permIDs := make([]int64, len(defaultPermissions))
+	for i, p := range defaultPermissions {
+		err = tx.QueryRow(ctx, `
+			INSERT INTO permissions (tenant_id, name, description)
+			VALUES ($1, $2, $3)
+			RETURNING id
+		`, tenantID, p.name, p.description).Scan(&permIDs[i])
+		if err != nil {
+			return nil, fmt.Errorf("seed permission %s: %w", p.name, err)
+		}
+	}
+
+	// Step 3: create owner role (is_system = true so it cannot be deleted).
+	var roleID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO roles (tenant_id, name, is_system, created_at)
+		VALUES ($1, 'owner', true, NOW())
+		RETURNING id
+	`, tenantID).Scan(&roleID)
+	if err != nil {
+		return nil, fmt.Errorf("create owner role: %w", err)
+	}
+
+	// Step 4: assign all permissions to the owner role.
+	for _, permID := range permIDs {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO role_permissions (role_id, permission_id, tenant_id)
+			VALUES ($1, $2, $3)
+			ON CONFLICT DO NOTHING
+		`, roleID, permID, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("assign permission to owner role: %w", err)
+		}
+	}
+
+	// Step 5: create owner user.
+	ownerEmail := "owner@emc." + in.Slug
+	var userID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
+		VALUES ($1, $2, 'Owner', $3, $4, true)
+		RETURNING id
+	`, tenantID, ownerEmail, in.Slug, roleID).Scan(&userID)
+	if err != nil {
+		return nil, fmt.Errorf("create owner user: %w", err)
+	}
+
+	// Step 6: store bcrypt hash — never the plaintext.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO user_credentials (user_id, tenant_id, password_hash)
+		VALUES ($1, $2, $3)
+	`, userID, tenantID, string(hash))
+	if err != nil {
+		return nil, fmt.Errorf("store owner credentials: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit create tenant tx: %w", err)
+	}
+
+	s.logger.Info().
+		Str("slug", in.Slug).
+		Str("tenant_id", strconv.FormatInt(tenantID, 10)).
+		Str("owner_email", ownerEmail).
+		Msg("admin: tenant created with owner")
+
+	tenant, err := s.getTenantByID(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CreateTenantResult{
+		Tenant: *tenant,
+		Owner: OwnerResult{
+			ID:           strconv.FormatInt(userID, 10),
+			Email:        ownerEmail,
+			TempPassword: tempPassword,
+			Role:         "owner",
+		},
+	}, nil
 }
 
 // ListTenantsPaginated returns a filtered, paginated list of tenants.
@@ -261,11 +391,11 @@ func (s *Service) ListTenantsPaginated(ctx context.Context, f TenantFilter) (*Te
 		totalPages = 1
 	}
 	return &TenantsPage{
-		Tenants:    tenants,
+		Data:       tenants,
 		Total:      total,
 		Page:       f.Page,
 		TotalPages: totalPages,
-		Limit:      f.Limit,
+		PerPage:    f.Limit,
 	}, nil
 }
 
@@ -983,6 +1113,19 @@ func generateSecret() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// generateTempPassword generates a 12-character alphanumeric temporary password.
+func generateTempPassword() (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 12)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	for i := range b {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+	return string(b), nil
 }
 
 // isDuplicateErr returns true when err is a PostgreSQL unique_violation (code 23505).

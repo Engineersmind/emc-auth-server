@@ -1,4 +1,4 @@
-package handlers
+﻿package handlers
 
 import (
 	"encoding/base64"
@@ -124,7 +124,7 @@ type LoginRequest struct {
 
 // tenantSlugFromCtx extracts the X-Tenant-Slug header.
 // Returns the slug and whether it was explicitly provided.
-// For login/session endpoints the slug is optional — defaults to "emc".
+// For login/session endpoints the slug is optional â€” defaults to "emc".
 func tenantSlugFromCtx(c echo.Context) (string, bool) {
 	slug := c.Request().Header.Get("X-Tenant-Slug")
 	return slug, slug != ""
@@ -269,7 +269,7 @@ type LoginOTPRequest struct {
 	Code            string `json:"code"`
 }
 
-// LoginOTP handles POST /api/v1/auth/login/otp — completes a TOTP-gated login.
+// LoginOTP handles POST /api/v1/auth/login/otp â€” completes a TOTP-gated login.
 //
 // @Summary      Complete TOTP login
 // @Description  Submit the TOTP code (or backup code) to complete a two-step login.
@@ -362,7 +362,7 @@ type LogoutRequest struct {
 // @Router       /api/v1/auth/refresh [post]
 func (h *AuthHandler) Refresh(c echo.Context) error {
 	var req RefreshRequest
-	_ = c.Bind(&req) // body is optional — cookie is the fallback
+	_ = c.Bind(&req) // body is optional â€” cookie is the fallback
 
 	// Accept refresh token from cookie when the body doesn't supply one.
 	if req.RefreshToken == "" {
@@ -379,7 +379,7 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		h.logger.Warn().Err(err).Msg("refresh failed")
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated â€” security event detected"})
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
@@ -408,7 +408,7 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 // Logout handles POST /api/v1/auth/logout (AUTH-04).
 //
 // @Summary      Logout
-// @Description  Revokes the supplied refresh token. Idempotent — calling twice is safe.
+// @Description  Revokes the supplied refresh token. Idempotent â€” calling twice is safe.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
@@ -418,7 +418,7 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 // @Router       /api/v1/auth/logout [post]
 func (h *AuthHandler) Logout(c echo.Context) error {
 	var req LogoutRequest
-	_ = c.Bind(&req) // body is optional — cookie is the fallback
+	_ = c.Bind(&req) // body is optional â€” cookie is the fallback
 
 	// Accept refresh token from cookie when the body doesn't supply one.
 	if req.RefreshToken == "" {
@@ -549,7 +549,7 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "password updated successfully"})
 }
 
-// ─── TOTP Handlers ───────────────────────────────────────────────────────────
+// â”€â”€â”€ TOTP Handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // TOTPEnroll handles POST /api/v1/auth/otp/enroll.
 //
@@ -622,7 +622,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
 		if containsMsg(err, "invalid TOTP") {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid TOTP code — check your authenticator app"})
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid TOTP code â€” check your authenticator app"})
 		}
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
@@ -669,7 +669,7 @@ func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "TOTP 2FA disabled"})
 }
 
-// ─── API Key Handlers ─────────────────────────────────────────────────────────
+// â”€â”€â”€ API Key Handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // CreateAPIKeyRequest is the JSON body for POST /api/v1/admin/api-keys.
 type CreateAPIKeyRequest struct {
@@ -688,7 +688,7 @@ type CreateAPIKeyRequest struct {
 // @Param        body  body      CreateAPIKeyRequest  true  "Key name and permissions"
 // @Success      201   {object}  auth.APIKeyResult
 // @Failure      400   {object}  map[string]string
-// @Router       /api/v1/admin/api-keys [post]
+// @Router       /api/v1/api-keys [post]
 func (h *AuthHandler) CreateAPIKey(c echo.Context) error {
 	if h.apiKeySvc == nil {
 		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "API keys not configured"})
@@ -722,7 +722,7 @@ func (h *AuthHandler) CreateAPIKey(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {array}   auth.APIKeySummary
 // @Failure      401  {object}  map[string]string
-// @Router       /api/v1/admin/api-keys [get]
+// @Router       /api/v1/api-keys [get]
 func (h *AuthHandler) ListAPIKeys(c echo.Context) error {
 	if h.apiKeySvc == nil {
 		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "API keys not configured"})
@@ -752,7 +752,7 @@ func (h *AuthHandler) ListAPIKeys(c echo.Context) error {
 // @Param        id   path      string  true  "API key ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /api/v1/admin/api-keys/{id} [delete]
+// @Router       /api/v1/api-keys/{id} [delete]
 func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 	if h.apiKeySvc == nil {
 		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "API keys not configured"})
@@ -780,7 +780,7 @@ func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 
 // ManagementToken exchanges an API key for a short-lived management JWT.
 // The JWT carries the API key's permissions so it can call /admin/* endpoints
-// for the key's tenant — equivalent to Auth0's client_credentials grant.
+// for the key's tenant â€” equivalent to Auth0's client_credentials grant.
 //
 // ManagementToken handles POST /api/v1/auth/management-token.
 //
@@ -788,7 +788,7 @@ func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 // @Description  Authenticates an API key (X-API-Key or Authorization: ApiKey) and returns a short-lived management JWT valid for 15 minutes. Use the returned token as Bearer auth on admin endpoints.
 // @Tags         AUTH
 // @Produce      json
-// @Param        X-API-Key  header    string  false  "API key (emck_…). Alternative: Authorization: ApiKey <key>"
+// @Param        X-API-Key  header    string  false  "API key (emck_â€¦). Alternative: Authorization: ApiKey <key>"
 // @Success      200        {object}  map[string]interface{}  "access_token, expires_in, token_type"
 // @Failure      401        {object}  map[string]string
 // @Failure      501        {object}  map[string]string  "Management tokens not configured"
@@ -807,7 +807,7 @@ func (h *AuthHandler) ManagementToken(c echo.Context) error {
 	}
 	if rawKey == "" {
 		return c.JSON(http.StatusUnauthorized, map[string]string{
-			"error": "API key required — set X-API-Key or Authorization: ApiKey <key>",
+			"error": "API key required â€” set X-API-Key or Authorization: ApiKey <key>",
 		})
 	}
 
@@ -976,7 +976,7 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		h.logger.Warn().Err(err).Msg("session refresh failed")
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated â€” security event detected"})
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
@@ -1055,7 +1055,7 @@ func (h *AuthHandler) Token(c echo.Context) error {
 	}
 	if req.GrantType != "client_credentials" {
 		return c.JSON(http.StatusBadRequest, map[string]string{
-			"error": "unsupported grant_type — only client_credentials is accepted",
+			"error": "unsupported grant_type â€” only client_credentials is accepted",
 		})
 	}
 	if req.ClientID == "" || req.ClientSecret == "" {
