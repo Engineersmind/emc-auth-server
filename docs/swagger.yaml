@@ -761,7 +761,7 @@ paths:
       consumes:
       - application/json
       description: Validates an agent API key and returns a signed short-lived JWT.
-        Public â€” no prior auth required.
+        Public — no prior auth required.
       parameters:
       - description: Agent key and tenant ID
         in: body
@@ -1021,7 +1021,7 @@ paths:
       consumes:
       - application/json
       description: Registers a new application for the tenant. Returns client_id and
-        client_secret â€” secret is shown exactly once.
+        client_secret — secret is shown exactly once.
       parameters:
       - description: Application name
         in: body
@@ -1284,7 +1284,7 @@ paths:
     post:
       consumes:
       - application/json
-      description: Revokes the supplied refresh token. Idempotent â€” calling twice
+      description: Revokes the supplied refresh token. Idempotent — calling twice
         is safe.
       parameters:
       - description: Refresh token to revoke
@@ -1317,7 +1317,7 @@ paths:
         and returns a short-lived management JWT valid for 15 minutes. Use the returned
         token as Bearer auth on admin endpoints.'
       parameters:
-      - description: 'API key (emck_â€¦). Alternative: Authorization: ApiKey <key>'
+      - description: 'API key (emck_…). Alternative: Authorization: ApiKey <key>'
         in: header
         name: X-API-Key
         type: string
@@ -2969,7 +2969,7 @@ paths:
     post:
       consumes:
       - application/x-www-form-urlencoded
-      description: Receives IdP SAMLResponse. Currently returns 501 â€” disabled until
+      description: Receives IdP SAMLResponse. Currently returns 501 — disabled until
         IdP XML signature verification is implemented.
       produces:
       - application/json

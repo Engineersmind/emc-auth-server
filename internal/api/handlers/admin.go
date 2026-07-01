@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -66,6 +67,11 @@ func tenantIDFromClaims(claims *auth.Claims) (int64, error) {
 // validPlans is the allowed set of plan values.
 var validPlans = map[string]bool{"free": true, "pro": true, "enterprise": true}
 
+// slugPattern restricts tenant slugs to lowercase alphanumeric segments
+// separated by single hyphens, since the slug is used verbatim to build the
+// owner login (owner@emc.<slug>) and in X-Tenant-Slug lookups.
+var slugPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
 // CreateTenantRequest is the body for POST /api/v1/admin/tenants.
 type CreateTenantRequest struct {
 	Name        string `json:"name"`
@@ -114,6 +120,9 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 	}
 	if req.Name == "" || req.Slug == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name and slug are required"})
+	}
+	if !slugPattern.MatchString(req.Slug) {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "slug must be lowercase alphanumeric with single hyphens (e.g. acme-corp)"})
 	}
 	if req.Plan != "" && !validPlans[req.Plan] {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "plan must be one of: free, pro, enterprise"})
@@ -1094,7 +1103,7 @@ func (h *AdminHandler) GetTenantAuditLogs(c echo.Context) error {
 // @Router       /api/v1/audit-logs/system [get]
 func (h *AdminHandler) GetSystemAuditLogs(c echo.Context) error {
 	p := auditQueryParams(c)
-	// No TenantID filter â€” returns all tenants.
+	// No TenantID filter — returns all tenants.
 
 	result, err := h.audit.Query(c.Request().Context(), p)
 	if err != nil {
@@ -1386,7 +1395,7 @@ func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-tenant management â€” super_admin only (tenant:manage permission)
+// Cross-tenant management — super_admin only (tenant:manage permission)
 // All handlers below accept :tid as the target tenant ID in the path.
 // ---------------------------------------------------------------------------
 
@@ -1763,7 +1772,7 @@ type CreateApplicationRequest struct {
 // CreateApplication handles POST /api/v1/admin/applications.
 //
 // @Summary      Create application
-// @Description  Registers a new application for the tenant. Returns client_id and client_secret â€” secret is shown exactly once.
+// @Description  Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once.
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json

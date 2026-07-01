@@ -76,10 +76,10 @@ func (h *SAMLHandler) InitiateLogin(c echo.Context) error {
 	return c.Redirect(http.StatusFound, redirectURL)
 }
 
-// HandleACS handles POST /saml/acs â€” Assertion Consumer Service.
+// HandleACS handles POST /saml/acs — Assertion Consumer Service.
 //
 // @Summary      SAML Assertion Consumer Service (disabled)
-// @Description  Receives IdP SAMLResponse. Currently returns 501 â€” disabled until IdP XML signature verification is implemented.
+// @Description  Receives IdP SAMLResponse. Currently returns 501 — disabled until IdP XML signature verification is implemented.
 // @Tags         saml
 // @Accept       application/x-www-form-urlencoded
 // @Produce      json
@@ -98,7 +98,7 @@ func (h *SAMLHandler) HandleACS(c echo.Context) error {
 	)
 }
 
-// handleACSImpl is the deferred full implementation â€” wired in once crewjam/saml
+// handleACSImpl is the deferred full implementation — wired in once crewjam/saml
 // validates the IdP signature on every assertion.
 //
 //nolint:unused

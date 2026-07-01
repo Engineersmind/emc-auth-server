@@ -178,7 +178,7 @@ func (h *AgentHandler) GetAgentAnalysis(c echo.Context) error {
 // AuthenticateAgent handles POST /api/v1/agents/authenticate.
 //
 // @Summary      Authenticate an agent and issue a JWT
-// @Description  Validates an agent API key and returns a signed short-lived JWT. Public â€” no prior auth required.
+// @Description  Validates an agent API key and returns a signed short-lived JWT. Public — no prior auth required.
 // @Tags         agent-auth
 // @Accept       json
 // @Produce      json

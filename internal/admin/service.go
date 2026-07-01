@@ -507,9 +507,18 @@ func (s *Service) GetTenantDashboardStats(ctx context.Context) (*TenantDashboard
 		return nil, fmt.Errorf("tenant dashboard stats: %w", err)
 	}
 
-	// active-tenants delta: compare active now vs active last month
-	// (active last month approximated as activeTenants - tenantsThisMonth + tenantsLastMonth)
+	// active-tenants delta: compare active now vs active last month.
+	// There is no historical snapshot of is_active, so this is an ESTIMATE:
+	// active last month ≈ active now, minus tenants created this month (not
+	// present last month), plus tenants created last month (assumed still
+	// active, since new tenants default to active). It does not account for
+	// tenants deactivated or reactivated within the window, so it can drift
+	// from the true prior count in either direction; clamp to a sane range
+	// so a skewed estimate can't produce a negative baseline for momPct.
 	activePrior := activeTenants - tenantsThisMonth + tenantsLastMonth
+	if activePrior < 0 {
+		activePrior = 0
+	}
 
 	return &TenantDashboardStats{
 		TotalTenants:      totalTenants,

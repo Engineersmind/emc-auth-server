@@ -140,7 +140,7 @@ const docTemplate = `{
         },
         "/api/v1/agents/authenticate": {
             "post": {
-                "description": "Validates an agent API key and returns a signed short-lived JWT. Public â€” no prior auth required.",
+                "description": "Validates an agent API key and returns a signed short-lived JWT. Public — no prior auth required.",
                 "consumes": [
                     "application/json"
                 ],
@@ -593,7 +593,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Registers a new application for the tenant. Returns client_id and client_secret â€” secret is shown exactly once.",
+                "description": "Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once.",
                 "consumes": [
                     "application/json"
                 ],
@@ -989,7 +989,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/logout": {
             "post": {
-                "description": "Revokes the supplied refresh token. Idempotent â€” calling twice is safe.",
+                "description": "Revokes the supplied refresh token. Idempotent — calling twice is safe.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1046,7 +1046,7 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "API key (emck_â€¦). Alternative: Authorization: ApiKey \u003ckey\u003e",
+                        "description": "API key (emck_…). Alternative: Authorization: ApiKey \u003ckey\u003e",
                         "name": "X-API-Key",
                         "in": "header"
                     }
@@ -3569,7 +3569,7 @@ const docTemplate = `{
         },
         "/saml/acs": {
             "post": {
-                "description": "Receives IdP SAMLResponse. Currently returns 501 â€” disabled until IdP XML signature verification is implemented.",
+                "description": "Receives IdP SAMLResponse. Currently returns 501 — disabled until IdP XML signature verification is implemented.",
                 "consumes": [
                     "application/x-www-form-urlencoded"
                 ],
