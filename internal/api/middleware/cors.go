@@ -106,8 +106,15 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 			}
 
 			// Check whether the request origin is in the allowed list.
+			// A "*" entry means all origins are permitted (wildcard mode).
+			wildcard := false
 			allowed := false
 			for _, o := range origins {
+				if o == "*" {
+					wildcard = true
+					allowed = true
+					break
+				}
 				if o == requestOrigin {
 					allowed = true
 					break
@@ -122,9 +129,14 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 
 			// Apply CORS response headers.
 			h := c.Response().Header()
-			h.Set("Access-Control-Allow-Origin", requestOrigin)
-			h.Set("Access-Control-Allow-Credentials", "true")
-			h.Set("Vary", "Origin")
+			if wildcard {
+				// Wildcard mode: browsers do not allow credentials with "*".
+				h.Set("Access-Control-Allow-Origin", "*")
+			} else {
+				h.Set("Access-Control-Allow-Origin", requestOrigin)
+				h.Set("Access-Control-Allow-Credentials", "true")
+				h.Set("Vary", "Origin")
+			}
 
 			// Handle preflight.
 			if c.Request().Method == http.MethodOptions {
