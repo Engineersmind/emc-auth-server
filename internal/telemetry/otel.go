@@ -36,11 +36,12 @@ func Init(ctx context.Context) (ShutdownFunc, error) {
 		serviceName = "emc-auth-server"
 	}
 
-	// NewSchemaless has no schema URL, so Merge won't conflict with
-	// resource.Default() which uses the SDK's own semconv schema (v1.41.x).
+	// Derive the schema URL from resource.Default() so both sides of the Merge
+	// always agree, regardless of which semconv version the SDK embeds.
+	defaultRes := resource.Default()
 	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewSchemaless(semconv.ServiceName(serviceName)),
+		defaultRes,
+		resource.NewWithAttributes(defaultRes.SchemaURL(), semconv.ServiceName(serviceName)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("otel resource: %w", err)
