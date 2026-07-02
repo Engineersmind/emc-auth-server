@@ -171,7 +171,7 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 // ListTenants handles GET /api/v1/admin/tenants.
 //
 // @Summary      List tenants
-// @Description  Returns a paginated, filtered list of tenants. Requires tenant:manage permission.
+// @Description  Returns tenants scoped to the caller's permissions: callers with tenant:manage get a paginated, filtered list of every tenant; any other authenticated caller gets only the tenants tied to their own account email, each with their role and usage stats (search/status/region/pagination params are ignored in that case).
 // @Tags         admin-tenants
 // @Produce      json
 // @Security     BearerAuth
@@ -374,7 +374,7 @@ func (h *AdminHandler) CheckSlug(c echo.Context) error {
 // GetTenantDashboardStats handles GET /api/v1/admin/stats/tenants.
 //
 // @Summary      Tenant dashboard stats
-// @Description  Returns system-wide tenant, application, and user counts with month-over-month deltas. Requires tenant:manage permission.
+// @Description  Returns stats scoped to the caller's permissions: callers with tenant:manage get system-wide tenant/application/user counts with month-over-month deltas; any other authenticated caller gets counts aggregated only across the tenants tied to their own account email (no deltas).
 // @Tags         admin-tenants
 // @Produce      json
 // @Security     BearerAuth

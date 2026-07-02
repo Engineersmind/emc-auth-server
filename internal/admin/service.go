@@ -219,13 +219,24 @@ var defaultPermissions = []struct{ name, description string }{
 // The same email may be used as OwnerEmail across multiple CreateTenant calls —
 // each call creates an independent users row scoped to its own tenant, so one
 // person can own multiple tenants without any shared credentials between them.
+// IMPORTANT: if that owner later sets the same password on two or more of
+// their tenants, Login cannot tell which tenant they mean and rejects the
+// attempt entirely — advise owners who manage multiple tenants to keep a
+// distinct password per tenant when handing off the temp password below.
 //
 // The plaintext temp password is returned in CreateTenantResult.Owner.TempPassword
 // and is never stored anywhere — only the bcrypt hash is persisted.
 func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*CreateTenantResult, error) {
-	if _, err := mail.ParseAddress(in.OwnerEmail); err != nil {
+	ownerAddr, err := mail.ParseAddress(in.OwnerEmail)
+	if err != nil {
 		return nil, fmt.Errorf("owner_email is required and must be a valid email address")
 	}
+	// mail.ParseAddress accepts RFC 5322 mailbox strings with a display name
+	// (e.g. "Jane Doe <jane@example.com>"). Store only the bare address —
+	// otherwise the literal input string ends up in users.email and the owner
+	// can never log in with the address they were actually given, since Login
+	// matches on an exact string.
+	ownerEmailAddr := ownerAddr.Address
 
 	secret, err := generateSecret()
 	if err != nil {
@@ -306,7 +317,7 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	}
 
 	// Step 5: create owner user.
-	ownerEmail := in.OwnerEmail
+	ownerEmail := ownerEmailAddr
 	var userID int64
 	err = tx.QueryRow(ctx, `
 		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)

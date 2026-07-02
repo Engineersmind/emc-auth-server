@@ -27,6 +27,12 @@ type RateLimitConfig struct {
 	PerTenantRate int
 }
 
+// maxRateLimitEmailLen caps how much of a submitted "email" is used as part of
+// a rate-limiter map key. RFC 5321 caps real addresses at 254 bytes; without
+// this, a client submitting an arbitrarily long "email" string could inflate
+// limiter-store memory with huge map keys.
+const maxRateLimitEmailLen = 254
+
 // DefaultRateLimitConfig returns AUTH-07 compliant defaults.
 func DefaultRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
@@ -159,9 +165,27 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 			// stable identifier available before authentication succeeds.
 			// "unknown-account" is the fallback key when the body can't be parsed,
 			// so the limit cannot be bypassed by sending a malformed body (AUTH-07).
+			// Trade-off vs. the old X-Tenant-Slug-keyed bucket: that capped *all*
+			// attempts against one tenant at cfg.PerTenantRate regardless of which
+			// email was tried; this one gives each email its own independent
+			// bucket, so an attacker rotating through many known/guessed emails
+			// against the same tenant faces no aggregate cap beyond the per-IP
+			// limit above. There is no tenant identifier available before Login
+			// resolves candidates, so a true per-tenant bucket isn't available
+			// here — a coarser, tenant-aware limiter applied after resolution
+			// would need to live in the service layer, not this middleware.
+			//
+			// Malformed/non-JSON bodies also share one "unknown-account" bucket
+			// across every caller — a body-parse failure from one client can
+			// count against unrelated callers hitting that same fallback key
+			// within the window. Low severity: still bounded by the per-IP limit,
+			// and only triggers when a client fails to send parseable JSON.
 			email := loginEmailFromBody(c)
 			if email == "" {
 				email = "unknown-account"
+			}
+			if len(email) > maxRateLimitEmailLen {
+				email = email[:maxRateLimitEmailLen]
 			}
 			accountLimiter := tenantStore.getOrCreate("account:"+email, cfg.PerTenantRate)
 			if !accountLimiter.Allow() {
