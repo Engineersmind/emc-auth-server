@@ -186,7 +186,7 @@ func loginEmailFromBody(c echo.Context) string {
 		return ""
 	}
 	data, err := io.ReadAll(io.LimitReader(req.Body, 1<<16)) // cap: login bodies are tiny
-	req.Body.Close()                                         //nolint:errcheck
+	_ = req.Body.Close()
 	req.Body = io.NopCloser(bytes.NewReader(data))
 	if err != nil {
 		return ""
