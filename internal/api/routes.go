@@ -51,6 +51,9 @@ type RoutesConfig struct {
 	// CookieDomain is the Domain attribute for auth cookies (e.g. ".engineersmind.com").
 	// Leave empty for localhost development.
 	CookieDomain string
+	// GlobalCORSOrigins are the allowed browser origins for slug-less endpoints
+	// (e.g. /auth/login), which have no tenant to look up a per-tenant list by.
+	GlobalCORSOrigins []string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -236,8 +239,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
 	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
 
-	// Per-tenant CORS service — DB-backed, Redis-cached, 60s TTL.
-	corsSvc := mw.NewTenantCORSService(deps.Pool, deps.Redis, deps.Logger)
+	// Per-tenant CORS service — DB-backed, Redis-cached, 60s TTL. Slug-less
+	// requests (e.g. /auth/login) fall back to the global allow-list instead.
+	corsSvc := mw.NewTenantCORSService(deps.Pool, deps.Redis, deps.Logger).
+		WithGlobalOrigins(deps.Config.GlobalCORSOrigins)
 
 	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
 		WithAppRateLimits(appLimitSvc).
@@ -315,13 +320,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		return c.JSON(http.StatusOK, map[string]string{"status": "admin ping ok"})
 	}, mw.RequirePermission("admin:access"))
 
-	// Tenant management — super_admin only (tenant:manage permission)
+	// GET /tenants and /tenants/stats: any authenticated user, not just
+	// tenant:manage — the handlers branch internally on the caller's permissions
+	// (platform admins get every tenant; everyone else gets only the tenants
+	// tied to their own email). Registered before tenantMgmt so /stats isn't
+	// shadowed by tenantMgmt's /tenants/:id.
+	adminGroup.GET("/tenants", adminHandler.ListTenants)
+	adminGroup.GET("/tenants/stats", adminHandler.GetTenantDashboardStats)
+
+	// Tenant management — remaining routes require tenant:manage (super_admin only).
 	tenantMgmt := adminGroup.Group("", mw.RequirePermission("tenant:manage"))
 	tenantMgmt.POST("/tenants", adminHandler.CreateTenant)
-	tenantMgmt.GET("/tenants", adminHandler.ListTenants)
 	// Static sub-paths registered before /:id so Echo does not treat them as ID params.
 	tenantMgmt.GET("/tenants/check-slug", adminHandler.CheckSlug)
-	tenantMgmt.GET("/tenants/stats", adminHandler.GetTenantDashboardStats)
 	tenantMgmt.GET("/tenants/:id", adminHandler.GetTenant)
 	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
 	tenantMgmt.PUT("/tenants/:id/activate", adminHandler.ActivateTenant)

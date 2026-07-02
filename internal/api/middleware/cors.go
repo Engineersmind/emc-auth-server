@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,11 +27,30 @@ type TenantCORSService struct {
 	pool     *pgxpool.Pool
 	redisCli *redis.Client
 	logger   zerolog.Logger
+
+	// globalOrigins are the allowed origins for slug-less requests (e.g.
+	// /auth/login), which have no tenant to look up a per-tenant list by.
+	// Set via WithGlobalOrigins.
+	globalOrigins []string
 }
 
 // NewTenantCORSService creates a TenantCORSService.
 func NewTenantCORSService(pool *pgxpool.Pool, redisCli *redis.Client, logger zerolog.Logger) *TenantCORSService {
 	return &TenantCORSService{pool: pool, redisCli: redisCli, logger: logger}
+}
+
+// WithGlobalOrigins sets the allowed origins used for requests that carry no
+// X-Tenant-Slug header (the tenant isn't known yet, so no per-tenant list applies).
+// An empty list is valid but means every slug-less endpoint (e.g. /auth/login)
+// will send no CORS headers at all — browser-based cross-origin calls to those
+// endpoints will be blocked client-side even though server-to-server calls are
+// unaffected. Logged loudly here so that isn't a silent deployment surprise.
+func (s *TenantCORSService) WithGlobalOrigins(origins []string) *TenantCORSService {
+	s.globalOrigins = origins
+	if len(origins) == 0 {
+		s.logger.Warn().Msg("GLOBAL_CORS_ORIGINS is empty — slug-less endpoints (e.g. /auth/login) will send no CORS headers, so browser-based cross-origin calls to them will be blocked")
+	}
+	return s
 }
 
 // GetOrigins returns the allowed CORS origins for a tenant slug.
@@ -72,34 +92,76 @@ func (s *TenantCORSService) InvalidateCache(ctx context.Context, tenantSlug stri
 	}
 }
 
+// headerListContains reports whether name (case-insensitive) appears in a
+// comma-separated header list, e.g. the value of Access-Control-Request-Headers.
+func headerListContains(list, name string) bool {
+	for _, h := range strings.Split(list, ",") {
+		if strings.EqualFold(strings.TrimSpace(h), name) {
+			return true
+		}
+	}
+	return false
+}
+
 // TenantCORS returns middleware that applies per-tenant CORS headers.
 //
 // CORS origins are loaded from the tenant's cors_origins DB column (Redis-cached).
-// The tenant is identified by the X-Tenant-Slug request header.
+// The tenant is identified by the X-Tenant-Slug request header, when present.
 //
 // Behaviour:
-//   - No X-Tenant-Slug or empty cors_origins → no CORS headers set (pass through).
-//   - Valid Origin present in tenant's list → standard CORS headers applied.
+//   - X-Tenant-Slug present → that tenant's configured cors_origins apply.
+//   - X-Tenant-Slug absent (e.g. /auth/login, which resolves its tenant
+//     internally from email/password and never sends this header) → the
+//     service's global allow-list applies instead (see WithGlobalOrigins).
+//   - Preflight (OPTIONS) that announces X-Tenant-Slug via
+//     Access-Control-Request-Headers → browsers never send a custom header's
+//     *value* during preflight, only its name, so slug is unavoidably empty
+//     here even for a tenant-scoped call. Reflect the origin permissively for
+//     this preflight response only; the real request (which does carry the
+//     header) still gets strict per-tenant origin enforcement below.
+//   - No origins resolved either way → no CORS headers set (pass through).
+//   - Valid Origin present in the resolved list → standard CORS headers applied.
 //   - Preflight (OPTIONS) → 204 with CORS headers; request chain stops.
 //   - Unknown origin → 403 Forbidden (with CORS violation body).
 func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			slug := c.Request().Header.Get(tenantSlugHeader)
-			// Browser preflight (OPTIONS) does not echo back header values —
-			// only lists them in Access-Control-Request-Headers. Default to
-			// "emc" so preflight requests resolve the correct tenant origins.
-			if slug == "" {
-				slug = "emc"
+			req := c.Request()
+			isPreflight := req.Method == http.MethodOptions
+			slug := req.Header.Get(tenantSlugHeader)
+			requestOrigin := req.Header.Get("Origin")
+
+			announcesTenantSlug := isPreflight &&
+				headerListContains(req.Header.Get("Access-Control-Request-Headers"), tenantSlugHeader)
+
+			if slug == "" && announcesTenantSlug {
+				if requestOrigin == "" {
+					return next(c)
+				}
+				h := c.Response().Header()
+				h.Set("Access-Control-Allow-Origin", requestOrigin)
+				h.Set("Access-Control-Allow-Credentials", "true")
+				h.Set("Vary", "Origin")
+				h.Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+				if reqHeaders := req.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+					h.Set("Access-Control-Allow-Headers", reqHeaders)
+				}
+				h.Set("Access-Control-Max-Age", "86400")
+				return c.NoContent(http.StatusNoContent)
 			}
-			origins := svc.GetOrigins(c.Request().Context(), slug)
+
+			var origins []string
+			if slug == "" {
+				origins = svc.globalOrigins
+			} else {
+				origins = svc.GetOrigins(req.Context(), slug)
+			}
 
 			// No configured origins — skip CORS handling entirely.
 			if len(origins) == 0 {
 				return next(c)
 			}
 
-			requestOrigin := c.Request().Header.Get("Origin")
 			if requestOrigin == "" {
 				// Non-browser request — proceed without CORS headers.
 				return next(c)

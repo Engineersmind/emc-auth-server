@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"net/mail"
 	"regexp"
 	"strconv"
 	"time"
@@ -11,9 +12,9 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
+	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
-	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 )
 
 // AdminHandler holds handlers for all Admin API endpoints.
@@ -60,6 +61,19 @@ func tenantIDFromClaims(claims *auth.Claims) (int64, error) {
 	return strconv.ParseInt(claims.TenantID, 10, 64)
 }
 
+// hasPermission reports whether claims carries the given permission string.
+func hasPermission(claims *auth.Claims, permission string) bool {
+	if claims == nil {
+		return false
+	}
+	for _, p := range claims.Permissions {
+		if p == permission {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // Tenant management (requires "tenant:manage" permission)
 // ---------------------------------------------------------------------------
@@ -68,8 +82,8 @@ func tenantIDFromClaims(claims *auth.Claims) (int64, error) {
 var validPlans = map[string]bool{"free": true, "pro": true, "enterprise": true}
 
 // slugPattern restricts tenant slugs to lowercase alphanumeric segments
-// separated by single hyphens, since the slug is used verbatim to build the
-// owner login (owner@emc.<slug>) and in X-Tenant-Slug lookups.
+// separated by single hyphens, since the slug is used verbatim in
+// X-Tenant-Slug lookups.
 var slugPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // CreateTenantRequest is the body for POST /api/v1/admin/tenants.
@@ -81,6 +95,7 @@ type CreateTenantRequest struct {
 	Region      string `json:"region"`
 	Description string `json:"description"`
 	Plan        string `json:"plan"`
+	OwnerEmail  string `json:"owner_email"`
 }
 
 // UpdateTenantRequest is the body for PUT /api/v1/admin/tenants/:id.
@@ -102,7 +117,7 @@ type SlugCheckResponse struct {
 // CreateTenant handles POST /api/v1/tenants.
 //
 // @Summary      Create tenant
-// @Description  Creates a new isolated tenant and auto-seeds an owner role with 8 default permissions and an owner user (owner@emc.<slug>). The owner.temp_password in the response is shown once and never stored — hand it to the tenant owner. Requires tenant:manage permission (super_admin only).
+// @Description  Creates a new isolated tenant and auto-seeds an owner role with 8 default permissions and an owner user using the provided owner_email. The owner.temp_password in the response is shown once and never stored — hand it to the tenant owner. Requires tenant:manage permission (super_admin only).
 // @Tags         admin-tenants
 // @Accept       json
 // @Produce      json
@@ -118,11 +133,14 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
-	if req.Name == "" || req.Slug == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name and slug are required"})
+	if req.Name == "" || req.Slug == "" || req.OwnerEmail == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name, slug, and owner_email are required"})
 	}
 	if !slugPattern.MatchString(req.Slug) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "slug must be lowercase alphanumeric with single hyphens (e.g. acme-corp)"})
+	}
+	if _, err := mail.ParseAddress(req.OwnerEmail); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "owner_email must be a valid email address"})
 	}
 	if req.Plan != "" && !validPlans[req.Plan] {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "plan must be one of: free, pro, enterprise"})
@@ -137,6 +155,7 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 		Region:      req.Region,
 		Description: req.Description,
 		Plan:        req.Plan,
+		OwnerEmail:  req.OwnerEmail,
 	})
 	if err != nil {
 		if errors.Is(err, admin.ErrAlreadyExists) {
@@ -152,7 +171,7 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 // ListTenants handles GET /api/v1/admin/tenants.
 //
 // @Summary      List tenants
-// @Description  Returns a paginated, filtered list of tenants. Requires tenant:manage permission.
+// @Description  Returns tenants scoped to the caller's permissions: callers with tenant:manage get a paginated, filtered list of every tenant; any other authenticated caller gets only the tenants tied to their own account email, each with their role and usage stats (search/status/region/pagination params are ignored in that case).
 // @Tags         admin-tenants
 // @Produce      json
 // @Security     BearerAuth
@@ -165,6 +184,29 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 // @Failure      403       {object}  map[string]string
 // @Router       /api/v1/tenants [get]
 func (h *AdminHandler) ListTenants(c echo.Context) error {
+	claims, _ := claimsFromCtx(c)
+
+	// Platform admins (tenant:manage) see every tenant. Anyone else authenticated
+	// (e.g. a tenant owner, who only has tenant-scoped permissions) sees only the
+	// tenants tied to their own email — never the full platform list.
+	if !hasPermission(claims, "tenant:manage") {
+		if claims == nil || claims.Email == "" {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+		}
+		owned, err := h.svc.ListOwnedTenants(c.Request().Context(), claims.Email)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("list owned tenants failed")
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list tenants"})
+		}
+		return c.JSON(http.StatusOK, map[string]any{
+			"data":        owned,
+			"total":       len(owned),
+			"page":        1,
+			"total_pages": 1,
+			"per_page":    len(owned),
+		})
+	}
+
 	page, _ := strconv.Atoi(c.QueryParam("page"))
 
 	perPage, _ := strconv.Atoi(c.QueryParam("per_page"))
@@ -332,7 +374,7 @@ func (h *AdminHandler) CheckSlug(c echo.Context) error {
 // GetTenantDashboardStats handles GET /api/v1/admin/stats/tenants.
 //
 // @Summary      Tenant dashboard stats
-// @Description  Returns system-wide tenant, application, and user counts with month-over-month deltas. Requires tenant:manage permission.
+// @Description  Returns stats scoped to the caller's permissions: callers with tenant:manage get system-wide tenant/application/user counts with month-over-month deltas; any other authenticated caller gets counts aggregated only across the tenants tied to their own account email (no deltas).
 // @Tags         admin-tenants
 // @Produce      json
 // @Security     BearerAuth
@@ -340,6 +382,30 @@ func (h *AdminHandler) CheckSlug(c echo.Context) error {
 // @Failure      403  {object}  map[string]string
 // @Router       /api/v1/tenants/stats [get]
 func (h *AdminHandler) GetTenantDashboardStats(c echo.Context) error {
+	claims, _ := claimsFromCtx(c)
+
+	// Same split as ListTenants: platform admins get system-wide stats;
+	// everyone else gets stats aggregated only across their own owned tenants.
+	if !hasPermission(claims, "tenant:manage") {
+		if claims == nil || claims.Email == "" {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+		}
+		owned, err := h.svc.ListOwnedTenants(c.Request().Context(), claims.Email)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("owned tenant stats failed")
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to retrieve dashboard stats"})
+		}
+		stats := admin.TenantDashboardStats{TotalTenants: len(owned)}
+		for _, t := range owned {
+			if t.IsActive {
+				stats.ActiveTenants++
+			}
+			stats.TotalApplications += t.Stats.AppCount
+			stats.TotalUsers += t.Stats.UserCount
+		}
+		return c.JSON(http.StatusOK, stats)
+	}
+
 	result, err := h.svc.GetTenantDashboardStats(c.Request().Context())
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: tenant dashboard stats failed")
@@ -1877,4 +1943,3 @@ func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 	h.auditAdmin(c, claims, audit.ActionAdminApplicationDeleted, "application", strconv.FormatInt(appID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "application deactivated"})
 }
-

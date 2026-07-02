@@ -11,9 +11,9 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
+	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
-	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 )
 
 // AuthHandler holds HTTP handlers for auth endpoints.
@@ -130,7 +130,6 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 	return slug, slug != ""
 }
 
-
 // Register handles POST /api/v1/auth/register.
 //
 // @Summary      Register a new user
@@ -199,22 +198,16 @@ func (h *AuthHandler) Register(c echo.Context) error {
 // Login handles POST /api/v1/auth/login.
 //
 // @Summary      Login
-// @Description  Authenticates an existing user and returns a JWT access token + refresh token pair. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
+// @Description  Authenticates an existing user by email and password only. The tenant is resolved automatically from which account the password matches — no tenant slug or header is required.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
-// @Param        X-Tenant-Slug  header    string        false  "Tenant slug (default: emc)"
-// @Param        body           body      LoginRequest  true   "Login credentials"
-// @Success      200            {object}  auth.AuthResult
-// @Failure      400            {object}  map[string]string
-// @Failure      401            {object}  map[string]string  "Invalid credentials"
+// @Param        body  body      LoginRequest  true  "Login credentials"
+// @Success      200   {object}  auth.AuthResult
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid credentials"
 // @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
-	slug, _ := tenantSlugFromCtx(c)
-	if slug == "" {
-		slug = "emc"
-	}
-
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -224,10 +217,9 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	}
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
-		TenantSlug: slug,
-		ClientID:   clientIDFromCtx(c),
-		Email:      req.Email,
-		Password:   req.Password,
+		ClientID: clientIDFromCtx(c),
+		Email:    req.Email,
+		Password: req.Password,
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("login failed")
@@ -888,22 +880,16 @@ type SessionLoginRequest = LoginRequest
 // SessionLogin handles POST /api/v1/auth/session.
 //
 // @Summary      Cookie-based login
-// @Description  Authenticates the user and stores tokens in HttpOnly SameSite=Lax cookies. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
+// @Description  Authenticates the user by email and password only, and stores tokens in HttpOnly SameSite=Lax cookies. The tenant is resolved automatically — no tenant slug or header is required.
 // @Tags         auth-session
 // @Accept       json
 // @Produce      json
-// @Param        X-Tenant-Slug  header    string              false  "Tenant slug (default: emc)"
-// @Param        body           body      SessionLoginRequest true   "Credentials"
-// @Success      200            {object}  map[string]string
-// @Failure      400            {object}  map[string]string
-// @Failure      401            {object}  map[string]string
+// @Param        body  body      SessionLoginRequest true  "Credentials"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/session [post]
 func (h *AuthHandler) SessionLogin(c echo.Context) error {
-	slug, _ := tenantSlugFromCtx(c)
-	if slug == "" {
-		slug = "emc"
-	}
-
 	var req LoginRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -913,10 +899,9 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 	}
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
-		TenantSlug: slug,
-		ClientID:   clientIDFromCtx(c),
-		Email:      req.Email,
-		Password:   req.Password,
+		ClientID: clientIDFromCtx(c),
+		Email:    req.Email,
+		Password: req.Password,
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("session login failed")

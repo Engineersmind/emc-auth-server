@@ -2,7 +2,11 @@
 package middleware
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,15 +15,23 @@ import (
 )
 
 // RateLimitConfig holds the parameters for the login rate limiter.
-// AUTH-07: 5 attempts/min per IP, 10 attempts/min per tenant.
+// AUTH-07: 5 attempts/min per IP, 10 attempts/min per account.
 type RateLimitConfig struct {
 	// PerIPRate is the number of requests allowed per minute per client IP.
 	// Default: 5 (AUTH-07).
 	PerIPRate int
-	// PerTenantRate is the number of requests allowed per minute per tenant slug.
+	// PerTenantRate is the number of requests allowed per minute per account
+	// email. Named PerTenantRate for historical reasons (AUTH-07); since Login
+	// no longer takes a tenant slug, this is keyed on the submitted email instead.
 	// Default: 10 (AUTH-07).
 	PerTenantRate int
 }
+
+// maxRateLimitEmailLen caps how much of a submitted "email" is used as part of
+// a rate-limiter map key. RFC 5321 caps real addresses at 254 bytes; without
+// this, a client submitting an arbitrarily long "email" string could inflate
+// limiter-store memory with huge map keys.
+const maxRateLimitEmailLen = 254
 
 // DefaultRateLimitConfig returns AUTH-07 compliant defaults.
 func DefaultRateLimitConfig() RateLimitConfig {
@@ -148,18 +160,38 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				})
 			}
 
-			// Per-tenant rate check (keyed by X-Tenant-Slug header value).
-			// Always apply — use "unknown-tenant" as fallback key when header is absent
-			// so the per-tenant limit cannot be bypassed by omitting the header (AUTH-07).
-			tenantSlug := c.Request().Header.Get("X-Tenant-Slug")
-			if tenantSlug == "" {
-				tenantSlug = "unknown-tenant"
+			// Per-account rate check, keyed on the submitted email — Login no
+			// longer takes a tenant slug/client_id up front, so email is the only
+			// stable identifier available before authentication succeeds.
+			// "unknown-account" is the fallback key when the body can't be parsed,
+			// so the limit cannot be bypassed by sending a malformed body (AUTH-07).
+			// Trade-off vs. the old X-Tenant-Slug-keyed bucket: that capped *all*
+			// attempts against one tenant at cfg.PerTenantRate regardless of which
+			// email was tried; this one gives each email its own independent
+			// bucket, so an attacker rotating through many known/guessed emails
+			// against the same tenant faces no aggregate cap beyond the per-IP
+			// limit above. There is no tenant identifier available before Login
+			// resolves candidates, so a true per-tenant bucket isn't available
+			// here — a coarser, tenant-aware limiter applied after resolution
+			// would need to live in the service layer, not this middleware.
+			//
+			// Malformed/non-JSON bodies also share one "unknown-account" bucket
+			// across every caller — a body-parse failure from one client can
+			// count against unrelated callers hitting that same fallback key
+			// within the window. Low severity: still bounded by the per-IP limit,
+			// and only triggers when a client fails to send parseable JSON.
+			email := loginEmailFromBody(c)
+			if email == "" {
+				email = "unknown-account"
 			}
-			tenantLimiter := tenantStore.getOrCreate("tenant:"+tenantSlug, cfg.PerTenantRate)
-			if !tenantLimiter.Allow() {
+			if len(email) > maxRateLimitEmailLen {
+				email = email[:maxRateLimitEmailLen]
+			}
+			accountLimiter := tenantStore.getOrCreate("account:"+email, cfg.PerTenantRate)
+			if !accountLimiter.Allow() {
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
-					"error":       "too many login attempts for this tenant",
+					"error":       "too many login attempts for this account",
 					"retry_after": "60",
 				})
 			}
@@ -167,4 +199,28 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 			return next(c)
 		}
 	}
+}
+
+// loginEmailFromBody peeks the "email" field out of a login request body
+// without consuming it, so the handler can still bind the full body afterward.
+// Returns "" if the body is missing, unreadable, or not valid JSON.
+func loginEmailFromBody(c echo.Context) string {
+	req := c.Request()
+	if req.Body == nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(req.Body, 1<<16)) // cap: login bodies are tiny
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	if err != nil {
+		return ""
+	}
+
+	var payload struct {
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(payload.Email))
 }

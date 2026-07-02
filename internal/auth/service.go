@@ -60,9 +60,11 @@ type RegisterInput struct {
 	LastName  string
 }
 
-// LoginInput is the payload for authenticating an existing user.
+// LoginInput is the payload for authenticating an existing user. The tenant is
+// not specified by the caller — Login resolves it by matching Email/Password
+// against every tenant's users, since the same email may own accounts in
+// multiple tenants.
 type LoginInput struct {
-	TenantSlug string
 	// ClientID is the optional X-Client-ID header value. See RegisterInput.
 	ClientID string
 	Email    string
@@ -283,37 +285,94 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 	return s.issueTokenPair(ctx, userID, tenantID, in.Email, roleName, perms, nil, appID)
 }
 
-// Login authenticates an existing user by email and password.
-func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
-	tenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("invalid credentials")
-		}
-		return nil, err
-	}
+// dummyPasswordHash has no known matching plaintext. Login pads every attempt
+// with compares against this hash up to loginCompareFloor, so "zero candidate
+// accounts" and "a handful of candidate accounts" take roughly the same time —
+// otherwise response latency alone would reveal whether an email exists, and
+// (since bcrypt compares scale with candidate count) roughly how many tenants
+// it belongs to. This bounds the leak up to the floor; an email with more real
+// candidates than the floor still takes proportionally longer.
+var dummyPasswordHash = []byte("$2a$12$CwTycUXWue0Thq9StjUM0uJ8fVWy9j9G2sQm.a5S0KgP4Us0Qwv2u")
 
-	var userID int64
-	var email, passwordHash string
-	var roleName string
-	var roleID *int64
-	err = s.pool.QueryRow(ctx, `
-		SELECT u.id, u.email, uc.password_hash, COALESCE(r.name, ''), u.role_id
+// loginCompareFloor is the minimum number of bcrypt comparisons Login performs
+// per attempt, real candidates plus dummy padding, to reduce how precisely
+// response timing can reveal an email's tenant-account count for the common case.
+const loginCompareFloor = 5
+
+// loginCandidate is one (tenant, user) row whose email matches a login attempt.
+type loginCandidate struct {
+	userID       int64
+	tenantID     int64
+	email        string
+	passwordHash string
+	roleName     string
+}
+
+// Login authenticates a user by email and password only — the caller never
+// specifies a tenant. The same email may have separate accounts (separate
+// passwords) in multiple tenants, so Login fetches every active account
+// matching the email and checks the password against each one to find the
+// single tenant it belongs to.
+func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, '')
 		FROM users u
 		JOIN user_credentials uc ON uc.user_id = u.id
+		JOIN tenants t ON t.id = u.tenant_id
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.tenant_id = $1 AND u.email = $2 AND u.is_active = true AND u.deleted_at IS NULL
-	`, tenantID, in.Email).Scan(&userID, &email, &passwordHash, &roleName, &roleID)
+		WHERE u.email = $1 AND u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
+	`, in.Email)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("invalid credentials")
-		}
-		return nil, fmt.Errorf("fetch user: %w", err)
+		return nil, fmt.Errorf("fetch login candidates: %w", err)
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(in.Password)); err != nil {
+	var candidates []loginCandidate
+	for rows.Next() {
+		var c loginCandidate
+		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan login candidate: %w", err)
+		}
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate login candidates: %w", err)
+	}
+
+	if len(candidates) == 0 {
+		for i := 0; i < loginCompareFloor; i++ {
+			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(in.Password))
+		}
 		return nil, fmt.Errorf("invalid credentials")
 	}
+
+	var matched *loginCandidate
+	matchCount := 0
+	for i := range candidates {
+		if bcrypt.CompareHashAndPassword([]byte(candidates[i].passwordHash), []byte(in.Password)) == nil {
+			matchCount++
+			matched = &candidates[i]
+		}
+	}
+	for i := len(candidates); i < loginCompareFloor; i++ {
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(in.Password))
+	}
+
+	if matchCount == 0 {
+		return nil, fmt.Errorf("invalid credentials")
+	}
+	if matchCount > 1 {
+		// Same password happens to be valid for more than one of this email's
+		// tenant accounts. Return the same generic error as any other failure —
+		// a distinct message here would tell an attacker "this password is
+		// valid for 2+ accounts", a stronger signal than plain match/no-match.
+		// The fix (differing passwords per tenant) is documented on CreateTenant,
+		// not surfaced here, to avoid using a login failure as the guidance channel.
+		return nil, fmt.Errorf("invalid credentials")
+	}
+
+	userID, tenantID, email, roleName := matched.userID, matched.tenantID, matched.email, matched.roleName
 
 	perms, err := s.loadPermissions(ctx, userID, tenantID)
 	if err != nil {
