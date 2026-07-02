@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/mail"
 	"strconv"
 	"time"
 
@@ -36,18 +37,33 @@ var (
 
 // TenantResult is the public representation of a tenant (jwt_secret is never exposed).
 type TenantResult struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	Slug        string   `json:"slug"`
-	DisplayName *string  `json:"display_name"`
-	Domain      *string  `json:"domain"`
-	Region      *string  `json:"region"`
-	Description *string  `json:"description"`
-	Plan        string   `json:"plan"`
-	IsActive    bool     `json:"is_active"`
-	CORSOrigins []string `json:"cors_origins"`
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	DisplayName *string   `json:"display_name"`
+	Domain      *string   `json:"domain"`
+	Region      *string   `json:"region"`
+	Description *string   `json:"description"`
+	Plan        string    `json:"plan"`
+	IsActive    bool      `json:"is_active"`
+	CORSOrigins []string  `json:"cors_origins"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// OwnedTenantStats summarizes one tenant's size for OwnedTenantResult.
+type OwnedTenantStats struct {
+	UserCount int `json:"user_count"`
+	RoleCount int `json:"role_count"`
+	AppCount  int `json:"app_count"`
+}
+
+// OwnedTenantResult is one tenant returned by ListOwnedTenants: the tenant
+// itself, the caller's role in it, and basic usage stats for that tenant only.
+type OwnedTenantResult struct {
+	TenantResult
+	Role  string           `json:"role"`
+	Stats OwnedTenantStats `json:"stats"`
 }
 
 // TenantFilter holds optional filter and pagination params for ListTenantsPaginated.
@@ -110,6 +126,7 @@ type CreateTenantInput struct {
 	Region      string
 	Description string
 	Plan        string // defaults to "free" when empty
+	OwnerEmail  string // required; the tenant owner's real, deliverable email
 }
 
 // UpdateTenantInput carries all fields accepted by UpdateTenant.
@@ -197,11 +214,19 @@ var defaultPermissions = []struct{ name, description string }{
 // CreateTenant creates a new tenant inside a single transaction that also seeds:
 //   - 8 default permissions
 //   - an "owner" system role with all 8 permissions
-//   - an owner user (email: owner@emc.<slug>) with a one-time temp password
+//   - an owner user (email: in.OwnerEmail) with a one-time temp password
+//
+// The same email may be used as OwnerEmail across multiple CreateTenant calls —
+// each call creates an independent users row scoped to its own tenant, so one
+// person can own multiple tenants without any shared credentials between them.
 //
 // The plaintext temp password is returned in CreateTenantResult.Owner.TempPassword
 // and is never stored anywhere — only the bcrypt hash is persisted.
 func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*CreateTenantResult, error) {
+	if _, err := mail.ParseAddress(in.OwnerEmail); err != nil {
+		return nil, fmt.Errorf("owner_email is required and must be a valid email address")
+	}
+
 	secret, err := generateSecret()
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
@@ -281,7 +306,7 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	}
 
 	// Step 5: create owner user.
-	ownerEmail := "owner@emc." + in.Slug
+	ownerEmail := in.OwnerEmail
 	var userID int64
 	err = tx.QueryRow(ctx, `
 		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
@@ -474,16 +499,16 @@ func (s *Service) GetTenantDashboardStats(ctx context.Context) (*TenantDashboard
 	// Single query: current totals + count of entities created this calendar month
 	// vs the prior calendar month — used to compute MoM growth %.
 	var (
-		totalTenants      int
-		activeTenants     int
-		tenantsThisMonth  int
-		tenantsLastMonth  int
-		totalApps         int
-		appsThisMonth     int
-		appsLastMonth     int
-		totalUsers        int
-		usersThisMonth    int
-		usersLastMonth    int
+		totalTenants     int
+		activeTenants    int
+		tenantsThisMonth int
+		tenantsLastMonth int
+		totalApps        int
+		appsThisMonth    int
+		appsLastMonth    int
+		totalUsers       int
+		usersThisMonth   int
+		usersLastMonth   int
 	)
 
 	err := s.pool.QueryRow(ctx, `
@@ -1009,6 +1034,51 @@ func (s *Service) getTenantByID(ctx context.Context, tenantID int64) (*TenantRes
 		return nil, fmt.Errorf("get tenant by id: %w", err)
 	}
 	return &t, nil
+}
+
+// ListOwnedTenants returns every tenant where an active, non-deleted user row
+// exists with the given email — i.e. every tenant this email owns or has an
+// account in — along with the caller's role and per-tenant usage stats.
+// Unlike ListTenantsPaginated (platform-admin-only, lists every tenant), this
+// is self-scoped: it only ever returns tenants tied to the caller's own email.
+func (s *Service) ListOwnedTenants(ctx context.Context, email string) ([]OwnedTenantResult, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT
+			t.id, t.name, t.slug, t.display_name, t.domain, t.region, t.description,
+			t.plan, t.is_active, t.cors_origins, t.created_at, t.updated_at,
+			COALESCE(r.name, '') AS role_name,
+			(SELECT COUNT(*) FROM users        WHERE tenant_id = t.id AND deleted_at IS NULL) AS user_count,
+			(SELECT COUNT(*) FROM roles        WHERE tenant_id = t.id)                        AS role_count,
+			(SELECT COUNT(*) FROM oauth_clients WHERE tenant_id = t.id AND deleted_at IS NULL) AS app_count
+		FROM users u
+		JOIN tenants t ON t.id = u.tenant_id
+		LEFT JOIN roles r ON r.id = u.role_id
+		WHERE u.email = $1 AND u.is_active = true AND u.deleted_at IS NULL
+		ORDER BY t.created_at DESC
+	`, email)
+	if err != nil {
+		return nil, fmt.Errorf("list owned tenants: %w", err)
+	}
+	defer rows.Close()
+
+	out := []OwnedTenantResult{}
+	for rows.Next() {
+		var r OwnedTenantResult
+		var id int64
+		if err := rows.Scan(
+			&id, &r.Name, &r.Slug, &r.DisplayName, &r.Domain, &r.Region, &r.Description,
+			&r.Plan, &r.IsActive, &r.CORSOrigins, &r.CreatedAt, &r.UpdatedAt,
+			&r.Role, &r.Stats.UserCount, &r.Stats.RoleCount, &r.Stats.AppCount,
+		); err != nil {
+			return nil, fmt.Errorf("scan owned tenant: %w", err)
+		}
+		r.ID = strconv.FormatInt(id, 10)
+		if r.CORSOrigins == nil {
+			r.CORSOrigins = []string{}
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // pgxScanner is satisfied by both *pgx.Row and pgx.Rows so scanTenantRow works for both.

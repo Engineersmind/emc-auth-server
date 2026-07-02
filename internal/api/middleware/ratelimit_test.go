@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,16 +15,21 @@ import (
 )
 
 // makeRequest creates a synthetic echo.Context with the given remote address and
-// X-Tenant-Slug header, runs it through the provided middleware, and returns the
-// HTTP status code.
-func makeRequest(t *testing.T, mw echo.MiddlewareFunc, remoteAddr, tenantSlug string) int {
+// a JSON body carrying the given email, runs it through the provided middleware,
+// and returns the HTTP status code. LoginRateLimiter keys its per-account bucket
+// on the email in the body since Login no longer takes a tenant slug/header.
+func makeRequest(t *testing.T, mw echo.MiddlewareFunc, remoteAddr, email string) int {
 	t.Helper()
 	e := echo.New()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
-	req.RemoteAddr = remoteAddr + ":12345"
-	if tenantSlug != "" {
-		req.Header.Set("X-Tenant-Slug", tenantSlug)
+	var body *strings.Reader
+	if email != "" {
+		body = strings.NewReader(`{"email":"` + email + `","password":"x"}`)
+	} else {
+		body = strings.NewReader(`{}`)
 	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = remoteAddr + ":12345"
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 	// Handler that always returns 200 (simulates a successful login handler).

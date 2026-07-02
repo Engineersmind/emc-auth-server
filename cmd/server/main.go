@@ -31,7 +31,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
-	"github.com/engineersmind/emc-auth-server/docs"   // swagger generated docs
+	"github.com/engineersmind/emc-auth-server/docs" // swagger generated docs
 	"github.com/engineersmind/emc-auth-server/internal/api"
 	"github.com/engineersmind/emc-auth-server/internal/config"
 	"github.com/engineersmind/emc-auth-server/internal/store"
@@ -144,6 +144,7 @@ func main() {
 			SMTPUsername:      cfg.SMTPUsername,
 			SMTPPassword:      cfg.SMTPPassword,
 			CookieDomain:      cfg.CookieDomain,
+			GlobalCORSOrigins: cfg.GlobalCORSOrigins,
 		},
 	})
 

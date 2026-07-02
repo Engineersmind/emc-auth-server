@@ -126,9 +126,8 @@ func TestLogin_Success(t *testing.T) {
 	}
 
 	result, err := svc.Login(ctx, auth.LoginInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   password,
+		Email:    email,
+		Password: password,
 	})
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
@@ -163,9 +162,8 @@ func TestLogin_WrongPassword(t *testing.T) {
 	}
 
 	_, err = svc.Login(ctx, auth.LoginInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "WrongPassword!",
+		Email:    email,
+		Password: "WrongPassword!",
 	})
 	if err == nil {
 		t.Fatal("Login() expected error for wrong password, got nil")
@@ -175,19 +173,18 @@ func TestLogin_WrongPassword(t *testing.T) {
 	}
 }
 
-func TestLogin_UnknownTenant(t *testing.T) {
+func TestLogin_UnknownEmail(t *testing.T) {
 	svc, cleanup := newServiceForTest(t)
 	defer cleanup()
 
 	ctx := context.Background()
 
 	_, err := svc.Login(ctx, auth.LoginInput{
-		TenantSlug: "no-such-tenant",
-		Email:      "user@example.com",
-		Password:   "Password123!",
+		Email:    "no-such-user@example.com",
+		Password: "Password123!",
 	})
 	if err == nil {
-		t.Fatal("Login() expected error for unknown tenant, got nil")
+		t.Fatal("Login() expected error for unknown email, got nil")
 	}
 }
 

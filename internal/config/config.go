@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds all application configuration loaded from environment variables.
@@ -36,26 +37,32 @@ type Config struct {
 	// In production set to the shared parent domain, e.g. ".engineersmind.com",
 	// so both app.engineersmind.com and auth.engineersmind.com can read the cookies.
 	CookieDomain string
+
+	// GlobalCORSOrigins are the allowed browser origins for slug-less endpoints
+	// (e.g. /auth/login) whose tenant isn't known until after authentication, so
+	// per-tenant CORS lookups don't apply. Comma-separated via GLOBAL_CORS_ORIGINS.
+	GlobalCORSOrigins []string
 }
 
 // Load reads configuration from environment variables with sensible defaults.
 func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
-		Port:         getEnv("PORT", "9090"),
-		DatabaseURL:  getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
-		RedisURL:     getEnv("REDIS_URL", "redis://localhost:6379/0"),
-		LogLevel:     getEnv("LOG_LEVEL", "info"),
-		Env:          getEnv("ENV", "development"),
-		JWTIssuer:    getEnv("JWT_ISSUER", "https://auth.emc.local"),
-		SMTPHost:     getEnv("SMTP_HOST", ""),
-		SMTPPort:     smtpPort,
-		SMTPFrom:     getEnv("SMTP_FROM", "no-reply@emc.local"),
-		SMTPUsername: getEnv("SMTP_USERNAME", ""),
-		SMTPPassword: getEnv("SMTP_PASSWORD", ""),
+		Port:              getEnv("PORT", "9090"),
+		DatabaseURL:       getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
+		RedisURL:          getEnv("REDIS_URL", "redis://localhost:6379/0"),
+		LogLevel:          getEnv("LOG_LEVEL", "info"),
+		Env:               getEnv("ENV", "development"),
+		JWTIssuer:         getEnv("JWT_ISSUER", "https://auth.emc.local"),
+		SMTPHost:          getEnv("SMTP_HOST", ""),
+		SMTPPort:          smtpPort,
+		SMTPFrom:          getEnv("SMTP_FROM", "no-reply@emc.local"),
+		SMTPUsername:      getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:      getEnv("SMTP_PASSWORD", ""),
 		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:9090"),
 		TOTPEncryptionKey: getEnv("TOTP_ENCRYPTION_KEY", ""),
 		CookieDomain:      getEnv("COOKIE_DOMAIN", ""),
+		GlobalCORSOrigins: getEnvList("GLOBAL_CORS_ORIGINS", ""),
 	}
 }
 
@@ -64,4 +71,19 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getEnvList parses a comma-separated env var into a trimmed, non-empty slice.
+// Trailing slashes are stripped since browser Origin headers never include a path.
+func getEnvList(key, fallback string) []string {
+	raw := getEnv(key, fallback)
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(p), "/"))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

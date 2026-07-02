@@ -224,9 +224,8 @@ func TestTOTPBypass_InvalidCode(t *testing.T) {
 
 	// Login — must return an OTP challenge since TOTP is now active.
 	loginResult, err := svc.Login(ctx, auth.LoginInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "SecPass123!",
+		Email:    email,
+		Password: "SecPass123!",
 	})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
@@ -249,9 +248,8 @@ func TestTOTPBypass_InvalidCode(t *testing.T) {
 
 	// Re-login to get a fresh session token (OTP sessions may be single-use after failure).
 	loginResult2, err := svc.Login(ctx, auth.LoginInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "SecPass123!",
+		Email:    email,
+		Password: "SecPass123!",
 	})
 	if err != nil {
 		t.Fatalf("second Login: %v", err)
@@ -292,9 +290,8 @@ func TestSQLInjection_LoginEmail(t *testing.T) {
 		t.Run(fmt.Sprintf("payload=%q", payload), func(t *testing.T) {
 			start := time.Now()
 			_, err := svc.Login(ctx, auth.LoginInput{
-				TenantSlug: "emc",
-				Email:      payload,
-				Password:   "anypassword",
+				Email:    payload,
+				Password: "anypassword",
 			})
 			elapsed := time.Since(start)
 
@@ -341,9 +338,8 @@ func TestSQLInjection_LoginPassword(t *testing.T) {
 		t.Run(fmt.Sprintf("payload=%q", payload), func(t *testing.T) {
 			start := time.Now()
 			_, err := svc.Login(ctx, auth.LoginInput{
-				TenantSlug: "emc",
-				Email:      "admin@emc.local",
-				Password:   payload,
+				Email:    "admin@emc.local",
+				Password: payload,
 			})
 			elapsed := time.Since(start)
 
