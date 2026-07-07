@@ -62,8 +62,10 @@ const (
 	ActionAdminCORSUpdated = "admin.cors_origins_updated"
 
 	// Admin — application (OAuth2 client) management
-	ActionAdminApplicationCreated = "admin.application_created"
-	ActionAdminApplicationDeleted = "admin.application_deleted"
+	ActionAdminApplicationCreated       = "admin.application_created"
+	ActionAdminApplicationUpdated       = "admin.application_updated"
+	ActionAdminApplicationDeleted       = "admin.application_deleted"
+	ActionAdminApplicationSecretRotated = "admin.application_secret_rotated"
 
 	// Auth — machine-to-machine client_credentials grant
 	ActionAuthClientCredentials = "auth.client_credentials"

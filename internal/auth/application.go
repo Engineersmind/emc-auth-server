@@ -27,6 +27,27 @@ const (
 // live application record.
 var ErrInvalidClient = errors.New("invalid client credentials")
 
+// ErrAppNotFound is returned when an application does not exist within the
+// caller's tenant (or has been deactivated).
+var ErrAppNotFound = errors.New("application not found")
+
+// ErrInvalidAppType is returned when an unknown application type is supplied.
+var ErrInvalidAppType = errors.New("invalid app_type — must be one of: web, spa, m2m, native")
+
+// validAppTypes mirrors the CHECK constraint on oauth_clients.app_type.
+var validAppTypes = map[string]bool{"web": true, "spa": true, "m2m": true, "native": true}
+
+// normalizeAppType applies the default type and validates against validAppTypes.
+func normalizeAppType(appType string) (string, error) {
+	if appType == "" {
+		return "web", nil
+	}
+	if !validAppTypes[appType] {
+		return "", ErrInvalidAppType
+	}
+	return appType, nil
+}
+
 // ApplicationService manages OAuth2 client application lifecycle.
 // Each tenant registers applications that receive a client_id / client_secret pair.
 // The raw client_secret is returned once at creation and never stored — only its
@@ -41,10 +62,12 @@ func NewApplicationService(pool *pgxpool.Pool, logger zerolog.Logger) *Applicati
 	return &ApplicationService{pool: pool, logger: logger}
 }
 
-// AppResult is returned by CreateApplication. ClientSecret is shown exactly once.
+// AppResult is returned by CreateApplication and RotateSecret.
+// ClientSecret is shown exactly once and never stored in plaintext.
 type AppResult struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
+	AppType      string    `json:"app_type"`
 	ClientID     string    `json:"client_id"`
 	ClientSecret string    `json:"client_secret"`
 	CreatedAt    time.Time `json:"created_at"`
@@ -54,39 +77,80 @@ type AppResult struct {
 type AppSummary struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
+	AppType   string    `json:"app_type"`
 	ClientID  string    `json:"client_id"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// AppDetail is the full public representation of one application — no secret.
+type AppDetail struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	AppType   string    `json:"app_type"`
+	ClientID  string    `json:"client_id"`
+	IsActive  bool      `json:"is_active"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// AppFilter holds optional filter and pagination params for ListApplicationsPaginated.
+type AppFilter struct {
+	Search string // ILIKE match on name and client_id; empty = no filter
+	Type   string // "web", "spa", "m2m", "native", or "" for all
+	Status string // "active", "inactive", or "" for all
+	Page   int    // 1-based; defaults to 1
+	Limit  int    // rows per page; defaults to 25, max 100
+}
+
+// AppsPage wraps a paginated application list.
+type AppsPage struct {
+	Data       []AppDetail `json:"data"`
+	Total      int         `json:"total"`
+	Page       int         `json:"page"`
+	TotalPages int         `json:"total_pages"`
+	PerPage    int         `json:"per_page"`
+}
+
+// generateClientCredentials mints a fresh client_id + client_secret pair.
+func generateClientCredentials() (clientID, rawSecret string, err error) {
+	cidbuf := make([]byte, clientIDBytes)
+	if _, err := rand.Read(cidbuf); err != nil {
+		return "", "", fmt.Errorf("generate client_id: %w", err)
+	}
+	secbuf := make([]byte, clientSecretBytes)
+	if _, err := rand.Read(secbuf); err != nil {
+		return "", "", fmt.Errorf("generate client_secret: %w", err)
+	}
+	return ClientIDPrefix + base64.RawURLEncoding.EncodeToString(cidbuf),
+		base64.RawURLEncoding.EncodeToString(secbuf), nil
+}
+
 // CreateApplication registers a new application for a tenant and returns its
 // client credentials. The raw client_secret must be stored by the caller; it
-// cannot be recovered after this call.
-func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int64, name string) (*AppResult, error) {
+// cannot be recovered after this call. appType defaults to "web" when empty.
+func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int64, name, appType string) (*AppResult, error) {
 	if name == "" {
 		return nil, fmt.Errorf("application name is required")
 	}
-
-	cidbuf := make([]byte, clientIDBytes)
-	if _, err := rand.Read(cidbuf); err != nil {
-		return nil, fmt.Errorf("generate client_id: %w", err)
+	normType, err := normalizeAppType(appType)
+	if err != nil {
+		return nil, err
 	}
-	clientID := ClientIDPrefix + base64.RawURLEncoding.EncodeToString(cidbuf)
 
-	secbuf := make([]byte, clientSecretBytes)
-	if _, err := rand.Read(secbuf); err != nil {
-		return nil, fmt.Errorf("generate client_secret: %w", err)
+	clientID, rawSecret, err := generateClientCredentials()
+	if err != nil {
+		return nil, err
 	}
-	rawSecret := base64.RawURLEncoding.EncodeToString(secbuf)
 	secretHash := HashToken(rawSecret)
 
 	var rowID int64
 	var createdAt time.Time
-	err := s.pool.QueryRow(ctx, `
+	err = s.pool.QueryRow(ctx, `
 		INSERT INTO oauth_clients
-		    (tenant_id, name, client_id, client_secret_hash, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, NOW(), NOW())
+		    (tenant_id, name, app_type, client_id, client_secret_hash, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
 		RETURNING id, created_at
-	`, tenantID, name, clientID, secretHash).Scan(&rowID, &createdAt)
+	`, tenantID, name, normType, clientID, secretHash).Scan(&rowID, &createdAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert application: %w", err)
 	}
@@ -94,6 +158,7 @@ func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int
 	return &AppResult{
 		ID:           strconv.FormatInt(rowID, 10),
 		Name:         name,
+		AppType:      normType,
 		ClientID:     clientID,
 		ClientSecret: rawSecret,
 		CreatedAt:    createdAt,
@@ -103,7 +168,7 @@ func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int
 // ListApplications returns all active applications for a tenant, without secrets.
 func (s *ApplicationService) ListApplications(ctx context.Context, tenantID int64) ([]AppSummary, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, client_id, created_at
+		SELECT id, name, app_type, client_id, created_at
 		FROM   oauth_clients
 		WHERE  tenant_id = $1 AND deleted_at IS NULL
 		ORDER  BY created_at DESC
@@ -117,13 +182,174 @@ func (s *ApplicationService) ListApplications(ctx context.Context, tenantID int6
 	for rows.Next() {
 		var a AppSummary
 		var id int64
-		if err := rows.Scan(&id, &a.Name, &a.ClientID, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan application: %w", err)
 		}
 		a.ID = strconv.FormatInt(id, 10)
 		apps = append(apps, a)
 	}
 	return apps, rows.Err()
+}
+
+// ListApplicationsPaginated returns a filtered, paginated page of a tenant's
+// applications (active and inactive), without secrets.
+func (s *ApplicationService) ListApplicationsPaginated(ctx context.Context, tenantID int64, f AppFilter) (*AppsPage, error) {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.Limit < 1 {
+		f.Limit = 25
+	}
+	if f.Limit > 100 {
+		f.Limit = 100
+	}
+	if f.Type != "" && !validAppTypes[f.Type] {
+		return nil, ErrInvalidAppType
+	}
+
+	// Dynamic WHERE clause built exclusively from positional parameters.
+	where := "WHERE tenant_id = $1"
+	args := []interface{}{tenantID}
+
+	if f.Search != "" {
+		args = append(args, "%"+f.Search+"%")
+		n := strconv.Itoa(len(args))
+		where += " AND (name ILIKE $" + n + " OR client_id ILIKE $" + n + ")"
+	}
+	if f.Type != "" {
+		args = append(args, f.Type)
+		where += " AND app_type = $" + strconv.Itoa(len(args))
+	}
+	switch f.Status {
+	case "active":
+		where += " AND deleted_at IS NULL"
+	case "inactive":
+		where += " AND deleted_at IS NOT NULL"
+	case "":
+		// no status filter — include both
+	default:
+		return nil, fmt.Errorf("invalid status — must be \"active\", \"inactive\", or empty")
+	}
+
+	var total int
+	if err := s.pool.QueryRow(ctx, "SELECT COUNT(*) FROM oauth_clients "+where, args...).Scan(&total); err != nil {
+		return nil, fmt.Errorf("count applications: %w", err)
+	}
+
+	args = append(args, f.Limit, (f.Page-1)*f.Limit)
+	query := `
+		SELECT id, name, app_type, client_id, (deleted_at IS NULL) AS is_active, created_at, updated_at
+		FROM   oauth_clients ` + where + `
+		ORDER  BY created_at DESC
+		LIMIT  $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args))
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list applications page: %w", err)
+	}
+	defer rows.Close()
+
+	data := []AppDetail{}
+	for rows.Next() {
+		var a AppDetail
+		var id int64
+		if err := rows.Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.IsActive, &a.CreatedAt, &a.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan application page: %w", err)
+		}
+		a.ID = strconv.FormatInt(id, 10)
+		data = append(data, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate applications page: %w", err)
+	}
+
+	totalPages := (total + f.Limit - 1) / f.Limit
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	return &AppsPage{
+		Data:       data,
+		Total:      total,
+		Page:       f.Page,
+		TotalPages: totalPages,
+		PerPage:    f.Limit,
+	}, nil
+}
+
+// GetApplication returns one application (active or inactive) by ID within a tenant.
+func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID int64) (*AppDetail, error) {
+	var a AppDetail
+	var id int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, name, app_type, client_id, (deleted_at IS NULL) AS is_active, created_at, updated_at
+		FROM   oauth_clients
+		WHERE  id = $1 AND tenant_id = $2
+	`, appID, tenantID).Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAppNotFound
+		}
+		return nil, fmt.Errorf("get application: %w", err)
+	}
+	a.ID = strconv.FormatInt(id, 10)
+	return &a, nil
+}
+
+// UpdateApplication updates an active application's name and/or app_type.
+// Empty fields are left unchanged. Returns the updated application.
+func (s *ApplicationService) UpdateApplication(ctx context.Context, tenantID, appID int64, name, appType string) (*AppDetail, error) {
+	if name == "" && appType == "" {
+		return nil, fmt.Errorf("nothing to update — provide name and/or app_type")
+	}
+	if appType != "" {
+		if _, err := normalizeAppType(appType); err != nil {
+			return nil, err
+		}
+	}
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE oauth_clients
+		SET    name       = COALESCE(NULLIF($1, ''), name),
+		       app_type   = COALESCE(NULLIF($2, ''), app_type),
+		       updated_at = NOW()
+		WHERE  id = $3 AND tenant_id = $4 AND deleted_at IS NULL
+	`, name, appType, appID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("update application: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, ErrAppNotFound
+	}
+	return s.GetApplication(ctx, tenantID, appID)
+}
+
+// RotateSecret replaces an active application's client_secret with a freshly
+// generated one and returns it. The old secret stops working immediately; the
+// new plaintext is shown exactly once (only its SHA-256 hash is stored).
+// The client_id is left unchanged so integrations only swap the secret.
+func (s *ApplicationService) RotateSecret(ctx context.Context, tenantID, appID int64) (*AppResult, error) {
+	secbuf := make([]byte, clientSecretBytes)
+	if _, err := rand.Read(secbuf); err != nil {
+		return nil, fmt.Errorf("generate client_secret: %w", err)
+	}
+	rawSecret := base64.RawURLEncoding.EncodeToString(secbuf)
+
+	var result AppResult
+	var id int64
+	err := s.pool.QueryRow(ctx, `
+		UPDATE oauth_clients
+		SET    client_secret_hash = $1, updated_at = NOW()
+		WHERE  id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+		RETURNING id, name, app_type, client_id, created_at
+	`, HashToken(rawSecret), appID, tenantID).Scan(&id, &result.Name, &result.AppType, &result.ClientID, &result.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAppNotFound
+		}
+		return nil, fmt.Errorf("rotate client_secret: %w", err)
+	}
+	result.ID = strconv.FormatInt(id, 10)
+	result.ClientSecret = rawSecret
+	return &result, nil
 }
 
 // DeactivateApplication soft-deletes an application by setting deleted_at.
@@ -138,7 +364,7 @@ func (s *ApplicationService) DeactivateApplication(ctx context.Context, tenantID
 		return fmt.Errorf("deactivate application: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("application not found")
+		return ErrAppNotFound
 	}
 	return nil
 }

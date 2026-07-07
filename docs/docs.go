@@ -558,21 +558,59 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns all active applications for the caller's tenant.",
+                "description": "Returns a paginated, filtered list of the tenant's applications. Secrets are never included.",
                 "produces": [
                     "application/json"
                 ],
                 "tags": [
                     "admin-applications"
                 ],
-                "summary": "List applications",
+                "summary": "List applications (paginated)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Match on name or client_id",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by app type (web|spa|m2m|native)",
+                        "name": "type",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by status (active|inactive); empty = all",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page (default 1)",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "type": "array",
-                            "items": {
-                                "$ref": "#/definitions/auth.AppSummary"
+                            "$ref": "#/definitions/auth.AppsPage"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
                             }
                         }
                     },
@@ -593,7 +631,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once.",
+                "description": "Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once and can never be retrieved again (only rotated).",
                 "consumes": [
                     "application/json"
                 ],
@@ -606,7 +644,7 @@ const docTemplate = `{
                 "summary": "Create application",
                 "parameters": [
                     {
-                        "description": "Application name",
+                        "description": "Application name and optional type (web|spa|m2m|native)",
                         "name": "body",
                         "in": "body",
                         "required": true,
@@ -644,13 +682,143 @@ const docTemplate = `{
             }
         },
         "/api/v1/applications/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns one application (active or inactive) by ID. The secret is never included.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Get application",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Application ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppDetail"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Updates an active application's name and/or type. Empty fields are left unchanged.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Update application",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Application ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Fields to update",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateApplicationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppDetail"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
             "delete": {
                 "security": [
                     {
                         "BearerAuth": []
                     }
                 ],
-                "description": "Soft-deletes an application. Its client_id is immediately rejected on login and register.",
+                "description": "Soft-deletes an application. Its client_id is immediately rejected on login, register, and the client_credentials grant.",
                 "produces": [
                     "application/json"
                 ],
@@ -675,6 +843,67 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{id}/rotate-secret": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Generates a new client_secret for the application. The old secret stops working immediately. The new secret is returned exactly once — it is stored only as a hash and can never be revealed later.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Rotate application client secret",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Application ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppResult"
                         }
                     },
                     "400": {
@@ -879,7 +1108,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/login": {
             "post": {
-                "description": "Authenticates an existing user and returns a JWT access token + refresh token pair. Defaults to tenant \"emc\" when X-Tenant-Slug is omitted.",
+                "description": "Authenticates an existing user by email and password only. The tenant is resolved automatically from which account the password matches — no tenant slug or header is required.",
                 "consumes": [
                     "application/json"
                 ],
@@ -891,12 +1120,6 @@ const docTemplate = `{
                 ],
                 "summary": "Login",
                 "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Tenant slug (default: emc)",
-                        "name": "X-Tenant-Slug",
-                        "in": "header"
-                    },
                     {
                         "description": "Login credentials",
                         "name": "body",
@@ -1466,7 +1689,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/session": {
             "post": {
-                "description": "Authenticates the user and stores tokens in HttpOnly SameSite=Lax cookies. Defaults to tenant \"emc\" when X-Tenant-Slug is omitted.",
+                "description": "Authenticates the user by email and password only, and stores tokens in HttpOnly SameSite=Lax cookies. The tenant is resolved automatically — no tenant slug or header is required.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1478,12 +1701,6 @@ const docTemplate = `{
                 ],
                 "summary": "Cookie-based login",
                 "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Tenant slug (default: emc)",
-                        "name": "X-Tenant-Slug",
-                        "in": "header"
-                    },
                     {
                         "description": "Credentials",
                         "name": "body",
@@ -2122,7 +2339,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns a paginated, filtered list of tenants. Requires tenant:manage permission.",
+                "description": "Returns tenants scoped to the caller's permissions: callers with tenant:manage get a paginated, filtered list of every tenant; any other authenticated caller gets only the tenants tied to their own account email, each with their role and usage stats (search/status/region/pagination params are ignored in that case).",
                 "produces": [
                     "application/json"
                 ],
@@ -2186,7 +2403,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Creates a new isolated tenant and auto-seeds an owner role with 8 default permissions and an owner user (owner@emc.\u003cslug\u003e). The owner.temp_password in the response is shown once and never stored — hand it to the tenant owner. Requires tenant:manage permission (super_admin only).",
+                "description": "Creates a new isolated tenant and auto-seeds an owner role with 8 default permissions and an owner user using the provided owner_email. The owner.temp_password in the response is shown once and never stored — hand it to the tenant owner. Requires tenant:manage permission (super_admin only).",
                 "consumes": [
                     "application/json"
                 ],
@@ -2295,7 +2512,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns system-wide tenant, application, and user counts with month-over-month deltas. Requires tenant:manage permission.",
+                "description": "Returns stats scoped to the caller's permissions: callers with tenant:manage get system-wide tenant/application/user counts with month-over-month deltas; any other authenticated caller gets counts aggregated only across the tenants tied to their own account email (no deltas).",
                 "produces": [
                     "application/json"
                 ],
@@ -2601,6 +2818,85 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/activity": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns paginated audit events for the specified tenant. Requires tenant:manage (super_admin only).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-cross-tenant"
+                ],
+                "summary": "Activity feed for a target tenant",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Target tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by action (e.g. auth.login)",
+                        "name": "action",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Filter by user ID",
+                        "name": "user_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "From datetime (RFC3339)",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "To datetime (RFC3339)",
+                        "name": "to",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page (default 1)",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 50, max 200)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.LogsPage"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2997,6 +3293,49 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/stats": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns audit-log-based activity counts for the specified tenant. Requires tenant:manage (super_admin only).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-cross-tenant"
+                ],
+                "summary": "Activity stats for a target tenant",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Target tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.StatsResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4151,6 +4490,32 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AppDetail": {
+            "type": "object",
+            "properties": {
+                "app_type": {
+                    "type": "string"
+                },
+                "client_id": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.AppRateLimit": {
             "type": "object",
             "properties": {
@@ -4180,6 +4545,9 @@ const docTemplate = `{
         "auth.AppResult": {
             "type": "object",
             "properties": {
+                "app_type": {
+                    "type": "string"
+                },
                 "client_id": {
                     "type": "string"
                 },
@@ -4197,20 +4565,26 @@ const docTemplate = `{
                 }
             }
         },
-        "auth.AppSummary": {
+        "auth.AppsPage": {
             "type": "object",
             "properties": {
-                "client_id": {
-                    "type": "string"
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.AppDetail"
+                    }
                 },
-                "created_at": {
-                    "type": "string"
+                "page": {
+                    "type": "integer"
                 },
-                "id": {
-                    "type": "string"
+                "per_page": {
+                    "type": "integer"
                 },
-                "name": {
-                    "type": "string"
+                "total": {
+                    "type": "integer"
+                },
+                "total_pages": {
+                    "type": "integer"
                 }
             }
         },
@@ -4326,6 +4700,10 @@ const docTemplate = `{
         "handlers.CreateApplicationRequest": {
             "type": "object",
             "properties": {
+                "app_type": {
+                    "description": "web | spa | m2m | native; defaults to web",
+                    "type": "string"
+                },
                 "name": {
                     "type": "string"
                 }
@@ -4369,6 +4747,9 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "name": {
+                    "type": "string"
+                },
+                "owner_email": {
                     "type": "string"
                 },
                 "plan": {
@@ -4565,6 +4946,17 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "grant_type": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpdateApplicationRequest": {
+            "type": "object",
+            "properties": {
+                "app_type": {
+                    "type": "string"
+                },
+                "name": {
                     "type": "string"
                 }
             }
