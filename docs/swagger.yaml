@@ -309,6 +309,23 @@ definitions:
         description: total audit events attributed to this agent
         type: integer
     type: object
+  auth.AppDetail:
+    properties:
+      app_type:
+        type: string
+      client_id:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      is_active:
+        type: boolean
+      name:
+        type: string
+      updated_at:
+        type: string
+    type: object
   auth.AppRateLimit:
     properties:
       app_id:
@@ -328,6 +345,8 @@ definitions:
     type: object
   auth.AppResult:
     properties:
+      app_type:
+        type: string
       client_id:
         type: string
       client_secret:
@@ -339,16 +358,20 @@ definitions:
       name:
         type: string
     type: object
-  auth.AppSummary:
+  auth.AppsPage:
     properties:
-      client_id:
-        type: string
-      created_at:
-        type: string
-      id:
-        type: string
-      name:
-        type: string
+      data:
+        items:
+          $ref: '#/definitions/auth.AppDetail'
+        type: array
+      page:
+        type: integer
+      per_page:
+        type: integer
+      total:
+        type: integer
+      total_pages:
+        type: integer
     type: object
   auth.AuthResult:
     properties:
@@ -423,6 +446,9 @@ definitions:
     type: object
   handlers.CreateApplicationRequest:
     properties:
+      app_type:
+        description: web | spa | m2m | native; defaults to web
+        type: string
       name:
         type: string
     type: object
@@ -451,6 +477,8 @@ definitions:
       domain:
         type: string
       name:
+        type: string
+      owner_email:
         type: string
       plan:
         type: string
@@ -578,6 +606,13 @@ definitions:
       client_secret:
         type: string
       grant_type:
+        type: string
+    type: object
+  handlers.UpdateApplicationRequest:
+    properties:
+      app_type:
+        type: string
+      name:
         type: string
     type: object
   handlers.UpdateCORSOriginsRequest:
@@ -996,16 +1031,42 @@ paths:
       - admin-rate-limits
   /api/v1/applications:
     get:
-      description: Returns all active applications for the caller's tenant.
+      description: Returns a paginated, filtered list of the tenant's applications.
+        Secrets are never included.
+      parameters:
+      - description: Match on name or client_id
+        in: query
+        name: search
+        type: string
+      - description: Filter by app type (web|spa|m2m|native)
+        in: query
+        name: type
+        type: string
+      - description: Filter by status (active|inactive); empty = all
+        in: query
+        name: status
+        type: string
+      - description: Page (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Page size (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            items:
-              $ref: '#/definitions/auth.AppSummary'
-            type: array
+            $ref: '#/definitions/auth.AppsPage'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
         "403":
           description: Forbidden
           schema:
@@ -1014,16 +1075,17 @@ paths:
             type: object
       security:
       - BearerAuth: []
-      summary: List applications
+      summary: List applications (paginated)
       tags:
       - admin-applications
     post:
       consumes:
       - application/json
       description: Registers a new application for the tenant. Returns client_id and
-        client_secret — secret is shown exactly once.
+        client_secret — secret is shown exactly once and can never be retrieved again
+        (only rotated).
       parameters:
-      - description: Application name
+      - description: Application name and optional type (web|spa|m2m|native)
         in: body
         name: body
         required: true
@@ -1056,7 +1118,7 @@ paths:
   /api/v1/applications/{id}:
     delete:
       description: Soft-deletes an application. Its client_id is immediately rejected
-        on login and register.
+        on login, register, and the client_credentials grant.
       parameters:
       - description: Application ID
         in: path
@@ -1093,6 +1155,133 @@ paths:
       security:
       - BearerAuth: []
       summary: Deactivate application
+      tags:
+      - admin-applications
+    get:
+      description: Returns one application (active or inactive) by ID. The secret
+        is never included.
+      parameters:
+      - description: Application ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppDetail'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get application
+      tags:
+      - admin-applications
+    put:
+      consumes:
+      - application/json
+      description: Updates an active application's name and/or type. Empty fields
+        are left unchanged.
+      parameters:
+      - description: Application ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      - description: Fields to update
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateApplicationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppDetail'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update application
+      tags:
+      - admin-applications
+  /api/v1/applications/{id}/rotate-secret:
+    post:
+      description: Generates a new client_secret for the application. The old secret
+        stops working immediately. The new secret is returned exactly once — it is
+        stored only as a hash and can never be revealed later.
+      parameters:
+      - description: Application ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Rotate application client secret
       tags:
       - admin-applications
   /api/v1/audit-logs:
@@ -1211,13 +1400,10 @@ paths:
     post:
       consumes:
       - application/json
-      description: Authenticates an existing user and returns a JWT access token +
-        refresh token pair. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
+      description: Authenticates an existing user by email and password only. The
+        tenant is resolved automatically from which account the password matches —
+        no tenant slug or header is required.
       parameters:
-      - description: 'Tenant slug (default: emc)'
-        in: header
-        name: X-Tenant-Slug
-        type: string
       - description: Login credentials
         in: body
         name: body
@@ -1598,13 +1784,10 @@ paths:
     post:
       consumes:
       - application/json
-      description: Authenticates the user and stores tokens in HttpOnly SameSite=Lax
-        cookies. Defaults to tenant "emc" when X-Tenant-Slug is omitted.
+      description: Authenticates the user by email and password only, and stores tokens
+        in HttpOnly SameSite=Lax cookies. The tenant is resolved automatically — no
+        tenant slug or header is required.
       parameters:
-      - description: 'Tenant slug (default: emc)'
-        in: header
-        name: X-Tenant-Slug
-        type: string
       - description: Credentials
         in: body
         name: body
@@ -2021,8 +2204,11 @@ paths:
       - admin-audit
   /api/v1/tenants:
     get:
-      description: Returns a paginated, filtered list of tenants. Requires tenant:manage
-        permission.
+      description: 'Returns tenants scoped to the caller''s permissions: callers with
+        tenant:manage get a paginated, filtered list of every tenant; any other authenticated
+        caller gets only the tenants tied to their own account email, each with their
+        role and usage stats (search/status/region/pagination params are ignored in
+        that case).'
       parameters:
       - description: Search by name, display name, or domain
         in: query
@@ -2067,9 +2253,9 @@ paths:
       consumes:
       - application/json
       description: Creates a new isolated tenant and auto-seeds an owner role with
-        8 default permissions and an owner user (owner@emc.<slug>). The owner.temp_password
-        in the response is shown once and never stored — hand it to the tenant owner.
-        Requires tenant:manage permission (super_admin only).
+        8 default permissions and an owner user using the provided owner_email. The
+        owner.temp_password in the response is shown once and never stored — hand
+        it to the tenant owner. Requires tenant:manage permission (super_admin only).
       parameters:
       - description: Tenant details
         in: body
@@ -2295,6 +2481,58 @@ paths:
       summary: Update tenant CORS origins
       tags:
       - admin-tenants
+  /api/v1/tenants/{tid}/activity:
+    get:
+      description: Returns paginated audit events for the specified tenant. Requires
+        tenant:manage (super_admin only).
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Filter by action (e.g. auth.login)
+        in: query
+        name: action
+        type: string
+      - description: Filter by user ID
+        in: query
+        name: user_id
+        type: string
+      - description: From datetime (RFC3339)
+        in: query
+        name: from
+        type: string
+      - description: To datetime (RFC3339)
+        in: query
+        name: to
+        type: string
+      - description: Page (default 1)
+        in: query
+        name: page
+        type: integer
+      - description: Page size (default 50, max 200)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.LogsPage'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Activity feed for a target tenant
+      tags:
+      - admin-cross-tenant
   /api/v1/tenants/{tid}/permissions:
     get:
       description: Returns all permissions belonging to the specified tenant. Requires
@@ -2555,6 +2793,34 @@ paths:
       summary: Replace permissions on a target-tenant role
       tags:
       - admin-cross-tenant
+  /api/v1/tenants/{tid}/stats:
+    get:
+      description: Returns audit-log-based activity counts for the specified tenant.
+        Requires tenant:manage (super_admin only).
+      parameters:
+      - description: Target tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.StatsResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Activity stats for a target tenant
+      tags:
+      - admin-cross-tenant
   /api/v1/tenants/{tid}/users:
     get:
       description: Returns paginated users for the specified tenant. Requires tenant:manage.
@@ -2700,8 +2966,10 @@ paths:
       - admin-tenants
   /api/v1/tenants/stats:
     get:
-      description: Returns system-wide tenant, application, and user counts with month-over-month
-        deltas. Requires tenant:manage permission.
+      description: 'Returns stats scoped to the caller''s permissions: callers with
+        tenant:manage get system-wide tenant/application/user counts with month-over-month
+        deltas; any other authenticated caller gets counts aggregated only across
+        the tenants tied to their own account email (no deltas).'
       produces:
       - application/json
       responses:

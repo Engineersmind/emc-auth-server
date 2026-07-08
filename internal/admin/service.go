@@ -199,7 +199,9 @@ func New(pool *pgxpool.Pool, resetSvc *auth.ResetService, logger zerolog.Logger)
 // Tenant management (super_admin only — caller must hold "tenant:manage" perm)
 // ---------------------------------------------------------------------------
 
-// defaultPermissions lists the 8 permissions seeded into every new tenant.
+// defaultPermissions lists the permissions seeded into every new tenant.
+// Each entry maps 1:1 onto the granular route guards in internal/api/routes.go,
+// so the auto-created owner role can operate the full tenant-admin API.
 var defaultPermissions = []struct{ name, description string }{
 	{"users:read", "Read users in the tenant"},
 	{"users:write", "Create and update users in the tenant"},
@@ -207,13 +209,16 @@ var defaultPermissions = []struct{ name, description string }{
 	{"roles:write", "Create and update roles in the tenant"},
 	{"permissions:read", "Read permissions in the tenant"},
 	{"permissions:write", "Create and update permissions in the tenant"},
-	{"apps:read", "Read applications in the tenant"},
-	{"apps:write", "Create and update applications in the tenant"},
+	{"apps:read", "Read applications, API keys, agents, and rate limits in the tenant"},
+	{"apps:write", "Create and update applications, API keys, agents, and rate limits in the tenant"},
+	{"audit:read", "Read the tenant audit log"},
+	{"stats:read", "Read tenant monitoring statistics"},
+	{"saml:manage", "Configure SAML SSO for the tenant"},
 }
 
 // CreateTenant creates a new tenant inside a single transaction that also seeds:
-//   - 8 default permissions
-//   - an "owner" system role with all 8 permissions
+//   - the default granular permissions (see defaultPermissions)
+//   - an "owner" system role holding all of them
 //   - an owner user (email: in.OwnerEmail) with a one-time temp password
 //
 // The same email may be used as OwnerEmail across multiple CreateTenant calls —

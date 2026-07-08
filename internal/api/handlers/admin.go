@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/mail"
 	"regexp"
@@ -1830,32 +1831,72 @@ func (h *AdminHandler) TenantDeleteUser(c echo.Context) error {
 // Application management (requires admin:access)
 // ---------------------------------------------------------------------------
 
-// CreateApplicationRequest is the body for POST /api/v1/admin/applications.
+// CreateApplicationRequest is the body for POST /api/v1/applications.
 type CreateApplicationRequest struct {
-	Name string `json:"name"`
+	Name    string `json:"name"`
+	AppType string `json:"app_type"` // web | spa | m2m | native; defaults to web
 }
 
-// CreateApplication handles POST /api/v1/admin/applications.
+// UpdateApplicationRequest is the body for PUT /api/v1/applications/:id.
+// Empty fields are left unchanged.
+type UpdateApplicationRequest struct {
+	Name    string `json:"name"`
+	AppType string `json:"app_type"`
+}
+
+// tenantFromClaimsOrPath resolves the target tenant for application handlers.
+// Cross-tenant routes carry :tid in the path (guarded by tenant:manage);
+// tenant-scoped routes derive the tenant from the caller's JWT.
+func (h *AdminHandler) tenantFromClaimsOrPath(c echo.Context) (int64, *auth.Claims, error) {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return 0, nil, fmt.Errorf("forbidden")
+	}
+	if c.Param("tid") != "" {
+		tid, err := targetTenantID(c)
+		if err != nil {
+			return 0, claims, fmt.Errorf("invalid tenant id")
+		}
+		return tid, claims, nil
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return 0, claims, fmt.Errorf("forbidden")
+	}
+	return tenantID, claims, nil
+}
+
+// appFilterFromQuery parses list query params shared by both list routes.
+func appFilterFromQuery(c echo.Context) auth.AppFilter {
+	page, _ := strconv.Atoi(c.QueryParam("page"))
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	return auth.AppFilter{
+		Search: c.QueryParam("search"),
+		Type:   c.QueryParam("type"),
+		Status: c.QueryParam("status"),
+		Page:   page,
+		Limit:  limit,
+	}
+}
+
+// CreateApplication handles POST /api/v1/applications and
+// POST /api/v1/tenants/:tid/applications.
 //
 // @Summary      Create application
-// @Description  Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once.
+// @Description  Registers a new application for the tenant. Returns client_id and client_secret — secret is shown exactly once and can never be retrieved again (only rotated).
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      CreateApplicationRequest  true  "Application name"
+// @Param        body  body      CreateApplicationRequest  true  "Application name and optional type (web|spa|m2m|native)"
 // @Success      201   {object}  auth.AppResult
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
 // @Router       /api/v1/applications [post]
 func (h *AdminHandler) CreateApplication(c echo.Context) error {
-	claims, ok := claimsFromCtx(c)
-	if !ok {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
-	}
-	tenantID, err := tenantIDFromClaims(claims)
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 	}
 
 	var req CreateApplicationRequest
@@ -1866,8 +1907,14 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
-	result, err := h.appSvc.CreateApplication(c.Request().Context(), tenantID, req.Name)
+	result, err := h.appSvc.CreateApplication(c.Request().Context(), tenantID, req.Name, req.AppType)
 	if err != nil {
+		if errors.Is(err, auth.ErrInvalidAppType) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "an application with this name already exists"})
+		}
 		h.logger.Error().Err(err).Msg("admin: create application failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create application"})
 	}
@@ -1876,38 +1923,166 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 	return c.JSON(http.StatusCreated, result)
 }
 
-// ListApplications handles GET /api/v1/admin/applications.
+// ListApplications handles GET /api/v1/applications and
+// GET /api/v1/tenants/:tid/applications.
 //
-// @Summary      List applications
-// @Description  Returns all active applications for the caller's tenant.
+// @Summary      List applications (paginated)
+// @Description  Returns a paginated, filtered list of the tenant's applications. Secrets are never included.
 // @Tags         admin-applications
 // @Produce      json
 // @Security     BearerAuth
-// @Success      200  {array}   auth.AppSummary
-// @Failure      403  {object}  map[string]string
+// @Param        search  query     string  false  "Match on name or client_id"
+// @Param        type    query     string  false  "Filter by app type (web|spa|m2m|native)"
+// @Param        status  query     string  false  "Filter by status (active|inactive); empty = all"
+// @Param        page    query     int     false  "Page (default 1)"
+// @Param        limit   query     int     false  "Page size (default 25, max 100)"
+// @Success      200     {object}  auth.AppsPage
+// @Failure      400     {object}  map[string]string
+// @Failure      403     {object}  map[string]string
 // @Router       /api/v1/applications [get]
 func (h *AdminHandler) ListApplications(c echo.Context) error {
-	claims, ok := claimsFromCtx(c)
-	if !ok {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
-	}
-	tenantID, err := tenantIDFromClaims(claims)
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 	}
 
-	apps, err := h.appSvc.ListApplications(c.Request().Context(), tenantID)
+	page, err := h.appSvc.ListApplicationsPaginated(c.Request().Context(), tenantID, appFilterFromQuery(c))
 	if err != nil {
+		if errors.Is(err, auth.ErrInvalidAppType) || containsMsg(err, "invalid status") {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("admin: list applications failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list applications"})
 	}
-	return c.JSON(http.StatusOK, apps)
+	return c.JSON(http.StatusOK, page)
 }
 
-// DeactivateApplication handles DELETE /api/v1/admin/applications/:id.
+// GetApplication handles GET /api/v1/applications/:id and
+// GET /api/v1/tenants/:tid/applications/:id.
+//
+// @Summary      Get application
+// @Description  Returns one application (active or inactive) by ID. The secret is never included.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      int  true  "Application ID"
+// @Success      200  {object}  auth.AppDetail
+// @Failure      400  {object}  map[string]string
+// @Failure      403  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/applications/{id} [get]
+func (h *AdminHandler) GetApplication(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid application id"})
+	}
+
+	app, err := h.appSvc.GetApplication(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		if errors.Is(err, auth.ErrAppNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: get application failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get application"})
+	}
+	return c.JSON(http.StatusOK, app)
+}
+
+// UpdateApplication handles PUT /api/v1/applications/:id and
+// PUT /api/v1/tenants/:tid/applications/:id.
+//
+// @Summary      Update application
+// @Description  Updates an active application's name and/or type. Empty fields are left unchanged.
+// @Tags         admin-applications
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      int                       true  "Application ID"
+// @Param        body  body      UpdateApplicationRequest  true  "Fields to update"
+// @Success      200   {object}  auth.AppDetail
+// @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string
+// @Failure      404   {object}  map[string]string
+// @Router       /api/v1/applications/{id} [put]
+func (h *AdminHandler) UpdateApplication(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid application id"})
+	}
+
+	var req UpdateApplicationRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	app, err := h.appSvc.UpdateApplication(c.Request().Context(), tenantID, appID, req.Name, req.AppType)
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrAppNotFound):
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
+		case errors.Is(err, auth.ErrInvalidAppType), containsMsg(err, "nothing to update"):
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		case containsMsg(err, "duplicate"), containsMsg(err, "unique"):
+			return c.JSON(http.StatusConflict, map[string]string{"error": "an application with this name already exists"})
+		}
+		h.logger.Error().Err(err).Msg("admin: update application failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update application"})
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminApplicationUpdated, "application", app.ID)
+	return c.JSON(http.StatusOK, app)
+}
+
+// RotateApplicationSecret handles POST /api/v1/applications/:id/rotate-secret and
+// POST /api/v1/tenants/:tid/applications/:id/rotate-secret.
+//
+// @Summary      Rotate application client secret
+// @Description  Generates a new client_secret for the application. The old secret stops working immediately. The new secret is returned exactly once — it is stored only as a hash and can never be revealed later.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      int  true  "Application ID"
+// @Success      200  {object}  auth.AppResult
+// @Failure      400  {object}  map[string]string
+// @Failure      403  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/applications/{id}/rotate-secret [post]
+func (h *AdminHandler) RotateApplicationSecret(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid application id"})
+	}
+
+	result, err := h.appSvc.RotateSecret(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		if errors.Is(err, auth.ErrAppNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: rotate application secret failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to rotate secret"})
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminApplicationSecretRotated, "application", result.ID)
+	return c.JSON(http.StatusOK, result)
+}
+
+// DeactivateApplication handles DELETE /api/v1/applications/:id and
+// DELETE /api/v1/tenants/:tid/applications/:id.
 //
 // @Summary      Deactivate application
-// @Description  Soft-deletes an application. Its client_id is immediately rejected on login and register.
+// @Description  Soft-deletes an application. Its client_id is immediately rejected on login, register, and the client_credentials grant.
 // @Tags         admin-applications
 // @Produce      json
 // @Security     BearerAuth
@@ -1918,13 +2093,9 @@ func (h *AdminHandler) ListApplications(c echo.Context) error {
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/applications/{id} [delete]
 func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
-	claims, ok := claimsFromCtx(c)
-	if !ok {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
-	}
-	tenantID, err := tenantIDFromClaims(claims)
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 	}
 
 	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -1933,7 +2104,7 @@ func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 	}
 
 	if err := h.appSvc.DeactivateApplication(c.Request().Context(), tenantID, appID); err != nil {
-		if containsMsg(err, "not found") {
+		if errors.Is(err, auth.ErrAppNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
 		}
 		h.logger.Error().Err(err).Msg("admin: deactivate application failed")
@@ -1942,4 +2113,61 @@ func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 
 	h.auditAdmin(c, claims, audit.ActionAdminApplicationDeleted, "application", strconv.FormatInt(appID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "application deactivated"})
+}
+
+// TenantGetStats handles GET /api/v1/tenants/:tid/stats.
+//
+// @Summary      Activity stats for a target tenant
+// @Description  Returns audit-log-based activity counts for the specified tenant. Requires tenant:manage (super_admin only).
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid  path      string  true  "Target tenant ID"
+// @Success      200  {object}  audit.StatsResult
+// @Failure      400  {object}  map[string]string
+// @Router       /api/v1/tenants/{tid}/stats [get]
+func (h *AdminHandler) TenantGetStats(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	result, err := h.audit.Stats(c.Request().Context(), &tid)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: tenant stats query failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query stats"})
+	}
+	return c.JSON(http.StatusOK, result)
+}
+
+// TenantGetActivity handles GET /api/v1/tenants/:tid/activity.
+//
+// @Summary      Activity feed for a target tenant
+// @Description  Returns paginated audit events for the specified tenant. Requires tenant:manage (super_admin only).
+// @Tags         admin-cross-tenant
+// @Produce      json
+// @Security     BearerAuth
+// @Param        tid      path      string  true   "Target tenant ID"
+// @Param        action   query     string  false  "Filter by action (e.g. auth.login)"
+// @Param        user_id  query     string  false  "Filter by user ID"
+// @Param        from     query     string  false  "From datetime (RFC3339)"
+// @Param        to       query     string  false  "To datetime (RFC3339)"
+// @Param        page     query     int     false  "Page (default 1)"
+// @Param        limit    query     int     false  "Page size (default 50, max 200)"
+// @Success      200      {object}  audit.LogsPage
+// @Failure      400      {object}  map[string]string
+// @Router       /api/v1/tenants/{tid}/activity [get]
+func (h *AdminHandler) TenantGetActivity(c echo.Context) error {
+	tid, err := targetTenantID(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
+	}
+	p := auditQueryParams(c)
+	p.TenantID = &tid
+
+	result, err := h.audit.Query(c.Request().Context(), p)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: tenant activity query failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query activity"})
+	}
+	return c.JSON(http.StatusOK, result)
 }

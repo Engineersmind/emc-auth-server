@@ -352,63 +352,96 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt.POST("/tenants/:tid/users", adminHandler.TenantCreateUser)
 	tenantMgmt.DELETE("/tenants/:tid/users/:uid", adminHandler.TenantDeleteUser)
 
-	// Permission management — tenant admin (admin:access permission)
-	rbacGroup := adminGroup.Group("", mw.RequirePermission("admin:access"))
-	rbacGroup.POST("/permissions", adminHandler.CreatePermission)
-	rbacGroup.GET("/permissions", adminHandler.ListPermissions)
-	rbacGroup.DELETE("/permissions/:id", adminHandler.DeletePermission)
-	rbacGroup.POST("/roles", adminHandler.CreateRole)
-	rbacGroup.GET("/roles", adminHandler.ListRoles)
-	rbacGroup.PUT("/roles/:id/permissions", adminHandler.UpdateRolePermissions)
-	rbacGroup.DELETE("/roles/:id", adminHandler.DeleteRole)
+	// Cross-tenant application management (EMC-004) — same handlers as the
+	// tenant-scoped /applications routes; the :tid path param overrides the
+	// JWT tenant. Guarded by tenant:manage via the tenantMgmt group.
+	tenantMgmt.GET("/tenants/:tid/applications", adminHandler.ListApplications)
+	tenantMgmt.POST("/tenants/:tid/applications", adminHandler.CreateApplication)
+	tenantMgmt.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication)
+	tenantMgmt.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication)
+	tenantMgmt.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication)
+	tenantMgmt.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret)
 
-	// User pool management — tenant admin (admin:access permission)
-	rbacGroup.GET("/users", adminHandler.ListUsers)
-	rbacGroup.POST("/users", adminHandler.CreateAdminUser)
-	rbacGroup.GET("/users/:id", adminHandler.GetAdminUser)
-	rbacGroup.PUT("/users/:id", adminHandler.UpdateAdminUser)
-	rbacGroup.PUT("/users/:id/role", adminHandler.AssignUserRole)
-	rbacGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser)
-	rbacGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset)
+	// Cross-tenant stats + activity feed (EMC-004 tenant overview page).
+	tenantMgmt.GET("/tenants/:tid/stats", adminHandler.TenantGetStats)
+	tenantMgmt.GET("/tenants/:tid/activity", adminHandler.TenantGetActivity)
 
-	// API key management — tenant admin (admin:access) (03-03)
-	rbacGroup.POST("/api-keys", authHandler.CreateAPIKey)
-	rbacGroup.GET("/api-keys", authHandler.ListAPIKeys)
-	rbacGroup.DELETE("/api-keys/:id", authHandler.RevokeAPIKey)
+	// Tenant-admin routes are guarded by granular per-resource permissions
+	// (seeded onto every tenant's "owner" role at creation), with "admin:access"
+	// accepted everywhere as the coarse fallback held by super_admin.
+	permsRead := mw.RequireAnyPermission("permissions:read", "admin:access")
+	permsWrite := mw.RequireAnyPermission("permissions:write", "admin:access")
+	rolesRead := mw.RequireAnyPermission("roles:read", "admin:access")
+	rolesWrite := mw.RequireAnyPermission("roles:write", "admin:access")
+	usersRead := mw.RequireAnyPermission("users:read", "admin:access")
+	usersWrite := mw.RequireAnyPermission("users:write", "admin:access")
+	appsRead := mw.RequireAnyPermission("apps:read", "admin:access")
+	appsWrite := mw.RequireAnyPermission("apps:write", "admin:access")
+	auditRead := mw.RequireAnyPermission("audit:read", "admin:access")
+	statsRead := mw.RequireAnyPermission("stats:read", "admin:access")
+	samlManage := mw.RequireAnyPermission("saml:manage", "admin:access")
 
-	// Monitoring stats — tenant-scoped (admin:access) and system-wide (tenant:manage)
-	rbacGroup.GET("/stats", adminHandler.GetStats)
+	// Permission management — permissions:read / permissions:write
+	adminGroup.POST("/permissions", adminHandler.CreatePermission, permsWrite)
+	adminGroup.GET("/permissions", adminHandler.ListPermissions, permsRead)
+	adminGroup.DELETE("/permissions/:id", adminHandler.DeletePermission, permsWrite)
+
+	// Role management — roles:read / roles:write
+	adminGroup.POST("/roles", adminHandler.CreateRole, rolesWrite)
+	adminGroup.GET("/roles", adminHandler.ListRoles, rolesRead)
+	adminGroup.PUT("/roles/:id/permissions", adminHandler.UpdateRolePermissions, rolesWrite)
+	adminGroup.DELETE("/roles/:id", adminHandler.DeleteRole, rolesWrite)
+
+	// User pool management — users:read / users:write
+	adminGroup.GET("/users", adminHandler.ListUsers, usersRead)
+	adminGroup.POST("/users", adminHandler.CreateAdminUser, usersWrite)
+	adminGroup.GET("/users/:id", adminHandler.GetAdminUser, usersRead)
+	adminGroup.PUT("/users/:id", adminHandler.UpdateAdminUser, usersWrite)
+	adminGroup.PUT("/users/:id/role", adminHandler.AssignUserRole, usersWrite)
+	adminGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser, usersWrite)
+	adminGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
+
+	// API key management — apps:read / apps:write (keys are machine credentials) (03-03)
+	adminGroup.POST("/api-keys", authHandler.CreateAPIKey, appsWrite)
+	adminGroup.GET("/api-keys", authHandler.ListAPIKeys, appsRead)
+	adminGroup.DELETE("/api-keys/:id", authHandler.RevokeAPIKey, appsWrite)
+
+	// Monitoring stats — tenant-scoped (stats:read) and system-wide (tenant:manage)
+	adminGroup.GET("/stats", adminHandler.GetStats, statsRead)
 	tenantMgmt.GET("/stats/system", adminHandler.GetSystemStats)
 
-	// Audit logs — tenant-scoped (admin:access) and system-wide (tenant:manage)
-	rbacGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs)
+	// Audit logs — tenant-scoped (audit:read) and system-wide (tenant:manage)
+	adminGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs, auditRead)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
 
-	// Application management — tenant admin (admin:access)
-	rbacGroup.POST("/applications", adminHandler.CreateApplication)
-	rbacGroup.GET("/applications", adminHandler.ListApplications)
-	rbacGroup.DELETE("/applications/:id", adminHandler.DeactivateApplication)
+	// Application management — apps:read / apps:write (tenant from JWT claims)
+	adminGroup.POST("/applications", adminHandler.CreateApplication, appsWrite)
+	adminGroup.GET("/applications", adminHandler.ListApplications, appsRead)
+	adminGroup.GET("/applications/:id", adminHandler.GetApplication, appsRead)
+	adminGroup.PUT("/applications/:id", adminHandler.UpdateApplication, appsWrite)
+	adminGroup.DELETE("/applications/:id", adminHandler.DeactivateApplication, appsWrite)
+	adminGroup.POST("/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, appsWrite)
 
-	// Per-app rate limit management — tenant admin (admin:access) (08-02)
-	rbacGroup.POST("/app-limits", adminHandler.CreateAppLimit)
-	rbacGroup.GET("/app-limits", adminHandler.ListAppLimits)
-	rbacGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit)
-	rbacGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit)
+	// Per-app rate limit management — apps:read / apps:write (08-02)
+	adminGroup.POST("/app-limits", adminHandler.CreateAppLimit, appsWrite)
+	adminGroup.GET("/app-limits", adminHandler.ListAppLimits, appsRead)
+	adminGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit, appsWrite)
+	adminGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit, appsWrite)
 
-	// SAML admin config — tenant admin (admin:access) (04-01)
-	rbacGroup.GET("/saml-config", samlHandler.GetSAMLConfig)
-	rbacGroup.PUT("/saml-config", samlHandler.UpsertSAMLConfig)
+	// SAML admin config — saml:manage (04-01)
+	adminGroup.GET("/saml-config", samlHandler.GetSAMLConfig, samlManage)
+	adminGroup.PUT("/saml-config", samlHandler.UpsertSAMLConfig, samlManage)
 
 	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
 	e.GET("/saml/login", samlHandler.InitiateLogin)
 	e.POST("/saml/acs", samlHandler.HandleACS)
 
-	// Agent management — tenant admin (admin:access) (08-01, 08-04)
-	rbacGroup.POST("/agents", agentHandler.RegisterAgent)
-	rbacGroup.GET("/agents", agentHandler.ListAgents)
-	rbacGroup.DELETE("/agents/:id", agentHandler.RevokeAgent)
-	rbacGroup.GET("/agents/analysis", agentHandler.GetAgentAnalysis)
+	// Agent management — apps:read / apps:write (agents are machine clients) (08-01, 08-04)
+	adminGroup.POST("/agents", agentHandler.RegisterAgent, appsWrite)
+	adminGroup.GET("/agents", agentHandler.ListAgents, appsRead)
+	adminGroup.DELETE("/agents/:id", agentHandler.RevokeAgent, appsWrite)
+	adminGroup.GET("/agents/analysis", agentHandler.GetAgentAnalysis, appsRead)
 
 	// Agent authentication — public (no JWT required) — issues agent JWT from raw key
 	apiV1.POST("/agents/authenticate", agentHandler.AuthenticateAgent)
