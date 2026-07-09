@@ -1221,7 +1221,7 @@ func clientCredentialsFromBasicAuth(c echo.Context) (clientID, clientSecret stri
 	}
 	id, secret, found := strings.Cut(string(decoded), ":")
 	if !found || id == "" || secret == "" {
-		return "", "", false, fmt.Errorf("Basic authorization header must be base64(client_id:client_secret)")
+		return "", "", false, fmt.Errorf("basic authorization header must be base64(client_id:client_secret)")
 	}
 	return id, secret, true, nil
 }
