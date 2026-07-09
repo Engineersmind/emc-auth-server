@@ -323,6 +323,10 @@ definitions:
         type: boolean
       name:
         type: string
+      scopes:
+        items:
+          type: string
+        type: array
       updated_at:
         type: string
     type: object
@@ -357,6 +361,10 @@ definitions:
         type: string
       name:
         type: string
+      scopes:
+        items:
+          type: string
+        type: array
     type: object
   auth.AppsPage:
     properties:
@@ -423,6 +431,31 @@ definitions:
       requests_per_minute:
         type: integer
     type: object
+  handlers.AppLoginRequest:
+    properties:
+      email:
+        type: string
+      password:
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  handlers.AppRegisterRequest:
+    properties:
+      email:
+        type: string
+      first_name:
+        type: string
+      last_name:
+        type: string
+      password:
+        minLength: 8
+        type: string
+    required:
+    - email
+    - password
+    type: object
   handlers.AssignRoleRequest:
     properties:
       role_id:
@@ -451,6 +484,11 @@ definitions:
         type: string
       name:
         type: string
+      scopes:
+        description: resource:action strings; optional
+        items:
+          type: string
+        type: array
     type: object
   handlers.CreatePermissionRequest:
     properties:
@@ -614,6 +652,10 @@ definitions:
         type: string
       name:
         type: string
+      scopes:
+        items:
+          type: string
+        type: array
     type: object
   handlers.UpdateCORSOriginsRequest:
     properties:
@@ -1366,6 +1408,95 @@ paths:
       summary: System-wide audit log
       tags:
       - admin-audit
+  /api/v1/auth/apps/login:
+    post:
+      consumes:
+      - application/json
+      description: 'Authenticates a user that belongs to the authenticated application''s
+        own user base — invisible to POST /auth/login and to every other application.
+        Application credentials via Authorization: Basic header only.'
+      parameters:
+      - description: Basic base64(client_id:client_secret)
+        in: header
+        name: Authorization
+        required: true
+        type: string
+      - description: Login credentials
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AppLoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid application or user credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Login an end user via application credentials
+      tags:
+      - AUTH
+  /api/v1/auth/apps/register:
+    post:
+      consumes:
+      - application/json
+      description: 'Creates a user account owned by the authenticated application
+        — the same email may hold independent accounts in different applications.
+        Application credentials via Authorization: Basic header only; no tenant slug
+        needed.'
+      parameters:
+      - description: Basic base64(client_id:client_secret)
+        in: header
+        name: Authorization
+        required: true
+        type: string
+      - description: Registration payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AppRegisterRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid application credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Email already registered in this application
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Register an end user via application credentials
+      tags:
+      - AUTH
   /api/v1/auth/forgot-password:
     post:
       consumes:
@@ -1859,10 +1990,16 @@ paths:
     post:
       consumes:
       - application/json
-      description: Issues a service-level access token using client_id + client_secret.
-        No user involved, no refresh token issued.
+      description: 'Issues a service-level access token. Credentials via Authorization:
+        Basic base64(client_id:client_secret) header only. No user involved, no refresh
+        token issued.'
       parameters:
-      - description: Client credentials
+      - description: Basic base64(client_id:client_secret)
+        in: header
+        name: Authorization
+        required: true
+        type: string
+      - description: grant_type only
         in: body
         name: body
         required: true

@@ -1190,10 +1190,15 @@ func (h *AdminHandler) auditAdmin(c echo.Context, claims *auth.Claims, action, r
 		return
 	}
 	tid, _ := strconv.ParseInt(claims.TenantID, 10, 64)
-	uid, _ := strconv.ParseInt(claims.UserID, 10, 64)
+	// Service tokens carry the public client_id in the UserID claim, which is
+	// not a users.id — record no user rather than a garbage zero.
+	var uidPtr *int64
+	if uid, err := strconv.ParseInt(claims.UserID, 10, 64); err == nil {
+		uidPtr = &uid
+	}
 	h.audit.Log(c.Request().Context(), audit.Event{
 		TenantID:     &tid,
-		UserID:       &uid,
+		UserID:       uidPtr,
 		ActorEmail:   claims.Email,
 		Action:       action,
 		ResourceType: resourceType,
@@ -1832,16 +1837,19 @@ func (h *AdminHandler) TenantDeleteUser(c echo.Context) error {
 // ---------------------------------------------------------------------------
 
 // CreateApplicationRequest is the body for POST /api/v1/applications.
+// Scopes become the permissions claim of the app's client_credentials tokens.
 type CreateApplicationRequest struct {
-	Name    string `json:"name"`
-	AppType string `json:"app_type"` // web | spa | m2m | native; defaults to web
+	Name    string   `json:"name"`
+	AppType string   `json:"app_type"` // web | spa | m2m | native; defaults to web
+	Scopes  []string `json:"scopes"`   // resource:action strings; optional
 }
 
 // UpdateApplicationRequest is the body for PUT /api/v1/applications/:id.
-// Empty fields are left unchanged.
+// Empty fields are left unchanged. Scopes omitted = unchanged; scopes: [] clears.
 type UpdateApplicationRequest struct {
-	Name    string `json:"name"`
-	AppType string `json:"app_type"`
+	Name    string   `json:"name"`
+	AppType string   `json:"app_type"`
+	Scopes  []string `json:"scopes"`
 }
 
 // tenantFromClaimsOrPath resolves the target tenant for application handlers.
@@ -1907,9 +1915,9 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
-	result, err := h.appSvc.CreateApplication(c.Request().Context(), tenantID, req.Name, req.AppType)
+	result, err := h.appSvc.CreateApplication(c.Request().Context(), tenantID, req.Name, req.AppType, req.Scopes)
 	if err != nil {
-		if errors.Is(err, auth.ErrInvalidAppType) {
+		if errors.Is(err, auth.ErrInvalidAppType) || errors.Is(err, auth.ErrInvalidScope) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
@@ -2023,12 +2031,12 @@ func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	app, err := h.appSvc.UpdateApplication(c.Request().Context(), tenantID, appID, req.Name, req.AppType)
+	app, err := h.appSvc.UpdateApplication(c.Request().Context(), tenantID, appID, req.Name, req.AppType, req.Scopes)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrAppNotFound):
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
-		case errors.Is(err, auth.ErrInvalidAppType), containsMsg(err, "nothing to update"):
+		case errors.Is(err, auth.ErrInvalidAppType), errors.Is(err, auth.ErrInvalidScope), containsMsg(err, "nothing to update"):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case containsMsg(err, "duplicate"), containsMsg(err, "unique"):
 			return c.JSON(http.StatusConflict, map[string]string{"error": "an application with this name already exists"})

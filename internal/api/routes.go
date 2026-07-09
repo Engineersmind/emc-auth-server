@@ -290,7 +290,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/session/logout", authHandler.SessionLogout, sessionCSRF)
 
 	// Client credentials token endpoint — machine-to-machine auth (no user).
-	authGroup.POST("/token", authHandler.Token, mw.LoginRateLimiter(rlCfg))
+	// TokenRateLimiter keys per client_id (not email) so each M2M client gets
+	// an isolated bucket instead of all sharing one email-less fallback bucket.
+	authGroup.POST("/token", authHandler.Token, mw.TokenRateLimiter(rlCfg))
+
+	// Application-authenticated end-user register/login (Auth0-style
+	// integration): the calling application authenticates itself via
+	// Authorization: Basic, and gets its own isolated end-user base, distinct
+	// from /register and /login above (which are tenant-level, first-party
+	// only). Rate-limited per client_id — same reasoning as /token.
+	authGroup.POST("/apps/register", authHandler.AppRegister, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/login", authHandler.AppLogin, mw.TokenRateLimiter(rlCfg))
 
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -109,6 +110,8 @@ func (h *AuthHandler) MyActivity(c echo.Context) error {
 }
 
 // RegisterRequest is the JSON body for POST /api/v1/auth/register.
+// This is the first-party, tenant-level flow — see AppRegisterRequest /
+// POST /api/v1/auth/apps/register for the application-authenticated flow.
 type RegisterRequest struct {
 	Email     string `json:"email"     validate:"required,email"`
 	Password  string `json:"password"  validate:"required,min=8"`
@@ -117,6 +120,8 @@ type RegisterRequest struct {
 }
 
 // LoginRequest is the JSON body for POST /api/v1/auth/login.
+// This is the first-party, tenant-level flow — see AppLoginRequest /
+// POST /api/v1/auth/apps/login for the application-authenticated flow.
 type LoginRequest struct {
 	Email    string `json:"email"    validate:"required,email"`
 	Password string `json:"password" validate:"required"`
@@ -147,7 +152,7 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 func (h *AuthHandler) Register(c echo.Context) error {
 	slug, ok := tenantSlugFromCtx(c)
 	if !ok {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "X-Tenant-Slug header is required"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "X-Tenant-Slug header is required — for application-authenticated registration use POST /api/v1/auth/apps/register"})
 	}
 
 	var req RegisterRequest
@@ -163,7 +168,7 @@ func (h *AuthHandler) Register(c echo.Context) error {
 
 	result, err := h.svc.Register(c.Request().Context(), auth.RegisterInput{
 		TenantSlug: slug,
-		ClientID:   clientIDFromCtx(c),
+		ClientID:   clientIDFromCtx(c), // legacy X-Client-ID tagging only — no secret, no auth
 		Email:      req.Email,
 		Password:   req.Password,
 		FirstName:  req.FirstName,
@@ -217,7 +222,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	}
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
-		ClientID: clientIDFromCtx(c),
+		ClientID: clientIDFromCtx(c), // legacy X-Client-ID tagging only — no secret, no auth
 		Email:    req.Email,
 		Password: req.Password,
 	})
@@ -230,6 +235,179 @@ func (h *AuthHandler) Login(c echo.Context) error {
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
 		})
+		if containsMsg(err, "invalid credentials") {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+	}
+
+	if result.OTPChallenge != nil {
+		return c.JSON(http.StatusOK, result.OTPChallenge)
+	}
+
+	tid, uid := claimsFromToken(result.Token.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthLogin,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusOK, result.Token)
+}
+
+// ---------------------------------------------------------------------------
+// Application-authenticated end-user register/login (Auth0-style integration)
+// ---------------------------------------------------------------------------
+
+// AppRegisterRequest is the JSON body for POST /api/v1/auth/apps/register.
+// The calling application is authenticated via the Authorization: Basic
+// header (RFC 6749 §2.3.1) — never in the body. The tenant and the isolated
+// user base are both derived from the authenticated application.
+type AppRegisterRequest struct {
+	Email     string `json:"email"     validate:"required,email"`
+	Password  string `json:"password"  validate:"required,min=8"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+// AppLoginRequest is the JSON body for POST /api/v1/auth/apps/login.
+// See AppRegisterRequest for the application-authentication contract.
+type AppLoginRequest struct {
+	Email    string `json:"email"    validate:"required,email"`
+	Password string `json:"password" validate:"required"`
+}
+
+// appCredentialsFromRequest resolves and requires the calling application's
+// credentials from the Authorization: Basic header — the only credential
+// channel these endpoints accept. AppRegisterRequest/AppLoginRequest have no
+// client_id/client_secret fields, so anything sent in the body is simply
+// unread, not rejected — there is nothing to strip.
+func appCredentialsFromRequest(c echo.Context) (clientID, clientSecret string, errResp map[string]string) {
+	id, secret, ok, err := clientCredentialsFromBasicAuth(c)
+	if err != nil {
+		return "", "", map[string]string{"error": err.Error()}
+	}
+	if !ok {
+		return "", "", map[string]string{"error": "Authorization: Basic base64(client_id:client_secret) header is required"}
+	}
+	return id, secret, nil
+}
+
+// AppRegister handles POST /api/v1/auth/apps/register.
+//
+// @Summary      Register an end user via application credentials
+// @Description  Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        Authorization  header  string              true  "Basic base64(client_id:client_secret)"
+// @Param        body           body    AppRegisterRequest  true  "Registration payload"
+// @Success      201  {object}  auth.AuthResult
+// @Failure      400  {object}  map[string]string
+// @Failure      401  {object}  map[string]string  "Invalid application credentials"
+// @Failure      409  {object}  map[string]string  "Email already registered in this application"
+// @Router       /api/v1/auth/apps/register [post]
+func (h *AuthHandler) AppRegister(c echo.Context) error {
+	var req AppRegisterRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Email == "" || req.Password == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
+	}
+	if len(req.Password) < 8 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+	}
+
+	clientID, clientSecret, errResp := appCredentialsFromRequest(c)
+	if errResp != nil {
+		return c.JSON(http.StatusBadRequest, errResp)
+	}
+
+	result, err := h.svc.Register(c.Request().Context(), auth.RegisterInput{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		Email:        req.Email,
+		Password:     req.Password,
+		FirstName:    req.FirstName,
+		LastName:     req.LastName,
+	})
+	if err != nil {
+		h.logger.Error().Err(err).Str("email", req.Email).Msg("app register failed")
+		if errors.Is(err, auth.ErrInvalidClient) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
+		}
+		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "email already registered in this application"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
+	}
+
+	tid, uid := claimsFromToken(result.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthRegister,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusCreated, result)
+}
+
+// AppLogin handles POST /api/v1/auth/apps/login.
+//
+// @Summary      Login an end user via application credentials
+// @Description  Authenticates a user that belongs to the authenticated application's own user base — invisible to POST /auth/login and to every other application. Application credentials via Authorization: Basic header only.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        Authorization  header  string           true  "Basic base64(client_id:client_secret)"
+// @Param        body           body    AppLoginRequest  true  "Login credentials"
+// @Success      200  {object}  auth.AuthResult
+// @Failure      400  {object}  map[string]string
+// @Failure      401  {object}  map[string]string  "Invalid application or user credentials"
+// @Router       /api/v1/auth/apps/login [post]
+func (h *AuthHandler) AppLogin(c echo.Context) error {
+	var req AppLoginRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if req.Email == "" || req.Password == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
+	}
+
+	clientID, clientSecret, errResp := appCredentialsFromRequest(c)
+	if errResp != nil {
+		return c.JSON(http.StatusBadRequest, errResp)
+	}
+
+	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		Email:        req.Email,
+		Password:     req.Password,
+	})
+	if err != nil {
+		h.logger.Warn().Err(err).Str("email", req.Email).Msg("app login failed")
+		h.audit.Log(c.Request().Context(), audit.Event{
+			ActorEmail:   req.Email,
+			Action:       audit.ActionAuthLoginFailed,
+			ResourceType: "user",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		})
+		if errors.Is(err, auth.ErrInvalidClient) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
+		}
 		if containsMsg(err, "invalid credentials") {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		}
@@ -1015,20 +1193,53 @@ func (h *AuthHandler) SessionLogout(c echo.Context) error {
 // ---------------------------------------------------------------------------
 
 // TokenRequest is the JSON body for POST /api/v1/auth/token.
+// ClientID/ClientSecret are bound ONLY to detect and reject credentials sent
+// in the body — the sole accepted channel is the Authorization: Basic header.
 type TokenRequest struct {
 	GrantType    string `json:"grant_type"`
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
 }
 
+// errBodyCredentials is the guidance returned when an integrator sends
+// client credentials in the request body instead of the Basic auth header.
+const errBodyCredentials = "client_id and client_secret must be sent via the Authorization: Basic header, not the request body"
+
+// clientCredentialsFromBasicAuth extracts client_id + client_secret from an
+// RFC 6749 §2.3.1 "Authorization: Basic base64(client_id:client_secret)"
+// header. Returns ok=false when the header is absent; an error when the header
+// is present but malformed — the two cases get different HTTP responses.
+func clientCredentialsFromBasicAuth(c echo.Context) (clientID, clientSecret string, ok bool, err error) {
+	header := c.Request().Header.Get(echo.HeaderAuthorization)
+	const prefix = "Basic "
+	if header == "" || !strings.HasPrefix(header, prefix) {
+		return "", "", false, nil
+	}
+	decoded, decodeErr := base64.StdEncoding.DecodeString(header[len(prefix):])
+	if decodeErr != nil {
+		return "", "", false, fmt.Errorf("invalid base64 in Basic authorization header")
+	}
+	id, secret, found := strings.Cut(string(decoded), ":")
+	if !found || id == "" || secret == "" {
+		return "", "", false, fmt.Errorf("Basic authorization header must be base64(client_id:client_secret)")
+	}
+	return id, secret, true, nil
+}
+
 // Token handles POST /api/v1/auth/token.
 //
+// Client credentials are accepted ONLY via the Authorization header
+// (RFC 6749 §2.3.1): Basic base64(client_id:client_secret). The JSON body
+// carries grant_type alone; credentials in the body are rejected with
+// guidance so misconfigured integrations fail loudly, not silently.
+//
 // @Summary      Client credentials token
-// @Description  Issues a service-level access token using client_id + client_secret. No user involved, no refresh token issued.
+// @Description  Issues a service-level access token. Credentials via Authorization: Basic base64(client_id:client_secret) header only. No user involved, no refresh token issued.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
-// @Param        body  body      TokenRequest  true  "Client credentials"
+// @Param        Authorization  header  string        true  "Basic base64(client_id:client_secret)"
+// @Param        body           body    TokenRequest  true  "grant_type only"
 // @Success      200   {object}  map[string]interface{}
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
@@ -1038,13 +1249,23 @@ func (h *AuthHandler) Token(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
+	if req.ClientID != "" || req.ClientSecret != "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": errBodyCredentials})
+	}
+
+	id, secret, ok, err := clientCredentialsFromBasicAuth(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
+	if !ok {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Authorization: Basic base64(client_id:client_secret) header is required"})
+	}
+	req.ClientID, req.ClientSecret = id, secret
+
 	if req.GrantType != "client_credentials" {
 		return c.JSON(http.StatusBadRequest, map[string]string{
 			"error": "unsupported grant_type — only client_credentials is accepted",
 		})
-	}
-	if req.ClientID == "" || req.ClientSecret == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "client_id and client_secret are required"})
 	}
 	if h.appSvc == nil {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "application service not configured"})

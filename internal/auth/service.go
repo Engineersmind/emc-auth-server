@@ -49,26 +49,41 @@ func (s *AuthService) WithApplications(appSvc *ApplicationService) *AuthService 
 }
 
 // RegisterInput is the payload for creating a new user.
+//
+// Two application-identification modes are supported:
+//   - ClientID + ClientSecret (server-to-server integrations): the application
+//     is fully AUTHENTICATED — the secret is verified against its hash and the
+//     tenant is derived from the application, so TenantSlug becomes optional.
+//   - ClientID alone (legacy X-Client-ID header): the id is only validated to
+//     exist within the slug-resolved tenant and stamped into the JWT for audit.
 type RegisterInput struct {
+	// TenantSlug is required unless ClientSecret is provided (the tenant is
+	// then derived from the authenticated application). When both are present
+	// the slug must resolve to the application's own tenant.
 	TenantSlug string
-	// ClientID is the optional X-Client-ID header value. When provided the
-	// service validates it against the tenant and stamps app_id in the JWT.
-	ClientID  string
-	Email     string
-	Password  string
-	FirstName string
-	LastName  string
+	// ClientID is the application identifier (body field for integrations, or
+	// the legacy X-Client-ID header). See the struct comment for the two modes.
+	ClientID string
+	// ClientSecret, when non-empty, upgrades ClientID validation to full
+	// application authentication (hash-verified, active applications only).
+	ClientSecret string
+	Email        string
+	Password     string
+	FirstName    string
+	LastName     string
 }
 
-// LoginInput is the payload for authenticating an existing user. The tenant is
-// not specified by the caller — Login resolves it by matching Email/Password
-// against every tenant's users, since the same email may own accounts in
-// multiple tenants.
+// LoginInput is the payload for authenticating an existing user. Without
+// application credentials the tenant is resolved by matching Email/Password
+// against every tenant's users (the same email may own accounts in multiple
+// tenants). With ClientID + ClientSecret the application is authenticated
+// first and the candidate search is pinned to that application's tenant.
 type LoginInput struct {
-	// ClientID is the optional X-Client-ID header value. See RegisterInput.
-	ClientID string
-	Email    string
-	Password string
+	// ClientID / ClientSecret follow the same two modes as RegisterInput.
+	ClientID     string
+	ClientSecret string
+	Email        string
+	Password     string
 }
 
 // AuthResult is returned by both Register and Login (when TOTP is not required).
@@ -213,14 +228,66 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 	}, nil
 }
 
-// Register creates a new user in the given tenant.
+// authenticateApp verifies client_id + client_secret against the stored hash
+// and returns the application's owning tenant and its row id. Deactivated
+// applications are rejected. Returns ErrInvalidClient on credential mismatch.
+func (s *AuthService) authenticateApp(ctx context.Context, clientID, clientSecret string) (tenantID, appRowID int64, err error) {
+	if s.appSvc == nil {
+		return 0, 0, fmt.Errorf("application service not configured")
+	}
+	if clientID == "" {
+		return 0, 0, ErrInvalidClient
+	}
+	return s.appSvc.AuthenticateClient(ctx, clientID, clientSecret)
+}
+
+// Register creates a new user. The target tenant comes either from an
+// authenticated application (ClientID + ClientSecret) or from TenantSlug.
 func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResult, error) {
-	tenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("tenant not found")
+	var tenantID int64
+	appID := ""
+	// appRowID is non-nil only for application-authenticated registration —
+	// the created user then BELONGS to that application (isolated user base),
+	// not just the tenant. Legacy X-Client-ID tagging does not scope the user.
+	var appRowID *int64
+
+	if in.ClientSecret != "" {
+		// Application-authenticated registration: the app proves itself and
+		// pins the tenant — integrators never need to know a tenant slug.
+		tid, aid, err := s.authenticateApp(ctx, in.ClientID, in.ClientSecret)
+		if err != nil {
+			return nil, err
 		}
-		return nil, err
+		// A slug supplied alongside app credentials must agree with the
+		// application's own tenant (confused-deputy guard). Same error as a
+		// bad secret so responses don't map app credentials to tenants.
+		if in.TenantSlug != "" {
+			slugTenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
+			if err != nil || slugTenantID != tid {
+				return nil, ErrInvalidClient
+			}
+		}
+		tenantID, appRowID = tid, &aid
+		appID = strconv.FormatInt(aid, 10)
+	} else {
+		tid, _, err := s.resolveTenant(ctx, in.TenantSlug)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, fmt.Errorf("tenant not found")
+			}
+			return nil, err
+		}
+		tenantID = tid
+
+		// Legacy tagging mode: validate the client before any writes — a bad
+		// client_id must not orphan a committed user row.
+		if in.ClientID != "" && s.appSvc != nil {
+			id, err := s.appSvc.ValidateClientID(ctx, tenantID, in.ClientID)
+			if err != nil {
+				return nil, fmt.Errorf("invalid client_id")
+			}
+			appID = strconv.FormatInt(id, 10)
+		}
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), BcryptCost)
@@ -238,16 +305,6 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		return nil, fmt.Errorf("fetch default role: %w", err)
 	}
 
-	// Validate the client before any writes — a bad client_id must not orphan a committed user row.
-	appID := ""
-	if in.ClientID != "" && s.appSvc != nil {
-		id, err := s.appSvc.ValidateClientID(ctx, tenantID, in.ClientID)
-		if err != nil {
-			return nil, fmt.Errorf("invalid client_id")
-		}
-		appID = strconv.FormatInt(id, 10)
-	}
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -256,10 +313,10 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 
 	var userID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES ($1, $2, $3, $4, $5, true)
+		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, application_id, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6, true)
 		RETURNING id
-	`, tenantID, in.Email, in.FirstName, in.LastName, roleID).Scan(&userID)
+	`, tenantID, in.Email, in.FirstName, in.LastName, roleID, appRowID).Scan(&userID)
 	if err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
 	}
@@ -308,20 +365,46 @@ type loginCandidate struct {
 	roleName     string
 }
 
-// Login authenticates a user by email and password only — the caller never
-// specifies a tenant. The same email may have separate accounts (separate
-// passwords) in multiple tenants, so Login fetches every active account
-// matching the email and checks the password against each one to find the
-// single tenant it belongs to.
+// Login authenticates a user by email and password. Without application
+// credentials the caller never specifies a tenant — the same email may have
+// separate accounts (separate passwords) in multiple tenants, so Login fetches
+// every active account matching the email and checks the password against each
+// one to find the single tenant it belongs to. With ClientID + ClientSecret
+// the application is authenticated first and the search is pinned to its tenant.
 func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
-	rows, err := s.pool.Query(ctx, `
+	// Application-authenticated mode: verify the app before touching any user
+	// data so bad app credentials fail fast and identically regardless of the
+	// submitted email.
+	appID := ""
+	var appTenantID, appRowID int64
+	if in.ClientSecret != "" {
+		tid, aid, err := s.authenticateApp(ctx, in.ClientID, in.ClientSecret)
+		if err != nil {
+			return nil, err
+		}
+		appTenantID, appRowID = tid, aid
+		appID = strconv.FormatInt(aid, 10)
+	}
+
+	// User-base isolation: app-authenticated logins only see that application's
+	// own users; generic logins only see tenant-level users (application_id IS
+	// NULL) — an app-scoped account can never authenticate outside its app.
+	candidateQuery := `
 		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, '')
 		FROM users u
 		JOIN user_credentials uc ON uc.user_id = u.id
 		JOIN tenants t ON t.id = u.tenant_id
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.email = $1 AND u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
-	`, in.Email)
+	`
+	args := []any{in.Email}
+	if appRowID != 0 {
+		candidateQuery += ` AND u.tenant_id = $2 AND u.application_id = $3`
+		args = append(args, appTenantID, appRowID)
+	} else {
+		candidateQuery += ` AND u.application_id IS NULL`
+	}
+	rows, err := s.pool.Query(ctx, candidateQuery, args...)
 	if err != nil {
 		return nil, fmt.Errorf("fetch login candidates: %w", err)
 	}
@@ -393,8 +476,9 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		}
 	}
 
-	appID := ""
-	if in.ClientID != "" && s.appSvc != nil {
+	// Legacy tagging mode (ClientID without a secret): validate the id exists
+	// in the matched tenant. Skipped when the app already authenticated above.
+	if appID == "" && in.ClientID != "" && s.appSvc != nil {
 		id, err := s.appSvc.ValidateClientID(ctx, tenantID, in.ClientID)
 		if err != nil {
 			return nil, fmt.Errorf("invalid client_id")
@@ -756,23 +840,26 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 
 // IssueServiceToken signs a short-lived access token for a machine client using
 // the client_credentials grant. There is no user, no refresh token, and the
-// role is fixed to "service". The appID is the string-encoded oauth_clients.id.
-// Scopes are loaded from the oauth_clients.scopes column so downstream permission
-// checks receive the correct grants.
+// role is fixed to "service". The sub claim carries the public client_id so
+// integrators can correlate tokens with their credentials; the numeric
+// oauth_clients.id remains available in the app_id claim. Scopes are loaded
+// from the oauth_clients.scopes column so downstream permission checks receive
+// the correct grants.
 func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int64) (string, int, error) {
+	var clientID string
 	var scopes []string
 	if err := s.pool.QueryRow(ctx,
-		`SELECT scopes FROM oauth_clients WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		`SELECT client_id, scopes FROM oauth_clients WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		appID, tenantID,
-	).Scan(&scopes); err != nil {
-		return "", 0, fmt.Errorf("load app scopes: %w", err)
+	).Scan(&clientID, &scopes); err != nil {
+		return "", 0, fmt.Errorf("load app client_id and scopes: %w", err)
 	}
 	if scopes == nil {
 		scopes = []string{}
 	}
 
 	claims := &Claims{
-		UserID:      strconv.FormatInt(appID, 10),
+		UserID:      clientID,
 		TenantID:    strconv.FormatInt(tenantID, 10),
 		AppID:       strconv.FormatInt(appID, 10),
 		Role:        "service",

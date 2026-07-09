@@ -3,6 +3,7 @@ package middleware
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -199,6 +200,73 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 			return next(c)
 		}
 	}
+}
+
+// TokenRateLimiter rate-limits the client_credentials token endpoint.
+// Unlike LoginRateLimiter it keys the per-account bucket on client_id — token
+// requests carry no email, so reusing the login limiter would collapse every
+// M2M client across all tenants into one shared "unknown-account" bucket,
+// letting a single noisy client starve every other tenant's integration.
+//
+// client_id is read from the Authorization Basic header or the JSON body,
+// mirroring the handler's credential resolution order. When no client_id can
+// be determined (malformed request), only the per-IP limit applies — a shared
+// fallback bucket would recreate the same cross-tenant collision.
+func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			ipLimiter := ipStore.getOrCreate("ip:"+ip, cfg.PerIPRate)
+			if !ipLimiter.Allow() {
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many token requests from your IP address",
+					"retry_after": "60",
+				})
+			}
+
+			if clientID := tokenClientID(c); clientID != "" {
+				if len(clientID) > maxRateLimitEmailLen {
+					clientID = clientID[:maxRateLimitEmailLen]
+				}
+				clientLimiter := tenantStore.getOrCreate("client:"+clientID, cfg.PerTenantRate)
+				if !clientLimiter.Allow() {
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSON(http.StatusTooManyRequests, map[string]string{
+						"error":       "too many token requests for this client",
+						"retry_after": "60",
+					})
+				}
+			}
+
+			return next(c)
+		}
+	}
+}
+
+// tokenClientID extracts the client_id from a token request for rate-limit
+// keying. Client credentials are header-only (Authorization: Basic), matching
+// the handler contract — body-sent credentials are rejected by the handler and
+// never key a bucket. Returns "" when no well-formed header is present.
+func tokenClientID(c echo.Context) string {
+	header := c.Request().Header.Get(echo.HeaderAuthorization)
+	if !strings.HasPrefix(header, "Basic ") {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(header[len("Basic "):])
+	if err != nil {
+		return ""
+	}
+	if id, _, found := strings.Cut(string(decoded), ":"); found && id != "" {
+		return id
+	}
+	return ""
 }
 
 // loginEmailFromBody peeks the "email" field out of a login request body
