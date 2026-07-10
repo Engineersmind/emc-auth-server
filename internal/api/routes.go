@@ -349,32 +349,74 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt.DELETE("/tenants/:id", adminHandler.DeactivateTenant)
 	tenantMgmt.PUT("/tenants/:id/cors-origins", adminHandler.UpdateTenantCORSOrigins)
 
-	// Cross-tenant management — drill into any tenant's permissions / roles / users.
-	// :tid = target tenant UUID. Caller must have tenant:manage (super_admin only).
-	tenantMgmt.GET("/tenants/:tid/permissions", adminHandler.TenantListPermissions)
-	tenantMgmt.POST("/tenants/:tid/permissions", adminHandler.TenantCreatePermission)
-	tenantMgmt.DELETE("/tenants/:tid/permissions/:pid", adminHandler.TenantDeletePermission)
-	tenantMgmt.GET("/tenants/:tid/roles", adminHandler.TenantListRoles)
-	tenantMgmt.POST("/tenants/:tid/roles", adminHandler.TenantCreateRole)
-	tenantMgmt.PUT("/tenants/:tid/roles/:rid/permissions", adminHandler.TenantUpdateRolePermissions)
-	tenantMgmt.DELETE("/tenants/:tid/roles/:rid", adminHandler.TenantDeleteRole)
-	tenantMgmt.GET("/tenants/:tid/users", adminHandler.TenantListUsers)
-	tenantMgmt.POST("/tenants/:tid/users", adminHandler.TenantCreateUser)
-	tenantMgmt.DELETE("/tenants/:tid/users/:uid", adminHandler.TenantDeleteUser)
+	// Canonical tenant-scoped resource routes — /tenants/:tid/... is ONE URL
+	// family serving both personas: super_admin (tenant:manage, any :tid) and
+	// the tenant's own admins (:tid must match the JWT tenant + the granular
+	// resource permission). Clients never branch on role to pick a URL.
+	tidPermsRead := mw.RequireTenantSelfOrAny("permissions:read")
+	tidPermsWrite := mw.RequireTenantSelfOrAny("permissions:write")
+	tidRolesRead := mw.RequireTenantSelfOrAny("roles:read")
+	tidRolesWrite := mw.RequireTenantSelfOrAny("roles:write")
+	tidUsersRead := mw.RequireTenantSelfOrAny("users:read")
+	tidUsersWrite := mw.RequireTenantSelfOrAny("users:write")
+	tidAppsRead := mw.RequireTenantSelfOrAny("apps:read")
+	tidAppsWrite := mw.RequireTenantSelfOrAny("apps:write")
+	tidStatsRead := mw.RequireTenantSelfOrAny("stats:read")
 
-	// Cross-tenant application management (EMC-004) — same handlers as the
-	// tenant-scoped /applications routes; the :tid path param overrides the
-	// JWT tenant. Guarded by tenant:manage via the tenantMgmt group.
-	tenantMgmt.GET("/tenants/:tid/applications", adminHandler.ListApplications)
-	tenantMgmt.POST("/tenants/:tid/applications", adminHandler.CreateApplication)
-	tenantMgmt.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication)
-	tenantMgmt.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication)
-	tenantMgmt.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication)
-	tenantMgmt.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret)
+	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
+	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
+	adminGroup.PUT("/tenants/:tid/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
+	adminGroup.DELETE("/tenants/:tid/permissions/:pid", adminHandler.DeletePermission, tidPermsWrite)
+	adminGroup.GET("/tenants/:tid/roles", adminHandler.TenantListRoles, tidRolesRead)
+	adminGroup.POST("/tenants/:tid/roles", adminHandler.TenantCreateRole, tidRolesWrite)
+	adminGroup.PUT("/tenants/:tid/roles/:rid/permissions", adminHandler.TenantUpdateRolePermissions, tidRolesWrite)
+	adminGroup.DELETE("/tenants/:tid/roles/:rid", adminHandler.TenantDeleteRole, tidRolesWrite)
+	adminGroup.GET("/tenants/:tid/users", adminHandler.ListUsers, tidUsersRead)
+	adminGroup.POST("/tenants/:tid/users", adminHandler.CreateAdminUser, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/users/:uid", adminHandler.GetAdminUser, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/users/:uid", adminHandler.UpdateAdminUser, tidUsersWrite)
+	adminGroup.PUT("/tenants/:tid/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
+	adminGroup.POST("/tenants/:tid/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
 
-	// Cross-tenant stats + activity feed (EMC-004 tenant overview page).
-	tenantMgmt.GET("/tenants/:tid/stats", adminHandler.TenantGetStats)
-	tenantMgmt.GET("/tenants/:tid/activity", adminHandler.TenantGetActivity)
+	// Application management under the canonical family — same handlers as
+	// the flat /applications aliases; the :tid path param overrides the JWT
+	// tenant (super_admin) or must equal it (tenant admins).
+	adminGroup.GET("/tenants/:tid/applications", adminHandler.ListApplications, tidAppsRead)
+	adminGroup.POST("/tenants/:tid/applications", adminHandler.CreateApplication, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication, tidAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, tidAppsWrite)
+
+	// End-user application roles under the canonical family (mirrors the flat
+	// /applications/:appID/roles aliases registered below).
+	adminGroup.POST("/tenants/:tid/applications/:appID/roles", adminHandler.CreateApplicationRole, tidRolesWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/roles", adminHandler.ListApplicationRoles, tidRolesRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id", adminHandler.UpdateApplicationRole, tidRolesWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, tidRolesWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, tidRolesWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/roles/:id", adminHandler.DeleteRole, tidRolesWrite)
+
+	// End-user application permissions under the canonical family.
+	adminGroup.POST("/tenants/:tid/applications/:appID/permissions", adminHandler.CreatePermission, tidPermsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/permissions", adminHandler.ListPermissions, tidPermsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.DeletePermission, tidPermsWrite)
+
+	// End-user application users under the canonical family — each
+	// application manages its own isolated user base.
+	adminGroup.GET("/tenants/:tid/applications/:appID/users", adminHandler.ListUsers, tidUsersRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users", adminHandler.CreateAdminUser, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid", adminHandler.GetAdminUser, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, tidUsersWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
+
+	// Tenant stats + activity feed (EMC-004 tenant overview page).
+	adminGroup.GET("/tenants/:tid/stats", adminHandler.TenantGetStats, tidStatsRead)
+	adminGroup.GET("/tenants/:tid/activity", adminHandler.TenantGetActivity, tidStatsRead)
 
 	// Tenant-admin routes are guarded by granular per-resource permissions
 	// (seeded onto every tenant's "owner" role at creation), with "admin:access"
@@ -394,6 +436,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Permission management — permissions:read / permissions:write
 	adminGroup.POST("/permissions", adminHandler.CreatePermission, permsWrite)
 	adminGroup.GET("/permissions", adminHandler.ListPermissions, permsRead)
+	adminGroup.PUT("/permissions/:id", adminHandler.UpdatePermission, permsWrite)
 	adminGroup.DELETE("/permissions/:id", adminHandler.DeletePermission, permsWrite)
 
 	// Role management — roles:read / roles:write
@@ -431,6 +474,34 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/applications/:id", adminHandler.UpdateApplication, appsWrite)
 	adminGroup.DELETE("/applications/:id", adminHandler.DeactivateApplication, appsWrite)
 	adminGroup.POST("/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, appsWrite)
+
+	// End-user application roles — roles:read / roles:write, scoped to one of
+	// the caller's own applications. :id (role) reuses UpdateRolePermissions /
+	// DeleteRole unchanged, since those already scope by tenant + role id.
+	adminGroup.POST("/applications/:appID/roles", adminHandler.CreateApplicationRole, rolesWrite)
+	adminGroup.GET("/applications/:appID/roles", adminHandler.ListApplicationRoles, rolesRead)
+	adminGroup.PUT("/applications/:appID/roles/:id", adminHandler.UpdateApplicationRole, rolesWrite)
+	adminGroup.PUT("/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, rolesWrite)
+	adminGroup.PUT("/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, rolesWrite)
+	adminGroup.DELETE("/applications/:appID/roles/:id", adminHandler.DeleteRole, rolesWrite)
+
+	// End-user application permissions — each application owns an isolated
+	// permission catalog; roles inside the application may only hold
+	// permissions from this catalog.
+	adminGroup.POST("/applications/:appID/permissions", adminHandler.CreatePermission, permsWrite)
+	adminGroup.GET("/applications/:appID/permissions", adminHandler.ListPermissions, permsRead)
+	adminGroup.PUT("/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, permsWrite)
+	adminGroup.DELETE("/applications/:appID/permissions/:pid", adminHandler.DeletePermission, permsWrite)
+
+	// End-user application users — each application manages its own isolated
+	// user base (flat aliases of the canonical /tenants/:tid variants).
+	adminGroup.GET("/applications/:appID/users", adminHandler.ListUsers, usersRead)
+	adminGroup.POST("/applications/:appID/users", adminHandler.CreateAdminUser, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid", adminHandler.GetAdminUser, usersRead)
+	adminGroup.PUT("/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, usersWrite)
+	adminGroup.PUT("/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, usersWrite)
+	adminGroup.POST("/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
+	adminGroup.DELETE("/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, usersWrite)
 
 	// Per-app rate limit management — apps:read / apps:write (08-02)
 	adminGroup.POST("/app-limits", adminHandler.CreateAppLimit, appsWrite)

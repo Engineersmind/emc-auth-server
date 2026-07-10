@@ -1,0 +1,1256 @@
+{
+ "info": {
+  "name": "EMC Auth — Application RBAC Flow",
+  "description": "End-to-end flow for application-scoped RBAC on the canonical /tenants/{tid}/... API family.\n\nFlow: super_admin creates a tenant (owner auto-seeded) → owner creates an application → owner defines the app's isolated permission catalog → owner creates roles inside the app and attaches permissions → owner marks one role default → end users register/login through the app's client credentials and receive JWTs carrying role + permissions.\n\nSet admin_password before running. Fully re-runnable: tenant slug, emails, and names are timestamped per run. Requests are sequential — run top to bottom (Collection Runner or newman).",
+  "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+ },
+ "item": [
+  {
+   "name": "01 — super_admin login",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/auth/login",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "auth",
+      "login"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"email\": \"{{admin_email}}\",\n  \"password\": \"{{admin_password}}\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('login 200', () => pm.response.to.have.status(200));",
+       "const j = pm.response.json();",
+       "pm.collectionVariables.set('admin_token', j.access_token);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "02 — super_admin creates tenant (owner auto-seeded)",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{admin_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"RBAC Demo {{tenant_suffix}}\",\n  \"slug\": \"rbac-demo-{{tenant_suffix}}\",\n  \"owner_email\": \"owner-{{tenant_suffix}}@rbac.test\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "prerequest",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.collectionVariables.set('tenant_suffix', String(Date.now()));"
+      ]
+     }
+    },
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('tenant created 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "pm.collectionVariables.set('tid', j.tenant.id);",
+       "pm.collectionVariables.set('owner_email', j.owner.email);",
+       "pm.collectionVariables.set('owner_password', j.owner.temp_password);",
+       "pm.test('owner temp password returned once', () => !!j.owner.temp_password);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "03 — owner login (temp password)",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/auth/login",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "auth",
+      "login"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"email\": \"{{owner_email}}\",\n  \"password\": \"{{owner_password}}\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('owner login 200', () => pm.response.to.have.status(200));",
+       "const j = pm.response.json();",
+       "pm.collectionVariables.set('owner_token', j.access_token);",
+       "const payload = JSON.parse(atob(j.access_token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));",
+       "pm.test('role claim = owner', () => payload.role === 'owner');",
+       "pm.test('tid matches created tenant', () => payload.tenant_id === pm.collectionVariables.get('tid'));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "04 — owner creates application",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"rbac-demo-app\",\n  \"app_type\": \"web\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('application created 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "pm.collectionVariables.set('app_id', j.id);",
+       "pm.collectionVariables.set('client_id', j.client_id);",
+       "pm.collectionVariables.set('client_secret', j.client_secret);",
+       "pm.test('client credentials returned once', () => !!j.client_id && !!j.client_secret);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "05 — owner lists applications",
+   "request": {
+    "method": "GET",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('list 200', () => pm.response.to.have.status(200));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "06 — owner creates app permission 'invoices:read'",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/permissions",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "permissions"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"invoices:read\",\n  \"description\": \"Read invoices\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('permission created 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "pm.test('scoped to the application', () => j.application_id === pm.collectionVariables.get('app_id'));",
+       "pm.collectionVariables.set('perm_read_id', j.id);",
+       "pm.collectionVariables.set('perm_read_name', j.name);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "07 — owner creates app permission 'invoices:write'",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/permissions",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "permissions"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"invoices:write\",\n  \"description\": \"Create and update invoices\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('permission created 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "pm.collectionVariables.set('perm_write_id', j.id);",
+       "pm.collectionVariables.set('perm_write_name', j.name);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "08 — owner lists the app's permission catalog",
+   "request": {
+    "method": "GET",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/permissions",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "permissions"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('list 200', () => pm.response.to.have.status(200));",
+       "const perms = pm.response.json();",
+       "pm.test('exactly the 2 app permissions', () => perms.length === 2);",
+       "pm.test('all scoped to this app', () => perms.every(p => p.application_id === pm.collectionVariables.get('app_id')));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "09 — owner edits a permission (rename + description)",
+   "request": {
+    "method": "PUT",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/permissions/{{perm_read_id}}",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "permissions",
+      "{{perm_read_id}}"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"invoices:view\",\n  \"description\": \"View invoices (renamed)\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('permission updated 200', () => pm.response.to.have.status(200));",
+       "const j = pm.response.json();",
+       "pm.test('name changed', () => j.name === 'invoices:view');",
+       "pm.collectionVariables.set('perm_read_name', j.name);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "10 — owner creates role 'viewer' (view permission)",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"viewer\",\n  \"permission_ids\": [\"{{perm_read_id}}\"]\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('role created 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "pm.test('scoped to the application', () => j.application_id === pm.collectionVariables.get('app_id'));",
+       "pm.test('not default until marked', () => j.is_default === false);",
+       "pm.collectionVariables.set('role_viewer_id', j.id);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "11 — owner creates role 'editer' (typo, fixed in 12)",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"editer\",\n  \"permission_ids\": [\"{{perm_read_id}}\", \"{{perm_write_id}}\"]\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('role created 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "pm.test('both permissions attached', () => j.permissions.length === 2);",
+       "pm.collectionVariables.set('role_editor_id', j.id);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "12 — owner renames role 'editer' → 'editor'",
+   "request": {
+    "method": "PUT",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles/{{role_editor_id}}",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles",
+      "{{role_editor_id}}"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"editor\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('role renamed 200', () => pm.response.to.have.status(200));",
+       "pm.test('name is editor', () => pm.response.json().name === 'editor');"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "13 — owner edits viewer's permission set (replace-set)",
+   "request": {
+    "method": "PUT",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles/{{role_viewer_id}}/permissions",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles",
+      "{{role_viewer_id}}",
+      "permissions"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"permission_ids\": [\"{{perm_read_id}}\"]\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('permissions replaced 200', () => pm.response.to.have.status(200));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "14 — owner lists the app's roles",
+   "request": {
+    "method": "GET",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('list 200', () => pm.response.to.have.status(200));",
+       "const roles = pm.response.json();",
+       "pm.test('viewer and editor present', () => roles.length === 2);"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "15 — owner marks 'viewer' as the default role",
+   "request": {
+    "method": "PUT",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles/{{role_viewer_id}}/default",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles",
+      "{{role_viewer_id}}",
+      "default"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('default set 200', () => pm.response.to.have.status(200));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "16 — end user registers via app credentials → default role on JWT",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/auth/apps/register",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "auth",
+      "apps",
+      "register"
+     ]
+    },
+    "auth": {
+     "type": "basic",
+     "basic": [
+      {
+       "key": "username",
+       "value": "{{client_id}}",
+       "type": "string"
+      },
+      {
+       "key": "password",
+       "value": "{{client_secret}}",
+       "type": "string"
+      }
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"email\": \"{{end_user_email}}\",\n  \"password\": \"EndUserPass123!\",\n  \"first_name\": \"End\",\n  \"last_name\": \"User\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "prerequest",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.collectionVariables.set('end_user_email', `enduser-${Date.now()}@rbac.test`);"
+      ]
+     }
+    },
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('register 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "pm.collectionVariables.set('end_user_token', j.access_token);",
+       "const payload = JSON.parse(atob(j.access_token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));",
+       "pm.test('default role auto-assigned', () => payload.role === 'viewer');",
+       "pm.test('permissions from the role', () => JSON.stringify(payload.permissions) === JSON.stringify([pm.collectionVariables.get('perm_read_name')]));",
+       "pm.test('app stamped on token', () => payload.app_id === pm.collectionVariables.get('app_id'));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "17 — end user logs in → same claims",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/auth/apps/login",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "auth",
+      "apps",
+      "login"
+     ]
+    },
+    "auth": {
+     "type": "basic",
+     "basic": [
+      {
+       "key": "username",
+       "value": "{{client_id}}",
+       "type": "string"
+      },
+      {
+       "key": "password",
+       "value": "{{client_secret}}",
+       "type": "string"
+      }
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"email\": \"{{end_user_email}}\",\n  \"password\": \"EndUserPass123!\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('login 200', () => pm.response.to.have.status(200));",
+       "const j = pm.response.json();",
+       "pm.collectionVariables.set('end_user_token', j.access_token);",
+       "const payload = JSON.parse(atob(j.access_token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));",
+       "pm.test('role claim = viewer', () => payload.role === 'viewer');"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "18 — end user fetches own profile (/auth/me)",
+   "request": {
+    "method": "GET",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{end_user_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/auth/me",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "auth",
+      "me"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('me 200', () => pm.response.to.have.status(200));",
+       "const j = pm.response.json();",
+       "pm.test('role = viewer', () => j.role === 'viewer');"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "19 — owner switches default role to 'editor'",
+   "request": {
+    "method": "PUT",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles/{{role_editor_id}}/default",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles",
+      "{{role_editor_id}}",
+      "default"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('default switched 200', () => pm.response.to.have.status(200));",
+       "const listReq = { url: pm.variables.get('base_url') + '/api/v1/tenants/' + pm.collectionVariables.get('tid') + '/applications/' + pm.collectionVariables.get('app_id') + '/roles', method: 'GET', header: { Authorization: 'Bearer ' + pm.collectionVariables.get('owner_token') } };",
+       "pm.sendRequest(listReq, (err, res) => {",
+       "  pm.test('roles list fetched', () => !err && res.code === 200);",
+       "  const defaults = res.json().filter(r => r.is_default);",
+       "  pm.test('exactly one default', () => defaults.length === 1 && defaults[0].id === pm.collectionVariables.get('role_editor_id'));",
+       "});"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "20 — new registration now gets 'editor' (not retroactive)",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/auth/apps/register",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "auth",
+      "apps",
+      "register"
+     ]
+    },
+    "auth": {
+     "type": "basic",
+     "basic": [
+      {
+       "key": "username",
+       "value": "{{client_id}}",
+       "type": "string"
+      },
+      {
+       "key": "password",
+       "value": "{{client_secret}}",
+       "type": "string"
+      }
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"email\": \"enduser2-{{tenant_suffix}}@rbac.test\",\n  \"password\": \"EndUserPass123!\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('register 201', () => pm.response.to.have.status(201));",
+       "const j = pm.response.json();",
+       "const payload = JSON.parse(atob(j.access_token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));",
+       "pm.test('role claim = editor', () => payload.role === 'editor');",
+       "pm.test('write permission present', () => payload.permissions.includes(pm.collectionVariables.get('perm_write_name')));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "21 — PROBE: tenant-level permission cannot attach to an app role (400)",
+   "request": {
+    "method": "POST",
+    "header": [
+     {
+      "key": "Content-Type",
+      "value": "application/json"
+     },
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/permissions",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "permissions"
+     ]
+    },
+    "body": {
+     "mode": "raw",
+     "raw": "{\n  \"name\": \"tenantlevel:probe\",\n  \"description\": \"tenant-level, must not attach to app roles\"\n}"
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('tenant-level permission created 201', () => pm.response.to.have.status(201));",
+       "const pid = pm.response.json().id;",
+       "const req = { url: pm.variables.get('base_url') + '/api/v1/tenants/' + pm.collectionVariables.get('tid') + '/applications/' + pm.collectionVariables.get('app_id') + '/roles/' + pm.collectionVariables.get('role_viewer_id') + '/permissions', method: 'PUT', header: { Authorization: 'Bearer ' + pm.collectionVariables.get('owner_token'), 'Content-Type': 'application/json' }, body: { mode: 'raw', raw: JSON.stringify({ permission_ids: [pid] }) } };",
+       "pm.sendRequest(req, (err, res) => {",
+       "  pm.test('cross-scope attach rejected 400', () => !err && res.code === 400);",
+       "});"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "22 — PROBE: owner denied on another tenant (403)",
+   "request": {
+    "method": "GET",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/1/roles",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "1",
+      "roles"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('cross-tenant access denied 403', () => pm.response.to.have.status(403));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "23 — PROBE: system role cannot become app default (400)",
+   "request": {
+    "method": "PUT",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles/1/default",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles",
+      "1",
+      "default"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('system/foreign role rejected', () => [400, 404].includes(pm.response.code));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "24 — owner deletes a permission from the app catalog",
+   "request": {
+    "method": "DELETE",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/permissions/{{perm_write_id}}",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "permissions",
+      "{{perm_write_id}}"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('permission deleted 200 (cascades out of roles)', () => pm.response.to.have.status(200));"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "25 — owner deletes the 'viewer' role",
+   "request": {
+    "method": "DELETE",
+    "header": [
+     {
+      "key": "Authorization",
+      "value": "Bearer {{owner_token}}"
+     }
+    ],
+    "url": {
+     "raw": "{{base_url}}/api/v1/tenants/{{tid}}/applications/{{app_id}}/roles/{{role_viewer_id}}",
+     "host": [
+      "{{base_url}}"
+     ],
+     "path": [
+      "api",
+      "v1",
+      "tenants",
+      "{{tid}}",
+      "applications",
+      "{{app_id}}",
+      "roles",
+      "{{role_viewer_id}}"
+     ]
+    }
+   },
+   "event": [
+    {
+     "listen": "test",
+     "script": {
+      "type": "text/javascript",
+      "exec": [
+       "pm.test('role deleted 200 (users degrade to roleless)', () => pm.response.to.have.status(200));"
+      ]
+     }
+    }
+   ]
+  }
+ ],
+ "variable": [
+  {
+   "key": "base_url",
+   "value": "http://localhost:9090"
+  },
+  {
+   "key": "admin_email",
+   "value": "admin@emc.local"
+  },
+  {
+   "key": "admin_password",
+   "value": "CHANGE_ME"
+  },
+  {
+   "key": "admin_token",
+   "value": ""
+  },
+  {
+   "key": "tenant_suffix",
+   "value": ""
+  },
+  {
+   "key": "tid",
+   "value": ""
+  },
+  {
+   "key": "owner_email",
+   "value": ""
+  },
+  {
+   "key": "owner_password",
+   "value": ""
+  },
+  {
+   "key": "owner_token",
+   "value": ""
+  },
+  {
+   "key": "app_id",
+   "value": ""
+  },
+  {
+   "key": "client_id",
+   "value": ""
+  },
+  {
+   "key": "client_secret",
+   "value": ""
+  },
+  {
+   "key": "perm_read_id",
+   "value": ""
+  },
+  {
+   "key": "perm_read_name",
+   "value": ""
+  },
+  {
+   "key": "perm_write_id",
+   "value": ""
+  },
+  {
+   "key": "perm_write_name",
+   "value": ""
+  },
+  {
+   "key": "role_viewer_id",
+   "value": ""
+  },
+  {
+   "key": "role_editor_id",
+   "value": ""
+  },
+  {
+   "key": "end_user_email",
+   "value": ""
+  },
+  {
+   "key": "end_user_token",
+   "value": ""
+  }
+ ]
+}

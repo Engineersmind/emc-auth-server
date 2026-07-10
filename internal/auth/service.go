@@ -295,14 +295,20 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
+	// Only application-credentialed registration can pick up a default role —
+	// end-user default roles are defined per application, and tenant-management
+	// roles (owner/super_admin) must never be auto-assigned by self-registration.
 	var roleID *int64
 	var roleName string
-	err = s.pool.QueryRow(ctx,
-		`SELECT id, name FROM roles WHERE tenant_id = $1 AND is_system = false ORDER BY name LIMIT 1`,
-		tenantID,
-	).Scan(&roleID, &roleName)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("fetch default role: %w", err)
+	if appRowID != nil {
+		err = s.pool.QueryRow(ctx,
+			`SELECT id, name FROM roles
+			 WHERE tenant_id = $1 AND application_id = $2 AND is_default = true AND is_system = false`,
+			tenantID, *appRowID,
+		).Scan(&roleID, &roleName)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("fetch default role: %w", err)
+		}
 	}
 
 	tx, err := s.pool.Begin(ctx)

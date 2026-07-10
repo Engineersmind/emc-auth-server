@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -507,6 +508,140 @@ func TestRegister_WithAppCredentials(t *testing.T) {
 	})
 	if !errors.Is(err, auth.ErrInvalidClient) {
 		t.Errorf("Register(slug/tenant mismatch) error = %v, want ErrInvalidClient", err)
+	}
+}
+
+// TestRegister_AssignsApplicationDefaultRole verifies that an app-scoped
+// registration is assigned the application's default role (and its
+// permissions), and that a role default in one application is not leaked
+// into another application's registrations.
+func TestRegister_AssignsApplicationDefaultRole(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	appSvc := auth.NewApplicationService(pool, logger)
+	app, err := appSvc.CreateApplication(ctx, tenantID, "default-role-app", "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication() error = %v", err)
+	}
+	appID, err := strconv.ParseInt(app.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse app id: %v", err)
+	}
+
+	var permID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO permissions (tenant_id, name, description) VALUES ($1, 'widgets:read', '')
+		RETURNING id
+	`, tenantID).Scan(&permID); err != nil {
+		t.Fatalf("insert permission: %v", err)
+	}
+
+	var roleID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO roles (tenant_id, application_id, name, is_system, is_default, created_at)
+		VALUES ($1, $2, 'viewer', false, true, NOW())
+		RETURNING id
+	`, tenantID, appID).Scan(&roleID); err != nil {
+		t.Fatalf("insert default role: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO role_permissions (role_id, permission_id, tenant_id) VALUES ($1, $2, $3)
+	`, roleID, permID, tenantID); err != nil {
+		t.Fatalf("assign permission to role: %v", err)
+	}
+
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
+
+	result, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        uniqueEmail("default-role"),
+		Password:     "Password123!",
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	claims, err := jwtSvc.Verify(ctx, result.AccessToken)
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if claims.Role != "viewer" {
+		t.Errorf("Register() assigned role = %q, want %q", claims.Role, "viewer")
+	}
+	if len(claims.Permissions) != 1 || claims.Permissions[0] != "widgets:read" {
+		t.Errorf("Register() permissions = %v, want [widgets:read]", claims.Permissions)
+	}
+
+	// A second application with no default role configured must register the
+	// user with no role, not fall back to any other application's default.
+	appB, err := appSvc.CreateApplication(ctx, tenantID, "no-default-role-app", "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication(appB) error = %v", err)
+	}
+	resultB, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID:     appB.ClientID,
+		ClientSecret: appB.ClientSecret,
+		Email:        uniqueEmail("no-default-role"),
+		Password:     "Password123!",
+	})
+	if err != nil {
+		t.Fatalf("Register(appB) error = %v", err)
+	}
+	claimsB, err := jwtSvc.Verify(ctx, resultB.AccessToken)
+	if err != nil {
+		t.Fatalf("Verify(appB) error = %v", err)
+	}
+	if claimsB.Role != "" {
+		t.Errorf("Register(appB, no default role) assigned role = %q, want empty", claimsB.Role)
+	}
+}
+
+// TestRegister_LegacyDoesNotInheritSystemRole verifies that tenant-level
+// registration (no application credentials) never falls back to a
+// tenant-management role such as owner/super_admin — those must only ever be
+// assigned by explicit admin action, never by self-registration.
+func TestRegister_LegacyDoesNotInheritSystemRole(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	svc := auth.NewAuthService(pool, jwtSvc, logger)
+
+	result, err := svc.Register(ctx, auth.RegisterInput{
+		TenantSlug: "emc",
+		Email:      uniqueEmail("legacy-no-role"),
+		Password:   "Password123!",
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	claims, err := jwtSvc.Verify(ctx, result.AccessToken)
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if claims.Role == "owner" || claims.Role == "super_admin" {
+		t.Errorf("Register() legacy registration got system role %q, want no system role", claims.Role)
 	}
 }
 
