@@ -1007,8 +1007,9 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 	}
 
 	_, err = tx.Exec(ctx, `
-		UPDATE roles SET is_default = true WHERE id = $1
-	`, roleID)
+		UPDATE roles SET is_default = true
+		WHERE id = $1 AND tenant_id = $2 AND application_id = $3
+	`, roleID, tenantID, applicationID)
 	if err != nil {
 		return fmt.Errorf("set default role: %w", err)
 	}

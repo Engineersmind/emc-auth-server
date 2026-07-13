@@ -27,6 +27,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS roles_one_default_per_app
 -- +goose Down
 -- +goose StatementBegin
 
+-- WARNING: dropping application_id silently discards which roles were
+-- application-scoped and which was each application's default — this is
+-- irreversible without an external backup; only run in a rollback where
+-- that state is disposable.
 DROP INDEX IF EXISTS roles_one_default_per_app;
 DROP INDEX IF EXISTS idx_roles_application_id;
 ALTER TABLE roles DROP COLUMN IF EXISTS is_default;
