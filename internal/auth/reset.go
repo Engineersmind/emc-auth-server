@@ -53,9 +53,14 @@ func (s *ResetService) ForgotPassword(ctx context.Context, tenantSlug, email str
 		return fmt.Errorf("resolve tenant for forgot-password: %w", err)
 	}
 
+	// Tenant-level users only (application_id IS NULL): the same email may hold
+	// independent accounts in multiple applications of this tenant, and this
+	// slug-based flow has no application context to disambiguate — resetting an
+	// arbitrary match would change the wrong account's password. App-scoped
+	// users reset through their application's own integration.
 	var userID int64
 	err = s.pool.QueryRow(ctx,
-		`SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND is_active = true AND deleted_at IS NULL`,
+		`SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND application_id IS NULL AND is_active = true AND deleted_at IS NULL`,
 		tenantID, email,
 	).Scan(&userID)
 	if err != nil {

@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -133,5 +134,103 @@ func TestLoginRateLimiter_DifferentIPsNotBlocked(t *testing.T) {
 	}
 	if status2 != http.StatusOK {
 		t.Errorf("%s first request: expected 200, got %d", ip2, status2)
+	}
+}
+
+// tokenRequest runs a synthetic client_credentials request through the given
+// middleware and returns the status code. Credentials are header-only: a
+// non-empty clientID synthesizes an Authorization: Basic header, or pass an
+// explicit basicHeader; with neither, the request is anonymous (per-IP only).
+func tokenRequest(t *testing.T, mw echo.MiddlewareFunc, remoteAddr, clientID, basicHeader string) int {
+	t.Helper()
+	e := echo.New()
+	body := strings.NewReader(`{"grant_type":"client_credentials"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/token", body)
+	req.Header.Set("Content-Type", "application/json")
+	if basicHeader == "" && clientID != "" {
+		basicHeader = "Basic " + base64.StdEncoding.EncodeToString([]byte(clientID+":secret"))
+	}
+	if basicHeader != "" {
+		req.Header.Set("Authorization", basicHeader)
+	}
+	req.RemoteAddr = remoteAddr + ":12345"
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	handler := mw(func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+	_ = handler(c)
+	return rec.Code
+}
+
+// TestTokenRateLimiter_IsolatesClients verifies that exhausting one client_id's
+// bucket does not throttle a different client_id — the cross-tenant collision
+// the email-keyed login limiter would have caused on this endpoint.
+func TestTokenRateLimiter_IsolatesClients(t *testing.T) {
+	middleware.ResetStoresForTest()
+
+	// High per-IP allowance so only the per-client bucket is exercised.
+	cfg := middleware.RateLimitConfig{PerIPRate: 1000, PerTenantRate: 3}
+	mw := middleware.TokenRateLimiter(cfg)
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+
+	for i := 1; i <= 3; i++ {
+		if code := tokenRequest(t, mw, ip, "app_client_A", ""); code != http.StatusOK {
+			t.Fatalf("client A request %d = %d, want 200", i, code)
+		}
+	}
+	if code := tokenRequest(t, mw, ip, "app_client_A", ""); code != http.StatusTooManyRequests {
+		t.Errorf("client A request 4 = %d, want 429", code)
+	}
+	// A different client from the same IP must NOT be throttled.
+	if code := tokenRequest(t, mw, ip, "app_client_B", ""); code != http.StatusOK {
+		t.Errorf("client B request after A throttled = %d, want 200", code)
+	}
+}
+
+// TestTokenRateLimiter_KeysBasicAuthHeader verifies the per-client bucket also
+// keys on a client_id delivered via the Authorization Basic header.
+func TestTokenRateLimiter_KeysBasicAuthHeader(t *testing.T) {
+	middleware.ResetStoresForTest()
+
+	cfg := middleware.RateLimitConfig{PerIPRate: 1000, PerTenantRate: 2}
+	mw := middleware.TokenRateLimiter(cfg)
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+
+	// base64("app_basic_client:secret")
+	header := "Basic " + base64.StdEncoding.EncodeToString([]byte("app_basic_client:secret"))
+	for i := 1; i <= 2; i++ {
+		if code := tokenRequest(t, mw, ip, "", header); code != http.StatusOK {
+			t.Fatalf("basic-auth request %d = %d, want 200", i, code)
+		}
+	}
+	if code := tokenRequest(t, mw, ip, "", header); code != http.StatusTooManyRequests {
+		t.Errorf("basic-auth request 3 = %d, want 429", code)
+	}
+}
+
+// TestTokenRateLimiter_NoClientIDFallsBackToIPOnly verifies that requests with
+// no determinable client_id are limited per-IP only — never via a shared bucket.
+func TestTokenRateLimiter_NoClientIDFallsBackToIPOnly(t *testing.T) {
+	middleware.ResetStoresForTest()
+
+	cfg := middleware.RateLimitConfig{PerIPRate: 2, PerTenantRate: 1000}
+	mw := middleware.TokenRateLimiter(cfg)
+
+	ipA := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%100)+10)
+	ipB := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%100)+120)
+
+	for i := 1; i <= 2; i++ {
+		if code := tokenRequest(t, mw, ipA, "", ""); code != http.StatusOK {
+			t.Fatalf("ipA request %d = %d, want 200", i, code)
+		}
+	}
+	if code := tokenRequest(t, mw, ipA, "", ""); code != http.StatusTooManyRequests {
+		t.Errorf("ipA request 3 = %d, want 429", code)
+	}
+	// A different IP with an equally anonymous request must not be affected —
+	// proves there is no shared "unknown client" bucket.
+	if code := tokenRequest(t, mw, ipB, "", ""); code != http.StatusOK {
+		t.Errorf("ipB request after ipA throttled = %d, want 200", code)
 	}
 }

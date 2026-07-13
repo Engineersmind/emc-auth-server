@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -34,8 +35,36 @@ var ErrAppNotFound = errors.New("application not found")
 // ErrInvalidAppType is returned when an unknown application type is supplied.
 var ErrInvalidAppType = errors.New("invalid app_type — must be one of: web, spa, m2m, native")
 
+// ErrInvalidScope is returned when a scope string does not follow the
+// resource:action convention or the scope list exceeds limits.
+var ErrInvalidScope = errors.New("invalid scope — scopes must be non-empty resource:action strings (max 50 scopes, 100 chars each)")
+
 // validAppTypes mirrors the CHECK constraint on oauth_clients.app_type.
 var validAppTypes = map[string]bool{"web": true, "spa": true, "m2m": true, "native": true}
+
+const (
+	maxScopesPerApp = 50
+	maxScopeLen     = 100
+)
+
+// validateScopes enforces the resource:action shape used by the permission
+// system so scopes flow into the token's permissions claim in the same format
+// permission guards expect. A nil/empty slice is valid (no scopes).
+func validateScopes(scopes []string) error {
+	if len(scopes) > maxScopesPerApp {
+		return ErrInvalidScope
+	}
+	for _, sc := range scopes {
+		if sc == "" || len(sc) > maxScopeLen {
+			return ErrInvalidScope
+		}
+		resource, action, found := strings.Cut(sc, ":")
+		if !found || resource == "" || action == "" {
+			return ErrInvalidScope
+		}
+	}
+	return nil
+}
 
 // normalizeAppType applies the default type and validates against validAppTypes.
 func normalizeAppType(appType string) (string, error) {
@@ -70,6 +99,7 @@ type AppResult struct {
 	AppType      string    `json:"app_type"`
 	ClientID     string    `json:"client_id"`
 	ClientSecret string    `json:"client_secret"`
+	Scopes       []string  `json:"scopes"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -88,6 +118,7 @@ type AppDetail struct {
 	Name      string    `json:"name"`
 	AppType   string    `json:"app_type"`
 	ClientID  string    `json:"client_id"`
+	Scopes    []string  `json:"scopes"`
 	IsActive  bool      `json:"is_active"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -128,13 +159,21 @@ func generateClientCredentials() (clientID, rawSecret string, err error) {
 // CreateApplication registers a new application for a tenant and returns its
 // client credentials. The raw client_secret must be stored by the caller; it
 // cannot be recovered after this call. appType defaults to "web" when empty.
-func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int64, name, appType string) (*AppResult, error) {
+// Scopes become the permissions claim of client_credentials tokens; nil/empty
+// means the app's tokens carry no grants until scopes are set via update.
+func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int64, name, appType string, scopes []string) (*AppResult, error) {
 	if name == "" {
 		return nil, fmt.Errorf("application name is required")
 	}
 	normType, err := normalizeAppType(appType)
 	if err != nil {
 		return nil, err
+	}
+	if err := validateScopes(scopes); err != nil {
+		return nil, err
+	}
+	if scopes == nil {
+		scopes = []string{}
 	}
 
 	clientID, rawSecret, err := generateClientCredentials()
@@ -147,10 +186,10 @@ func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int
 	var createdAt time.Time
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO oauth_clients
-		    (tenant_id, name, app_type, client_id, client_secret_hash, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+		    (tenant_id, name, app_type, client_id, client_secret_hash, scopes, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
 		RETURNING id, created_at
-	`, tenantID, name, normType, clientID, secretHash).Scan(&rowID, &createdAt)
+	`, tenantID, name, normType, clientID, secretHash, scopes).Scan(&rowID, &createdAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert application: %w", err)
 	}
@@ -161,6 +200,7 @@ func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int
 		AppType:      normType,
 		ClientID:     clientID,
 		ClientSecret: rawSecret,
+		Scopes:       scopes,
 		CreatedAt:    createdAt,
 	}, nil
 }
@@ -280,39 +320,49 @@ func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID
 	var a AppDetail
 	var id int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, name, app_type, client_id, (deleted_at IS NULL) AS is_active, created_at, updated_at
+		SELECT id, name, app_type, client_id, scopes, (deleted_at IS NULL) AS is_active, created_at, updated_at
 		FROM   oauth_clients
 		WHERE  id = $1 AND tenant_id = $2
-	`, appID, tenantID).Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	`, appID, tenantID).Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.Scopes, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAppNotFound
 		}
 		return nil, fmt.Errorf("get application: %w", err)
 	}
+	if a.Scopes == nil {
+		a.Scopes = []string{}
+	}
 	a.ID = strconv.FormatInt(id, 10)
 	return &a, nil
 }
 
-// UpdateApplication updates an active application's name and/or app_type.
-// Empty fields are left unchanged. Returns the updated application.
-func (s *ApplicationService) UpdateApplication(ctx context.Context, tenantID, appID int64, name, appType string) (*AppDetail, error) {
-	if name == "" && appType == "" {
-		return nil, fmt.Errorf("nothing to update — provide name and/or app_type")
+// UpdateApplication updates an active application's name, app_type, and/or
+// scopes. Empty name/app_type are left unchanged; a nil scopes slice leaves
+// scopes unchanged, while an empty non-nil slice clears them. Returns the
+// updated application. Scope changes affect tokens issued from then on —
+// already-issued tokens keep their permissions until they expire (≤15 min).
+func (s *ApplicationService) UpdateApplication(ctx context.Context, tenantID, appID int64, name, appType string, scopes []string) (*AppDetail, error) {
+	if name == "" && appType == "" && scopes == nil {
+		return nil, fmt.Errorf("nothing to update — provide name, app_type, and/or scopes")
 	}
 	if appType != "" {
 		if _, err := normalizeAppType(appType); err != nil {
 			return nil, err
 		}
 	}
+	if err := validateScopes(scopes); err != nil {
+		return nil, err
+	}
 
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oauth_clients
 		SET    name       = COALESCE(NULLIF($1, ''), name),
 		       app_type   = COALESCE(NULLIF($2, ''), app_type),
+		       scopes     = COALESCE($3, scopes),
 		       updated_at = NOW()
-		WHERE  id = $3 AND tenant_id = $4 AND deleted_at IS NULL
-	`, name, appType, appID, tenantID)
+		WHERE  id = $4 AND tenant_id = $5 AND deleted_at IS NULL
+	`, name, appType, scopes, appID, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("update application: %w", err)
 	}

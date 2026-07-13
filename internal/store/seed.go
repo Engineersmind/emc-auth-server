@@ -86,11 +86,11 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 	}
 	logger.Info().Str("role", "super_admin").Int64("id", roleID).Msg("seed role ensured")
 
-	// 3. Seed super-admin user (idempotent via partial index idx_users_email_active).
+	// 3. Seed super-admin user (idempotent via partial index users_tenant_email_tenant_level_key).
 	_, err = pool.Exec(ctx, `
 		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
 		VALUES ($1, 'admin@emc.local', 'Super', 'Admin', $2, true)
-		ON CONFLICT (tenant_id, email) WHERE deleted_at IS NULL DO NOTHING
+		ON CONFLICT (tenant_id, email) WHERE application_id IS NULL AND deleted_at IS NULL DO NOTHING
 	`, tenantID, roleID)
 	if err != nil {
 		return fmt.Errorf("seed user: %w", err)

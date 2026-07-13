@@ -329,3 +329,277 @@ func TestMe_ReturnsClaims(t *testing.T) {
 		t.Errorf("Me() Permissions len = %d, want %d", len(result.Permissions), len(claims.Permissions))
 	}
 }
+
+// TestIssueServiceToken_SubIsClientID verifies that a client_credentials
+// service token carries the public client_id in the sub/user_id claim (not the
+// numeric oauth_clients.id), keeps the numeric id in app_id, and fixes the
+// role to "service" (EMC-005 contract).
+func TestIssueServiceToken_SubIsClientID(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	appSvc := auth.NewApplicationService(pool, logger)
+	created, err := appSvc.CreateApplication(ctx, tenantID, "m2m-sub-claim", "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication() error = %v", err)
+	}
+
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	svc := auth.NewAuthService(pool, jwtSvc, logger)
+
+	_, appID, err := appSvc.AuthenticateClient(ctx, created.ClientID, created.ClientSecret)
+	if err != nil {
+		t.Fatalf("AuthenticateClient() error = %v", err)
+	}
+
+	token, expiresIn, err := svc.IssueServiceToken(ctx, tenantID, appID)
+	if err != nil {
+		t.Fatalf("IssueServiceToken() error = %v", err)
+	}
+	if expiresIn != 900 {
+		t.Errorf("IssueServiceToken() expiresIn = %d, want 900", expiresIn)
+	}
+
+	claims, err := jwtSvc.Verify(ctx, token)
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if claims.UserID != created.ClientID {
+		t.Errorf("service token UserID/sub = %q, want client_id %q", claims.UserID, created.ClientID)
+	}
+	if claims.Subject != created.ClientID {
+		t.Errorf("service token Subject = %q, want client_id %q", claims.Subject, created.ClientID)
+	}
+	if claims.AppID != created.ID {
+		t.Errorf("service token AppID = %q, want numeric app id %q", claims.AppID, created.ID)
+	}
+	if claims.Role != "service" {
+		t.Errorf("service token Role = %q, want %q", claims.Role, "service")
+	}
+	if len(claims.Permissions) != 0 {
+		t.Errorf("service token Permissions = %v, want empty (no scopes configured)", claims.Permissions)
+	}
+}
+
+// TestIssueServiceToken_ScopesBecomePermissions verifies configured scopes
+// surface as the permissions claim of a client_credentials token.
+func TestIssueServiceToken_ScopesBecomePermissions(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	appSvc := auth.NewApplicationService(pool, logger)
+	created, err := appSvc.CreateApplication(ctx, tenantID, "m2m-scoped", "m2m", []string{"orders:read", "orders:write"})
+	if err != nil {
+		t.Fatalf("CreateApplication() error = %v", err)
+	}
+
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	svc := auth.NewAuthService(pool, jwtSvc, logger)
+
+	_, appID, err := appSvc.AuthenticateClient(ctx, created.ClientID, created.ClientSecret)
+	if err != nil {
+		t.Fatalf("AuthenticateClient() error = %v", err)
+	}
+
+	token, _, err := svc.IssueServiceToken(ctx, tenantID, appID)
+	if err != nil {
+		t.Fatalf("IssueServiceToken() error = %v", err)
+	}
+	claims, err := jwtSvc.Verify(ctx, token)
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if len(claims.Permissions) != 2 || claims.Permissions[0] != "orders:read" || claims.Permissions[1] != "orders:write" {
+		t.Errorf("service token Permissions = %v, want [orders:read orders:write]", claims.Permissions)
+	}
+}
+
+// newAppAuthFixture spins up a service with an attached ApplicationService and
+// returns an application (with credentials) registered in the seed tenant.
+func newAppAuthFixture(t *testing.T) (*auth.AuthService, *auth.AppResult, int64, context.Context) {
+	t.Helper()
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	appSvc := auth.NewApplicationService(pool, logger)
+	app, err := appSvc.CreateApplication(ctx, tenantID, "integration-app", "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication() error = %v", err)
+	}
+
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
+	return svc, app, tenantID, ctx
+}
+
+// TestRegister_WithAppCredentials verifies that client_id + client_secret
+// authenticate the application, derive the tenant (no slug needed), and stamp
+// app_id into the issued JWT.
+func TestRegister_WithAppCredentials(t *testing.T) {
+	svc, app, _, ctx := newAppAuthFixture(t)
+
+	result, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        uniqueEmail("app-register"),
+		Password:     "Password123!",
+		FirstName:    "App",
+		LastName:     "User",
+	})
+	if err != nil {
+		t.Fatalf("Register(app credentials, no slug) error = %v", err)
+	}
+	if result.AccessToken == "" {
+		t.Fatal("Register() AccessToken is empty")
+	}
+
+	// Wrong secret must be rejected with the sentinel, before any user write.
+	_, err = svc.Register(ctx, auth.RegisterInput{
+		ClientID:     app.ClientID,
+		ClientSecret: "wrong-secret",
+		Email:        uniqueEmail("app-register-bad"),
+		Password:     "Password123!",
+	})
+	if !errors.Is(err, auth.ErrInvalidClient) {
+		t.Errorf("Register(wrong secret) error = %v, want ErrInvalidClient", err)
+	}
+
+	// A slug pointing at a different tenant than the app's must be rejected.
+	_, err = svc.Register(ctx, auth.RegisterInput{
+		TenantSlug:   "outreach",
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        uniqueEmail("app-register-mismatch"),
+		Password:     "Password123!",
+	})
+	if !errors.Is(err, auth.ErrInvalidClient) {
+		t.Errorf("Register(slug/tenant mismatch) error = %v, want ErrInvalidClient", err)
+	}
+}
+
+// TestLogin_WithAppCredentials verifies app-authenticated login pins the
+// candidate search to the app's tenant and stamps app_id, and that bad app
+// credentials fail regardless of valid user credentials.
+func TestLogin_WithAppCredentials(t *testing.T) {
+	svc, app, _, ctx := newAppAuthFixture(t)
+
+	email := uniqueEmail("app-login")
+	if _, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        email,
+		Password:     "Password123!",
+	}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	result, err := svc.Login(ctx, auth.LoginInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        email,
+		Password:     "Password123!",
+	})
+	if err != nil {
+		t.Fatalf("Login(app credentials) error = %v", err)
+	}
+	if result.Token == nil || result.Token.AccessToken == "" {
+		t.Fatal("Login() returned no token")
+	}
+
+	// Valid user + invalid app secret must fail with the client sentinel —
+	// user credentials must never compensate for a bad application secret.
+	_, err = svc.Login(ctx, auth.LoginInput{
+		ClientID:     app.ClientID,
+		ClientSecret: "wrong-secret",
+		Email:        email,
+		Password:     "Password123!",
+	})
+	if !errors.Is(err, auth.ErrInvalidClient) {
+		t.Errorf("Login(bad app secret) error = %v, want ErrInvalidClient", err)
+	}
+}
+
+// TestAppUserIsolation verifies per-application user bases: the same email can
+// register independently in two apps of one tenant, each app only authenticates
+// its own users, and app-scoped users are invisible to the generic login.
+func TestAppUserIsolation(t *testing.T) {
+	svc, appA, tenantID, ctx := newAppAuthFixture(t)
+
+	// Second application in the same tenant.
+	pool := testhelper.NewTestDB(t)
+	appSvc := auth.NewApplicationService(pool, testhelper.TestLogger())
+	appB, err := appSvc.CreateApplication(ctx, tenantID, "integration-app-b", "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication(appB) error = %v", err)
+	}
+
+	email := uniqueEmail("iso")
+
+	// Same email registers independently in both apps, different passwords.
+	if _, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID: appA.ClientID, ClientSecret: appA.ClientSecret,
+		Email: email, Password: "PasswordAppA123!",
+	}); err != nil {
+		t.Fatalf("Register(appA) error = %v", err)
+	}
+	if _, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID: appB.ClientID, ClientSecret: appB.ClientSecret,
+		Email: email, Password: "PasswordAppB123!",
+	}); err != nil {
+		t.Fatalf("Register(appB, same email) error = %v — per-app accounts must be independent", err)
+	}
+
+	// Each app authenticates only its own account/password.
+	if _, err := svc.Login(ctx, auth.LoginInput{
+		ClientID: appA.ClientID, ClientSecret: appA.ClientSecret,
+		Email: email, Password: "PasswordAppA123!",
+	}); err != nil {
+		t.Errorf("Login(appA, own password) error = %v", err)
+	}
+	if _, err := svc.Login(ctx, auth.LoginInput{
+		ClientID: appA.ClientID, ClientSecret: appA.ClientSecret,
+		Email: email, Password: "PasswordAppB123!",
+	}); err == nil {
+		t.Error("Login(appA with appB's password) succeeded — user bases are not isolated")
+	}
+
+	// App-scoped users must be invisible to the generic (credential-less) login.
+	if _, err := svc.Login(ctx, auth.LoginInput{
+		Email: email, Password: "PasswordAppA123!",
+	}); err == nil {
+		t.Error("generic Login() authenticated an app-scoped user — must require the app's credentials")
+	}
+}

@@ -46,7 +46,7 @@ services:
       TOTP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       SEED_DEMO_DATA: "true"
       SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
-      GLOBAL_CORS_ORIGINS: "http://localhost:5173,https://emc-auth.senie.ai"
+      GLOBAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090,https://emc-auth.senie.ai"
     depends_on:
       postgres:
         condition: service_healthy

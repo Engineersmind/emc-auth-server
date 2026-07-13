@@ -45,7 +45,7 @@ func newApplicationService(t *testing.T) (*auth.ApplicationService, context.Cont
 func TestApplicationService_CreateReturnsCredentialsOnce(t *testing.T) {
 	svc, ctx, tenantA, _ := newApplicationService(t)
 
-	result, err := svc.CreateApplication(ctx, tenantA, "web-frontend", "spa")
+	result, err := svc.CreateApplication(ctx, tenantA, "web-frontend", "spa", nil)
 	if err != nil {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
@@ -75,7 +75,7 @@ func TestApplicationService_CreateReturnsCredentialsOnce(t *testing.T) {
 func TestApplicationService_CrossTenantIsolation(t *testing.T) {
 	svc, ctx, tenantA, tenantB := newApplicationService(t)
 
-	created, err := svc.CreateApplication(ctx, tenantA, "tenant-a-app", "")
+	created, err := svc.CreateApplication(ctx, tenantA, "tenant-a-app", "", nil)
 	if err != nil {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
@@ -119,7 +119,7 @@ func TestApplicationService_CrossTenantIsolation(t *testing.T) {
 func TestApplicationService_AuthenticateClientBindsTenant(t *testing.T) {
 	svc, ctx, tenantA, _ := newApplicationService(t)
 
-	created, err := svc.CreateApplication(ctx, tenantA, "m2m-service", "m2m")
+	created, err := svc.CreateApplication(ctx, tenantA, "m2m-service", "m2m", nil)
 	if err != nil {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
@@ -155,7 +155,7 @@ func TestApplicationService_AuthenticateClientBindsTenant(t *testing.T) {
 func TestApplicationService_RotateSecret(t *testing.T) {
 	svc, ctx, tenantA, tenantB := newApplicationService(t)
 
-	created, err := svc.CreateApplication(ctx, tenantA, "rotate-me", "web")
+	created, err := svc.CreateApplication(ctx, tenantA, "rotate-me", "web", nil)
 	if err != nil {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
@@ -190,7 +190,7 @@ func TestApplicationService_RotateSecret(t *testing.T) {
 func TestApplicationService_GetAndUpdate(t *testing.T) {
 	svc, ctx, tenantA, tenantB := newApplicationService(t)
 
-	created, err := svc.CreateApplication(ctx, tenantA, "get-update-app", "")
+	created, err := svc.CreateApplication(ctx, tenantA, "get-update-app", "", nil)
 	if err != nil {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
@@ -213,7 +213,7 @@ func TestApplicationService_GetAndUpdate(t *testing.T) {
 	}
 
 	// Partial update: change type only, name must survive.
-	updated, err := svc.UpdateApplication(ctx, tenantA, appID, "", "m2m")
+	updated, err := svc.UpdateApplication(ctx, tenantA, appID, "", "m2m", nil)
 	if err != nil {
 		t.Fatalf("UpdateApplication() error = %v", err)
 	}
@@ -222,10 +222,10 @@ func TestApplicationService_GetAndUpdate(t *testing.T) {
 	}
 
 	// Invalid type rejected; cross-tenant update rejected.
-	if _, err := svc.UpdateApplication(ctx, tenantA, appID, "", "bogus"); err != auth.ErrInvalidAppType {
+	if _, err := svc.UpdateApplication(ctx, tenantA, appID, "", "bogus", nil); err != auth.ErrInvalidAppType {
 		t.Errorf("UpdateApplication(bogus type) error = %v, want ErrInvalidAppType", err)
 	}
-	if _, err := svc.UpdateApplication(ctx, tenantB, appID, "hijacked", ""); err != auth.ErrAppNotFound {
+	if _, err := svc.UpdateApplication(ctx, tenantB, appID, "hijacked", "", nil); err != auth.ErrAppNotFound {
 		t.Errorf("UpdateApplication() from tenant B error = %v, want ErrAppNotFound", err)
 	}
 }
@@ -237,7 +237,7 @@ func TestApplicationService_ListPaginated(t *testing.T) {
 
 	mkApp := func(name, appType string) int64 {
 		t.Helper()
-		r, err := svc.CreateApplication(ctx, tenantA, name, appType)
+		r, err := svc.CreateApplication(ctx, tenantA, name, appType, nil)
 		if err != nil {
 			t.Fatalf("CreateApplication(%s) error = %v", name, err)
 		}
@@ -322,5 +322,64 @@ func TestApplicationService_ListPaginated(t *testing.T) {
 	}
 	if pageB.Total != 0 {
 		t.Errorf("tenant B Total = %d, want 0", pageB.Total)
+	}
+}
+
+// TestApplicationService_ScopesRoundTrip verifies scopes persist through
+// create, surface on get, follow nil-unchanged / empty-clears update semantics,
+// and reject malformed scope strings.
+func TestApplicationService_ScopesRoundTrip(t *testing.T) {
+	svc, ctx, tenantA, _ := newApplicationService(t)
+
+	created, err := svc.CreateApplication(ctx, tenantA, "scoped-app", "m2m", []string{"orders:read", "orders:write"})
+	if err != nil {
+		t.Fatalf("CreateApplication() error = %v", err)
+	}
+	if len(created.Scopes) != 2 {
+		t.Fatalf("created Scopes = %v, want 2 entries", created.Scopes)
+	}
+	appID, _ := strconv.ParseInt(created.ID, 10, 64)
+
+	got, err := svc.GetApplication(ctx, tenantA, appID)
+	if err != nil {
+		t.Fatalf("GetApplication() error = %v", err)
+	}
+	if len(got.Scopes) != 2 || got.Scopes[0] != "orders:read" || got.Scopes[1] != "orders:write" {
+		t.Errorf("GetApplication() Scopes = %v, want [orders:read orders:write]", got.Scopes)
+	}
+
+	// nil scopes on update leaves them unchanged.
+	updated, err := svc.UpdateApplication(ctx, tenantA, appID, "renamed", "", nil)
+	if err != nil {
+		t.Fatalf("UpdateApplication(nil scopes) error = %v", err)
+	}
+	if len(updated.Scopes) != 2 {
+		t.Errorf("UpdateApplication(nil scopes) Scopes = %v, want unchanged 2 entries", updated.Scopes)
+	}
+
+	// Replacing scopes takes effect.
+	updated, err = svc.UpdateApplication(ctx, tenantA, appID, "", "", []string{"reports:read"})
+	if err != nil {
+		t.Fatalf("UpdateApplication(replace scopes) error = %v", err)
+	}
+	if len(updated.Scopes) != 1 || updated.Scopes[0] != "reports:read" {
+		t.Errorf("UpdateApplication(replace) Scopes = %v, want [reports:read]", updated.Scopes)
+	}
+
+	// Empty non-nil slice clears scopes.
+	updated, err = svc.UpdateApplication(ctx, tenantA, appID, "", "", []string{})
+	if err != nil {
+		t.Fatalf("UpdateApplication(clear scopes) error = %v", err)
+	}
+	if len(updated.Scopes) != 0 {
+		t.Errorf("UpdateApplication(clear) Scopes = %v, want empty", updated.Scopes)
+	}
+
+	// Malformed scopes are rejected on create and update.
+	if _, err := svc.CreateApplication(ctx, tenantA, "bad-scope-app", "", []string{"no-colon"}); err != auth.ErrInvalidScope {
+		t.Errorf("CreateApplication(bad scope) error = %v, want ErrInvalidScope", err)
+	}
+	if _, err := svc.UpdateApplication(ctx, tenantA, appID, "", "", []string{":action-only"}); err != auth.ErrInvalidScope {
+		t.Errorf("UpdateApplication(bad scope) error = %v, want ErrInvalidScope", err)
 	}
 }

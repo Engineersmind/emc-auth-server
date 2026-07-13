@@ -1062,6 +1062,133 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/apps/login": {
+            "post": {
+                "description": "Authenticates a user that belongs to the authenticated application's own user base — invisible to POST /auth/login and to every other application. Application credentials via Authorization: Basic header only.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Login an end user via application credentials",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Login credentials",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppLoginRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid application or user credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/register": {
+            "post": {
+                "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Register an end user via application credentials",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Registration payload",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppRegisterRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid application credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Email already registered in this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/forgot-password": {
             "post": {
                 "description": "Sends a reset link to the email address. ALWAYS returns 200 regardless of whether the email is registered (prevents email enumeration).",
@@ -1799,7 +1926,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/token": {
             "post": {
-                "description": "Issues a service-level access token using client_id + client_secret. No user involved, no refresh token issued.",
+                "description": "Issues a service-level access token. Credentials via Authorization: Basic base64(client_id:client_secret) header only. No user involved, no refresh token issued.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1812,7 +1939,14 @@ const docTemplate = `{
                 "summary": "Client credentials token",
                 "parameters": [
                     {
-                        "description": "Client credentials",
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "grant_type only",
                         "name": "body",
                         "in": "body",
                         "required": true,
@@ -4511,6 +4645,12 @@ const docTemplate = `{
                 "name": {
                     "type": "string"
                 },
+                "scopes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "updated_at": {
                     "type": "string"
                 }
@@ -4562,6 +4702,12 @@ const docTemplate = `{
                 },
                 "name": {
                     "type": "string"
+                },
+                "scopes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },
@@ -4664,6 +4810,43 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.AppLoginRequest": {
+            "type": "object",
+            "required": [
+                "email",
+                "password"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "password": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.AppRegisterRequest": {
+            "type": "object",
+            "required": [
+                "email",
+                "password"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "first_name": {
+                    "type": "string"
+                },
+                "last_name": {
+                    "type": "string"
+                },
+                "password": {
+                    "type": "string",
+                    "minLength": 8
+                }
+            }
+        },
         "handlers.AssignRoleRequest": {
             "type": "object",
             "properties": {
@@ -4706,6 +4889,13 @@ const docTemplate = `{
                 },
                 "name": {
                     "type": "string"
+                },
+                "scopes": {
+                    "description": "resource:action strings; optional",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },
@@ -4939,12 +5129,6 @@ const docTemplate = `{
         "handlers.TokenRequest": {
             "type": "object",
             "properties": {
-                "client_id": {
-                    "type": "string"
-                },
-                "client_secret": {
-                    "type": "string"
-                },
                 "grant_type": {
                     "type": "string"
                 }
@@ -4958,6 +5142,12 @@ const docTemplate = `{
                 },
                 "name": {
                     "type": "string"
+                },
+                "scopes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },

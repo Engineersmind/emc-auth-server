@@ -167,7 +167,7 @@ func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logg
 		if err := pool.QueryRow(ctx, `
 			INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
 			VALUES ($1, $2, $3, $4, $5, true)
-			ON CONFLICT (tenant_id, email) WHERE deleted_at IS NULL
+			ON CONFLICT (tenant_id, email) WHERE application_id IS NULL AND deleted_at IS NULL
 			DO UPDATE SET role_id = EXCLUDED.role_id
 			RETURNING id
 		`, tenantID, u.email, u.firstName, u.lastName, roleID).Scan(&userID); err != nil {
