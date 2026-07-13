@@ -211,7 +211,7 @@ func TestTOTPBypass_InvalidCode(t *testing.T) {
 	}
 
 	// Enroll TOTP for the user.
-	_, err = totpSvc.Enroll(ctx, userID, tenantID, email)
+	_, err = totpSvc.Enroll(ctx, userID, tenantID, email, "")
 	if err != nil {
 		t.Fatalf("Enroll TOTP: %v", err)
 	}

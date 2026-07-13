@@ -105,10 +105,23 @@ type OTPChallenge struct {
 	ExpiresIn       int    `json:"expires_in"`
 }
 
-// LoginResult wraps either a full token pair or an OTP challenge.
+// MFAEnrollmentChallenge is returned by Login when the user's application has
+// MFA mode 'required' but the user has no active TOTP enrollment. The
+// enrollment token authorizes exactly two calls — POST /auth/login/mfa/enroll
+// and POST /auth/login/mfa/activate — for this one user; activation completes
+// the pending login and returns the token pair. No JWT exists until then.
+type MFAEnrollmentChallenge struct {
+	MFAEnrollmentRequired bool   `json:"mfa_enrollment_required"`
+	EnrollmentToken       string `json:"enrollment_token"`
+	ExpiresIn             int    `json:"expires_in"`
+}
+
+// LoginResult wraps a full token pair, an OTP challenge, or a forced-MFA
+// enrollment challenge — exactly one field is non-nil.
 type LoginResult struct {
-	Token        *AuthResult
-	OTPChallenge *OTPChallenge
+	Token         *AuthResult
+	OTPChallenge  *OTPChallenge
+	MFAEnrollment *MFAEnrollmentChallenge
 }
 
 // MeResult is returned by GET /api/v1/auth/me.
@@ -474,11 +487,31 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		if err != nil {
 			s.logger.Warn().Err(err).Msg("login: failed to check TOTP status, skipping TOTP step")
 		} else if active {
-			challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms)
+			// An active enrollment always gates login — even when the
+			// application's policy is 'disabled' (fail-secure: the server never
+			// silently skips a second factor the user set up; admins remove
+			// enrollments explicitly via the MFA reset API).
+			challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID)
 			if err != nil {
 				return nil, fmt.Errorf("create OTP session: %w", err)
 			}
 			return &LoginResult{OTPChallenge: challenge}, nil
+		} else if appRowID != 0 {
+			// Application-scoped user without an active enrollment: enforce the
+			// application's MFA policy. Fail closed on a policy read error —
+			// issuing tokens when we cannot prove the app does NOT require MFA
+			// would turn a transient DB error into a silent policy bypass.
+			mode, err := s.totpSvc.GetAppMFAMode(ctx, appRowID)
+			if err != nil {
+				return nil, fmt.Errorf("load app MFA policy: %w", err)
+			}
+			if mode == MFAModeRequired {
+				challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID)
+				if err != nil {
+					return nil, fmt.Errorf("create MFA enrollment session: %w", err)
+				}
+				return &LoginResult{MFAEnrollment: challenge}, nil
+			}
 		}
 	}
 
@@ -511,9 +544,16 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 		return nil, fmt.Errorf("TOTP not configured on this server")
 	}
 
-	session, err := s.loadOTPSession(ctx, in.OTPSessionToken)
+	key := otpSessionKey(in.OTPSessionToken)
+	session, err := s.loadOTPSession(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("invalid or expired OTP session")
+	}
+
+	// Per-session attempt budget — a 6-digit code inside a 5-minute window
+	// with unlimited attempts is a realistic brute-force target.
+	if err := s.bumpOTPAttempts(ctx, key, OTPSessionTTL); err != nil {
+		return nil, err
 	}
 
 	err = s.totpSvc.Verify(ctx, session.UserID, in.Code)
@@ -524,34 +564,104 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 		}
 	}
 
-	s.redisCli.Del(ctx, otpSessionKey(in.OTPSessionToken)) //nolint:errcheck
+	s.clearOTPSession(ctx, key)
 
-	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms, nil, "")
+	// session.AppID carries the application context through the challenge so
+	// an app-authenticated login keeps its app_id claim after the OTP step.
+	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms, nil, session.AppID)
+}
+
+// EnrollPending generates the TOTP secret for a forced-enrollment login
+// (application MFA mode 'required', user not yet enrolled). Authorized solely
+// by the enrollment token minted at the password step — no JWT exists yet.
+// The returned OTPSession identifies the user for audit logging.
+func (s *AuthService) EnrollPending(ctx context.Context, enrollmentToken string) (*EnrollResult, *OTPSession, error) {
+	if s.totpSvc == nil || s.redisCli == nil {
+		return nil, nil, fmt.Errorf("TOTP not configured on this server")
+	}
+
+	key := mfaEnrollKey(enrollmentToken)
+	session, err := s.loadOTPSession(ctx, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid or expired enrollment session")
+	}
+
+	// The session exists because the user had no ACTIVE enrollment at the
+	// password step. If one was activated since (e.g. a parallel login
+	// completed enrollment first), this token must not rotate it.
+	active, err := s.totpSvc.IsActive(ctx, session.UserID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if active {
+		s.clearOTPSession(ctx, key)
+		return nil, nil, fmt.Errorf("invalid or expired enrollment session")
+	}
+
+	// The authenticator entry is labelled with the owning application's name.
+	issuer := ""
+	if session.AppID != "" {
+		if id, perr := strconv.ParseInt(session.AppID, 10, 64); perr == nil {
+			var name string
+			if qerr := s.pool.QueryRow(ctx, `SELECT name FROM oauth_clients WHERE id = $1`, id).Scan(&name); qerr == nil {
+				issuer = name
+			}
+		}
+	}
+
+	result, err := s.totpSvc.Enroll(ctx, session.UserID, session.TenantID, session.Email, issuer)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, session, nil
+}
+
+// ActivatePending verifies the first TOTP code of a forced enrollment,
+// activates it, and completes the pending login in one step — the response
+// carries the token pair, so the user lands in the application without
+// re-entering their password. The returned OTPSession identifies the user for
+// audit logging (non-nil whenever the session resolved, even on code errors).
+func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code string) (*AuthResult, *OTPSession, error) {
+	if s.totpSvc == nil || s.redisCli == nil {
+		return nil, nil, fmt.Errorf("TOTP not configured on this server")
+	}
+
+	key := mfaEnrollKey(enrollmentToken)
+	session, err := s.loadOTPSession(ctx, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid or expired enrollment session")
+	}
+
+	if err := s.bumpOTPAttempts(ctx, key, MFAEnrollmentSessionTTL); err != nil {
+		return nil, session, err
+	}
+
+	if err := s.totpSvc.VerifyAndActivate(ctx, session.UserID, code); err != nil {
+		return nil, session, err
+	}
+
+	s.clearOTPSession(ctx, key)
+
+	tokens, err := s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms, nil, session.AppID)
+	if err != nil {
+		return nil, session, err
+	}
+	return tokens, session, nil
 }
 
 // createOTPSession stores pre-auth user state in Redis and returns a challenge token.
-func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string) (*OTPChallenge, error) {
-	raw, err := GenerateRefreshToken()
-	if err != nil {
-		return nil, err
-	}
-	sessionToken := raw
-
-	payload, err := json.Marshal(OTPSession{
+func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string) (*OTPChallenge, error) {
+	sessionToken, err := s.storePreAuthSession(ctx, otpSessionKey, OTPSessionTTL, OTPSession{
 		UserID:   userID,
 		TenantID: tenantID,
 		Email:    email,
 		RoleName: roleName,
 		Perms:    perms,
+		AppID:    appID,
 	})
 	if err != nil {
 		return nil, err
 	}
-
-	if err := s.redisCli.Set(ctx, otpSessionKey(sessionToken), payload, OTPSessionTTL).Err(); err != nil {
-		return nil, fmt.Errorf("store OTP session: %w", err)
-	}
-
 	return &OTPChallenge{
 		RequiresOTP:     true,
 		OTPSessionToken: sessionToken,
@@ -559,9 +669,48 @@ func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int
 	}, nil
 }
 
-// loadOTPSession retrieves and decodes the pre-auth session from Redis.
-func (s *AuthService) loadOTPSession(ctx context.Context, token string) (*OTPSession, error) {
-	data, err := s.redisCli.Get(ctx, otpSessionKey(token)).Bytes()
+// createMFAEnrollmentSession stores pre-auth state for a forced enrollment and
+// returns the challenge handed back by Login instead of tokens.
+func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string) (*MFAEnrollmentChallenge, error) {
+	enrollmentToken, err := s.storePreAuthSession(ctx, mfaEnrollKey, MFAEnrollmentSessionTTL, OTPSession{
+		UserID:   userID,
+		TenantID: tenantID,
+		Email:    email,
+		RoleName: roleName,
+		Perms:    perms,
+		AppID:    appID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &MFAEnrollmentChallenge{
+		MFAEnrollmentRequired: true,
+		EnrollmentToken:       enrollmentToken,
+		ExpiresIn:             int(MFAEnrollmentSessionTTL.Seconds()),
+	}, nil
+}
+
+// storePreAuthSession mints an opaque token, stores the session under
+// keyFn(token) with the given TTL, and returns the raw token.
+func (s *AuthService) storePreAuthSession(ctx context.Context, keyFn func(string) string, ttl time.Duration, sess OTPSession) (string, error) {
+	raw, err := GenerateRefreshToken()
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(sess)
+	if err != nil {
+		return "", err
+	}
+	if err := s.redisCli.Set(ctx, keyFn(raw), payload, ttl).Err(); err != nil {
+		return "", fmt.Errorf("store pre-auth session: %w", err)
+	}
+	return raw, nil
+}
+
+// loadOTPSession retrieves and decodes a pre-auth session from Redis by its
+// full storage key (otpSessionKey(...) or mfaEnrollKey(...)).
+func (s *AuthService) loadOTPSession(ctx context.Context, key string) (*OTPSession, error) {
+	data, err := s.redisCli.Get(ctx, key).Bytes()
 	if err != nil {
 		return nil, fmt.Errorf("OTP session not found or expired: %w", err)
 	}
@@ -572,8 +721,39 @@ func (s *AuthService) loadOTPSession(ctx context.Context, token string) (*OTPSes
 	return &sess, nil
 }
 
+// bumpOTPAttempts enforces the per-session attempt budget (MaxOTPAttempts).
+// Counting uses an atomic INCR on a sibling key; exceeding the budget deletes
+// the session so the user must restart from the password step. Fails closed:
+// if the counter is unreachable, no verification happens.
+func (s *AuthService) bumpOTPAttempts(ctx context.Context, baseKey string, ttl time.Duration) error {
+	attemptsKey := baseKey + ":attempts"
+	attempts, err := s.redisCli.Incr(ctx, attemptsKey).Result()
+	if err != nil {
+		return ErrServiceUnavailable
+	}
+	if attempts == 1 {
+		// Outlive the session slightly so the counter cannot expire first and
+		// reset the budget mid-session.
+		s.redisCli.Expire(ctx, attemptsKey, ttl+time.Minute) //nolint:errcheck
+	}
+	if attempts > MaxOTPAttempts {
+		s.clearOTPSession(ctx, baseKey)
+		return ErrTooManyOTPAttempts
+	}
+	return nil
+}
+
+// clearOTPSession removes a pre-auth session and its attempt counter.
+func (s *AuthService) clearOTPSession(ctx context.Context, baseKey string) {
+	s.redisCli.Del(ctx, baseKey, baseKey+":attempts") //nolint:errcheck
+}
+
 func otpSessionKey(token string) string {
 	return "otp:session:" + HashToken(token)
+}
+
+func mfaEnrollKey(token string) string {
+	return "mfa:enroll:" + HashToken(token)
 }
 
 // Me returns profile information derived from JWT claims.

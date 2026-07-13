@@ -244,6 +244,9 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
 	}
+	if result.MFAEnrollment != nil {
+		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
+	}
 
 	tid, uid := claimsFromToken(result.Token.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
@@ -417,6 +420,12 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
 	}
+	if result.MFAEnrollment != nil {
+		// The application's MFA policy is 'required' and this user has no
+		// active enrollment: no tokens yet — the client takes the enrollment
+		// token through /auth/login/mfa/enroll + /auth/login/mfa/activate.
+		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
+	}
 
 	tid, uid := claimsFromToken(result.Token.AccessToken)
 	h.audit.Log(c.Request().Context(), audit.Event{
@@ -442,7 +451,7 @@ type LoginOTPRequest struct {
 // LoginOTP handles POST /api/v1/auth/login/otp — completes a TOTP-gated login.
 //
 // @Summary      Complete TOTP login
-// @Description  Submit the TOTP code (or backup code) to complete a two-step login.
+// @Description  Submit the TOTP code (or backup code) to complete a two-step login. The session allows 5 incorrect codes before it is invalidated. Returns the full token pair (and sets auth cookies for browser clients).
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
@@ -450,6 +459,7 @@ type LoginOTPRequest struct {
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
+// @Failure      429   {object}  map[string]string  "Attempt budget exhausted — restart login"
 // @Router       /api/v1/auth/login/otp [post]
 func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	var req LoginOTPRequest
@@ -466,6 +476,15 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("login OTP failed")
+		h.audit.Log(c.Request().Context(), audit.Event{
+			Action:       audit.ActionAuthMFAChallengeFailed,
+			ResourceType: "user",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		})
+		if errors.Is(err, auth.ErrTooManyOTPAttempts) {
+			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		}
 		if containsMsg(err, "invalid TOTP") || containsMsg(err, "invalid or expired") || containsMsg(err, "invalid backup") {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired OTP code"})
 		}
@@ -483,11 +502,134 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
-	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message":    "logged in",
-		"expires_in": result.ExpiresIn,
-		"expires_at": result.ExpiresAt,
+	// The full token pair is returned in the body (not just cookies) so
+	// application-integrated (non-browser) clients can complete the app-login
+	// MFA flow; cookies are still set for browser/SPA clients.
+	return c.JSON(http.StatusOK, result)
+}
+
+// MFAEnrollRequest is the JSON body for POST /api/v1/auth/login/mfa/enroll.
+type MFAEnrollRequest struct {
+	EnrollmentToken string `json:"enrollment_token"`
+}
+
+// MFAEnrollPending handles POST /api/v1/auth/login/mfa/enroll — forced MFA
+// enrollment for applications whose MFA mode is 'required'.
+//
+// @Summary      Begin forced MFA enrollment
+// @Description  Exchanges the enrollment token returned by a login against a 'required'-MFA application for a TOTP secret (otpauth:// URI + backup codes). The token authorizes only this call and /auth/login/mfa/activate; no JWT is issued until activation completes.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        body  body      MFAEnrollRequest  true  "Enrollment token from the login response"
+// @Success      200   {object}  auth.EnrollResult
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid or expired enrollment token"
+// @Router       /api/v1/auth/login/mfa/enroll [post]
+func (h *AuthHandler) MFAEnrollPending(c echo.Context) error {
+	var req MFAEnrollRequest
+	if err := c.Bind(&req); err != nil || req.EnrollmentToken == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "enrollment_token is required"})
+	}
+
+	result, session, err := h.svc.EnrollPending(c.Request().Context(), req.EnrollmentToken)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("pending MFA enroll failed")
+		if containsMsg(err, "not configured") {
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
+		}
+		if containsMsg(err, "invalid or expired") {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired enrollment token"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "MFA enrollment failed"})
+	}
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &session.TenantID,
+		UserID:       &session.UserID,
+		ActorEmail:   session.Email,
+		Action:       audit.ActionAuthMFAEnrolled,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
 	})
+
+	return c.JSON(http.StatusOK, result)
+}
+
+// MFAActivateRequest is the JSON body for POST /api/v1/auth/login/mfa/activate.
+type MFAActivateRequest struct {
+	EnrollmentToken string `json:"enrollment_token"`
+	Code            string `json:"code"`
+}
+
+// MFAActivatePending handles POST /api/v1/auth/login/mfa/activate — verifies
+// the first TOTP code of a forced enrollment and completes the pending login.
+//
+// @Summary      Activate forced MFA enrollment and complete login
+// @Description  Verifies the first TOTP code for a pending enrollment, marks MFA active, and completes the login in the same step — the response carries the token pair. 5 incorrect codes invalidate the enrollment session.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        body  body      MFAActivateRequest  true  "Enrollment token + first TOTP code"
+// @Success      200   {object}  auth.AuthResult
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid code or expired enrollment token"
+// @Failure      429   {object}  map[string]string  "Attempt budget exhausted — restart login"
+// @Router       /api/v1/auth/login/mfa/activate [post]
+func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
+	var req MFAActivateRequest
+	if err := c.Bind(&req); err != nil || req.EnrollmentToken == "" || req.Code == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "enrollment_token and code are required"})
+	}
+
+	result, session, err := h.svc.ActivatePending(c.Request().Context(), req.EnrollmentToken, req.Code)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("pending MFA activate failed")
+		event := audit.Event{
+			Action:       audit.ActionAuthMFAChallengeFailed,
+			ResourceType: "user",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		}
+		if session != nil {
+			event.TenantID, event.UserID, event.ActorEmail = &session.TenantID, &session.UserID, session.Email
+		}
+		h.audit.Log(c.Request().Context(), event)
+
+		if errors.Is(err, auth.ErrTooManyOTPAttempts) {
+			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		}
+		if containsMsg(err, "not configured") {
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
+		}
+		if containsMsg(err, "invalid TOTP") || containsMsg(err, "invalid or expired") {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid code or expired enrollment token"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "MFA activation failed"})
+	}
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &session.TenantID,
+		UserID:       &session.UserID,
+		ActorEmail:   session.Email,
+		Action:       audit.ActionAuthMFAActivated,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &session.TenantID,
+		UserID:       &session.UserID,
+		ActorEmail:   session.Email,
+		Action:       audit.ActionAuthLogin,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusOK, result)
 }
 
 // Me handles GET /api/v1/auth/me.
@@ -721,15 +863,26 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 
 // â”€â”€â”€ TOTP Handlers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+// TOTPEnrollRequest is the (optional) JSON body for POST /api/v1/auth/otp/enroll.
+// Code is only required when the caller already has an ACTIVE enrollment and
+// is rotating it (new phone): a valid current TOTP or backup code proves
+// control of the existing second factor.
+type TOTPEnrollRequest struct {
+	Code string `json:"code"`
+}
+
 // TOTPEnroll handles POST /api/v1/auth/otp/enroll.
 //
 // @Summary      Enroll in TOTP 2FA
-// @Description  Generates a TOTP secret and returns an otpauth:// URI plus backup codes.
+// @Description  Generates a TOTP secret and returns an otpauth:// URI plus backup codes. The authenticator issuer is the owning application's name for application-scoped users. Rejected when the application's MFA mode is 'disabled'. Re-enrolling while active requires a valid current TOTP or backup code in the body.
 // @Tags         AUTH
+// @Accept       json
 // @Produce      json
 // @Security     BearerAuth
+// @Param        body  body      TOTPEnrollRequest  false  "Current code (required only when re-enrolling)"
 // @Success      200  {object}  auth.EnrollResult
 // @Failure      401  {object}  map[string]string
+// @Failure      403  {object}  map[string]string  "MFA disabled for this application, or missing re-enrollment proof"
 // @Router       /api/v1/auth/otp/enroll [post]
 func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 	if h.totpSvc == nil {
@@ -749,11 +902,30 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant_id in token"})
 	}
 
-	result, err := h.totpSvc.Enroll(c.Request().Context(), userID, tenantID, claims.Email)
+	var req TOTPEnrollRequest
+	_ = c.Bind(&req) // body is optional — only needed as re-enrollment proof
+
+	result, err := h.totpSvc.EnrollUser(c.Request().Context(), userID, tenantID, claims.Email, req.Code)
 	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrTOTPReenrollProof):
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		case errors.Is(err, auth.ErrUserNotFound):
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
 		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("TOTP enroll failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "TOTP enrollment failed"})
 	}
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &tenantID,
+		UserID:       &userID,
+		ActorEmail:   claims.Email,
+		Action:       audit.ActionAuthMFAEnrolled,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
 
 	return c.JSON(http.StatusOK, result)
 }
@@ -797,6 +969,17 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
+	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &tenantID,
+		UserID:       &userID,
+		ActorEmail:   claims.Email,
+		Action:       audit.ActionAuthMFAActivated,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusOK, map[string]string{"message": "TOTP 2FA activated successfully"})
 }
 
@@ -808,7 +991,7 @@ type TOTPDisableRequest struct {
 // TOTPDisable handles DELETE /api/v1/auth/otp.
 //
 // @Summary      Disable TOTP 2FA
-// @Description  Disables TOTP for the current user. Requires a valid TOTP code or backup code.
+// @Description  Disables TOTP for the current user. Requires a valid TOTP code or backup code. Rejected when the user's application has MFA mode 'required' — users cannot opt out of a mandated policy.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
@@ -816,6 +999,7 @@ type TOTPDisableRequest struct {
 // @Param        body  body      TOTPDisableRequest  true  "Current TOTP or backup code"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string  "MFA is required by the application's policy"
 // @Router       /api/v1/auth/otp [delete]
 func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 	if h.totpSvc == nil {
@@ -832,9 +1016,23 @@ func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 	}
 
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
-	if err := h.totpSvc.Disable(c.Request().Context(), userID, req.Code); err != nil {
+	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	if err := h.totpSvc.DisableUser(c.Request().Context(), userID, tenantID, req.Code); err != nil {
+		if errors.Is(err, auth.ErrMFARequiredByPolicy) {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		}
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &tenantID,
+		UserID:       &userID,
+		ActorEmail:   claims.Email,
+		Action:       audit.ActionAuthMFADisabled,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "TOTP 2FA disabled"})
 }
@@ -1098,6 +1296,9 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
+	}
+	if result.MFAEnrollment != nil {
+		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
 	}
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)

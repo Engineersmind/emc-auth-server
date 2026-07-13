@@ -247,6 +247,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
 		WithAppRateLimits(appLimitSvc).
 		WithApplications(appSvc).
+		WithTOTP(totpSvc).
 		WithCORS(corsSvc)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
@@ -270,7 +271,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/register", authHandler.Register)
 	// Login is rate-limited at route level (not global) to avoid impacting other endpoints.
 	authGroup.POST("/login", authHandler.Login, mw.LoginRateLimiter(rlCfg))
-	authGroup.POST("/login/otp", authHandler.LoginOTP) // complete TOTP-gated login (03-02)
+	// TOTP challenge completion + forced-enrollment endpoints (03-02, issue #63).
+	// OTPRateLimiter bounds endpoint volume per IP and per session token; the
+	// hard per-session cap of auth.MaxOTPAttempts incorrect codes lives in the
+	// service layer (Redis INCR), so a 6-digit code cannot be brute-forced
+	// within the challenge TTL.
+	authGroup.POST("/login/otp", authHandler.LoginOTP, mw.OTPRateLimiter(rlCfg))                  // complete TOTP-gated login
+	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, mw.OTPRateLimiter(rlCfg))   // forced enrollment: get QR + backup codes
+	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, mw.OTPRateLimiter(rlCfg)) // forced enrollment: first code → tokens
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
@@ -404,6 +412,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.DeletePermission, tidPermsWrite)
 
+	// Per-application MFA policy under the canonical family (issue #63) —
+	// owner (apps:read/apps:write, own tenant) and super_admin (tenant:manage,
+	// any tenant) manage each application's MFA mode; MFA policy is
+	// application configuration, so it rides the apps:* permissions.
+	adminGroup.GET("/tenants/:tid/applications/:appID/mfa", adminHandler.GetApplicationMFA, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, tidUsersWrite)
+
 	// End-user application users under the canonical family — each
 	// application manages its own isolated user base.
 	adminGroup.GET("/tenants/:tid/applications/:appID/users", adminHandler.ListUsers, tidUsersRead)
@@ -492,6 +508,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications/:appID/permissions", adminHandler.ListPermissions, permsRead)
 	adminGroup.PUT("/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, permsWrite)
 	adminGroup.DELETE("/applications/:appID/permissions/:pid", adminHandler.DeletePermission, permsWrite)
+
+	// Per-application MFA policy — flat aliases of the canonical
+	// /tenants/:tid/applications/:appID/mfa family (issue #63).
+	adminGroup.GET("/applications/:appID/mfa", adminHandler.GetApplicationMFA, appsRead)
+	adminGroup.PUT("/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appsWrite)
+	adminGroup.DELETE("/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, usersWrite)
 
 	// End-user application users — each application manages its own isolated
 	// user base (flat aliases of the canonical /tenants/:tid variants).

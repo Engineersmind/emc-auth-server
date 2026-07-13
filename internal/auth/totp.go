@@ -52,10 +52,19 @@ type EnrollResult struct {
 	BackupCodes []string `json:"backup_codes"`
 }
 
-// Enroll generates a new TOTP secret for the user.
-func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID int64, email string) (*EnrollResult, error) {
+// Enroll generates a new TOTP secret for the user. issuer labels the entry in
+// the user's authenticator app — pass the owning application's name for
+// app-scoped users (or "" for the server-wide TOTPIssuer fallback).
+//
+// Enroll is the raw primitive: it applies no application policy and no
+// re-enrollment proof. User-initiated enrollment must go through EnrollUser
+// (mfa.go), which enforces both.
+func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID int64, email, issuer string) (*EnrollResult, error) {
+	if issuer == "" {
+		issuer = TOTPIssuer
+	}
 	key, err := totp.Generate(totp.GenerateOpts{
-		Issuer:      TOTPIssuer,
+		Issuer:      issuer,
 		AccountName: email,
 		SecretSize:  32,
 	})
@@ -294,14 +303,30 @@ func hashBackupCode(code string) string {
 
 // ─── OTP Session (Redis-backed pre-auth state) ───────────────────────────────
 
-// OTPSession holds pre-authentication state while waiting for the TOTP code.
+// OTPSession holds pre-authentication state while waiting for the TOTP code
+// (or, for 'required'-mode applications, while the user completes enrollment).
 type OTPSession struct {
 	UserID   int64
 	TenantID int64
 	Email    string
 	RoleName string
 	Perms    []string
+	// AppID is the string-encoded oauth_clients.id when the login came through
+	// a registered application; "" for tenant-level logins. Carried through the
+	// challenge so the finally-issued JWT keeps its app_id claim.
+	AppID string
 }
 
 // OTPSessionTTL is how long the intermediate TOTP challenge state lives.
 const OTPSessionTTL = 5 * time.Minute
+
+// MFAEnrollmentSessionTTL is how long a pending forced-enrollment session
+// lives — longer than OTPSessionTTL because the user must install/open an
+// authenticator app, scan the QR code, and type the first code.
+const MFAEnrollmentSessionTTL = 10 * time.Minute
+
+// MaxOTPAttempts is the per-session budget of incorrect codes before the
+// challenge (or pending enrollment) is invalidated and the user must restart
+// from the password step. Hard cap against 6-digit brute force inside the
+// session TTL window.
+const MaxOTPAttempts = 5

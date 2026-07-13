@@ -23,6 +23,7 @@ type AdminHandler struct {
 	svc         *admin.Service
 	appLimitSvc *auth.AppRateLimitService
 	appSvc      *auth.ApplicationService
+	totpSvc     *auth.TOTPService
 	corsSvc     *mw.TenantCORSService
 	audit       *audit.Logger
 	logger      zerolog.Logger
@@ -48,6 +49,12 @@ func (h *AdminHandler) WithCORS(svc *mw.TenantCORSService) *AdminHandler {
 // WithApplications attaches the ApplicationService for application CRUD handlers.
 func (h *AdminHandler) WithApplications(svc *auth.ApplicationService) *AdminHandler {
 	h.appSvc = svc
+	return h
+}
+
+// WithTOTP attaches the TOTPService for per-application MFA policy handlers.
+func (h *AdminHandler) WithTOTP(svc *auth.TOTPService) *AdminHandler {
+	h.totpSvc = svc
 	return h
 }
 
@@ -2216,6 +2223,147 @@ func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 
 	h.auditAdmin(c, claims, audit.ActionAdminApplicationDeleted, "application", strconv.FormatInt(appID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "application deactivated"})
+}
+
+// ---------------------------------------------------------------------------
+// Per-application MFA policy (issue #63) — owner (apps:read/apps:write on the
+// own tenant) and super_admin (tenant:manage, any tenant) via the same
+// canonical /tenants/:tid/applications/:appID/mfa family + flat aliases.
+// ---------------------------------------------------------------------------
+
+// UpdateApplicationMFARequest is the body for PUT .../applications/:appID/mfa.
+type UpdateApplicationMFARequest struct {
+	Mode string `json:"mode"`
+}
+
+// GetApplicationMFA handles GET /api/v1/applications/:appID/mfa and
+// GET /api/v1/tenants/:tid/applications/:appID/mfa.
+//
+// @Summary      Get application MFA policy
+// @Description  Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional) plus enrollment stats over the application's own user base.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID  path      string  true  "Application ID"
+// @Success      200    {object}  auth.MFAPolicy
+// @Failure      403    {object}  map[string]string
+// @Failure      404    {object}  map[string]string  "Application not found"
+// @Router       /api/v1/applications/{appID}/mfa [get]
+func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, ok := h.applicationOwnedByTenant(c, tenantID)
+	if !ok {
+		return nil
+	}
+
+	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: get application MFA policy failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get MFA policy"})
+	}
+	return c.JSON(http.StatusOK, policy)
+}
+
+// UpdateApplicationMFA handles PUT /api/v1/applications/:appID/mfa and
+// PUT /api/v1/tenants/:tid/applications/:appID/mfa.
+//
+// @Summary      Set application MFA policy
+// @Description  Sets the application's MFA mode. 'required' forces TOTP enrollment at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login until an admin resets them); 'optional' restores the default opt-in behaviour.
+// @Tags         admin-applications
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID  path      string                       true  "Application ID"
+// @Param        body   body      UpdateApplicationMFARequest  true  "MFA mode: disabled | optional | required"
+// @Success      200    {object}  auth.MFAPolicy
+// @Failure      400    {object}  map[string]string  "Invalid mode"
+// @Failure      403    {object}  map[string]string
+// @Failure      404    {object}  map[string]string  "Application not found"
+// @Router       /api/v1/applications/{appID}/mfa [put]
+func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, ok := h.applicationOwnedByTenant(c, tenantID)
+	if !ok {
+		return nil
+	}
+
+	var req UpdateApplicationMFARequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	// Service tokens carry the public client_id in UserID — record no updater
+	// rather than a garbage id (same convention as auditAdmin).
+	var updatedBy *int64
+	if claims != nil {
+		if uid, perr := strconv.ParseInt(claims.UserID, 10, 64); perr == nil {
+			updatedBy = &uid
+		}
+	}
+
+	if err := h.totpSvc.SetAppMFAPolicy(c.Request().Context(), tenantID, appID, req.Mode, updatedBy); err != nil {
+		if errors.Is(err, auth.ErrInvalidMFAMode) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: set application MFA policy failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminMFAPolicyUpdated, "application", strconv.FormatInt(appID, 10))
+
+	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: reload application MFA policy failed")
+		return c.JSON(http.StatusOK, map[string]string{"message": "MFA policy updated"})
+	}
+	return c.JSON(http.StatusOK, policy)
+}
+
+// ResetUserMFA handles DELETE /api/v1/applications/:appID/users/:uid/mfa and
+// DELETE /api/v1/tenants/:tid/applications/:appID/users/:uid/mfa.
+//
+// @Summary      Reset a user's MFA enrollment
+// @Description  Removes the user's TOTP enrollment (support path for lost phone + backup codes). The user must belong to the application's own user base. If the application's MFA mode is 'required', the user is forced through enrollment again at their next login. Idempotent.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID  path      string  true  "Application ID"
+// @Param        uid    path      string  true  "User ID"
+// @Success      200    {object}  map[string]string
+// @Failure      403    {object}  map[string]string
+// @Failure      404    {object}  map[string]string  "Application or user not found"
+// @Router       /api/v1/applications/{appID}/users/{uid}/mfa [delete]
+func (h *AdminHandler) ResetUserMFA(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, ok := h.applicationOwnedByTenant(c, tenantID)
+	if !ok {
+		return nil
+	}
+
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	if err := h.totpSvc.ResetUserMFA(c.Request().Context(), tenantID, &appID, userID); err != nil {
+		if errors.Is(err, auth.ErrUserNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: reset user MFA failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to reset user MFA"})
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminUserMFAReset, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "MFA enrollment reset — the user will set up MFA again according to the application's policy"})
 }
 
 // TenantGetStats handles GET /api/v1/tenants/:tid/stats.

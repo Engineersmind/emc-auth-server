@@ -72,6 +72,16 @@ const (
 
 	// Auth — machine-to-machine client_credentials grant
 	ActionAuthClientCredentials = "auth.client_credentials"
+
+	// Auth — MFA/TOTP lifecycle (issue #63)
+	ActionAuthMFAEnrolled        = "auth.mfa_enrolled"
+	ActionAuthMFAActivated       = "auth.mfa_activated"
+	ActionAuthMFADisabled        = "auth.mfa_disabled"
+	ActionAuthMFAChallengeFailed = "auth.mfa_challenge_failed"
+
+	// Admin — per-application MFA policy management (issue #63)
+	ActionAdminMFAPolicyUpdated = "admin.mfa_policy_updated"
+	ActionAdminUserMFAReset     = "admin.user_mfa_reset"
 )
 
 // ---------------------------------------------------------------------------

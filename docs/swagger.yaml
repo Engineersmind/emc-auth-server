@@ -413,6 +413,26 @@ definitions:
       otp_uri:
         type: string
     type: object
+  auth.MFAPolicy:
+    properties:
+      application_id:
+        type: string
+      enrolled_users:
+        description: |-
+          Enrollment stats over the application's own isolated user base — for the
+          owner dashboard. Pending = enrolled but never activated.
+        type: integer
+      mode:
+        type: string
+      pending_enrollments:
+        type: integer
+      total_users:
+        type: integer
+      updated_at:
+        description: UpdatedAt is nil when no explicit policy row exists (implicit
+          'optional').
+        type: string
+    type: object
   auth.MeResult:
     properties:
       email:
@@ -580,6 +600,18 @@ definitions:
       refresh_token:
         type: string
     type: object
+  handlers.MFAActivateRequest:
+    properties:
+      code:
+        type: string
+      enrollment_token:
+        type: string
+    type: object
+  handlers.MFAEnrollRequest:
+    properties:
+      enrollment_token:
+        type: string
+    type: object
   handlers.RefreshRequest:
     properties:
       refresh_token:
@@ -645,6 +677,11 @@ definitions:
       code:
         type: string
     type: object
+  handlers.TOTPEnrollRequest:
+    properties:
+      code:
+        type: string
+    type: object
   handlers.TokenRequest:
     properties:
       client_id:
@@ -652,6 +689,11 @@ definitions:
       client_secret:
         type: string
       grant_type:
+        type: string
+    type: object
+  handlers.UpdateApplicationMFARequest:
+    properties:
+      mode:
         type: string
     type: object
   handlers.UpdateApplicationRequest:
@@ -1165,6 +1207,90 @@ paths:
       summary: Create application
       tags:
       - admin-applications
+  /api/v1/applications/{appID}/mfa:
+    get:
+      description: Returns the application's MFA mode (disabled|optional|required;
+        no explicit policy = optional) plus enrollment stats over the application's
+        own user base.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MFAPolicy'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get application MFA policy
+      tags:
+      - admin-applications
+    put:
+      consumes:
+      - application/json
+      description: Sets the application's MFA mode. 'required' forces TOTP enrollment
+        at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments
+        (already-active enrollments still gate login until an admin resets them);
+        'optional' restores the default opt-in behaviour.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: 'MFA mode: disabled | optional | required'
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateApplicationMFARequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MFAPolicy'
+        "400":
+          description: Invalid mode
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set application MFA policy
+      tags:
+      - admin-applications
   /api/v1/applications/{appID}/roles:
     get:
       description: Returns all roles scoped to the given application with their permission
@@ -1336,6 +1462,49 @@ paths:
       summary: Mark a role as the application's default
       tags:
       - admin-rbac
+  /api/v1/applications/{appID}/users/{uid}/mfa:
+    delete:
+      description: Removes the user's TOTP enrollment (support path for lost phone
+        + backup codes). The user must belong to the application's own user base.
+        If the application's MFA mode is 'required', the user is forced through enrollment
+        again at their next login. Idempotent.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: User ID
+        in: path
+        name: uid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application or user not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Reset a user's MFA enrollment
+      tags:
+      - admin-applications
   /api/v1/applications/{id}:
     delete:
       description: Soft-deletes an application. Its client_id is immediately rejected
@@ -1742,11 +1911,92 @@ paths:
       summary: Login
       tags:
       - AUTH
+  /api/v1/auth/login/mfa/activate:
+    post:
+      consumes:
+      - application/json
+      description: Verifies the first TOTP code for a pending enrollment, marks MFA
+        active, and completes the login in the same step — the response carries the
+        token pair. 5 incorrect codes invalidate the enrollment session.
+      parameters:
+      - description: Enrollment token + first TOTP code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.MFAActivateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid code or expired enrollment token
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Attempt budget exhausted — restart login
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Activate forced MFA enrollment and complete login
+      tags:
+      - AUTH
+  /api/v1/auth/login/mfa/enroll:
+    post:
+      consumes:
+      - application/json
+      description: Exchanges the enrollment token returned by a login against a 'required'-MFA
+        application for a TOTP secret (otpauth:// URI + backup codes). The token authorizes
+        only this call and /auth/login/mfa/activate; no JWT is issued until activation
+        completes.
+      parameters:
+      - description: Enrollment token from the login response
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.MFAEnrollRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EnrollResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid or expired enrollment token
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Begin forced MFA enrollment
+      tags:
+      - AUTH
   /api/v1/auth/login/otp:
     post:
       consumes:
       - application/json
       description: Submit the TOTP code (or backup code) to complete a two-step login.
+        The session allows 5 incorrect codes before it is invalidated. Returns the
+        full token pair (and sets auth cookies for browser clients).
       parameters:
       - description: OTP session token + TOTP code
         in: body
@@ -1769,6 +2019,12 @@ paths:
             type: object
         "401":
           description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Attempt budget exhausted — restart login
           schema:
             additionalProperties:
               type: string
@@ -1896,7 +2152,8 @@ paths:
       consumes:
       - application/json
       description: Disables TOTP for the current user. Requires a valid TOTP code
-        or backup code.
+        or backup code. Rejected when the user's application has MFA mode 'required'
+        — users cannot opt out of a mandated policy.
       parameters:
       - description: Current TOTP or backup code
         in: body
@@ -1915,6 +2172,12 @@ paths:
             type: object
         "400":
           description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: MFA is required by the application's policy
           schema:
             additionalProperties:
               type: string
@@ -1958,8 +2221,18 @@ paths:
       - AUTH
   /api/v1/auth/otp/enroll:
     post:
+      consumes:
+      - application/json
       description: Generates a TOTP secret and returns an otpauth:// URI plus backup
-        codes.
+        codes. The authenticator issuer is the owning application's name for application-scoped
+        users. Rejected when the application's MFA mode is 'disabled'. Re-enrolling
+        while active requires a valid current TOTP or backup code in the body.
+      parameters:
+      - description: Current code (required only when re-enrolling)
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/handlers.TOTPEnrollRequest'
       produces:
       - application/json
       responses:
@@ -1969,6 +2242,13 @@ paths:
             $ref: '#/definitions/auth.EnrollResult'
         "401":
           description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: MFA disabled for this application, or missing re-enrollment
+            proof
           schema:
             additionalProperties:
               type: string

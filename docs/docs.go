@@ -681,6 +681,129 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/mfa": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional) plus enrollment stats over the application's own user base.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Get application MFA policy",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MFAPolicy"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets the application's MFA mode. 'required' forces TOTP enrollment at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login until an admin resets them); 'optional' restores the default opt-in behaviour.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Set application MFA policy",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "MFA mode: disabled | optional | required",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateApplicationMFARequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MFAPolicy"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid mode",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/roles": {
             "get": {
                 "security": [
@@ -930,6 +1053,68 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/users/{uid}/mfa": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the user's TOTP enrollment (support path for lost phone + backup codes). The user must belong to the application's own user base. If the application's MFA mode is 'required', the user is forced through enrollment again at their next login. Idempotent.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Reset a user's MFA enrollment",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application or user not found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -1544,9 +1729,122 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/login/mfa/activate": {
+            "post": {
+                "description": "Verifies the first TOTP code for a pending enrollment, marks MFA active, and completes the login in the same step — the response carries the token pair. 5 incorrect codes invalidate the enrollment session.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Activate forced MFA enrollment and complete login",
+                "parameters": [
+                    {
+                        "description": "Enrollment token + first TOTP code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFAActivateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid code or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Attempt budget exhausted — restart login",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/login/mfa/enroll": {
+            "post": {
+                "description": "Exchanges the enrollment token returned by a login against a 'required'-MFA application for a TOTP secret (otpauth:// URI + backup codes). The token authorizes only this call and /auth/login/mfa/activate; no JWT is issued until activation completes.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Begin forced MFA enrollment",
+                "parameters": [
+                    {
+                        "description": "Enrollment token from the login response",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFAEnrollRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EnrollResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/login/otp": {
             "post": {
-                "description": "Submit the TOTP code (or backup code) to complete a two-step login.",
+                "description": "Submit the TOTP code (or backup code) to complete a two-step login. The session allows 5 incorrect codes before it is invalidated. Returns the full token pair (and sets auth cookies for browser clients).",
                 "consumes": [
                     "application/json"
                 ],
@@ -1586,6 +1884,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Attempt budget exhausted — restart login",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -1778,7 +2085,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Disables TOTP for the current user. Requires a valid TOTP code or backup code.",
+                "description": "Disables TOTP for the current user. Requires a valid TOTP code or backup code. Rejected when the user's application has MFA mode 'required' — users cannot opt out of a mandated policy.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1812,6 +2119,15 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "MFA is required by the application's policy",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -1880,7 +2196,10 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Generates a TOTP secret and returns an otpauth:// URI plus backup codes.",
+                "description": "Generates a TOTP secret and returns an otpauth:// URI plus backup codes. The authenticator issuer is the owning application's name for application-scoped users. Rejected when the application's MFA mode is 'disabled'. Re-enrolling while active requires a valid current TOTP or backup code in the body.",
+                "consumes": [
+                    "application/json"
+                ],
                 "produces": [
                     "application/json"
                 ],
@@ -1888,6 +2207,16 @@ const docTemplate = `{
                     "AUTH"
                 ],
                 "summary": "Enroll in TOTP 2FA",
+                "parameters": [
+                    {
+                        "description": "Current code (required only when re-enrolling)",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.TOTPEnrollRequest"
+                        }
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -1897,6 +2226,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "MFA disabled for this application, or missing re-enrollment proof",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4763,6 +5101,31 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.MFAPolicy": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string"
+                },
+                "enrolled_users": {
+                    "description": "Enrollment stats over the application's own isolated user base — for the\nowner dashboard. Pending = enrolled but never activated.",
+                    "type": "integer"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "pending_enrollments": {
+                    "type": "integer"
+                },
+                "total_users": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "description": "UpdatedAt is nil when no explicit policy row exists (implicit 'optional').",
+                    "type": "string"
+                }
+            }
+        },
         "auth.MeResult": {
             "type": "object",
             "properties": {
@@ -5019,6 +5382,25 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.MFAActivateRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                },
+                "enrollment_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.MFAEnrollRequest": {
+            "type": "object",
+            "properties": {
+                "enrollment_token": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.RefreshRequest": {
             "type": "object",
             "properties": {
@@ -5119,6 +5501,14 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.TOTPEnrollRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.TokenRequest": {
             "type": "object",
             "properties": {
@@ -5129,6 +5519,14 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "grant_type": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpdateApplicationMFARequest": {
+            "type": "object",
+            "properties": {
+                "mode": {
                     "type": "string"
                 }
             }
