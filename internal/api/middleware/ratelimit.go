@@ -208,10 +208,11 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 // M2M client across all tenants into one shared "unknown-account" bucket,
 // letting a single noisy client starve every other tenant's integration.
 //
-// client_id is read from the Authorization Basic header or the JSON body,
-// mirroring the handler's credential resolution order. When no client_id can
-// be determined (malformed request), only the per-IP limit applies — a shared
-// fallback bucket would recreate the same cross-tenant collision.
+// client_id is read only from the Authorization: Basic header — the handler
+// rejects body-sent credentials, so the body is never consulted here either.
+// When no client_id can be determined (malformed request), only the per-IP
+// limit applies — a shared fallback bucket would recreate the same
+// cross-tenant collision.
 func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	startCleanup()
 

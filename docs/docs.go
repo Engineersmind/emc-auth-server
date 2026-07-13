@@ -5129,12 +5129,6 @@ const docTemplate = `{
         "handlers.TokenRequest": {
             "type": "object",
             "properties": {
-                "client_id": {
-                    "type": "string"
-                },
-                "client_secret": {
-                    "type": "string"
-                },
                 "grant_type": {
                     "type": "string"
                 }

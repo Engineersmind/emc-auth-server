@@ -39,14 +39,17 @@ CREATE INDEX IF NOT EXISTS idx_users_application_id
       AND deleted_at IS NULL;
 
 -- Login()'s candidate query (internal/auth/service.go) now filters app-scoped
--- attempts with "AND u.application_id = $3". Recreate the migration-31 login
--- covering index with application_id included so that filter is still served
--- entirely from the index, matching the original's intent of avoiding a heap
--- fetch on the login hot path.
+-- attempts with "AND u.application_id = $3" (and tenant-level attempts with
+-- "AND u.application_id IS NULL"). application_id must be a key column, not
+-- just INCLUDE-d, so Postgres can apply it as an index condition — as an
+-- INCLUDE-only column it can only support index-only scans, not narrow the
+-- scan itself, which would force scanning every (tenant_id,email) match and
+-- filtering by application_id afterward once per-application duplicate emails
+-- exist. A trailing key column still serves plain tenant_id+email lookups.
 DROP INDEX IF EXISTS idx_users_login_covering;
 CREATE INDEX IF NOT EXISTS idx_users_login_covering
-    ON users (tenant_id, email)
-    INCLUDE (id, role_id, is_active, email_verified, token_version, application_id)
+    ON users (tenant_id, email, application_id)
+    INCLUDE (id, role_id, is_active, email_verified, token_version)
     WHERE deleted_at IS NULL;
 
 -- +goose StatementEnd
