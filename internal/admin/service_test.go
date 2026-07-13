@@ -55,6 +55,22 @@ func newAdminFixture(t *testing.T) adminFixture {
 	return adminFixture{pool: pool, svc: admin.New(pool, nil, logger), tenantID: tenantID, appID: appID}
 }
 
+// seedSystemRoleID returns the id of the tenant-level system role that
+// RunSeed guarantees exists in the seed tenant (super_admin). Tests must not
+// rely on an 'owner' role — that is only created by CreateTenant, not by the
+// seed, so it is absent on a fresh CI database.
+func seedSystemRoleID(t *testing.T, f adminFixture) int64 {
+	t.Helper()
+	var id int64
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT id FROM roles WHERE tenant_id = $1 AND name = 'super_admin' AND is_system = true`,
+		f.tenantID,
+	).Scan(&id); err != nil {
+		t.Fatalf("fetch seed system role id: %v", err)
+	}
+	return id
+}
+
 func parseID(t *testing.T, id string) int64 {
 	t.Helper()
 	n, err := strconv.ParseInt(id, 10, 64)
@@ -133,14 +149,11 @@ func TestSetDefaultRole_RejectsSystemRole(t *testing.T) {
 	f := newAdminFixture(t)
 	ctx := context.Background()
 
-	var ownerRoleID int64
-	if err := f.pool.QueryRow(ctx, `SELECT id FROM roles WHERE tenant_id = $1 AND name = 'owner'`, f.tenantID).Scan(&ownerRoleID); err != nil {
-		t.Fatalf("fetch owner role id: %v", err)
-	}
+	systemRoleID := seedSystemRoleID(t, f)
 
-	err := f.svc.SetDefaultRole(ctx, f.tenantID, f.appID, ownerRoleID)
+	err := f.svc.SetDefaultRole(ctx, f.tenantID, f.appID, systemRoleID)
 	if !errors.Is(err, admin.ErrSystemRole) {
-		t.Errorf("SetDefaultRole(owner role) error = %v, want ErrSystemRole", err)
+		t.Errorf("SetDefaultRole(system role) error = %v, want ErrSystemRole", err)
 	}
 }
 
@@ -259,13 +272,10 @@ func TestUpdateRoleName(t *testing.T) {
 		t.Errorf("UpdateRoleName name = %q, want %q", renamed.Name, "viewer")
 	}
 
-	// System roles (owner) must not be renameable through this path.
-	var ownerRoleID int64
-	if err := f.pool.QueryRow(ctx, `SELECT id FROM roles WHERE tenant_id = $1 AND name = 'owner'`, f.tenantID).Scan(&ownerRoleID); err != nil {
-		t.Fatalf("fetch owner role id: %v", err)
-	}
-	if _, err := f.svc.UpdateRoleName(ctx, f.tenantID, f.appID, ownerRoleID, "hijacked"); !errors.Is(err, admin.ErrNotFound) {
-		t.Errorf("UpdateRoleName(owner) error = %v, want ErrNotFound", err)
+	// System roles (super_admin/owner) must not be renameable through this path.
+	systemRoleID := seedSystemRoleID(t, f)
+	if _, err := f.svc.UpdateRoleName(ctx, f.tenantID, f.appID, systemRoleID, "hijacked"); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("UpdateRoleName(system role) error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -340,13 +350,10 @@ func TestUsers_ApplicationScoped(t *testing.T) {
 	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, appUserID, parseID(t, appRole.ID)); err != nil {
 		t.Fatalf("AssignUserRole(app user, app role) error = %v", err)
 	}
-	// Tenant-level role (owner) on an app user must be rejected.
-	var ownerRoleID int64
-	if err := f.pool.QueryRow(ctx, `SELECT id FROM roles WHERE tenant_id = $1 AND name = 'owner'`, f.tenantID).Scan(&ownerRoleID); err != nil {
-		t.Fatalf("fetch owner role id: %v", err)
-	}
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, appUserID, ownerRoleID); !errors.Is(err, admin.ErrRoleScope) {
-		t.Errorf("AssignUserRole(app user, owner role) error = %v, want ErrRoleScope", err)
+	// Tenant-level role (super_admin) on an app user must be rejected.
+	systemRoleID := seedSystemRoleID(t, f)
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, appUserID, systemRoleID); !errors.Is(err, admin.ErrRoleScope) {
+		t.Errorf("AssignUserRole(app user, tenant-level role) error = %v, want ErrRoleScope", err)
 	}
 	// App role on a tenant-level user must be rejected too.
 	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, tenantUserID, parseID(t, appRole.ID)); !errors.Is(err, admin.ErrRoleScope) {
@@ -354,7 +361,7 @@ func TestUsers_ApplicationScoped(t *testing.T) {
 	}
 
 	// CreateUser with a role from another scope must be rejected.
-	if _, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID, "appuser2@iso.test", "Password123!", "", "", &ownerRoleID); !errors.Is(err, admin.ErrRoleScope) {
+	if _, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID, "appuser2@iso.test", "Password123!", "", "", &systemRoleID); !errors.Is(err, admin.ErrRoleScope) {
 		t.Errorf("CreateUser(app user, owner role) error = %v, want ErrRoleScope", err)
 	}
 }
