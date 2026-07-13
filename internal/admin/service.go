@@ -29,6 +29,19 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	// ErrAlreadyActive is returned when ActivateTenant is called on an already-active tenant.
 	ErrAlreadyActive = errors.New("tenant already active")
+	// ErrSystemRole is returned when an operation that only applies to end-user
+	// application roles (e.g. SetDefaultRole) targets a tenant-management role
+	// (super_admin/owner, is_system = true).
+	ErrSystemRole = errors.New("cannot use a system role for this operation")
+	// ErrPermissionScope is returned when a role-permission assignment refers
+	// to a permission that does not exist in the role's own scope — roles are
+	// isolated to their application and can only hold that application's
+	// permissions (or tenant-level permissions for tenant-level roles).
+	ErrPermissionScope = errors.New("permission does not belong to this role's application")
+	// ErrRoleScope is returned when a user-role assignment pairs a user and a
+	// role from different scopes — an application's users can only hold that
+	// application's roles, and tenant-level users only tenant-level roles.
+	ErrRoleScope = errors.New("role does not belong to this user's application")
 )
 
 // ---------------------------------------------------------------------------
@@ -139,36 +152,45 @@ type UpdateTenantInput struct {
 	Plan        string
 }
 
-// PermissionResult is the public representation of a tenant-scoped permission.
+// PermissionResult is the public representation of a permission.
+// ApplicationID is nil for tenant-level management permissions (the seeded
+// catalog held by owner/super_admin); set for end-user permissions defined
+// inside one of the tenant's applications.
 type PermissionResult struct {
-	ID          string    `json:"id"`
-	TenantID    string    `json:"tenant_id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID            string    `json:"id"`
+	TenantID      string    `json:"tenant_id"`
+	ApplicationID *string   `json:"application_id,omitempty"`
+	Name          string    `json:"name"`
+	Description   string    `json:"description"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
-// RoleResult is the public representation of a tenant-scoped role with its permissions.
+// RoleResult is the public representation of a role with its permissions.
+// ApplicationID is nil for tenant-management roles (super_admin/owner); set
+// for end-user roles defined inside one of the tenant's applications.
 type RoleResult struct {
-	ID          string             `json:"id"`
-	TenantID    string             `json:"tenant_id"`
-	Name        string             `json:"name"`
-	IsSystem    bool               `json:"is_system"`
-	Permissions []PermissionResult `json:"permissions"`
-	CreatedAt   time.Time          `json:"created_at"`
+	ID            string             `json:"id"`
+	TenantID      string             `json:"tenant_id"`
+	ApplicationID *string            `json:"application_id,omitempty"`
+	Name          string             `json:"name"`
+	IsSystem      bool               `json:"is_system"`
+	IsDefault     bool               `json:"is_default"`
+	Permissions   []PermissionResult `json:"permissions"`
+	CreatedAt     time.Time          `json:"created_at"`
 }
 
 // UserResult is the public representation of a user in the pool.
 type UserResult struct {
-	ID        string    `json:"id"`
-	TenantID  string    `json:"tenant_id"`
-	Email     string    `json:"email"`
-	FirstName string    `json:"first_name"`
-	LastName  string    `json:"last_name"`
-	Role      string    `json:"role"`
-	RoleID    *string   `json:"role_id"`
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
+	ID            string    `json:"id"`
+	TenantID      string    `json:"tenant_id"`
+	ApplicationID *string   `json:"application_id,omitempty"`
+	Email         string    `json:"email"`
+	FirstName     string    `json:"first_name"`
+	LastName      string    `json:"last_name"`
+	Role          string    `json:"role"`
+	RoleID        *string   `json:"role_id"`
+	IsActive      bool      `json:"is_active"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // UsersPage wraps a paginated user list.
@@ -625,15 +647,18 @@ func (s *Service) UpdateTenantCORSOrigins(ctx context.Context, tenantID int64, o
 // Permission management (tenant-scoped)
 // ---------------------------------------------------------------------------
 
-// CreatePermission adds a new permission to the given tenant.
-func (s *Service) CreatePermission(ctx context.Context, tenantID int64, name, description string) (*PermissionResult, error) {
+// CreatePermission adds a new permission. applicationID nil creates a
+// tenant-level management permission; set, an end-user permission scoped to
+// (and isolated within) that application.
+func (s *Service) CreatePermission(ctx context.Context, tenantID int64, applicationID *int64, name, description string) (*PermissionResult, error) {
 	var p PermissionResult
 	var id, tid int64
+	var appID *int64
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO permissions (tenant_id, name, description)
-		VALUES ($1, $2, $3)
-		RETURNING id, tenant_id, name, description, created_at
-	`, tenantID, name, description).Scan(&id, &tid, &p.Name, &p.Description, &p.CreatedAt)
+		INSERT INTO permissions (tenant_id, application_id, name, description)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, tenant_id, application_id, name, description, created_at
+	`, tenantID, applicationID, name, description).Scan(&id, &tid, &appID, &p.Name, &p.Description, &p.CreatedAt)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
@@ -642,17 +667,24 @@ func (s *Service) CreatePermission(ctx context.Context, tenantID int64, name, de
 	}
 	p.ID = strconv.FormatInt(id, 10)
 	p.TenantID = strconv.FormatInt(tid, 10)
+	if appID != nil {
+		s := strconv.FormatInt(*appID, 10)
+		p.ApplicationID = &s
+	}
 	return &p, nil
 }
 
-// ListPermissions returns all permissions for the given tenant.
-func (s *Service) ListPermissions(ctx context.Context, tenantID int64) ([]PermissionResult, error) {
+// ListPermissions returns permissions for the tenant. applicationID nil lists
+// every permission in the tenant (management catalog plus every application's,
+// matching pre-existing behavior); non-nil scopes to that application only.
+func (s *Service) ListPermissions(ctx context.Context, tenantID int64, applicationID *int64) ([]PermissionResult, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, tenant_id, name, description, created_at
+		SELECT id, tenant_id, application_id, name, description, created_at
 		FROM permissions
 		WHERE tenant_id = $1
+		  AND ($2::BIGINT IS NULL OR application_id = $2)
 		ORDER BY name
-	`, tenantID)
+	`, tenantID, applicationID)
 	if err != nil {
 		return nil, fmt.Errorf("list permissions: %w", err)
 	}
@@ -662,11 +694,16 @@ func (s *Service) ListPermissions(ctx context.Context, tenantID int64) ([]Permis
 	for rows.Next() {
 		var p PermissionResult
 		var id, tid int64
-		if err := rows.Scan(&id, &tid, &p.Name, &p.Description, &p.CreatedAt); err != nil {
+		var appID *int64
+		if err := rows.Scan(&id, &tid, &appID, &p.Name, &p.Description, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan permission: %w", err)
 		}
 		p.ID = strconv.FormatInt(id, 10)
 		p.TenantID = strconv.FormatInt(tid, 10)
+		if appID != nil {
+			s := strconv.FormatInt(*appID, 10)
+			p.ApplicationID = &s
+		}
 		perms = append(perms, p)
 	}
 	if perms == nil {
@@ -675,12 +712,49 @@ func (s *Service) ListPermissions(ctx context.Context, tenantID int64) ([]Permis
 	return perms, rows.Err()
 }
 
-// DeletePermission removes a permission from the tenant.
-// Cascades to role_permissions and user_permissions automatically (FK ON DELETE CASCADE).
-func (s *Service) DeletePermission(ctx context.Context, tenantID, permissionID int64) error {
+// UpdatePermission renames a permission and/or replaces its description.
+// An empty name keeps the current one. applicationID nil applies no scope
+// filter (tenant-admin routes may edit any of the tenant's permissions);
+// non-nil requires the permission to belong to that application.
+func (s *Service) UpdatePermission(ctx context.Context, tenantID int64, applicationID *int64, permissionID int64, name, description string) (*PermissionResult, error) {
+	var p PermissionResult
+	var id, tid int64
+	var appID *int64
+	err := s.pool.QueryRow(ctx, `
+		UPDATE permissions
+		SET name = COALESCE(NULLIF($1, ''), name), description = $2, updated_at = NOW()
+		WHERE id = $3 AND tenant_id = $4
+		  AND ($5::BIGINT IS NULL OR application_id = $5)
+		RETURNING id, tenant_id, application_id, name, description, created_at
+	`, name, description, permissionID, tenantID, applicationID).Scan(&id, &tid, &appID, &p.Name, &p.Description, &p.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		if isDuplicateErr(err) {
+			return nil, ErrAlreadyExists
+		}
+		return nil, fmt.Errorf("update permission: %w", err)
+	}
+	p.ID = strconv.FormatInt(id, 10)
+	p.TenantID = strconv.FormatInt(tid, 10)
+	if appID != nil {
+		s := strconv.FormatInt(*appID, 10)
+		p.ApplicationID = &s
+	}
+	return &p, nil
+}
+
+// DeletePermission removes a permission from the tenant. applicationID nil
+// applies no scope filter; non-nil requires the permission to belong to that
+// application. Cascades to role_permissions and user_permissions (FK ON
+// DELETE CASCADE).
+func (s *Service) DeletePermission(ctx context.Context, tenantID int64, applicationID *int64, permissionID int64) error {
 	ct, err := s.pool.Exec(ctx, `
-		DELETE FROM permissions WHERE id = $1 AND tenant_id = $2
-	`, permissionID, tenantID)
+		DELETE FROM permissions
+		WHERE id = $1 AND tenant_id = $2
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+	`, permissionID, tenantID, applicationID)
 	if err != nil {
 		return fmt.Errorf("delete permission: %w", err)
 	}
@@ -695,7 +769,9 @@ func (s *Service) DeletePermission(ctx context.Context, tenantID, permissionID i
 // ---------------------------------------------------------------------------
 
 // CreateRole creates a role and optionally assigns permissions to it.
-func (s *Service) CreateRole(ctx context.Context, tenantID int64, name string, permissionIDs []int64) (*RoleResult, error) {
+// applicationID is nil for a tenant-level role; set to scope the role as an
+// end-user role belonging to one of the tenant's applications.
+func (s *Service) CreateRole(ctx context.Context, tenantID int64, applicationID *int64, name string, permissionIDs []int64) (*RoleResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin create role tx: %w", err)
@@ -705,10 +781,10 @@ func (s *Service) CreateRole(ctx context.Context, tenantID int64, name string, p
 	var roleID int64
 	var createdAt time.Time
 	err = tx.QueryRow(ctx, `
-		INSERT INTO roles (tenant_id, name, is_system, created_at)
-		VALUES ($1, $2, false, NOW())
+		INSERT INTO roles (tenant_id, application_id, name, is_system, created_at)
+		VALUES ($1, $2, $3, false, NOW())
 		RETURNING id, created_at
-	`, tenantID, name).Scan(&roleID, &createdAt)
+	`, tenantID, applicationID, name).Scan(&roleID, &createdAt)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
@@ -716,14 +792,22 @@ func (s *Service) CreateRole(ctx context.Context, tenantID int64, name string, p
 		return nil, fmt.Errorf("insert role: %w", err)
 	}
 
-	for _, permID := range permissionIDs {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO role_permissions (role_id, permission_id)
-			SELECT $1, id FROM permissions WHERE id = $2 AND tenant_id = $3
+	// Isolation: a role may only hold permissions from its own scope — the
+	// same application for app roles, tenant-level for tenant-level roles.
+	// IS NOT DISTINCT FROM treats two NULLs as equal, unlike plain =.
+	for _, permID := range dedupeInt64s(permissionIDs) {
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO role_permissions (role_id, permission_id, tenant_id)
+			SELECT $1, id, tenant_id FROM permissions
+			WHERE id = $2 AND tenant_id = $3
+			  AND application_id IS NOT DISTINCT FROM $4::BIGINT
 			ON CONFLICT DO NOTHING
-		`, roleID, permID, tenantID)
+		`, roleID, permID, tenantID, applicationID)
 		if err != nil {
 			return nil, fmt.Errorf("assign permission to role: %w", err)
+		}
+		if ct.RowsAffected() == 0 {
+			return nil, fmt.Errorf("permission %d: %w", permID, ErrPermissionScope)
 		}
 	}
 
@@ -734,14 +818,42 @@ func (s *Service) CreateRole(ctx context.Context, tenantID int64, name string, p
 	return s.getRoleByID(ctx, tenantID, roleID)
 }
 
-// ListRoles returns all roles for the tenant, each with their assigned permissions.
-func (s *Service) ListRoles(ctx context.Context, tenantID int64) ([]RoleResult, error) {
+// int64PtrEqual reports whether two optional ids are the same scope: both
+// nil (tenant-level) or both set to the same value.
+func int64PtrEqual(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// dedupeInt64s returns ids with duplicates removed, preserving order — a
+// duplicated id would make the ON CONFLICT DO NOTHING attach report zero rows
+// and be misread as a scope violation.
+func dedupeInt64s(ids []int64) []int64 {
+	seen := make(map[int64]struct{}, len(ids))
+	out := ids[:0:0]
+	for _, id := range ids {
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// ListRoles returns roles for the tenant, each with their assigned permissions.
+// applicationID nil lists every role in the tenant (tenant-management roles
+// plus every application's end-user roles, matching pre-existing behavior);
+// a non-nil value scopes the list to that application's end-user roles only.
+func (s *Service) ListRoles(ctx context.Context, tenantID int64, applicationID *int64) ([]RoleResult, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, tenant_id, name, is_system, created_at
+		SELECT id, tenant_id, application_id, name, is_system, is_default, created_at
 		FROM roles
 		WHERE tenant_id = $1
+		  AND ($2::BIGINT IS NULL OR application_id = $2)
 		ORDER BY name
-	`, tenantID)
+	`, tenantID, applicationID)
 	if err != nil {
 		return nil, fmt.Errorf("list roles: %w", err)
 	}
@@ -751,11 +863,16 @@ func (s *Service) ListRoles(ctx context.Context, tenantID int64) ([]RoleResult, 
 	for rows.Next() {
 		var r RoleResult
 		var id, tid int64
-		if err := rows.Scan(&id, &tid, &r.Name, &r.IsSystem, &r.CreatedAt); err != nil {
+		var appID *int64
+		if err := rows.Scan(&id, &tid, &appID, &r.Name, &r.IsSystem, &r.IsDefault, &r.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan role: %w", err)
 		}
 		r.ID = strconv.FormatInt(id, 10)
 		r.TenantID = strconv.FormatInt(tid, 10)
+		if appID != nil {
+			s := strconv.FormatInt(*appID, 10)
+			r.ApplicationID = &s
+		}
 		r.Permissions = []PermissionResult{}
 		roles = append(roles, r)
 	}
@@ -779,7 +896,9 @@ func (s *Service) ListRoles(ctx context.Context, tenantID int64) ([]RoleResult, 
 	return roles, nil
 }
 
-// UpdateRolePermissions replaces the permission set on a role.
+// UpdateRolePermissions replaces the permission set on a role. Every
+// permission must belong to the role's own scope (its application, or
+// tenant-level for tenant-level roles) — see ErrPermissionScope.
 func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID int64, permissionIDs []int64) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -787,10 +906,13 @@ func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID in
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var exists bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM roles WHERE id = $1 AND tenant_id = $2)`, roleID, tenantID).Scan(&exists)
-	if err != nil || !exists {
-		return ErrNotFound
+	var roleAppID *int64
+	err = tx.QueryRow(ctx, `SELECT application_id FROM roles WHERE id = $1 AND tenant_id = $2`, roleID, tenantID).Scan(&roleAppID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("update role perms: lookup role: %w", err)
 	}
 
 	_, err = tx.Exec(ctx, `DELETE FROM role_permissions WHERE role_id = $1`, roleID)
@@ -798,18 +920,42 @@ func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID in
 		return fmt.Errorf("clear role permissions: %w", err)
 	}
 
-	for _, permID := range permissionIDs {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO role_permissions (role_id, permission_id)
-			SELECT $1, id FROM permissions WHERE id = $2 AND tenant_id = $3
+	for _, permID := range dedupeInt64s(permissionIDs) {
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO role_permissions (role_id, permission_id, tenant_id)
+			SELECT $1, id, tenant_id FROM permissions
+			WHERE id = $2 AND tenant_id = $3
+			  AND application_id IS NOT DISTINCT FROM $4::BIGINT
 			ON CONFLICT DO NOTHING
-		`, roleID, permID, tenantID)
+		`, roleID, permID, tenantID, roleAppID)
 		if err != nil {
 			return fmt.Errorf("assign permission: %w", err)
+		}
+		if ct.RowsAffected() == 0 {
+			return fmt.Errorf("permission %d: %w", permID, ErrPermissionScope)
 		}
 	}
 
 	return tx.Commit(ctx)
+}
+
+// UpdateRoleName renames an end-user application role. System roles
+// (owner/super_admin) and roles outside the given application are rejected.
+func (s *Service) UpdateRoleName(ctx context.Context, tenantID, applicationID, roleID int64, name string) (*RoleResult, error) {
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE roles SET name = $1, updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND application_id = $4 AND is_system = false
+	`, name, roleID, tenantID, applicationID)
+	if err != nil {
+		if isDuplicateErr(err) {
+			return nil, ErrAlreadyExists
+		}
+		return nil, fmt.Errorf("rename role: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+	return s.getRoleByID(ctx, tenantID, roleID)
 }
 
 // DeleteRole removes a role from the tenant.
@@ -826,12 +972,61 @@ func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) error 
 	return nil
 }
 
+// SetDefaultRole marks roleID as the default role for applicationID, clearing
+// any previously-default role for that application in one transaction. Only
+// application-scoped, non-system roles are eligible — tenant-management roles
+// (super_admin/owner) must never be handed to an end user via /register.
+func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, roleID int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin set default role tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var isSystem bool
+	var appID *int64
+	err = tx.QueryRow(ctx, `
+		SELECT is_system, application_id FROM roles WHERE id = $1 AND tenant_id = $2
+	`, roleID, tenantID).Scan(&isSystem, &appID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("set default role: lookup: %w", err)
+	}
+	if isSystem || appID == nil || *appID != applicationID {
+		return ErrSystemRole
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE roles SET is_default = false
+		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
+	`, tenantID, applicationID)
+	if err != nil {
+		return fmt.Errorf("clear previous default role: %w", err)
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE roles SET is_default = true
+		WHERE id = $1 AND tenant_id = $2 AND application_id = $3
+	`, roleID, tenantID, applicationID)
+	if err != nil {
+		return fmt.Errorf("set default role: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
 // ---------------------------------------------------------------------------
 // User pool management (tenant-scoped)
 // ---------------------------------------------------------------------------
 
 // ListUsers returns a paginated, searchable list of users in the tenant.
-func (s *Service) ListUsers(ctx context.Context, tenantID int64, search string, page, limit int) (*UsersPage, error) {
+// ListUsers returns a paginated, searchable user list. applicationID nil
+// lists every user in the tenant (admins plus every application's end users,
+// matching pre-existing behavior); non-nil isolates the list to that
+// application's own user base.
+func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *int64, search string, page, limit int) (*UsersPage, error) {
 	if page < 1 {
 		page = 1
 	}
@@ -851,23 +1046,25 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, search string, 
 		FROM users
 		WHERE tenant_id = $1
 		  AND deleted_at IS NULL
-		  AND ($2 = '%%' OR email ILIKE $2 OR first_name ILIKE $2 OR last_name ILIKE $2)
-	`, tenantID, searchPattern).Scan(&total)
+		  AND ($2::BIGINT IS NULL OR application_id = $2)
+		  AND ($3 = '%%' OR email ILIKE $3 OR first_name ILIKE $3 OR last_name ILIKE $3)
+	`, tenantID, applicationID, searchPattern).Scan(&total)
 	if err != nil {
 		return nil, fmt.Errorf("count users: %w", err)
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT u.id, u.tenant_id, u.email, u.first_name, u.last_name,
+		SELECT u.id, u.tenant_id, u.application_id, u.email, u.first_name, u.last_name,
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.tenant_id = $1
 		  AND u.deleted_at IS NULL
-		  AND ($2 = '%%' OR u.email ILIKE $2 OR u.first_name ILIKE $2 OR u.last_name ILIKE $2)
+		  AND ($2::BIGINT IS NULL OR u.application_id = $2)
+		  AND ($3 = '%%' OR u.email ILIKE $3 OR u.first_name ILIKE $3 OR u.last_name ILIKE $3)
 		ORDER BY u.created_at DESC
-		LIMIT $3 OFFSET $4
-	`, tenantID, searchPattern, limit, offset)
+		LIMIT $4 OFFSET $5
+	`, tenantID, applicationID, searchPattern, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -877,13 +1074,17 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, search string, 
 	for rows.Next() {
 		var u UserResult
 		var id, tid int64
-		var roleID *int64
-		if err := rows.Scan(&id, &tid, &u.Email, &u.FirstName, &u.LastName,
+		var appID, roleID *int64
+		if err := rows.Scan(&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 			&u.Role, &roleID, &u.IsActive, &u.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		u.ID = strconv.FormatInt(id, 10)
 		u.TenantID = strconv.FormatInt(tid, 10)
+		if appID != nil {
+			as := strconv.FormatInt(*appID, 10)
+			u.ApplicationID = &as
+		}
 		if roleID != nil {
 			rs := strconv.FormatInt(*roleID, 10)
 			u.RoleID = &rs
@@ -909,8 +1110,25 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, search string, 
 	}, nil
 }
 
-// CreateUser creates a new user in the tenant with a hashed password.
-func (s *Service) CreateUser(ctx context.Context, tenantID int64, email, password, firstName, lastName string, roleID *int64) (*UserResult, error) {
+// CreateUser creates a new user with a hashed password. applicationID nil
+// creates a tenant-level user; set, an end user belonging to that
+// application's isolated user base. An optional role must belong to the same
+// scope as the user (ErrRoleScope otherwise).
+func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID *int64, email, password, firstName, lastName string, roleID *int64) (*UserResult, error) {
+	if roleID != nil {
+		var roleAppID *int64
+		err := s.pool.QueryRow(ctx, `SELECT application_id FROM roles WHERE id = $1 AND tenant_id = $2`, *roleID, tenantID).Scan(&roleAppID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrNotFound
+			}
+			return nil, fmt.Errorf("create user: lookup role: %w", err)
+		}
+		if !int64PtrEqual(roleAppID, applicationID) {
+			return nil, ErrRoleScope
+		}
+	}
+
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), auth.BcryptCost)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
@@ -924,10 +1142,10 @@ func (s *Service) CreateUser(ctx context.Context, tenantID int64, email, passwor
 
 	var userID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES ($1, $2, $3, $4, $5, true)
+		INSERT INTO users (tenant_id, application_id, email, first_name, last_name, role_id, is_active)
+		VALUES ($1, $2, $3, $4, $5, $6, true)
 		RETURNING id
-	`, tenantID, email, firstName, lastName, roleID).Scan(&userID)
+	`, tenantID, applicationID, email, firstName, lastName, roleID).Scan(&userID)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
@@ -947,21 +1165,25 @@ func (s *Service) CreateUser(ctx context.Context, tenantID int64, email, passwor
 		return nil, fmt.Errorf("commit create user: %w", err)
 	}
 
-	return s.getUserByID(ctx, tenantID, userID)
+	return s.getUserByID(ctx, tenantID, applicationID, userID)
 }
 
-// GetUser fetches a single user by ID within the tenant.
-func (s *Service) GetUser(ctx context.Context, tenantID, userID int64) (*UserResult, error) {
-	return s.getUserByID(ctx, tenantID, userID)
+// GetUser fetches a single user by ID. applicationID nil applies no scope
+// filter (tenant-admin routes may reach any of the tenant's users); non-nil
+// requires the user to belong to that application.
+func (s *Service) GetUser(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserResult, error) {
+	return s.getUserByID(ctx, tenantID, applicationID, userID)
 }
 
-// UpdateUser updates a user's profile fields.
-func (s *Service) UpdateUser(ctx context.Context, tenantID, userID int64, email, firstName, lastName string) (*UserResult, error) {
+// UpdateUser updates a user's profile fields, with the same optional
+// application scope filter as GetUser.
+func (s *Service) UpdateUser(ctx context.Context, tenantID int64, applicationID *int64, userID int64, email, firstName, lastName string) (*UserResult, error) {
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE users
 		SET email = $1, first_name = $2, last_name = $3, updated_at = NOW()
 		WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-	`, email, firstName, lastName, userID, tenantID)
+		  AND ($6::BIGINT IS NULL OR application_id = $6)
+	`, email, firstName, lastName, userID, tenantID, applicationID)
 	if err != nil {
 		if isDuplicateErr(err) {
 			return nil, ErrAlreadyExists
@@ -971,15 +1193,38 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID, userID int64, email,
 	if ct.RowsAffected() == 0 {
 		return nil, ErrNotFound
 	}
-	return s.getUserByID(ctx, tenantID, userID)
+	return s.getUserByID(ctx, tenantID, applicationID, userID)
 }
 
-// AssignUserRole sets the role for a user within the tenant.
-func (s *Service) AssignUserRole(ctx context.Context, tenantID, userID, roleID int64) error {
-	var roleExists bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM roles WHERE id = $1 AND tenant_id = $2)`, roleID, tenantID).Scan(&roleExists)
-	if err != nil || !roleExists {
-		return ErrNotFound
+// AssignUserRole sets the role for a user. The role must belong to the same
+// scope as the user — an application's users may only hold that application's
+// roles, tenant-level users only tenant-level roles (ErrRoleScope otherwise).
+// applicationID optionally pins the user lookup to one application.
+func (s *Service) AssignUserRole(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64) error {
+	var roleAppID *int64
+	err := s.pool.QueryRow(ctx, `SELECT application_id FROM roles WHERE id = $1 AND tenant_id = $2`, roleID, tenantID).Scan(&roleAppID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("assign role: lookup role: %w", err)
+	}
+
+	var userAppID *int64
+	err = s.pool.QueryRow(ctx, `
+		SELECT application_id FROM users
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+	`, userID, tenantID, applicationID).Scan(&userAppID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("assign role: lookup user: %w", err)
+	}
+
+	if !int64PtrEqual(roleAppID, userAppID) {
+		return ErrRoleScope
 	}
 
 	ct, err := s.pool.Exec(ctx, `
@@ -995,12 +1240,14 @@ func (s *Service) AssignUserRole(ctx context.Context, tenantID, userID, roleID i
 	return nil
 }
 
-// DeleteUser soft-deletes a user (sets deleted_at, is_active = false).
-func (s *Service) DeleteUser(ctx context.Context, tenantID, userID int64) error {
+// DeleteUser soft-deletes a user (sets deleted_at, is_active = false), with
+// the same optional application scope filter as GetUser.
+func (s *Service) DeleteUser(ctx context.Context, tenantID int64, applicationID *int64, userID int64) error {
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE users SET deleted_at = NOW(), is_active = false, updated_at = NOW()
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-	`, userID, tenantID)
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+	`, userID, tenantID, applicationID)
 	if err != nil {
 		return fmt.Errorf("delete user: %w", err)
 	}
@@ -1010,15 +1257,17 @@ func (s *Service) DeleteUser(ctx context.Context, tenantID, userID int64) error 
 	return nil
 }
 
-// ForcePasswordReset dispatches a password reset email to the specified user.
-func (s *Service) ForcePasswordReset(ctx context.Context, tenantID, userID int64) error {
+// ForcePasswordReset dispatches a password reset email to the specified user,
+// with the same optional application scope filter as GetUser.
+func (s *Service) ForcePasswordReset(ctx context.Context, tenantID int64, applicationID *int64, userID int64) error {
 	var email, tenantSlug string
 	err := s.pool.QueryRow(ctx, `
 		SELECT u.email, t.slug
 		FROM users u
 		JOIN tenants t ON t.id = u.tenant_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&email, &tenantSlug)
+		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
+	`, userID, tenantID, applicationID).Scan(&email, &tenantSlug)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -1119,18 +1368,19 @@ func scanTenantRow(row pgxScanner) (TenantResult, error) {
 	return t, nil
 }
 
-func (s *Service) getUserByID(ctx context.Context, tenantID, userID int64) (*UserResult, error) {
+func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserResult, error) {
 	var u UserResult
 	var id, tid int64
-	var roleID *int64
+	var appID, roleID *int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT u.id, u.tenant_id, u.email, u.first_name, u.last_name,
+		SELECT u.id, u.tenant_id, u.application_id, u.email, u.first_name, u.last_name,
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(
-		&id, &tid, &u.Email, &u.FirstName, &u.LastName,
+		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
+	`, userID, tenantID, applicationID).Scan(
+		&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 	)
 	if err != nil {
@@ -1141,6 +1391,10 @@ func (s *Service) getUserByID(ctx context.Context, tenantID, userID int64) (*Use
 	}
 	u.ID = strconv.FormatInt(id, 10)
 	u.TenantID = strconv.FormatInt(tid, 10)
+	if appID != nil {
+		as := strconv.FormatInt(*appID, 10)
+		u.ApplicationID = &as
+	}
 	if roleID != nil {
 		rs := strconv.FormatInt(*roleID, 10)
 		u.RoleID = &rs
@@ -1151,10 +1405,11 @@ func (s *Service) getUserByID(ctx context.Context, tenantID, userID int64) (*Use
 func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID int64) (*RoleResult, error) {
 	var r RoleResult
 	var id, tid int64
+	var appID *int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, tenant_id, name, is_system, created_at
+		SELECT id, tenant_id, application_id, name, is_system, is_default, created_at
 		FROM roles WHERE id = $1 AND tenant_id = $2
-	`, roleID, tenantID).Scan(&id, &tid, &r.Name, &r.IsSystem, &r.CreatedAt)
+	`, roleID, tenantID).Scan(&id, &tid, &appID, &r.Name, &r.IsSystem, &r.IsDefault, &r.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -1163,6 +1418,10 @@ func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID int64) (*Rol
 	}
 	r.ID = strconv.FormatInt(id, 10)
 	r.TenantID = strconv.FormatInt(tid, 10)
+	if appID != nil {
+		s := strconv.FormatInt(*appID, 10)
+		r.ApplicationID = &s
+	}
 	perms, err := s.loadRolePermissions(ctx, roleID)
 	if err != nil {
 		return nil, err
@@ -1173,7 +1432,7 @@ func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID int64) (*Rol
 
 func (s *Service) loadRolePermissions(ctx context.Context, roleID int64) ([]PermissionResult, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT p.id, p.tenant_id, p.name, p.description, p.created_at
+		SELECT p.id, p.tenant_id, p.application_id, p.name, p.description, p.created_at
 		FROM permissions p
 		JOIN role_permissions rp ON rp.permission_id = p.id
 		WHERE rp.role_id = $1
@@ -1188,8 +1447,13 @@ func (s *Service) loadRolePermissions(ctx context.Context, roleID int64) ([]Perm
 	for rows.Next() {
 		var p PermissionResult
 		var id, tid int64
-		if err := rows.Scan(&id, &tid, &p.Name, &p.Description, &p.CreatedAt); err != nil {
+		var appID *int64
+		if err := rows.Scan(&id, &tid, &appID, &p.Name, &p.Description, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan role permission: %w", err)
+		}
+		if appID != nil {
+			s := strconv.FormatInt(*appID, 10)
+			p.ApplicationID = &s
 		}
 		p.ID = strconv.FormatInt(id, 10)
 		p.TenantID = strconv.FormatInt(tid, 10)

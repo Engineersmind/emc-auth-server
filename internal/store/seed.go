@@ -71,7 +71,7 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 	_, err = pool.Exec(ctx, `
 		INSERT INTO roles (tenant_id, name, is_system)
 		VALUES ($1, 'super_admin', true)
-		ON CONFLICT (tenant_id, name) WHERE deleted_at IS NULL DO NOTHING
+		ON CONFLICT (tenant_id, name) WHERE application_id IS NULL AND deleted_at IS NULL DO NOTHING
 	`, tenantID)
 	if err != nil {
 		return fmt.Errorf("seed role: %w", err)
@@ -126,7 +126,7 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 		VALUES
 		  ($1, 'tenant:manage',  'Create, update, and deactivate tenants (super_admin only)'),
 		  ($1, 'admin:access',   'Access tenant admin operations (roles, permissions, user pool)')
-		ON CONFLICT (tenant_id, name) WHERE deleted_at IS NULL DO NOTHING
+		ON CONFLICT (tenant_id, name) WHERE application_id IS NULL AND deleted_at IS NULL DO NOTHING
 	`, tenantID)
 	if err != nil {
 		return fmt.Errorf("seed permissions: %w", err)

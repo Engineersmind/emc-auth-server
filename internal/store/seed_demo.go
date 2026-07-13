@@ -114,7 +114,7 @@ func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logg
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO permissions (tenant_id, name, description)
 		VALUES ($1, 'admin:access', 'Access tenant admin operations')
-		ON CONFLICT (tenant_id, name) WHERE deleted_at IS NULL
+		ON CONFLICT (tenant_id, name) WHERE application_id IS NULL AND deleted_at IS NULL
 		DO UPDATE SET description = EXCLUDED.description
 		RETURNING id
 	`, tenantID).Scan(&permAdminID); err != nil {
@@ -127,7 +127,7 @@ func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logg
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO roles (tenant_id, name, is_system)
 		VALUES ($1, 'admin', false)
-		ON CONFLICT (tenant_id, name) WHERE deleted_at IS NULL
+		ON CONFLICT (tenant_id, name) WHERE application_id IS NULL AND deleted_at IS NULL
 		DO UPDATE SET is_system = EXCLUDED.is_system
 		RETURNING id
 	`, tenantID).Scan(&roleAdminID); err != nil {
@@ -138,7 +138,7 @@ func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logg
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO roles (tenant_id, name, is_system)
 		VALUES ($1, 'member', false)
-		ON CONFLICT (tenant_id, name) WHERE deleted_at IS NULL
+		ON CONFLICT (tenant_id, name) WHERE application_id IS NULL AND deleted_at IS NULL
 		DO UPDATE SET is_system = EXCLUDED.is_system
 		RETURNING id
 	`, tenantID).Scan(&roleMemberID); err != nil {

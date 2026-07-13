@@ -39,12 +39,15 @@ const (
 
 	// Admin — permission management
 	ActionAdminPermissionCreated = "admin.permission_created"
+	ActionAdminPermissionUpdated = "admin.permission_updated"
 	ActionAdminPermissionDeleted = "admin.permission_deleted"
 
 	// Admin — role management
 	ActionAdminRoleCreated            = "admin.role_created"
+	ActionAdminRoleUpdated            = "admin.role_updated"
 	ActionAdminRolePermissionsUpdated = "admin.role_permissions_updated"
 	ActionAdminRoleDeleted            = "admin.role_deleted"
+	ActionAdminRoleDefaultSet         = "admin.role_default_set"
 
 	// Admin — user pool management
 	ActionAdminUserCreated        = "admin.user_created"
