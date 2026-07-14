@@ -428,6 +428,36 @@ definitions:
       user_id:
         type: string
     type: object
+  auth.ProviderConfigDetail:
+    properties:
+      client_id:
+        type: string
+      created_at:
+        type: string
+      enabled:
+        type: boolean
+      id:
+        type: string
+      provider:
+        type: string
+      redirect_allow:
+        items:
+          type: string
+        type: array
+      updated_at:
+        type: string
+    type: object
+  auth.UserIdentityDetail:
+    properties:
+      created_at:
+        type: string
+      id:
+        type: string
+      provider:
+        type: string
+      provider_email:
+        type: string
+    type: object
   handlers.AppLimitRequest:
     properties:
       app_id:
@@ -580,6 +610,13 @@ definitions:
       refresh_token:
         type: string
     type: object
+  handlers.OAuthExchangeRequest:
+    properties:
+      client_id:
+        type: string
+      login_code:
+        type: string
+    type: object
   handlers.RefreshRequest:
     properties:
       refresh_token:
@@ -699,6 +736,19 @@ definitions:
         type: string
       last_name:
         type: string
+    type: object
+  handlers.UpsertProviderConfigRequest:
+    properties:
+      client_id:
+        type: string
+      client_secret:
+        type: string
+      enabled:
+        type: boolean
+      redirect_allow:
+        items:
+          type: string
+        type: array
     type: object
   saml.SAMLConfig:
     properties:
@@ -1161,6 +1211,110 @@ paths:
       summary: Create application
       tags:
       - admin-applications
+  /api/v1/applications/{appID}/identity-providers:
+    get:
+      description: Returns provider configs without secrets. Requires apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.ProviderConfigDetail'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List social login providers configured for an application
+      tags:
+      - oauth
+  /api/v1/applications/{appID}/identity-providers/{provider}:
+    delete:
+      description: Deletes the provider config. Existing linked identities and sessions
+        are unaffected; new logins via this provider stop immediately. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Provider (google)
+        in: path
+        name: provider
+        required: true
+        type: string
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Remove a social login provider from an application
+      tags:
+      - oauth
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the provider credentials (client secret stored
+        AES-256-GCM encrypted) and the exact-match redirect allow-list. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Provider (google)
+        in: path
+        name: provider
+        required: true
+        type: string
+      - description: Provider config
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpsertProviderConfigRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.ProviderConfigDetail'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Configure a social login provider for an application
+      tags:
+      - oauth
   /api/v1/applications/{appID}/roles:
     get:
       description: Returns all roles scoped to the given application with their permission
@@ -1887,6 +2041,41 @@ paths:
       summary: My activity log
       tags:
       - AUTH
+  /api/v1/auth/oauth/exchange:
+    post:
+      consumes:
+      - application/json
+      description: Consumes the single-use login_code issued by the social login callback
+        and returns the standard access + refresh token pair.
+      parameters:
+      - description: client_id + login_code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.OAuthExchangeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Exchange social login code for tokens
+      tags:
+      - oauth
   /api/v1/auth/otp:
     delete:
       consumes:
@@ -3310,6 +3499,71 @@ paths:
       summary: Force password reset
       tags:
       - admin-users
+  /api/v1/users/{id}/identities:
+    get:
+      description: Returns the external identities (Google etc.) linked to one user
+        in the caller's tenant. Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.UserIdentityDetail'
+            type: array
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List a user's linked social identities
+      tags:
+      - oauth
+  /api/v1/users/{id}/identities/{provider}:
+    delete:
+      description: Removes the provider link. Refused when it is the user's only login
+        method (no password and no other identity). Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Provider (google)
+        in: path
+        name: provider
+        required: true
+        type: string
+      responses:
+        "204":
+          description: Unlinked
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Unlink a social identity from a user
+      tags:
+      - oauth
   /api/v1/users/{id}/role:
     put:
       consumes:
@@ -3365,6 +3619,80 @@ paths:
       summary: Health check
       tags:
       - system
+  /oauth/{provider}/callback:
+    get:
+      description: Consumes the single-use state, exchanges the code (PKCE), verifies
+        the provider ID token, resolves/links/provisions the user, and redirects back
+        to the application with a one-time login_code.
+      parameters:
+      - description: Provider (google)
+        in: path
+        name: provider
+        required: true
+        type: string
+      - description: Authorization code from the provider
+        in: query
+        name: code
+        type: string
+      - description: Opaque state issued at login start
+        in: query
+        name: state
+        required: true
+        type: string
+      - description: Provider error (e.g. access_denied)
+        in: query
+        name: error
+        type: string
+      responses:
+        "302":
+          description: Redirect back to the application
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Social login callback
+      tags:
+      - oauth
+  /oauth/{provider}/login:
+    get:
+      description: Validates the application and redirect target, then redirects the
+        browser to the provider's consent screen (Authorization Code + PKCE).
+      parameters:
+      - description: Provider (google)
+        in: path
+        name: provider
+        required: true
+        type: string
+      - description: Application client_id
+        in: query
+        name: client_id
+        required: true
+        type: string
+      - description: Post-login redirect target (must be in the application's allow-list;
+          optional when the list has exactly one entry)
+        in: query
+        name: redirect
+        type: string
+      responses:
+        "302":
+          description: Redirect to provider
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Start social login
+      tags:
+      - oauth
   /saml/acs:
     post:
       consumes:
