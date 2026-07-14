@@ -72,6 +72,18 @@ const (
 
 	// Auth — machine-to-machine client_credentials grant
 	ActionAuthClientCredentials = "auth.client_credentials"
+
+	// Auth — social login (issue #64)
+	ActionAuthGoogleLogin       = "auth.google_login"
+	ActionAuthGoogleLoginFailed = "auth.google_login_failed"
+	ActionAuthGoogleLinked      = "auth.google_account_linked"
+
+	// Admin — identity provider (social login) configuration
+	ActionAdminIdPConfigUpdated = "admin.identity_provider_updated"
+	ActionAdminIdPConfigDeleted = "admin.identity_provider_deleted"
+
+	// Admin — user identity management
+	ActionAdminUserIdentityUnlinked = "admin.user_identity_unlinked"
 )
 
 // ---------------------------------------------------------------------------
