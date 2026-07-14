@@ -12,6 +12,7 @@ import (
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
@@ -300,6 +301,12 @@ func (s *OAuthLoginService) HandleCallback(ctx context.Context, st *OAuthState, 
 	}
 
 	userID, outcome, err := s.resolveUser(ctx, st, claims)
+	if isUniqueViolation(err) {
+		// Two concurrent first-logins raced on the users/user_identities
+		// unique indexes; the loser re-resolves against the winner's rows
+		// (now an existing-identity or auto-link hit).
+		userID, outcome, err = s.resolveUser(ctx, st, claims)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -320,6 +327,14 @@ func (s *OAuthLoginService) HandleCallback(ctx context.Context, st *OAuthState, 
 		TenantID:    st.TenantID,
 		Email:       claims.Email,
 	}, nil
+}
+
+// isUniqueViolation reports whether err is a PostgreSQL unique-index
+// violation (SQLSTATE 23505) — the signature of two concurrent logins racing
+// to create the same user or identity link.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
 // resolveUser maps a verified provider identity onto a local app-scoped user:
@@ -363,13 +378,22 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, cla
 		if !emailVerified {
 			return 0, "", ErrOAuthLinkConflict
 		}
-		_, err = s.pool.Exec(ctx, `
+		// ON CONFLICT DO NOTHING makes the link idempotent under concurrent
+		// callbacks for the same account: both requests resolve to the same
+		// user above; whichever INSERT lands second is a no-op instead of a
+		// unique-index violation, and that request is a plain login.
+		tag, err := s.pool.Exec(ctx, `
 			INSERT INTO user_identities
 			    (user_id, tenant_id, application_id, provider, provider_sub, provider_email)
 			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT DO NOTHING
 		`, userID, st.TenantID, st.AppRowID, st.Provider, claims.Sub, claims.Email)
 		if err != nil {
 			return 0, "", fmt.Errorf("link identity: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			// A concurrent request linked this identity first.
+			return userID, "login", nil
 		}
 		return userID, "linked", nil
 	}
@@ -499,7 +523,7 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, ''), oc.id
 		FROM   users u
-		JOIN   oauth_clients oc ON oc.client_id = $3 AND oc.deleted_at IS NULL
+		JOIN   oauth_clients oc ON oc.client_id = $3 AND oc.tenant_id = $2 AND oc.deleted_at IS NULL
 		LEFT   JOIN roles r ON r.id = u.role_id
 		WHERE  u.id = $1 AND u.tenant_id = $2
 		  AND  u.is_active = true AND u.deleted_at IS NULL

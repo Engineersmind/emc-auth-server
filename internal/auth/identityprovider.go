@@ -295,18 +295,30 @@ func (s *IdentityProviderService) ListUserIdentities(ctx context.Context, tenant
 // UnlinkUserIdentity removes one linked identity from a user. Refuses when it
 // is the user's ONLY login method (no user_credentials row and no other
 // identity) — that would strand the account with no way to authenticate.
+//
+// The guard and the DELETE run in one transaction with the user row locked
+// FOR UPDATE: concurrent unlinks on the same user serialize on that lock, so
+// two requests can never both pass the guard and jointly strip the account of
+// every login method (including unlinks of two DIFFERENT providers).
 func (s *IdentityProviderService) UnlinkUserIdentity(ctx context.Context, tenantID, userID int64, provider string) error {
 	if !supportedProviders[provider] {
 		return ErrProviderNotSupported
 	}
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin unlink tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
 	var hasPassword bool
 	var identityCount int
-	err := s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM user_credentials WHERE user_id = u.id),
 		       (SELECT COUNT(*) FROM user_identities WHERE user_id = u.id)
 		FROM   users u
 		WHERE  u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+		FOR UPDATE OF u
 	`, userID, tenantID).Scan(&hasPassword, &identityCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -318,7 +330,7 @@ func (s *IdentityProviderService) UnlinkUserIdentity(ctx context.Context, tenant
 		return ErrLastLoginMethod
 	}
 
-	tag, err := s.pool.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		DELETE FROM user_identities
 		WHERE user_id = $1 AND tenant_id = $2 AND provider = $3
 	`, userID, tenantID, provider)
@@ -327,6 +339,10 @@ func (s *IdentityProviderService) UnlinkUserIdentity(ctx context.Context, tenant
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrIdentityNotFound
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit unlink: %w", err)
 	}
 	return nil
 }
