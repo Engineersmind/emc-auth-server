@@ -42,6 +42,13 @@ type RoutesConfig struct {
 	AppBaseURL string
 	// TOTPEncryptionKey is the 64-char hex key for AES-256-GCM TOTP secret encryption.
 	TOTPEncryptionKey string
+	// OAuthClientSecretEncryptionKey is the 64-char hex key for AES-256-GCM
+	// encryption of social-login provider client secrets (issue #64).
+	// Required in production/staging — the server refuses to start without it.
+	OAuthClientSecretEncryptionKey string
+	// OAuthClientSecretEncryptionKeyPrevious is the old key accepted for
+	// decryption during rotation (empty when no rotation is in progress).
+	OAuthClientSecretEncryptionKeyPrevious string
 	// SMTP fields for mailer (used in production; dev logs to console).
 	SMTPHost     string
 	SMTPPort     int
@@ -252,6 +259,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
 	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
 	samlHandler := handlers.NewSAMLHandler(samlService, jwtSvc, deps.Logger)
+
+	// Social login (issue #64) — Google OAuth for app-scoped end users.
+	// The secret box fails hard in production/staging when the key is unset;
+	// in development it falls back to an insecure zero key with a warning.
+	secretBox, sbErr := auth.NewSecretBox(deps.Config.OAuthClientSecretEncryptionKey, deps.Config.Env, "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", deps.Logger)
+	if sbErr != nil {
+		deps.Logger.Fatal().Err(sbErr).Msg("social login init failed — check OAUTH_CLIENT_SECRET_ENCRYPTION_KEY")
+	}
+	if err := secretBox.WithPreviousKey(deps.Config.OAuthClientSecretEncryptionKeyPrevious, "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS"); err != nil {
+		deps.Logger.Fatal().Err(err).Msg("social login init failed — check OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS")
+	}
+	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Logger)
+	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
+	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
 
 	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
 	e.Use(mw.AppRateLimiter(appLimitSvc, deps.Redis))
@@ -517,6 +538,25 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
 	e.GET("/saml/login", samlHandler.InitiateLogin)
 	e.POST("/saml/acs", samlHandler.HandleACS)
+
+	// Social login browser endpoints — public, top-level like SAML, but with
+	// the dedicated rate limiting SAML's routes lack (issue #64).
+	e.GET("/oauth/:provider/login", oauthHandler.Login, mw.OAuthRateLimiter(rlCfg))
+	e.GET("/oauth/:provider/callback", oauthHandler.Callback, mw.OAuthRateLimiter(rlCfg))
+
+	// Login-code exchange — the tenant app swaps the one-time code for the
+	// standard token pair. Per-IP limited; codes are single-use and ≤60s.
+	authGroup.POST("/oauth/exchange", oauthHandler.Exchange, mw.OAuthRateLimiter(rlCfg))
+
+	// Identity provider (social login) admin config — apps:read / apps:write.
+	adminGroup.GET("/applications/:appID/identity-providers", oauthHandler.ListProviderConfigs, appsRead)
+	adminGroup.PUT("/applications/:appID/identity-providers/:provider", oauthHandler.UpsertProviderConfig, appsWrite)
+	adminGroup.DELETE("/applications/:appID/identity-providers/:provider", oauthHandler.DeleteProviderConfig, appsWrite)
+
+	// User identity management — list/unlink a user's linked social
+	// identities (users:read / users:write).
+	adminGroup.GET("/users/:id/identities", oauthHandler.ListUserIdentities, usersRead)
+	adminGroup.DELETE("/users/:id/identities/:provider", oauthHandler.UnlinkUserIdentity, usersWrite)
 
 	// Agent management — apps:read / apps:write (agents are machine clients) (08-01, 08-04)
 	adminGroup.POST("/agents", agentHandler.RegisterAgent, appsWrite)

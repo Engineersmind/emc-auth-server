@@ -251,6 +251,51 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	}
 }
 
+// OAuthRateLimiter rate-limits the social-login browser redirect endpoints
+// (GET /oauth/:provider/login and /oauth/:provider/callback, issue #64).
+// Neither LoginRateLimiter (JSON-body email key) nor TokenRateLimiter (Basic
+// auth header key) fits a browser GET, so this variant keys the second bucket
+// on the client_id query parameter. When no client_id is present (e.g. the
+// callback, where only state identifies the attempt), only the per-IP limit
+// applies — state itself is single-use, so callback replay is already dead.
+func OAuthRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			ipLimiter := ipStore.getOrCreate("ip:"+ip, cfg.PerIPRate)
+			if !ipLimiter.Allow() {
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many login attempts from your IP address",
+					"retry_after": "60",
+				})
+			}
+
+			if clientID := c.QueryParam("client_id"); clientID != "" {
+				if len(clientID) > maxRateLimitEmailLen {
+					clientID = clientID[:maxRateLimitEmailLen]
+				}
+				clientLimiter := tenantStore.getOrCreate("oauthclient:"+clientID, cfg.PerTenantRate)
+				if !clientLimiter.Allow() {
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSON(http.StatusTooManyRequests, map[string]string{
+						"error":       "too many login attempts for this application",
+						"retry_after": "60",
+					})
+				}
+			}
+
+			return next(c)
+		}
+	}
+}
+
 // tokenClientID extracts the client_id from a token request for rate-limit
 // keying. Client credentials are header-only (Authorization: Basic), matching
 // the handler contract — body-sent credentials are rejected by the handler and

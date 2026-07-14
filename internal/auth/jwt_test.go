@@ -14,7 +14,6 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
 
-
 func TestJWTService_SignAndVerify(t *testing.T) {
 	pool := testhelper.NewTestDB(t)
 	testhelper.CleanupTables(t, pool)
