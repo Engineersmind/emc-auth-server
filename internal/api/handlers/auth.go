@@ -21,7 +21,8 @@ import (
 type AuthHandler struct {
 	svc       *auth.AuthService
 	resetSvc  *auth.ResetService
-	totpSvc   *auth.TOTPService // nil when TOTP not configured
+	totpSvc   *auth.TOTPService     // nil when TOTP not configured
+	emailSvc  *auth.EmailMFAService // nil when email MFA not configured
 	apiKeySvc *auth.APIKeyService
 	appSvc    *auth.ApplicationService // nil until WithApplications is called
 	jwtSvc    *auth.JWTService
@@ -38,6 +39,12 @@ func NewAuthHandler(svc *auth.AuthService, resetSvc *auth.ResetService, auditLog
 // WithTOTP attaches a TOTPService to the handler.
 func (h *AuthHandler) WithTOTP(totpSvc *auth.TOTPService) *AuthHandler {
 	h.totpSvc = totpSvc
+	return h
+}
+
+// WithEmailMFA attaches an EmailMFAService to the handler.
+func (h *AuthHandler) WithEmailMFA(emailSvc *auth.EmailMFAService) *AuthHandler {
+	h.emailSvc = emailSvc
 	return h
 }
 
@@ -432,6 +439,132 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		TenantID:     tid,
 		UserID:       uid,
 		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthLogin,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
+	return c.JSON(http.StatusOK, result.Token)
+}
+
+// MagicLinkRequest is the JSON body for POST /api/v1/auth/apps/login/magic.
+type MagicLinkRequest struct {
+	Email string `json:"email"`
+}
+
+// AppMagicLink handles POST /api/v1/auth/apps/login/magic — requests a
+// passwordless sign-in link for an end user of the authenticated application.
+//
+// @Summary      Request a magic sign-in link
+// @Description  Emails a single-use, 15-minute sign-in link to the account address if it exists in the application's user base. Always returns success for unknown emails (no account enumeration). Requires magic-link sign-in to be enabled on the application's auth policy.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        Authorization  header  string            true  "Basic base64(client_id:client_secret)"
+// @Param        body           body    MagicLinkRequest  true  "Account email"
+// @Success      200  {object}  map[string]string
+// @Failure      400  {object}  map[string]string
+// @Failure      401  {object}  map[string]string  "Invalid application credentials"
+// @Failure      403  {object}  map[string]string  "Magic link not enabled for this application"
+// @Router       /api/v1/auth/apps/login/magic [post]
+func (h *AuthHandler) AppMagicLink(c echo.Context) error {
+	var req MagicLinkRequest
+	if err := c.Bind(&req); err != nil || req.Email == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email is required"})
+	}
+
+	clientID, clientSecret, errResp := appCredentialsFromRequest(c)
+	if errResp != nil {
+		return c.JSON(http.StatusBadRequest, errResp)
+	}
+
+	err := h.svc.RequestMagicLink(c.Request().Context(), clientID, clientSecret, req.Email)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("magic link request failed")
+		if errors.Is(err, auth.ErrInvalidClient) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
+		}
+		if errors.Is(err, auth.ErrMagicLinkDisabled) || errors.Is(err, auth.ErrMagicLinkNotConfigured) {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		}
+		if containsMsg(err, "not configured on this server") {
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "magic link not configured on this server"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not send sign-in link"})
+	}
+
+	h.audit.Log(c.Request().Context(), audit.Event{
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthMagicLinkRequested,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "if an account exists for this email, a sign-in link has been sent"})
+}
+
+// MagicLinkVerifyRequest is the JSON body for POST /api/v1/auth/apps/login/magic/verify.
+type MagicLinkVerifyRequest struct {
+	Token string `json:"token"`
+}
+
+// AppMagicLinkVerify handles POST /api/v1/auth/apps/login/magic/verify —
+// consumes a magic-link token and completes the login.
+//
+// @Summary      Verify a magic sign-in link
+// @Description  Consumes the single-use token from the emailed link. The application's MFA policy still applies: the response is a token pair, an OTP challenge (requires_otp), or a forced-enrollment challenge (403 mfa_enrollment_required) — exactly like a password login.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        Authorization  header  string                  true  "Basic base64(client_id:client_secret)"
+// @Param        body           body    MagicLinkVerifyRequest  true  "Token from the emailed link"
+// @Success      200  {object}  auth.AuthResult
+// @Failure      401  {object}  map[string]string  "Invalid application credentials or invalid/expired link"
+// @Failure      403  {object}  map[string]string  "MFA enrollment required"
+// @Router       /api/v1/auth/apps/login/magic/verify [post]
+func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
+	var req MagicLinkVerifyRequest
+	if err := c.Bind(&req); err != nil || req.Token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "token is required"})
+	}
+
+	clientID, clientSecret, errResp := appCredentialsFromRequest(c)
+	if errResp != nil {
+		return c.JSON(http.StatusBadRequest, errResp)
+	}
+
+	result, err := h.svc.VerifyMagicLink(c.Request().Context(), clientID, clientSecret, req.Token)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("magic link verify failed")
+		h.audit.Log(c.Request().Context(), audit.Event{
+			Action:       audit.ActionAuthLoginFailed,
+			ResourceType: "user",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		})
+		if errors.Is(err, auth.ErrInvalidClient) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
+		}
+		if errors.Is(err, auth.ErrInvalidMagicLink) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "sign-in failed"})
+	}
+
+	if result.OTPChallenge != nil {
+		return c.JSON(http.StatusOK, result.OTPChallenge)
+	}
+	if result.MFAEnrollment != nil {
+		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
+	}
+
+	tid, uid := claimsFromToken(result.Token.AccessToken)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     tid,
+		UserID:       uid,
 		Action:       audit.ActionAuthLogin,
 		ResourceType: "user",
 		IPAddress:    c.RealIP(),
@@ -981,6 +1114,395 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 	})
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "TOTP 2FA activated successfully"})
+}
+
+// TOTPStatus handles GET /api/v1/auth/otp/status.
+//
+// @Summary      Get own MFA status
+// @Description  Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low.
+// @Tags         AUTH
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  auth.TOTPStatus
+// @Failure      401  {object}  map[string]string
+// @Router       /api/v1/auth/otp/status [get]
+func (h *AuthHandler) TOTPStatus(c echo.Context) error {
+	if h.totpSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	userID, err := strconv.ParseInt(claims.UserID, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid user_id in token"})
+	}
+
+	status, err := h.totpSvc.Status(c.Request().Context(), userID)
+	if err != nil {
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("TOTP status failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load MFA status"})
+	}
+
+	if h.emailSvc != nil {
+		emailActive, err := h.emailSvc.IsActive(c.Request().Context(), userID)
+		if err != nil {
+			h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA status failed")
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load MFA status"})
+		}
+		status.EmailActive = emailActive
+	}
+	return c.JSON(http.StatusOK, status)
+}
+
+// TOTPRegenerateCodesRequest is the JSON body for POST /api/v1/auth/otp/backup-codes.
+type TOTPRegenerateCodesRequest struct {
+	Code string `json:"code"`
+}
+
+// TOTPRegenerateCodes handles POST /api/v1/auth/otp/backup-codes.
+//
+// @Summary      Regenerate backup codes
+// @Description  Replaces all remaining backup codes with a fresh set of 8 WITHOUT rotating the TOTP secret — the authenticator app keeps working. Requires a valid current TOTP or backup code. Every previous backup code is invalidated; the new plaintext codes are shown exactly once.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      TOTPRegenerateCodesRequest  true  "Current TOTP or backup code"
+// @Success      200   {object}  map[string][]string
+// @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string  "Missing or invalid proof code"
+// @Router       /api/v1/auth/otp/backup-codes [post]
+func (h *AuthHandler) TOTPRegenerateCodes(c echo.Context) error {
+	if h.totpSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
+	}
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	var req TOTPRegenerateCodesRequest
+	if err := c.Bind(&req); err != nil || req.Code == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required to regenerate backup codes"})
+	}
+
+	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
+	codes, err := h.totpSvc.RegenerateBackupCodes(c.Request().Context(), userID, req.Code)
+	if err != nil {
+		if errors.Is(err, auth.ErrTOTPProofRequired) {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		}
+		if containsMsg(err, "not active") || containsMsg(err, "no TOTP enrollment") {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "TOTP is not active for this account"})
+		}
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("TOTP backup code regeneration failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to regenerate backup codes"})
+	}
+
+	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &tenantID,
+		UserID:       &userID,
+		ActorEmail:   claims.Email,
+		Action:       audit.ActionAuthMFACodesRegenerated,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
+	return c.JSON(http.StatusOK, map[string][]string{"backup_codes": codes})
+}
+
+// ─── Email MFA Handlers (issue #63) ─────────────────────────────────────────
+
+// mfaClaimIDs extracts the numeric user and tenant ids from JWT claims.
+func mfaClaimIDs(c echo.Context) (claims *auth.Claims, userID, tenantID int64, ok bool) {
+	claims, valid := c.Get("user").(*auth.Claims)
+	if !valid || claims == nil {
+		return nil, 0, 0, false
+	}
+	userID, err := strconv.ParseInt(claims.UserID, 10, 64)
+	if err != nil {
+		return nil, 0, 0, false
+	}
+	tenantID, err = strconv.ParseInt(claims.TenantID, 10, 64)
+	if err != nil {
+		return nil, 0, 0, false
+	}
+	return claims, userID, tenantID, true
+}
+
+// auditMFA logs an MFA lifecycle event for the authenticated user.
+func (h *AuthHandler) auditMFA(c echo.Context, tenantID, userID int64, email, action string) {
+	h.audit.Log(c.Request().Context(), audit.Event{
+		TenantID:     &tenantID,
+		UserID:       &userID,
+		ActorEmail:   email,
+		Action:       action,
+		ResourceType: "user",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+}
+
+// emailMFAErrorResponse maps EmailMFAService errors onto HTTP responses.
+func emailMFAErrorResponse(c echo.Context, err error) error {
+	switch {
+	case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrMFAMethodNotAllowed), errors.Is(err, auth.ErrMFARequiredByPolicy):
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	case errors.Is(err, auth.ErrTooManyOTPAttempts), errors.Is(err, auth.ErrTooManyResends):
+		return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+	case errors.Is(err, auth.ErrEmailCodeInvalid):
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
+	case errors.Is(err, auth.ErrEmailMFANotActive):
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, auth.ErrUserNotFound):
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+	}
+	return nil
+}
+
+// EmailMFAEnroll handles POST /api/v1/auth/otp/email/enroll.
+//
+// @Summary      Enroll in email MFA
+// @Description  Starts email-OTP enrollment: sends a verification code to the account's email address. Activate with POST /auth/otp/email/activate. Rejected when the application's MFA mode is 'disabled' or its policy does not allow the email method.
+// @Tags         AUTH
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  map[string]string
+// @Failure      401  {object}  map[string]string
+// @Failure      403  {object}  map[string]string  "MFA disabled or email method not allowed for this application"
+// @Router       /api/v1/auth/otp/email/enroll [post]
+func (h *AuthHandler) EmailMFAEnroll(c echo.Context) error {
+	if h.emailSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
+	}
+	claims, userID, tenantID, ok := mfaClaimIDs(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	if err := h.emailSvc.BeginEnrollment(c.Request().Context(), userID, tenantID, claims.Email); err != nil {
+		if resp := emailMFAErrorResponse(c, err); resp != nil {
+			return resp
+		}
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA enroll failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "email MFA enrollment failed"})
+	}
+
+	h.auditMFA(c, tenantID, userID, claims.Email, audit.ActionAuthMFAEmailEnrolled)
+	return c.JSON(http.StatusOK, map[string]string{"message": "verification code sent — confirm with POST /auth/otp/email/activate"})
+}
+
+// EmailMFACodeRequest is the JSON body for the email-MFA code endpoints.
+type EmailMFACodeRequest struct {
+	Code string `json:"code"`
+}
+
+// EmailMFAActivate handles POST /api/v1/auth/otp/email/activate.
+//
+// @Summary      Activate email MFA
+// @Description  Verifies the emailed code and marks email MFA active. From then on, logins are challenged with a one-time code sent to the account's inbox.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      EmailMFACodeRequest  true  "Emailed verification code"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid or expired code"
+// @Failure      429   {object}  map[string]string  "Attempt budget exhausted"
+// @Router       /api/v1/auth/otp/email/activate [post]
+func (h *AuthHandler) EmailMFAActivate(c echo.Context) error {
+	if h.emailSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
+	}
+	claims, userID, tenantID, ok := mfaClaimIDs(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	var req EmailMFACodeRequest
+	if err := c.Bind(&req); err != nil || req.Code == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required"})
+	}
+
+	if err := h.emailSvc.ActivateEnrollment(c.Request().Context(), userID, req.Code); err != nil {
+		if resp := emailMFAErrorResponse(c, err); resp != nil {
+			return resp
+		}
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA activate failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "email MFA activation failed"})
+	}
+
+	h.auditMFA(c, tenantID, userID, claims.Email, audit.ActionAuthMFAEmailActivated)
+	return c.JSON(http.StatusOK, map[string]string{"message": "email MFA activated successfully"})
+}
+
+// EmailMFASendCode handles POST /api/v1/auth/otp/email/send.
+//
+// @Summary      Send an email MFA verification code
+// @Description  Sends a fresh one-time code to the account's inbox for an already-active email MFA enrollment — used as proof for self-service actions such as disabling email MFA.
+// @Tags         AUTH
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  map[string]string
+// @Failure      400  {object}  map[string]string  "Email MFA not active"
+// @Failure      401  {object}  map[string]string
+// @Router       /api/v1/auth/otp/email/send [post]
+func (h *AuthHandler) EmailMFASendCode(c echo.Context) error {
+	if h.emailSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
+	}
+	claims, userID, tenantID, ok := mfaClaimIDs(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	if err := h.emailSvc.SendVerificationCode(c.Request().Context(), userID, tenantID, claims.Email); err != nil {
+		if resp := emailMFAErrorResponse(c, err); resp != nil {
+			return resp
+		}
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA send failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to send verification code"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "verification code sent"})
+}
+
+// EmailMFADisable handles DELETE /api/v1/auth/otp/email.
+//
+// @Summary      Disable email MFA
+// @Description  Disables email MFA for the current user. Requires a fresh emailed code (request one via POST /auth/otp/email/send). Rejected when it is the user's last second factor under a 'required' application policy.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      EmailMFACodeRequest  true  "Emailed verification code"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid or expired code"
+// @Failure      403   {object}  map[string]string  "MFA is required by the application's policy"
+// @Router       /api/v1/auth/otp/email [delete]
+func (h *AuthHandler) EmailMFADisable(c echo.Context) error {
+	if h.emailSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
+	}
+	claims, userID, tenantID, ok := mfaClaimIDs(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+
+	var req EmailMFACodeRequest
+	if err := c.Bind(&req); err != nil || req.Code == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required to disable email MFA"})
+	}
+
+	if err := h.emailSvc.Disable(c.Request().Context(), userID, tenantID, req.Code); err != nil {
+		if resp := emailMFAErrorResponse(c, err); resp != nil {
+			return resp
+		}
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA disable failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to disable email MFA"})
+	}
+
+	h.auditMFA(c, tenantID, userID, claims.Email, audit.ActionAuthMFAEmailDisabled)
+	return c.JSON(http.StatusOK, map[string]string{"message": "email MFA disabled"})
+}
+
+// LoginOTPResendRequest is the JSON body for POST /api/v1/auth/login/otp/resend.
+type LoginOTPResendRequest struct {
+	OTPSessionToken string `json:"otp_session_token"`
+}
+
+// LoginOTPResend handles POST /api/v1/auth/login/otp/resend — re-sends the
+// emailed code for an open login challenge.
+//
+// @Summary      Resend login email code
+// @Description  Re-sends the one-time email code for an open OTP challenge (max 3 re-sends per challenge). Only available when the challenge's methods include "email".
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        body  body      LoginOTPResendRequest  true  "OTP session token"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid or expired session"
+// @Failure      429   {object}  map[string]string  "Re-send budget exhausted"
+// @Router       /api/v1/auth/login/otp/resend [post]
+func (h *AuthHandler) LoginOTPResend(c echo.Context) error {
+	var req LoginOTPResendRequest
+	if err := c.Bind(&req); err != nil || req.OTPSessionToken == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "otp_session_token is required"})
+	}
+
+	if err := h.svc.ResendLoginOTP(c.Request().Context(), req.OTPSessionToken); err != nil {
+		h.logger.Warn().Err(err).Msg("login OTP resend failed")
+		if errors.Is(err, auth.ErrTooManyResends) {
+			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		}
+		if containsMsg(err, "not configured") {
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
+		}
+		if containsMsg(err, "invalid or expired") {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired OTP session"})
+		}
+		if containsMsg(err, "not an available method") {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to resend code"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "code sent"})
+}
+
+// MFAEmailPendingRequest is the JSON body for POST /api/v1/auth/login/mfa/email.
+type MFAEmailPendingRequest struct {
+	EnrollmentToken string `json:"enrollment_token"`
+}
+
+// MFAEmailPending handles POST /api/v1/auth/login/mfa/email — the EMAIL path
+// of a forced enrollment.
+//
+// @Summary      Begin forced MFA enrollment via email
+// @Description  Sends a one-time code to the pending account's inbox for a login against a 'required'-MFA application. Submitting that code to /auth/login/mfa/activate enrolls the user in email MFA and completes the login. Available only when the application's allowed_methods include "email".
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        body  body      MFAEmailPendingRequest  true  "Enrollment token from the login response"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "Invalid or expired enrollment token"
+// @Failure      403   {object}  map[string]string  "Email method not allowed for this application"
+// @Failure      429   {object}  map[string]string  "Re-send budget exhausted"
+// @Router       /api/v1/auth/login/mfa/email [post]
+func (h *AuthHandler) MFAEmailPending(c echo.Context) error {
+	var req MFAEmailPendingRequest
+	if err := c.Bind(&req); err != nil || req.EnrollmentToken == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "enrollment_token is required"})
+	}
+
+	_, err := h.svc.SendPendingEnrollmentCode(c.Request().Context(), req.EnrollmentToken)
+	if err != nil {
+		h.logger.Warn().Err(err).Msg("pending email MFA send failed")
+		if errors.Is(err, auth.ErrMFAMethodNotAllowed) {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		}
+		if errors.Is(err, auth.ErrTooManyResends) {
+			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		}
+		if containsMsg(err, "not configured") {
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
+		}
+		if containsMsg(err, "invalid or expired") {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired enrollment token"})
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to send enrollment code"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"message": "code sent — activate with POST /auth/login/mfa/activate"})
 }
 
 // TOTPDisableRequest is the JSON body for DELETE /api/v1/auth/otp.

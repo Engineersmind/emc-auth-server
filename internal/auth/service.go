@@ -23,6 +23,7 @@ type AuthService struct {
 	pool     *pgxpool.Pool
 	jwtSvc   *JWTService
 	totpSvc  *TOTPService        // nil when TOTP not configured
+	emailSvc *EmailMFAService    // nil when email MFA not configured
 	redisCli *redis.Client       // used for OTP session storage
 	appSvc   *ApplicationService // nil when application context is not needed
 	logger   zerolog.Logger
@@ -45,6 +46,13 @@ func (s *AuthService) WithTOTP(totpSvc *TOTPService, redisCli *redis.Client) *Au
 // validate X-Client-ID on login and register and stamp app_id into JWTs.
 func (s *AuthService) WithApplications(appSvc *ApplicationService) *AuthService {
 	s.appSvc = appSvc
+	return s
+}
+
+// WithEmailMFA attaches an EmailMFAService so login challenges can mint and
+// verify emailed one-time codes for users enrolled in the email method.
+func (s *AuthService) WithEmailMFA(emailSvc *EmailMFAService) *AuthService {
+	s.emailSvc = emailSvc
 	return s
 }
 
@@ -98,22 +106,29 @@ type AuthResult struct {
 	// On a 401 with code="token_invalid" or if refresh fails, redirect to login.
 }
 
-// OTPChallenge is returned by Login when the user has active TOTP.
+// OTPChallenge is returned by Login when the user has an active second factor.
+// Methods lists what the user can complete the challenge with ("totp",
+// "email"); when it includes "email" a code has already been sent to the
+// account's inbox (re-sendable via POST /auth/login/otp/resend).
 type OTPChallenge struct {
-	RequiresOTP     bool   `json:"requires_otp"`
-	OTPSessionToken string `json:"otp_session_token"`
-	ExpiresIn       int    `json:"expires_in"`
+	RequiresOTP     bool     `json:"requires_otp"`
+	OTPSessionToken string   `json:"otp_session_token"`
+	Methods         []string `json:"methods"`
+	ExpiresIn       int      `json:"expires_in"`
 }
 
 // MFAEnrollmentChallenge is returned by Login when the user's application has
-// MFA mode 'required' but the user has no active TOTP enrollment. The
-// enrollment token authorizes exactly two calls — POST /auth/login/mfa/enroll
-// and POST /auth/login/mfa/activate — for this one user; activation completes
-// the pending login and returns the token pair. No JWT exists until then.
+// MFA mode 'required' but the user has no active second factor. The
+// enrollment token authorizes only the /auth/login/mfa/* endpoints for this
+// one user; AllowedMethods lists which methods the application permits
+// ("totp" → enroll + activate, "email" → email/send + activate). Activation
+// completes the pending login and returns the token pair. No JWT exists until
+// then.
 type MFAEnrollmentChallenge struct {
-	MFAEnrollmentRequired bool   `json:"mfa_enrollment_required"`
-	EnrollmentToken       string `json:"enrollment_token"`
-	ExpiresIn             int    `json:"expires_in"`
+	MFAEnrollmentRequired bool     `json:"mfa_enrollment_required"`
+	EnrollmentToken       string   `json:"enrollment_token"`
+	AllowedMethods        []string `json:"allowed_methods"`
+	ExpiresIn             int      `json:"expires_in"`
 }
 
 // LoginResult wraps a full token pair, an OTP challenge, or a forced-MFA
@@ -482,37 +497,10 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		perms = []string{}
 	}
 
-	if s.totpSvc != nil && s.redisCli != nil {
-		active, err := s.totpSvc.IsActive(ctx, userID)
-		if err != nil {
-			s.logger.Warn().Err(err).Msg("login: failed to check TOTP status, skipping TOTP step")
-		} else if active {
-			// An active enrollment always gates login — even when the
-			// application's policy is 'disabled' (fail-secure: the server never
-			// silently skips a second factor the user set up; admins remove
-			// enrollments explicitly via the MFA reset API).
-			challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID)
-			if err != nil {
-				return nil, fmt.Errorf("create OTP session: %w", err)
-			}
-			return &LoginResult{OTPChallenge: challenge}, nil
-		} else if appRowID != 0 {
-			// Application-scoped user without an active enrollment: enforce the
-			// application's MFA policy. Fail closed on a policy read error —
-			// issuing tokens when we cannot prove the app does NOT require MFA
-			// would turn a transient DB error into a silent policy bypass.
-			mode, err := s.totpSvc.GetAppMFAMode(ctx, appRowID)
-			if err != nil {
-				return nil, fmt.Errorf("load app MFA policy: %w", err)
-			}
-			if mode == MFAModeRequired {
-				challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID)
-				if err != nil {
-					return nil, fmt.Errorf("create MFA enrollment session: %w", err)
-				}
-				return &LoginResult{MFAEnrollment: challenge}, nil
-			}
-		}
+	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms); err != nil {
+		return nil, err
+	} else if gate != nil {
+		return gate, nil
 	}
 
 	// Legacy tagging mode (ClientID without a secret): validate the id exists
@@ -530,6 +518,89 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		return nil, err
 	}
 	return &LoginResult{Token: tokens}, nil
+}
+
+// mfaGate applies the post-credential MFA step shared by every first factor
+// (password login and magic-link verification). It returns a non-nil
+// LoginResult carrying a challenge when one is due, or nil when the caller
+// may issue tokens directly:
+//
+//   - any ACTIVE second factor (TOTP or email) → OTP challenge, even when the
+//     application's policy is 'disabled' (fail-secure: the server never
+//     silently skips a factor the user set up; admins remove enrollments
+//     explicitly via the MFA reset API);
+//   - application mode 'required' and no active factor → forced-enrollment
+//     challenge. Fails closed on a policy read error — issuing tokens when we
+//     cannot prove the app does NOT require MFA would turn a transient DB
+//     error into a silent policy bypass.
+func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string) (*LoginResult, error) {
+	if s.totpSvc == nil || s.redisCli == nil {
+		return nil, nil
+	}
+
+	// Load the application's policy first so it governs which active factors are
+	// offered. Fail closed on a read error — issuing tokens when we cannot read
+	// the policy would turn a transient DB error into a silent MFA bypass.
+	// appRowID 0 is a non-app-scoped login (tenant admin): no app policy, so
+	// every active factor is honoured.
+	var mode string
+	var allowedMethods []string
+	if appRowID != 0 {
+		var cfgErr error
+		mode, allowedMethods, cfgErr = s.totpSvc.GetAppMFAConfig(ctx, appRowID)
+		if cfgErr != nil {
+			return nil, fmt.Errorf("load app MFA policy: %w", cfgErr)
+		}
+	}
+
+	totpActive, err := s.totpSvc.IsActive(ctx, userID)
+	if err != nil {
+		s.logger.Warn().Err(err).Msg("login: failed to check TOTP status, skipping TOTP step")
+	}
+	emailActive := false
+	if s.emailSvc != nil {
+		emailActive, err = s.emailSvc.IsActive(ctx, userID)
+		if err != nil {
+			s.logger.Warn().Err(err).Msg("login: failed to check email MFA status, skipping email step")
+			emailActive = false
+		}
+	}
+
+	// The application policy is authoritative: a factor is only challenged/sent
+	// when it is BOTH active for the user AND still in the app's allowed_methods.
+	// Removing a method from the policy therefore stops it being offered even to
+	// users who had already enrolled it. A non-app login (appRowID 0) has no
+	// policy and honours every active factor.
+	permitted := func(method string) bool {
+		return appRowID == 0 || methodAllowed(allowedMethods, method)
+	}
+	var methods []string
+	if totpActive && permitted(MFAMethodTOTP) {
+		methods = append(methods, MFAMethodTOTP)
+	}
+	if emailActive && permitted(MFAMethodEmail) {
+		methods = append(methods, MFAMethodEmail)
+	}
+
+	if len(methods) > 0 {
+		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods)
+		if err != nil {
+			return nil, fmt.Errorf("create OTP session: %w", err)
+		}
+		return &LoginResult{OTPChallenge: challenge}, nil
+	}
+
+	// No policy-permitted active factor remains. Under 'required' the user must
+	// (re)enroll a permitted method before finishing login; otherwise the login
+	// proceeds (the app does not enforce MFA).
+	if appRowID != 0 && mode == MFAModeRequired {
+		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods)
+		if err != nil {
+			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
+		}
+		return &LoginResult{MFAEnrollment: challenge}, nil
+	}
+	return nil, nil
 }
 
 // LoginOTPInput is the payload for completing a TOTP-gated login.
@@ -556,12 +627,23 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 		return nil, err
 	}
 
-	err = s.totpSvc.Verify(ctx, session.UserID, in.Code)
-	if err != nil {
-		err2 := s.totpSvc.VerifyBackupCode(ctx, session.UserID, in.Code)
-		if err2 != nil {
-			return nil, fmt.Errorf("invalid TOTP code")
+	// Accept whichever active method the code satisfies: the emailed code for
+	// this session, a TOTP code, or a backup code.
+	verified := false
+	if methodAllowed(session.Methods, MFAMethodEmail) {
+		if storedHash, gerr := s.redisCli.Get(ctx, key+":email").Result(); gerr == nil && HashToken(in.Code) == storedHash {
+			verified = true
 		}
+	}
+	if !verified && methodAllowed(session.Methods, MFAMethodTOTP) {
+		if s.totpSvc.Verify(ctx, session.UserID, in.Code) == nil {
+			verified = true
+		} else if s.totpSvc.VerifyBackupCode(ctx, session.UserID, in.Code) == nil {
+			verified = true
+		}
+	}
+	if !verified {
+		return nil, fmt.Errorf("invalid TOTP code")
 	}
 
 	s.clearOTPSession(ctx, key)
@@ -586,6 +668,11 @@ func (s *AuthService) EnrollPending(ctx context.Context, enrollmentToken string)
 		return nil, nil, fmt.Errorf("invalid or expired enrollment session")
 	}
 
+	// Forced enrollment must respect the application's allowed method set.
+	if !methodAllowed(session.Methods, MFAMethodTOTP) {
+		return nil, nil, ErrMFAMethodNotAllowed
+	}
+
 	// The session exists because the user had no ACTIVE enrollment at the
 	// password step. If one was activated since (e.g. a parallel login
 	// completed enrollment first), this token must not rotate it.
@@ -599,21 +686,49 @@ func (s *AuthService) EnrollPending(ctx context.Context, enrollmentToken string)
 	}
 
 	// The authenticator entry is labelled with the owning application's name.
-	issuer := ""
-	if session.AppID != "" {
-		if id, perr := strconv.ParseInt(session.AppID, 10, 64); perr == nil {
-			var name string
-			if qerr := s.pool.QueryRow(ctx, `SELECT name FROM oauth_clients WHERE id = $1`, id).Scan(&name); qerr == nil {
-				issuer = name
-			}
-		}
-	}
+	issuer := s.appNameByID(ctx, session.AppID)
 
 	result, err := s.totpSvc.Enroll(ctx, session.UserID, session.TenantID, session.Email, issuer)
 	if err != nil {
 		return nil, nil, err
 	}
 	return result, session, nil
+}
+
+// SendPendingEnrollmentCode starts the EMAIL path of a forced enrollment:
+// mints a one-time code bound to the enrollment session and sends it to the
+// account's inbox. Activating with that code (ActivatePending) enrolls the
+// user in email MFA and completes the login.
+func (s *AuthService) SendPendingEnrollmentCode(ctx context.Context, enrollmentToken string) (*OTPSession, error) {
+	if s.emailSvc == nil || s.redisCli == nil {
+		return nil, fmt.Errorf("email MFA not configured on this server")
+	}
+
+	key := mfaEnrollKey(enrollmentToken)
+	session, err := s.loadOTPSession(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("invalid or expired enrollment session")
+	}
+	if !methodAllowed(session.Methods, MFAMethodEmail) {
+		return session, ErrMFAMethodNotAllowed
+	}
+
+	resends, err := s.redisCli.Incr(ctx, key+":resend").Result()
+	if err != nil {
+		return session, ErrServiceUnavailable
+	}
+	if resends == 1 {
+		s.redisCli.Expire(ctx, key+":resend", MFAEnrollmentSessionTTL+time.Minute) //nolint:errcheck
+	}
+	if resends > EmailOTPMaxResends {
+		return session, ErrTooManyResends
+	}
+
+	appName := s.appNameByID(ctx, session.AppID)
+	if err := s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), MFAEnrollmentSessionTTL); err != nil {
+		return session, err
+	}
+	return session, nil
 }
 
 // ActivatePending verifies the first TOTP code of a forced enrollment,
@@ -636,8 +751,26 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 		return nil, session, err
 	}
 
-	if err := s.totpSvc.VerifyAndActivate(ctx, session.UserID, code); err != nil {
-		return nil, session, err
+	// The code may satisfy either pending path: the emailed enrollment code
+	// (email method) or the first authenticator code (TOTP method). The email
+	// hash is checked first — a 6-digit emailed code must never be fed into
+	// the TOTP activator, and vice versa a TOTP code will not match the hash.
+	activated := false
+	if methodAllowed(session.Methods, MFAMethodEmail) && s.emailSvc != nil {
+		if storedHash, gerr := s.redisCli.Get(ctx, key+":email").Result(); gerr == nil && HashToken(code) == storedHash {
+			if err := s.emailSvc.ActivatePendingEnrollment(ctx, session.UserID, session.TenantID); err != nil {
+				return nil, session, err
+			}
+			activated = true
+		}
+	}
+	if !activated {
+		if !methodAllowed(session.Methods, MFAMethodTOTP) {
+			return nil, session, fmt.Errorf("invalid TOTP code")
+		}
+		if err := s.totpSvc.VerifyAndActivate(ctx, session.UserID, code); err != nil {
+			return nil, session, err
+		}
 	}
 
 	s.clearOTPSession(ctx, key)
@@ -649,8 +782,10 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 	return tokens, session, nil
 }
 
-// createOTPSession stores pre-auth user state in Redis and returns a challenge token.
-func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string) (*OTPChallenge, error) {
+// createOTPSession stores pre-auth user state in Redis and returns a challenge
+// token. When the user's active methods include email, a one-time code is
+// minted and sent to the account's inbox alongside the challenge.
+func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string) (*OTPChallenge, error) {
 	sessionToken, err := s.storePreAuthSession(ctx, otpSessionKey, OTPSessionTTL, OTPSession{
 		UserID:   userID,
 		TenantID: tenantID,
@@ -658,20 +793,67 @@ func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int
 		RoleName: roleName,
 		Perms:    perms,
 		AppID:    appID,
+		Methods:  methods,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	if methodAllowed(methods, MFAMethodEmail) && s.emailSvc != nil {
+		appName := s.appNameByID(ctx, appID)
+		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(sessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL); err != nil {
+			// If email is the ONLY method the challenge would be uncompletable —
+			// fail the login rather than strand the user. With TOTP also active
+			// the challenge still works, so log and continue.
+			if !methodAllowed(methods, MFAMethodTOTP) {
+				s.clearOTPSession(ctx, otpSessionKey(sessionToken))
+				return nil, fmt.Errorf("send email OTP: %w", err)
+			}
+			s.logger.Warn().Err(err).Msg("login: email OTP send failed, TOTP still available")
+		}
+	}
+
 	return &OTPChallenge{
 		RequiresOTP:     true,
 		OTPSessionToken: sessionToken,
+		Methods:         methods,
 		ExpiresIn:       int(OTPSessionTTL.Seconds()),
 	}, nil
 }
 
+// ResendLoginOTP re-sends the emailed code for an open OTP challenge, capped
+// at EmailOTPMaxResends per session.
+func (s *AuthService) ResendLoginOTP(ctx context.Context, otpSessionToken string) error {
+	if s.emailSvc == nil || s.redisCli == nil {
+		return fmt.Errorf("email MFA not configured on this server")
+	}
+	key := otpSessionKey(otpSessionToken)
+	session, err := s.loadOTPSession(ctx, key)
+	if err != nil {
+		return fmt.Errorf("invalid or expired OTP session")
+	}
+	if !methodAllowed(session.Methods, MFAMethodEmail) {
+		return fmt.Errorf("email is not an available method for this login")
+	}
+
+	resends, err := s.redisCli.Incr(ctx, key+":resend").Result()
+	if err != nil {
+		return ErrServiceUnavailable
+	}
+	if resends == 1 {
+		s.redisCli.Expire(ctx, key+":resend", OTPSessionTTL+time.Minute) //nolint:errcheck
+	}
+	if resends > EmailOTPMaxResends {
+		return ErrTooManyResends
+	}
+
+	appName := s.appNameByID(ctx, session.AppID)
+	return s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), OTPSessionTTL)
+}
+
 // createMFAEnrollmentSession stores pre-auth state for a forced enrollment and
 // returns the challenge handed back by Login instead of tokens.
-func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string) (*MFAEnrollmentChallenge, error) {
+func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, allowedMethods []string) (*MFAEnrollmentChallenge, error) {
 	enrollmentToken, err := s.storePreAuthSession(ctx, mfaEnrollKey, MFAEnrollmentSessionTTL, OTPSession{
 		UserID:   userID,
 		TenantID: tenantID,
@@ -679,6 +861,7 @@ func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, te
 		RoleName: roleName,
 		Perms:    perms,
 		AppID:    appID,
+		Methods:  allowedMethods,
 	})
 	if err != nil {
 		return nil, err
@@ -686,8 +869,40 @@ func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, te
 	return &MFAEnrollmentChallenge{
 		MFAEnrollmentRequired: true,
 		EnrollmentToken:       enrollmentToken,
+		AllowedMethods:        allowedMethods,
 		ExpiresIn:             int(MFAEnrollmentSessionTTL.Seconds()),
 	}, nil
+}
+
+// appRowIDFromClaim parses the string-encoded oauth_clients.id used in JWT
+// claims and pre-auth sessions; nil for tenant-level ("") or malformed values.
+func appRowIDFromClaim(appID string) *int64 {
+	if appID == "" {
+		return nil
+	}
+	id, err := strconv.ParseInt(appID, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+
+// appNameByID resolves an application's display name from its string row id;
+// returns "" for tenant-level logins or on lookup failure (personalisation
+// only — never fatal).
+func (s *AuthService) appNameByID(ctx context.Context, appID string) string {
+	if appID == "" {
+		return ""
+	}
+	id, err := strconv.ParseInt(appID, 10, 64)
+	if err != nil {
+		return ""
+	}
+	var name string
+	if err := s.pool.QueryRow(ctx, `SELECT name FROM oauth_clients WHERE id = $1`, id).Scan(&name); err != nil {
+		return ""
+	}
+	return name
 }
 
 // storePreAuthSession mints an opaque token, stores the session under
@@ -743,9 +958,10 @@ func (s *AuthService) bumpOTPAttempts(ctx context.Context, baseKey string, ttl t
 	return nil
 }
 
-// clearOTPSession removes a pre-auth session and its attempt counter.
+// clearOTPSession removes a pre-auth session and its sibling keys (attempt
+// counter, pending email code, resend counter).
 func (s *AuthService) clearOTPSession(ctx context.Context, baseKey string) {
-	s.redisCli.Del(ctx, baseKey, baseKey+":attempts") //nolint:errcheck
+	s.redisCli.Del(ctx, baseKey, baseKey+":attempts", baseKey+":email", baseKey+":resend") //nolint:errcheck
 }
 
 func otpSessionKey(token string) string {

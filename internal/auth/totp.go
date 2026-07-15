@@ -198,6 +198,69 @@ func (s *TOTPService) Disable(ctx context.Context, userID int64, code string) er
 	return nil
 }
 
+// TOTPStatus is returned by Status — the user-facing view of their own MFA
+// state, including how many single-use backup codes remain so clients can
+// prompt regeneration before the user runs out. EmailActive reflects the
+// email-OTP method and is populated by the handler (email MFA lives in its
+// own service).
+type TOTPStatus struct {
+	Enrolled             bool `json:"enrolled"`
+	Active               bool `json:"active"`
+	BackupCodesRemaining int  `json:"backup_codes_remaining"`
+	EmailActive          bool `json:"email_active"`
+}
+
+// Status reports the user's TOTP enrollment state and remaining backup codes.
+func (s *TOTPService) Status(ctx context.Context, userID int64) (*TOTPStatus, error) {
+	st := &TOTPStatus{}
+	var codes []string
+	err := s.pool.QueryRow(ctx, `
+		SELECT is_active, backup_codes FROM totp_secrets WHERE user_id = $1
+	`, userID).Scan(&st.Active, &codes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return st, nil
+		}
+		return nil, fmt.Errorf("load TOTP status: %w", err)
+	}
+	st.Enrolled = true
+	st.BackupCodesRemaining = len(codes)
+	return st, nil
+}
+
+// RegenerateBackupCodes replaces the user's backup codes with a fresh set of
+// BackupCodeCount codes WITHOUT rotating the TOTP secret — the authenticator
+// app keeps working. Requires an active enrollment and proof of control
+// (a valid current TOTP or remaining backup code); every previous backup code
+// is invalidated. The plaintext codes are returned exactly once.
+func (s *TOTPService) RegenerateBackupCodes(ctx context.Context, userID int64, currentCode string) ([]string, error) {
+	if currentCode == "" {
+		return nil, ErrTOTPProofRequired
+	}
+	if err := s.Verify(ctx, userID, currentCode); err != nil {
+		if err2 := s.VerifyBackupCode(ctx, userID, currentCode); err2 != nil {
+			return nil, ErrTOTPProofRequired
+		}
+	}
+
+	plainCodes, hashedCodes, err := generateBackupCodes(BackupCodeCount, BackupCodeLength)
+	if err != nil {
+		return nil, fmt.Errorf("generate backup codes: %w", err)
+	}
+
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE totp_secrets SET backup_codes = $2, updated_at = NOW()
+		WHERE user_id = $1 AND is_active = true
+	`, userID, hashedCodes)
+	if err != nil {
+		return nil, fmt.Errorf("store backup codes: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, fmt.Errorf("TOTP not active for this user")
+	}
+	return plainCodes, nil
+}
+
 // IsActive returns true if the user has an active TOTP enrollment.
 func (s *TOTPService) IsActive(ctx context.Context, userID int64) (bool, error) {
 	var active bool
@@ -214,9 +277,11 @@ func (s *TOTPService) IsActive(ctx context.Context, userID int64) (bool, error) 
 }
 
 // ─── AES-256-GCM helpers ────────────────────────────────────────────────────
+// Package-level so other services (e.g. EmailSenderService for SMTP
+// passwords) can share the same envelope format and server encryption key.
 
-func (s *TOTPService) encrypt(plaintext string) (string, error) {
-	block, err := aes.NewCipher(s.encKey)
+func encryptAESGCM(key []byte, plaintext string) (string, error) {
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -232,12 +297,12 @@ func (s *TOTPService) encrypt(plaintext string) (string, error) {
 	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
-func (s *TOTPService) decrypt(encrypted string) (string, error) {
+func decryptAESGCM(key []byte, encrypted string) (string, error) {
 	data, err := base64.StdEncoding.DecodeString(encrypted)
 	if err != nil {
 		return "", fmt.Errorf("base64 decode: %w", err)
 	}
-	block, err := aes.NewCipher(s.encKey)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -255,6 +320,18 @@ func (s *TOTPService) decrypt(encrypted string) (string, error) {
 	}
 	return string(plaintext), nil
 }
+
+func (s *TOTPService) encrypt(plaintext string) (string, error) {
+	return encryptAESGCM(s.encKey, plaintext)
+}
+
+func (s *TOTPService) decrypt(encrypted string) (string, error) {
+	return decryptAESGCM(s.encKey, encrypted)
+}
+
+// EncryptionKey exposes the server encryption key for sibling services that
+// share the same AES-256-GCM envelope (SMTP password storage).
+func (s *TOTPService) EncryptionKey() []byte { return s.encKey }
 
 // loadSecret fetches and decrypts the TOTP secret from DB.
 func (s *TOTPService) loadSecret(ctx context.Context, userID int64) (secret string, isActive bool, err error) {
@@ -315,6 +392,10 @@ type OTPSession struct {
 	// a registered application; "" for tenant-level logins. Carried through the
 	// challenge so the finally-issued JWT keeps its app_id claim.
 	AppID string
+	// Methods lists the MFA methods relevant to this session: for an OTP
+	// challenge, the user's ACTIVE methods; for a forced-enrollment session,
+	// the application's ALLOWED methods.
+	Methods []string
 }
 
 // OTPSessionTTL is how long the intermediate TOTP challenge state lives.

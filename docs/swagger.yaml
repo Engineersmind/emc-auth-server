@@ -404,6 +404,28 @@ definitions:
       token_type:
         type: string
     type: object
+  auth.EmailSenderSettings:
+    properties:
+      application_id:
+        description: nil = tenant-level
+        type: string
+      from_address:
+        type: string
+      has_password:
+        type: boolean
+      is_active:
+        type: boolean
+      smtp_host:
+        type: string
+      smtp_port:
+        type: integer
+      smtp_username:
+        type: string
+      tenant_id:
+        type: string
+      updated_at:
+        type: string
+    type: object
   auth.EnrollResult:
     properties:
       backup_codes:
@@ -415,13 +437,26 @@ definitions:
     type: object
   auth.MFAPolicy:
     properties:
+      allowed_methods:
+        items:
+          type: string
+        type: array
       application_id:
         type: string
+      email_enrolled_users:
+        type: integer
       enrolled_users:
         description: |-
           Enrollment stats over the application's own isolated user base — for the
-          owner dashboard. Pending = enrolled but never activated.
+          owner dashboard. Pending = TOTP enrolled but never activated.
         type: integer
+      magic_link_enabled:
+        description: |-
+          Passwordless magic-link sign-in (opt-in; the redirect URL is the
+          application frontend that receives ?token=…).
+        type: boolean
+      magic_link_redirect_url:
+        type: string
       mode:
         type: string
       pending_enrollments:
@@ -447,6 +482,17 @@ definitions:
         type: string
       user_id:
         type: string
+    type: object
+  auth.TOTPStatus:
+    properties:
+      active:
+        type: boolean
+      backup_codes_remaining:
+        type: integer
+      email_active:
+        type: boolean
+      enrolled:
+        type: boolean
     type: object
   handlers.AppLimitRequest:
     properties:
@@ -566,6 +612,11 @@ definitions:
       role_id:
         type: string
     type: object
+  handlers.EmailMFACodeRequest:
+    properties:
+      code:
+        type: string
+    type: object
   handlers.ForgotPasswordRequest:
     properties:
       email:
@@ -582,6 +633,11 @@ definitions:
     properties:
       code:
         type: string
+      otp_session_token:
+        type: string
+    type: object
+  handlers.LoginOTPResendRequest:
+    properties:
       otp_session_token:
         type: string
     type: object
@@ -607,9 +663,24 @@ definitions:
       enrollment_token:
         type: string
     type: object
+  handlers.MFAEmailPendingRequest:
+    properties:
+      enrollment_token:
+        type: string
+    type: object
   handlers.MFAEnrollRequest:
     properties:
       enrollment_token:
+        type: string
+    type: object
+  handlers.MagicLinkRequest:
+    properties:
+      email:
+        type: string
+    type: object
+  handlers.MagicLinkVerifyRequest:
+    properties:
+      token:
         type: string
     type: object
   handlers.RefreshRequest:
@@ -682,6 +753,11 @@ definitions:
       code:
         type: string
     type: object
+  handlers.TOTPRegenerateCodesRequest:
+    properties:
+      code:
+        type: string
+    type: object
   handlers.TokenRequest:
     properties:
       client_id:
@@ -693,6 +769,14 @@ definitions:
     type: object
   handlers.UpdateApplicationMFARequest:
     properties:
+      allowed_methods:
+        items:
+          type: string
+        type: array
+      magic_link_enabled:
+        type: boolean
+      magic_link_redirect_url:
+        type: string
       mode:
         type: string
     type: object
@@ -744,6 +828,21 @@ definitions:
       first_name:
         type: string
       last_name:
+        type: string
+    type: object
+  handlers.UpsertEmailSenderRequest:
+    properties:
+      from_address:
+        type: string
+      is_active:
+        type: boolean
+      smtp_host:
+        type: string
+      smtp_password:
+        type: string
+      smtp_port:
+        type: integer
+      smtp_username:
         type: string
     type: object
   saml.SAMLConfig:
@@ -1245,17 +1344,20 @@ paths:
     put:
       consumes:
       - application/json
-      description: Sets the application's MFA mode. 'required' forces TOTP enrollment
-        at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments
-        (already-active enrollments still gate login until an admin resets them);
-        'optional' restores the default opt-in behaviour.
+      description: Sets the application's MFA mode and (optionally) its allowed methods.
+        'required' forces enrollment in an allowed method at the next login of every
+        not-yet-enrolled user; 'disabled' rejects new enrollments (already-active
+        enrollments still gate login until an admin resets them); 'optional' restores
+        the default opt-in behaviour. allowed_methods omitted keeps the current set
+        (default ["totp"]).
       parameters:
       - description: Application ID
         in: path
         name: appID
         required: true
         type: string
-      - description: 'MFA mode: disabled | optional | required'
+      - description: MFA mode (disabled | optional | required) + optional allowed_methods
+          subset of [totp, email]
         in: body
         name: body
         required: true
@@ -1797,6 +1899,98 @@ paths:
       summary: Login an end user via application credentials
       tags:
       - AUTH
+  /api/v1/auth/apps/login/magic:
+    post:
+      consumes:
+      - application/json
+      description: Emails a single-use, 15-minute sign-in link to the account address
+        if it exists in the application's user base. Always returns success for unknown
+        emails (no account enumeration). Requires magic-link sign-in to be enabled
+        on the application's auth policy.
+      parameters:
+      - description: Basic base64(client_id:client_secret)
+        in: header
+        name: Authorization
+        required: true
+        type: string
+      - description: Account email
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.MagicLinkRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid application credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Magic link not enabled for this application
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Request a magic sign-in link
+      tags:
+      - AUTH
+  /api/v1/auth/apps/login/magic/verify:
+    post:
+      consumes:
+      - application/json
+      description: 'Consumes the single-use token from the emailed link. The application''s
+        MFA policy still applies: the response is a token pair, an OTP challenge (requires_otp),
+        or a forced-enrollment challenge (403 mfa_enrollment_required) — exactly like
+        a password login.'
+      parameters:
+      - description: Basic base64(client_id:client_secret)
+        in: header
+        name: Authorization
+        required: true
+        type: string
+      - description: Token from the emailed link
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.MagicLinkVerifyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "401":
+          description: Invalid application credentials or invalid/expired link
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: MFA enrollment required
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Verify a magic sign-in link
+      tags:
+      - AUTH
   /api/v1/auth/apps/register:
     post:
       consumes:
@@ -1953,6 +2147,57 @@ paths:
       summary: Activate forced MFA enrollment and complete login
       tags:
       - AUTH
+  /api/v1/auth/login/mfa/email:
+    post:
+      consumes:
+      - application/json
+      description: Sends a one-time code to the pending account's inbox for a login
+        against a 'required'-MFA application. Submitting that code to /auth/login/mfa/activate
+        enrolls the user in email MFA and completes the login. Available only when
+        the application's allowed_methods include "email".
+      parameters:
+      - description: Enrollment token from the login response
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.MFAEmailPendingRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid or expired enrollment token
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Email method not allowed for this application
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Re-send budget exhausted
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Begin forced MFA enrollment via email
+      tags:
+      - AUTH
   /api/v1/auth/login/mfa/enroll:
     post:
       consumes:
@@ -2030,6 +2275,50 @@ paths:
               type: string
             type: object
       summary: Complete TOTP login
+      tags:
+      - AUTH
+  /api/v1/auth/login/otp/resend:
+    post:
+      consumes:
+      - application/json
+      description: Re-sends the one-time email code for an open OTP challenge (max
+        3 re-sends per challenge). Only available when the challenge's methods include
+        "email".
+      parameters:
+      - description: OTP session token
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.LoginOTPResendRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid or expired session
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Re-send budget exhausted
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Resend login email code
       tags:
       - AUTH
   /api/v1/auth/logout:
@@ -2219,6 +2508,203 @@ paths:
       summary: Activate TOTP 2FA
       tags:
       - AUTH
+  /api/v1/auth/otp/backup-codes:
+    post:
+      consumes:
+      - application/json
+      description: Replaces all remaining backup codes with a fresh set of 8 WITHOUT
+        rotating the TOTP secret — the authenticator app keeps working. Requires a
+        valid current TOTP or backup code. Every previous backup code is invalidated;
+        the new plaintext codes are shown exactly once.
+      parameters:
+      - description: Current TOTP or backup code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.TOTPRegenerateCodesRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              items:
+                type: string
+              type: array
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Missing or invalid proof code
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Regenerate backup codes
+      tags:
+      - AUTH
+  /api/v1/auth/otp/email:
+    delete:
+      consumes:
+      - application/json
+      description: Disables email MFA for the current user. Requires a fresh emailed
+        code (request one via POST /auth/otp/email/send). Rejected when it is the
+        user's last second factor under a 'required' application policy.
+      parameters:
+      - description: Emailed verification code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.EmailMFACodeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid or expired code
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: MFA is required by the application's policy
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Disable email MFA
+      tags:
+      - AUTH
+  /api/v1/auth/otp/email/activate:
+    post:
+      consumes:
+      - application/json
+      description: Verifies the emailed code and marks email MFA active. From then
+        on, logins are challenged with a one-time code sent to the account's inbox.
+      parameters:
+      - description: Emailed verification code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.EmailMFACodeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid or expired code
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Attempt budget exhausted
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Activate email MFA
+      tags:
+      - AUTH
+  /api/v1/auth/otp/email/enroll:
+    post:
+      description: 'Starts email-OTP enrollment: sends a verification code to the
+        account''s email address. Activate with POST /auth/otp/email/activate. Rejected
+        when the application''s MFA mode is ''disabled'' or its policy does not allow
+        the email method.'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: MFA disabled or email method not allowed for this application
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Enroll in email MFA
+      tags:
+      - AUTH
+  /api/v1/auth/otp/email/send:
+    post:
+      description: Sends a fresh one-time code to the account's inbox for an already-active
+        email MFA enrollment — used as proof for self-service actions such as disabling
+        email MFA.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Email MFA not active
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Send an email MFA verification code
+      tags:
+      - AUTH
   /api/v1/auth/otp/enroll:
     post:
       consumes:
@@ -2256,6 +2742,29 @@ paths:
       security:
       - BearerAuth: []
       summary: Enroll in TOTP 2FA
+      tags:
+      - AUTH
+  /api/v1/auth/otp/status:
+    get:
+      description: Returns the authenticated user's TOTP enrollment state and how
+        many single-use backup codes remain — clients should prompt regeneration when
+        the count runs low.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.TOTPStatus'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get own MFA status
       tags:
       - AUTH
   /api/v1/auth/refresh:
@@ -2487,6 +2996,104 @@ paths:
       summary: Client credentials token
       tags:
       - AUTH
+  /api/v1/email-settings:
+    delete:
+      description: Removes the white-label sender at this scope; sends fall back to
+        the next level (application → tenant → global).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: No sender configured at this scope
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete email sender settings
+      tags:
+      - admin-email-senders
+    get:
+      description: Returns the white-label sender configured for the tenant (or one
+        application). The SMTP password is never returned — has_password reports whether
+        one is stored. 404 = no sender at this scope (the global server sender applies).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailSenderSettings'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: No sender configured at this scope
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get email sender settings
+      tags:
+      - admin-email-senders
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the white-label sender for the tenant (or one
+        application). MFA code emails then go out From this address via this SMTP
+        relay, with priority application → tenant → global; a relay failure falls
+        back to the global sender. The SMTP password is stored encrypted (AES-256-GCM);
+        omit it on update to keep the current one. The owner is responsible for SPF/DKIM
+        on the sending domain.
+      parameters:
+      - description: Sender settings (from_address + smtp_host required)
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpsertEmailSenderRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailSenderSettings'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set email sender settings
+      tags:
+      - admin-email-senders
   /api/v1/permissions:
     get:
       description: Returns all permissions for the caller's tenant. Requires admin:access.

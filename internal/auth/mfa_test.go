@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,20 +13,103 @@ import (
 	"github.com/pquerna/otp/totp"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/mailer"
 	"github.com/engineersmind/emc-auth-server/internal/store"
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
 
+// captureMailer records MFA code emails instead of sending them, so tests can
+// read the plaintext codes and assert which sender was resolved.
+type captureMailer struct {
+	mu      sync.Mutex
+	sent    []mailer.MFACodeEmail
+	links   []mailer.MagicLinkEmail
+	senders []*mailer.SMTPConfig // parallel to sends; nil = global sender
+}
+
+func (m *captureMailer) SendReset(ctx context.Context, e mailer.ResetEmail) error { return nil }
+
+func (m *captureMailer) SendMFACode(ctx context.Context, e mailer.MFACodeEmail) error {
+	return m.SendMFACodeFrom(ctx, nil, e)
+}
+
+func (m *captureMailer) SendMFACodeFrom(ctx context.Context, sender *mailer.SMTPConfig, e mailer.MFACodeEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sent = append(m.sent, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendMagicLink(ctx context.Context, sender *mailer.SMTPConfig, e mailer.MagicLinkEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.links = append(m.links, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+// lastLink returns the most recently "sent" magic link email.
+func (m *captureMailer) lastLink(t *testing.T) mailer.MagicLinkEmail {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.links) == 0 {
+		t.Fatal("no magic link email was sent")
+	}
+	return m.links[len(m.links)-1]
+}
+
+// linkCount returns how many magic link emails were sent.
+func (m *captureMailer) linkCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.links)
+}
+
+// codeCount returns how many MFA code emails were sent.
+func (m *captureMailer) codeCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.sent)
+}
+
+// lastCode returns the most recently "sent" code.
+func (m *captureMailer) lastCode(t *testing.T) mailer.MFACodeEmail {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.sent) == 0 {
+		t.Fatal("no MFA code email was sent")
+	}
+	return m.sent[len(m.sent)-1]
+}
+
+// lastSender returns the sender override used for the most recent send
+// (nil = global sender).
+func (m *captureMailer) lastSender(t *testing.T) *mailer.SMTPConfig {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.senders) == 0 {
+		t.Fatal("no MFA code email was sent")
+	}
+	return m.senders[len(m.senders)-1]
+}
+
 // mfaFixture bundles everything the application-scoped MFA tests need:
 // real DB + Redis, the seeded "emc" tenant, and fully wired services.
 type mfaFixture struct {
-	ctx      context.Context
-	pool     *pgxpool.Pool
-	tenantID int64
-	authSvc  *auth.AuthService
-	totpSvc  *auth.TOTPService
-	appSvc   *auth.ApplicationService
-	jwtSvc   *auth.JWTService
+	ctx       context.Context
+	pool      *pgxpool.Pool
+	tenantID  int64
+	authSvc   *auth.AuthService
+	totpSvc   *auth.TOTPService
+	emailSvc  *auth.EmailMFAService
+	senderSvc *auth.EmailSenderService
+	appSvc    *auth.ApplicationService
+	jwtSvc    *auth.JWTService
+	mail      *captureMailer
 }
 
 func newMFAFixture(t *testing.T) *mfaFixture {
@@ -51,13 +135,18 @@ func newMFAFixture(t *testing.T) *mfaFixture {
 	}
 	appSvc := auth.NewApplicationService(pool, logger)
 	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	mail := &captureMailer{}
+	senderSvc := auth.NewEmailSenderService(pool, totpSvc.EncryptionKey(), logger)
+	emailSvc := auth.NewEmailMFAService(pool, rdb, mail, logger).WithSenders(senderSvc)
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger).
 		WithTOTP(totpSvc, rdb).
+		WithEmailMFA(emailSvc).
 		WithApplications(appSvc)
 
 	return &mfaFixture{
 		ctx: ctx, pool: pool, tenantID: tenantID,
-		authSvc: authSvc, totpSvc: totpSvc, appSvc: appSvc, jwtSvc: jwtSvc,
+		authSvc: authSvc, totpSvc: totpSvc, emailSvc: emailSvc, senderSvc: senderSvc,
+		appSvc: appSvc, jwtSvc: jwtSvc, mail: mail,
 	}
 }
 
@@ -152,18 +241,18 @@ func TestAppMFAPolicy_DefaultsAndUpsert(t *testing.T) {
 	}
 
 	// Invalid mode is rejected.
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, "sometimes", nil); !errors.Is(err, auth.ErrInvalidMFAMode) {
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, "sometimes", nil, nil); !errors.Is(err, auth.ErrInvalidMFAMode) {
 		t.Errorf("SetAppMFAPolicy(invalid) error = %v, want ErrInvalidMFAMode", err)
 	}
 
 	// Upsert to required, then back to disabled.
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil); err != nil {
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil, nil); err != nil {
 		t.Fatalf("SetAppMFAPolicy(required): %v", err)
 	}
 	if mode, _ = f.totpSvc.GetAppMFAMode(f.ctx, appID); mode != auth.MFAModeRequired {
 		t.Errorf("mode after set = %q, want required", mode)
 	}
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeDisabled, nil); err != nil {
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeDisabled, nil, nil); err != nil {
 		t.Fatalf("SetAppMFAPolicy(disabled): %v", err)
 	}
 	policy, err := f.totpSvc.GetAppMFAPolicy(f.ctx, f.tenantID, appID)
@@ -214,7 +303,7 @@ func TestLogin_RequiredMode_ForcedEnrollmentCompletesLogin(t *testing.T) {
 	email := uniqueEmail("mfa-required")
 	f.registerAppUser(t, app, email, "Password123!")
 
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil); err != nil {
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil, nil); err != nil {
 		t.Fatalf("SetAppMFAPolicy: %v", err)
 	}
 
@@ -389,7 +478,7 @@ func TestEnrollUser_DisabledModeRejectsNewEnrollments(t *testing.T) {
 	email := uniqueEmail("mfa-disabled")
 	userID := f.registerAppUser(t, app, email, "Password123!")
 
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeDisabled, nil); err != nil {
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeDisabled, nil, nil); err != nil {
 		t.Fatalf("SetAppMFAPolicy: %v", err)
 	}
 
@@ -437,7 +526,7 @@ func TestDisableUser_RequiredModeRejected(t *testing.T) {
 	userID := f.registerAppUser(t, app, email, "Password123!")
 	secret := f.enrollAndActivate(t, userID, email)
 
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil); err != nil {
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil, nil); err != nil {
 		t.Fatalf("SetAppMFAPolicy: %v", err)
 	}
 
@@ -446,11 +535,90 @@ func TestDisableUser_RequiredModeRejected(t *testing.T) {
 	}
 
 	// Back to optional → the same request succeeds.
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional, nil); err != nil {
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional, nil, nil); err != nil {
 		t.Fatalf("SetAppMFAPolicy(optional): %v", err)
 	}
 	if err := f.totpSvc.DisableUser(f.ctx, userID, f.tenantID, codeFor(t, secret)); err != nil {
 		t.Errorf("DisableUser(optional app) error = %v, want success", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Backup-code lifecycle
+// ---------------------------------------------------------------------------
+
+func TestTOTPStatus_And_RegenerateBackupCodes(t *testing.T) {
+	f := newMFAFixture(t)
+	app, _ := f.createApp(t, "codes-app")
+	email := uniqueEmail("mfa-codes")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+
+	// Not enrolled → empty status.
+	st, err := f.totpSvc.Status(f.ctx, userID)
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if st.Enrolled || st.Active || st.BackupCodesRemaining != 0 {
+		t.Errorf("unenrolled status = %+v, want all-zero", st)
+	}
+
+	// Regeneration requires an active enrollment.
+	if _, err := f.totpSvc.RegenerateBackupCodes(f.ctx, userID, "000000"); err == nil {
+		t.Error("RegenerateBackupCodes(unenrolled) succeeded, want error")
+	}
+
+	secret := f.enrollAndActivate(t, userID, email)
+	st, _ = f.totpSvc.Status(f.ctx, userID)
+	if !st.Enrolled || !st.Active || st.BackupCodesRemaining != auth.BackupCodeCount {
+		t.Errorf("active status = %+v, want enrolled/active with %d codes", st, auth.BackupCodeCount)
+	}
+
+	// Consuming a backup code shows up in the count.
+	firstEnroll, err := f.totpSvc.EnrollUser(f.ctx, userID, f.tenantID, email, codeFor(t, secret))
+	if err != nil {
+		t.Fatalf("re-enroll to capture codes: %v", err)
+	}
+	secret = secretFromOTPURI(t, firstEnroll.OTPURI)
+	if err := f.totpSvc.VerifyAndActivate(f.ctx, userID, codeFor(t, secret)); err != nil {
+		t.Fatalf("re-activate: %v", err)
+	}
+	if err := f.totpSvc.VerifyBackupCode(f.ctx, userID, firstEnroll.BackupCodes[0]); err != nil {
+		t.Fatalf("VerifyBackupCode: %v", err)
+	}
+	st, _ = f.totpSvc.Status(f.ctx, userID)
+	if st.BackupCodesRemaining != auth.BackupCodeCount-1 {
+		t.Errorf("codes remaining after one use = %d, want %d", st.BackupCodesRemaining, auth.BackupCodeCount-1)
+	}
+
+	// Regenerate without proof → rejected; with a wrong code → rejected.
+	if _, err := f.totpSvc.RegenerateBackupCodes(f.ctx, userID, ""); !errors.Is(err, auth.ErrTOTPProofRequired) {
+		t.Errorf("RegenerateBackupCodes(no code) error = %v, want ErrTOTPProofRequired", err)
+	}
+	if _, err := f.totpSvc.RegenerateBackupCodes(f.ctx, userID, "000000"); !errors.Is(err, auth.ErrTOTPProofRequired) {
+		t.Errorf("RegenerateBackupCodes(bad code) error = %v, want ErrTOTPProofRequired", err)
+	}
+
+	// With a valid TOTP code → fresh full set; the secret still works and every
+	// old backup code is dead.
+	newCodes, err := f.totpSvc.RegenerateBackupCodes(f.ctx, userID, codeFor(t, secret))
+	if err != nil {
+		t.Fatalf("RegenerateBackupCodes: %v", err)
+	}
+	if len(newCodes) != auth.BackupCodeCount {
+		t.Errorf("regenerated %d codes, want %d", len(newCodes), auth.BackupCodeCount)
+	}
+	st, _ = f.totpSvc.Status(f.ctx, userID)
+	if st.BackupCodesRemaining != auth.BackupCodeCount {
+		t.Errorf("codes remaining after regeneration = %d, want %d", st.BackupCodesRemaining, auth.BackupCodeCount)
+	}
+	if err := f.totpSvc.Verify(f.ctx, userID, codeFor(t, secret)); err != nil {
+		t.Errorf("TOTP secret stopped working after backup-code regeneration: %v", err)
+	}
+	if err := f.totpSvc.VerifyBackupCode(f.ctx, userID, firstEnroll.BackupCodes[1]); err == nil {
+		t.Error("old backup code still valid after regeneration, want invalidated")
+	}
+	if err := f.totpSvc.VerifyBackupCode(f.ctx, userID, newCodes[0]); err != nil {
+		t.Errorf("new backup code rejected: %v", err)
 	}
 }
 
