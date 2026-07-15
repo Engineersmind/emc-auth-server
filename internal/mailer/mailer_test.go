@@ -133,7 +133,11 @@ func TestSMTPMailer_LiveSend(t *testing.T) {
 	// Poll the Mailpit API until the message shows up.
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		resp, err := http.Get(apiBase + "/api/v1/messages")
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, apiBase+"/api/v1/messages", nil) //nolint:gosec // test-only call to a local Mailpit API from an env-supplied base URL
+		if err != nil {
+			t.Fatalf("mailpit api request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req) //nolint:gosec // test-only call to a local Mailpit API from an env-supplied base URL
 		if err != nil {
 			t.Fatalf("mailpit api: %v", err)
 		}
@@ -144,7 +148,7 @@ func TestSMTPMailer_LiveSend(t *testing.T) {
 			} `json:"messages"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&out)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		for _, msg := range out.Messages {
 			if strings.Contains(msg.Subject, "Sign in to EMC Live Test") {
