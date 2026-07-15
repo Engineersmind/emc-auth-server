@@ -80,7 +80,7 @@ services:
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-no-reply@emc.local}
-      SMTP_TLS: ${SMTP_TLS-none}
+      SMTP_TLS: ${SMTP_TLS:-none}
     depends_on:
       postgres:
         condition: service_healthy

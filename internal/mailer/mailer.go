@@ -1,6 +1,7 @@
 // Package mailer provides email dispatch for the emc-auth-server.
-// In development (ENV=development), all emails are logged to the zerolog logger
-// at INFO level. In production, emails are sent via SMTP using go-mail
+// Delivery is selected by whether an SMTP host is configured, not by ENV (see
+// NewMailer): with no SMTP_HOST, emails are logged to the zerolog logger at INFO
+// level; with an SMTP_HOST set, emails are sent via SMTP using go-mail
 // (github.com/wneessen/go-mail), which supports STARTTLS (587) and implicit
 // TLS (465), SMTP AUTH negotiation, and per-send context timeouts so a slow or
 // unreachable relay can never hang a login request.
