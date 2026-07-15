@@ -609,6 +609,27 @@ type LoginOTPInput struct {
 	Code            string
 }
 
+// emailCodeConsume deletes the stored email-code hash only when it matches the
+// submitted hash, in one atomic step. A plain GET-check-then-delete would let
+// two concurrent requests both pass the comparison and redeem the same code
+// once each; a plain GETDEL would burn an outstanding email code whenever a
+// non-matching code (e.g. a TOTP code) is tried against it.
+var emailCodeConsume = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
+// consumeEmailCode reports whether code matches the email-code hash stored at
+// key, consuming the hash atomically on success so the code is single-use even
+// under concurrent verification attempts. A mismatch (or missing/expired key)
+// leaves any stored code intact and returns false.
+func (s *AuthService) consumeEmailCode(ctx context.Context, key, code string) bool {
+	n, err := emailCodeConsume.Run(ctx, s.redisCli, []string{key}, HashToken(code)).Int()
+	return err == nil && n == 1
+}
+
 // LoginOTP completes a TOTP-gated login.
 func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResult, error) {
 	if s.totpSvc == nil || s.redisCli == nil {
@@ -631,9 +652,7 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 	// this session, a TOTP code, or a backup code.
 	verified := false
 	if methodAllowed(session.Methods, MFAMethodEmail) {
-		if storedHash, gerr := s.redisCli.Get(ctx, key+":email").Result(); gerr == nil && HashToken(in.Code) == storedHash {
-			verified = true
-		}
+		verified = s.consumeEmailCode(ctx, key+":email", in.Code)
 	}
 	if !verified && methodAllowed(session.Methods, MFAMethodTOTP) {
 		if s.totpSvc.Verify(ctx, session.UserID, in.Code) == nil {
@@ -757,7 +776,7 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 	// the TOTP activator, and vice versa a TOTP code will not match the hash.
 	activated := false
 	if methodAllowed(session.Methods, MFAMethodEmail) && s.emailSvc != nil {
-		if storedHash, gerr := s.redisCli.Get(ctx, key+":email").Result(); gerr == nil && HashToken(code) == storedHash {
+		if s.consumeEmailCode(ctx, key+":email", code) {
 			if err := s.emailSvc.ActivatePendingEnrollment(ctx, session.UserID, session.TenantID); err != nil {
 				return nil, session, err
 			}

@@ -207,7 +207,7 @@ func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 	if methods != nil && !ValidMFAMethods(methods) {
 		return ErrInvalidMFAMethods
 	}
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO application_mfa_settings (application_id, tenant_id, mode, allowed_methods, updated_by, updated_at)
 		VALUES ($1, $2, $3, COALESCE($4, '{totp}'::TEXT[]), $5, NOW())
 		ON CONFLICT (application_id) DO UPDATE
@@ -220,12 +220,19 @@ func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 	if err != nil {
 		return fmt.Errorf("upsert app MFA policy: %w", err)
 	}
+	// The DO UPDATE is tenant-pinned: a conflicting row owned by another
+	// tenant filters the update down to zero rows. Surface that instead of
+	// reporting success on a write that never happened.
+	if tag.RowsAffected() == 0 {
+		return ErrAppNotFound
+	}
 	return nil
 }
 
 // SetAppMagicLink upserts the application's passwordless magic-link settings.
 // nil fields keep the stored values. Enabling requires a redirect URL (stored
-// or provided); the URL must be absolute http(s).
+// or provided); the URL must be absolute https (http is allowed for loopback
+// hosts only — sign-in tokens must not transit cleartext).
 func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID int64, enabled *bool, redirectURL *string, updatedBy *int64) error {
 	if redirectURL != nil && *redirectURL != "" {
 		if !validMagicRedirectURL(*redirectURL) {
@@ -249,7 +256,7 @@ func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID in
 		}
 	}
 
-	_, err := s.pool.Exec(ctx, `
+	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO application_mfa_settings (application_id, tenant_id, magic_link_enabled, magic_link_redirect_url, updated_by, updated_at)
 		VALUES ($1, $2, COALESCE($3, false), COALESCE($4, ''), $5, NOW())
 		ON CONFLICT (application_id) DO UPDATE
@@ -261,6 +268,10 @@ func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID in
 	`, appRowID, tenantID, enabled, redirectURL, updatedBy)
 	if err != nil {
 		return fmt.Errorf("upsert magic link settings: %w", err)
+	}
+	// Tenant-pinned DO UPDATE — see SetAppMFAPolicy.
+	if tag.RowsAffected() == 0 {
+		return ErrAppNotFound
 	}
 	return nil
 }

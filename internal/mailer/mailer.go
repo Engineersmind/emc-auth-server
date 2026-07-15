@@ -268,7 +268,13 @@ func (m *SMTPMailer) SendMFACodeFrom(ctx context.Context, sender *SMTPConfig, em
 	if email.AppName != "" {
 		source = email.AppName
 	}
-	subject := fmt.Sprintf("Your verification code: %s", email.Code)
+	// The code must never appear in the subject: subjects are stored in
+	// plaintext by SMTP relay logs and shown in push-notification previews
+	// and inbox list views, none of which require opening the message.
+	subject := "Your verification code"
+	if email.AppName != "" {
+		subject = fmt.Sprintf("Your %s verification code", email.AppName)
+	}
 	body := fmt.Sprintf(`Your one-time verification code for %s is:
 
     %s

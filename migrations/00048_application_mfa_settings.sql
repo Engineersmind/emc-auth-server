@@ -25,6 +25,13 @@ CREATE TABLE IF NOT EXISTS application_mfa_settings (
     tenant_id      BIGINT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     mode           TEXT NOT NULL DEFAULT 'optional'
                    CHECK (mode IN ('disabled', 'optional', 'required')),
+    -- Included here (not only via the later ALTERs in 00049/00051, which are
+    -- ADD COLUMN IF NOT EXISTS and no-op on fresh databases) so the table is
+    -- never live without the columns the policy upsert references — a deploy
+    -- that stops between migrations must not break MFA-policy writes.
+    allowed_methods         TEXT[] NOT NULL DEFAULT '{totp}',
+    magic_link_enabled      BOOLEAN NOT NULL DEFAULT false,
+    magic_link_redirect_url TEXT NOT NULL DEFAULT '',
     -- Who last changed the policy (owner or super_admin) — audit convenience;
     -- the authoritative trail is audit_logs (admin.mfa_policy_updated).
     updated_by     BIGINT REFERENCES users(id) ON DELETE SET NULL,

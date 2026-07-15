@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -230,10 +231,25 @@ func (s *AuthService) resolveEmailSender(ctx context.Context, tenantID int64, ap
 	return sender
 }
 
-// validMagicRedirectURL reports whether s is an absolute http(s) URL.
+// validMagicRedirectURL reports whether s is an absolute URL a single-use
+// sign-in token may be appended to: https anywhere, or http for loopback
+// hosts only (local development). Over any other cleartext http URL the
+// token would transit unencrypted and land in intermediary and receiving
+// server logs.
 func validMagicRedirectURL(s string) bool {
 	u, err := url.Parse(s)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+	if err != nil || u.Host == "" {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		host := u.Hostname()
+		return host == "localhost" || host == "::1" || strings.HasPrefix(host, "127.")
+	default:
+		return false
+	}
 }
 
 // buildMagicLink appends the token as a query parameter to the application's

@@ -2325,6 +2325,9 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		if errors.Is(err, auth.ErrInvalidMFAMode) || errors.Is(err, auth.ErrInvalidMFAMethods) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
+		if errors.Is(err, auth.ErrAppNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("admin: set application MFA policy failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})
 	}
@@ -2333,6 +2336,9 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		if err := h.totpSvc.SetAppMagicLink(c.Request().Context(), tenantID, appID, req.MagicLinkEnabled, req.MagicLinkRedirectURL, updatedBy); err != nil {
 			if errors.Is(err, auth.ErrMagicLinkNotConfigured) {
 				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			if errors.Is(err, auth.ErrAppNotFound) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 			}
 			h.logger.Error().Err(err).Msg("admin: set application magic link failed")
 			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set magic link settings"})
