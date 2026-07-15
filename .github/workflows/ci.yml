@@ -227,8 +227,10 @@ jobs:
           # --wait blocks until postgres + redis health checks pass (no fixed sleep needed)
           docker compose -f docker-compose.yml up -d --wait postgres redis
           # [CI-11] PORT=8080 required — server defaults to 9090; curl must match
+          # Host port 5433: docker-compose.yml maps postgres 5433->5432 (dodges
+          # native-PostgreSQL conflicts on dev machines); smoke test must match.
           docker run --rm --network host \
-            -e DATABASE_URL=postgres://emc_auth:password@localhost:5432/emc_auth?sslmode=disable \
+            -e DATABASE_URL=postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable \
             -e REDIS_URL=redis://localhost:6379/0 \
             -e JWT_ISSUER=https://auth.emc.local \
             -e APP_BASE_URL=http://localhost:8080 \

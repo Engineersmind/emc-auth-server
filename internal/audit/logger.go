@@ -93,6 +93,18 @@ const (
 	// Admin — white-label email sender management (issue #63 follow-on)
 	ActionAdminEmailSenderUpdated = "admin.email_sender_updated"
 	ActionAdminEmailSenderDeleted = "admin.email_sender_deleted"
+
+	// Auth — social login (issue #64)
+	ActionAuthGoogleLogin       = "auth.google_login"
+	ActionAuthGoogleLoginFailed = "auth.google_login_failed"
+	ActionAuthGoogleLinked      = "auth.google_account_linked"
+
+	// Admin — identity provider (social login) configuration
+	ActionAdminIdPConfigUpdated = "admin.identity_provider_updated"
+	ActionAdminIdPConfigDeleted = "admin.identity_provider_deleted"
+
+	// Admin — user identity management
+	ActionAdminUserIdentityUnlinked = "admin.user_identity_unlinked"
 )
 
 // ---------------------------------------------------------------------------

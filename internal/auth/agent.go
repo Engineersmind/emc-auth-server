@@ -57,20 +57,20 @@ type AgentSummary struct {
 // AgentWithStats includes audit-derived activity metrics (08-03).
 type AgentWithStats struct {
 	AgentSummary
-	RequestCount int        `json:"request_count"`       // total audit events attributed to this agent
-	LastActive   *time.Time `json:"last_active"`         // most recent audit event timestamp
+	RequestCount int        `json:"request_count"` // total audit events attributed to this agent
+	LastActive   *time.Time `json:"last_active"`   // most recent audit event timestamp
 }
 
 // AgentAnalysis holds 24h risk-scoring data for a single agent (08-04).
 type AgentAnalysis struct {
-	AgentID       string  `json:"agent_id"`
-	AgentName     string  `json:"agent_name"`
-	AgentType     string  `json:"agent_type"`
-	RequestCount  int     `json:"request_count_24h"`   // total audit events in last 24h
-	RateLimitHits int     `json:"rate_limit_hits_24h"` // events with action containing "rate_limit"
-	UniqueIPs     int     `json:"unique_ips_24h"`      // distinct IP addresses seen
-	OffHoursCount int     `json:"off_hours_count_24h"` // requests outside 08:00–20:00 UTC
-	RiskScore     int     `json:"risk_score"`          // 0–100 composite score
+	AgentID       string   `json:"agent_id"`
+	AgentName     string   `json:"agent_name"`
+	AgentType     string   `json:"agent_type"`
+	RequestCount  int      `json:"request_count_24h"`   // total audit events in last 24h
+	RateLimitHits int      `json:"rate_limit_hits_24h"` // events with action containing "rate_limit"
+	UniqueIPs     int      `json:"unique_ips_24h"`      // distinct IP addresses seen
+	OffHoursCount int      `json:"off_hours_count_24h"` // requests outside 08:00–20:00 UTC
+	RiskScore     int      `json:"risk_score"`          // 0–100 composite score
 	RiskFactors   []string `json:"risk_factors"`        // human-readable reasons for elevated score
 }
 

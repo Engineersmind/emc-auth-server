@@ -94,7 +94,11 @@ func (s *limiterStore) cleanup(ttl time.Duration) {
 var (
 	ipStore     = &limiterStore{}
 	tenantStore = &limiterStore{}
-	cleanupOnce sync.Once
+	// oauthClientStore is deliberately separate from tenantStore so OAuth
+	// client_id keys can never collide with tenant/email keys — isolation is
+	// structural, not dependent on a string prefix convention.
+	oauthClientStore = &limiterStore{}
+	cleanupOnce      sync.Once
 )
 
 // startCleanup starts a background goroutine that evicts stale limiter entries
@@ -108,6 +112,7 @@ func startCleanup() {
 				// Evict entries not seen in 10 minutes — well beyond the 1-minute window.
 				ipStore.cleanup(10 * time.Minute)
 				tenantStore.cleanup(10 * time.Minute)
+				oauthClientStore.cleanup(10 * time.Minute)
 			}
 		}()
 	})
@@ -120,6 +125,7 @@ func startCleanup() {
 func ResetStoresForTest() {
 	ipStore.store.Range(func(k, _ any) bool { ipStore.store.Delete(k); return true })
 	tenantStore.store.Range(func(k, _ any) bool { tenantStore.store.Delete(k); return true })
+	oauthClientStore.store.Range(func(k, _ any) bool { oauthClientStore.store.Delete(k); return true })
 }
 
 // LoginRateLimiter returns an Echo middleware that enforces two-level rate limiting
@@ -208,10 +214,11 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 // M2M client across all tenants into one shared "unknown-account" bucket,
 // letting a single noisy client starve every other tenant's integration.
 //
-// client_id is read from the Authorization Basic header or the JSON body,
-// mirroring the handler's credential resolution order. When no client_id can
-// be determined (malformed request), only the per-IP limit applies — a shared
-// fallback bucket would recreate the same cross-tenant collision.
+// client_id is read only from the Authorization: Basic header — the handler
+// rejects body-sent credentials, so the body is never consulted here either.
+// When no client_id can be determined (malformed request), only the per-IP
+// limit applies — a shared fallback bucket would recreate the same
+// cross-tenant collision.
 func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	startCleanup()
 
@@ -292,6 +299,51 @@ func OTPRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 					c.Response().Header().Set("Retry-After", "60")
 					return c.JSON(http.StatusTooManyRequests, map[string]string{
 						"error":       "too many OTP attempts for this session",
+						"retry_after": "60",
+					})
+				}
+			}
+
+			return next(c)
+		}
+	}
+}
+
+// OAuthRateLimiter rate-limits the social-login browser redirect endpoints
+// (GET /oauth/:provider/login and /oauth/:provider/callback, issue #64).
+// Neither LoginRateLimiter (JSON-body email key) nor TokenRateLimiter (Basic
+// auth header key) fits a browser GET, so this variant keys the second bucket
+// on the client_id query parameter. When no client_id is present (e.g. the
+// callback, where only state identifies the attempt), only the per-IP limit
+// applies — state itself is single-use, so callback replay is already dead.
+func OAuthRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			ipLimiter := ipStore.getOrCreate("ip:"+ip, cfg.PerIPRate)
+			if !ipLimiter.Allow() {
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many login attempts from your IP address",
+					"retry_after": "60",
+				})
+			}
+
+			if clientID := c.QueryParam("client_id"); clientID != "" {
+				if len(clientID) > maxRateLimitEmailLen {
+					clientID = clientID[:maxRateLimitEmailLen]
+				}
+				clientLimiter := oauthClientStore.getOrCreate(clientID, cfg.PerTenantRate)
+				if !clientLimiter.Allow() {
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSON(http.StatusTooManyRequests, map[string]string{
+						"error":       "too many login attempts for this application",
 						"retry_after": "60",
 					})
 				}

@@ -7,7 +7,10 @@ services:
       POSTGRES_USER: emc_auth
       POSTGRES_PASSWORD: password
     ports:
-      - "5432:5432"
+      # Host port 5433: a native Windows PostgreSQL commonly occupies 5432 on
+      # dev machines and hijacks host-side connections. Matches DATABASE_URL
+      # in .env. Inside the compose network the server still uses postgres:5432.
+      - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -60,6 +63,10 @@ services:
       JWT_ISSUER: "http://localhost:9090"
       APP_BASE_URL: "http://localhost:9090"
       TOTP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      # Social login (issue #64): value comes from .env in this directory via
+      # compose interpolation — never hardcode the key in this committed file.
+      OAUTH_CLIENT_SECRET_ENCRYPTION_KEY: "${OAUTH_CLIENT_SECRET_ENCRYPTION_KEY:-}"
+      OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS: "${OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS:-}"
       SEED_DEMO_DATA: "true"
       SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
       GLOBAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090,https://emc-auth.senie.ai"

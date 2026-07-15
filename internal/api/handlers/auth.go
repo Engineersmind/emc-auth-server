@@ -1920,8 +1920,8 @@ func (h *AuthHandler) SessionLogout(c echo.Context) error {
 // in the body — the sole accepted channel is the Authorization: Basic header.
 type TokenRequest struct {
 	GrantType    string `json:"grant_type"`
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
+	ClientID     string `json:"client_id" swaggerignore:"true"`
+	ClientSecret string `json:"client_secret" swaggerignore:"true"`
 }
 
 // errBodyCredentials is the guidance returned when an integrator sends

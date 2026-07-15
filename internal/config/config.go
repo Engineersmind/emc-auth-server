@@ -36,6 +36,19 @@ type Config struct {
 	// Required when TOTP is used. Must be exactly 64 hex characters.
 	TOTPEncryptionKey string
 
+	// OAuthClientSecretEncryptionKey is a 32-byte hex-encoded key used to
+	// AES-256-GCM encrypt social-login provider client secrets at rest
+	// (identity_provider_configs.client_secret_enc). Generate with:
+	// openssl rand -hex 32. Unlike TOTP's key there is NO zero-key fallback
+	// in production — the server refuses to start (issue #64).
+	OAuthClientSecretEncryptionKey string
+
+	// OAuthClientSecretEncryptionKeyPrevious enables zero-downtime key
+	// rotation: set the NEW key as OAUTH_CLIENT_SECRET_ENCRYPTION_KEY and the
+	// old one here. Decryption falls back to this key; rows re-encrypt under
+	// the new key on their next admin write. Remove once rotation completes.
+	OAuthClientSecretEncryptionKeyPrevious string
+
 	// CookieDomain sets the Domain attribute on auth cookies.
 	// Leave empty for localhost development (browser scopes to current host).
 	// In production set to the shared parent domain, e.g. ".engineersmind.com",
@@ -52,22 +65,24 @@ type Config struct {
 func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
-		Port:              getEnv("PORT", "9090"),
-		DatabaseURL:       getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
-		RedisURL:          getEnv("REDIS_URL", "redis://localhost:6379/0"),
-		LogLevel:          getEnv("LOG_LEVEL", "info"),
-		Env:               getEnv("ENV", "development"),
-		JWTIssuer:         getEnv("JWT_ISSUER", "https://auth.emc.local"),
-		SMTPHost:          getEnv("SMTP_HOST", ""),
-		SMTPPort:          smtpPort,
-		SMTPFrom:          getEnv("SMTP_FROM", "no-reply@emc.local"),
-		SMTPUsername:      getEnv("SMTP_USERNAME", ""),
-		SMTPPassword:      getEnv("SMTP_PASSWORD", ""),
-		SMTPTLS:           getEnv("SMTP_TLS", ""),
-		AppBaseURL:        getEnv("APP_BASE_URL", "http://localhost:9090"),
-		TOTPEncryptionKey: getEnv("TOTP_ENCRYPTION_KEY", ""),
-		CookieDomain:      getEnv("COOKIE_DOMAIN", ""),
-		GlobalCORSOrigins: getEnvList("GLOBAL_CORS_ORIGINS", ""),
+		Port:                                   getEnv("PORT", "9090"),
+		DatabaseURL:                            getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
+		RedisURL:                               getEnv("REDIS_URL", "redis://localhost:6379/0"),
+		LogLevel:                               getEnv("LOG_LEVEL", "info"),
+		Env:                                    getEnv("ENV", "development"),
+		JWTIssuer:                              getEnv("JWT_ISSUER", "https://auth.emc.local"),
+		SMTPHost:                               getEnv("SMTP_HOST", ""),
+		SMTPPort:                               smtpPort,
+		SMTPFrom:                               getEnv("SMTP_FROM", "no-reply@emc.local"),
+		SMTPUsername:                           getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:                           getEnv("SMTP_PASSWORD", ""),
+		SMTPTLS:                                getEnv("SMTP_TLS", ""),
+		AppBaseURL:                             getEnv("APP_BASE_URL", "http://localhost:9090"),
+		TOTPEncryptionKey:                      getEnv("TOTP_ENCRYPTION_KEY", ""),
+		OAuthClientSecretEncryptionKey:         getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", ""),
+		OAuthClientSecretEncryptionKeyPrevious: getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS", ""),
+		CookieDomain:                           getEnv("COOKIE_DOMAIN", ""),
+		GlobalCORSOrigins:                      getEnvList("GLOBAL_CORS_ORIGINS", ""),
 	}
 }
 
