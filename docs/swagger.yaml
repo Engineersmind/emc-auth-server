@@ -1250,7 +1250,7 @@ paths:
         name: appID
         required: true
         type: string
-      - description: Provider (google)
+      - description: Provider (google, github)
         in: path
         name: provider
         required: true
@@ -1280,7 +1280,7 @@ paths:
         name: appID
         required: true
         type: string
-      - description: Provider (google)
+      - description: Provider (google, github)
         in: path
         name: provider
         required: true
@@ -3539,7 +3539,7 @@ paths:
         name: id
         required: true
         type: string
-      - description: Provider (google)
+      - description: Provider (google, github)
         in: path
         name: provider
         required: true
@@ -3625,7 +3625,7 @@ paths:
         the provider ID token, resolves/links/provisions the user, and redirects back
         to the application with a one-time login_code.
       parameters:
-      - description: Provider (google)
+      - description: Provider (google, github)
         in: path
         name: provider
         required: true
@@ -3660,7 +3660,7 @@ paths:
       description: Validates the application and redirect target, then redirects the
         browser to the provider's consent screen (Authorization Code + PKCE).
       parameters:
-      - description: Provider (google)
+      - description: Provider (google, github)
         in: path
         name: provider
         required: true

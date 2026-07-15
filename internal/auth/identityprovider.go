@@ -14,14 +14,24 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Supported social login providers (issue #64). Microsoft/GitHub become
-// additional entries here — the schema and flow are already provider-generic.
+// Supported social login providers (issue #64 Google, issue #66 GitHub).
+// Microsoft becomes an additional entry here — the schema and flow are
+// already provider-generic.
 const (
 	ProviderGoogle = "google"
+	ProviderGitHub = "github"
 )
 
 var supportedProviders = map[string]bool{
 	ProviderGoogle: true,
+	ProviderGitHub: true,
+}
+
+// IsSupportedProvider reports whether name is a known social login provider.
+// Handlers use it to gate raw path input before deriving provider-labelled
+// audit actions from it.
+func IsSupportedProvider(name string) bool {
+	return supportedProviders[name]
 }
 
 // ErrProviderNotSupported is returned when the provider path segment is not a

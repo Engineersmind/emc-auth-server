@@ -755,7 +755,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -818,7 +818,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -4214,7 +4214,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -4341,7 +4341,7 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -4392,7 +4392,7 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true

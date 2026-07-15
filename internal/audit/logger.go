@@ -73,10 +73,15 @@ const (
 	// Auth — machine-to-machine client_credentials grant
 	ActionAuthClientCredentials = "auth.client_credentials"
 
-	// Auth — social login (issue #64)
+	// Auth — social login (issue #64 Google, issue #66 GitHub). These
+	// constants document the emitted action values; handlers derive them per
+	// provider via SocialLoginAction and friends.
 	ActionAuthGoogleLogin       = "auth.google_login"
 	ActionAuthGoogleLoginFailed = "auth.google_login_failed"
 	ActionAuthGoogleLinked      = "auth.google_account_linked"
+	ActionAuthGitHubLogin       = "auth.github_login"
+	ActionAuthGitHubLoginFailed = "auth.github_login_failed"
+	ActionAuthGitHubLinked      = "auth.github_account_linked"
 
 	// Admin — identity provider (social login) configuration
 	ActionAdminIdPConfigUpdated = "admin.identity_provider_updated"
@@ -85,6 +90,24 @@ const (
 	// Admin — user identity management
 	ActionAdminUserIdentityUnlinked = "admin.user_identity_unlinked"
 )
+
+// SocialLoginAction returns the audit action for a successful social login
+// with the given provider (e.g. "auth.google_login", "auth.github_login").
+// Callers must pass a validated provider name — never raw request input.
+func SocialLoginAction(provider string) string {
+	return "auth." + provider + "_login"
+}
+
+// SocialLoginFailedAction returns the audit action for a failed social login.
+func SocialLoginFailedAction(provider string) string {
+	return "auth." + provider + "_login_failed"
+}
+
+// SocialLinkedAction returns the audit action for a social identity being
+// auto-linked to an existing local account.
+func SocialLinkedAction(provider string) string {
+	return "auth." + provider + "_account_linked"
+}
 
 // ---------------------------------------------------------------------------
 // Event — input to Logger.Log()
