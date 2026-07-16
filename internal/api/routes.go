@@ -55,6 +55,7 @@ type RoutesConfig struct {
 	SMTPFrom     string
 	SMTPUsername string
 	SMTPPassword string
+	SMTPTLS      string
 	// CookieDomain is the Domain attribute for auth cookies (e.g. ".engineersmind.com").
 	// Leave empty for localhost development.
 	CookieDomain string
@@ -224,9 +225,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		SMTPFrom:     deps.Config.SMTPFrom,
 		SMTPUsername: deps.Config.SMTPUsername,
 		SMTPPassword: deps.Config.SMTPPassword,
+		SMTPTLS:      deps.Config.SMTPTLS,
 		Logger:       deps.Logger,
 	})
 	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger)
+
+	// White-label email senders (issue #63 follow-on) — MFA code emails
+	// resolve their sender application → tenant → global (SMTP_FROM).
+	senderSvc := auth.NewEmailSenderService(deps.Pool, totpSvc.EncryptionKey(), deps.Logger)
+
+	// Email MFA service (issue #63) — email one-time codes as a second factor,
+	// per-application opt-in via application_mfa_settings.allowed_methods.
+	emailMFASvc := auth.NewEmailMFAService(deps.Pool, deps.Redis, m, deps.Logger).
+		WithSenders(senderSvc)
+	authSvc.WithEmailMFA(emailMFASvc)
 
 	// Audit logger — shared by both auth and admin handlers
 	auditLog := audit.New(deps.Pool, deps.Logger)
@@ -235,6 +247,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
 		WithTOTP(totpSvc).
+		WithEmailMFA(emailMFASvc).
 		WithAPIKeys(apiKeySvc).
 		WithApplications(appSvc).
 		WithCookieConfig(cookieCfg).
@@ -254,6 +267,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
 		WithAppRateLimits(appLimitSvc).
 		WithApplications(appSvc).
+		WithTOTP(totpSvc).
+		WithEmailSenders(senderSvc).
 		WithCORS(corsSvc)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
@@ -291,7 +306,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/register", authHandler.Register)
 	// Login is rate-limited at route level (not global) to avoid impacting other endpoints.
 	authGroup.POST("/login", authHandler.Login, mw.LoginRateLimiter(rlCfg))
-	authGroup.POST("/login/otp", authHandler.LoginOTP) // complete TOTP-gated login (03-02)
+	// TOTP challenge completion + forced-enrollment endpoints (03-02, issue #63).
+	// OTPRateLimiter bounds endpoint volume per IP and per session token; the
+	// hard per-session cap of auth.MaxOTPAttempts incorrect codes lives in the
+	// service layer (Redis INCR), so a 6-digit code cannot be brute-forced
+	// within the challenge TTL.
+	authGroup.POST("/login/otp", authHandler.LoginOTP, mw.OTPRateLimiter(rlCfg))                    // complete MFA-gated login (TOTP, backup, or emailed code)
+	authGroup.POST("/login/otp/resend", authHandler.LoginOTPResend, mw.OTPRateLimiter(rlCfg))       // re-send the emailed login code (max 3/challenge)
+	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, mw.OTPRateLimiter(rlCfg))     // forced enrollment, TOTP path: get QR + backup codes
+	authGroup.POST("/login/mfa/email", authHandler.MFAEmailPending, mw.OTPRateLimiter(rlCfg))       // forced enrollment, email path: send code to inbox
+	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, mw.OTPRateLimiter(rlCfg)) // forced enrollment: first code → tokens
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
@@ -323,6 +347,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/apps/register", authHandler.AppRegister, mw.TokenRateLimiter(rlCfg))
 	authGroup.POST("/apps/login", authHandler.AppLogin, mw.TokenRateLimiter(rlCfg))
 
+	// Passwordless magic-link sign-in (issue #63 follow-on) — per-application
+	// opt-in. The link replaces only the password step: verification runs the
+	// same MFA gate as /apps/login, so a 'required' app still challenges.
+	authGroup.POST("/apps/login/magic", authHandler.AppMagicLink, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify, mw.TokenRateLimiter(rlCfg))
+
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates
 	// the refresh token (distributed lock + fresh user DB load) and writes new
@@ -337,7 +367,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	otpGroup := authGroup.Group("/otp", jwtRenew)
 	otpGroup.POST("/enroll", authHandler.TOTPEnroll)
 	otpGroup.POST("/activate", authHandler.TOTPActivate)
+	otpGroup.GET("/status", authHandler.TOTPStatus)                 // all-method MFA state + backup codes remaining
+	otpGroup.POST("/backup-codes", authHandler.TOTPRegenerateCodes) // fresh set of 8, secret unchanged
 	otpGroup.DELETE("", authHandler.TOTPDisable)
+
+	// Email MFA self-service (issue #63) — one-time codes to the account inbox.
+	otpGroup.POST("/email/enroll", authHandler.EmailMFAEnroll)     // policy-checked; sends verification code
+	otpGroup.POST("/email/activate", authHandler.EmailMFAActivate) // confirm code → method active
+	otpGroup.POST("/email/send", authHandler.EmailMFASendCode)     // fresh code as proof for self-service actions
+	otpGroup.DELETE("/email", authHandler.EmailMFADisable)         // code-verified; last-factor guard under 'required'
 
 	// Admin routes — require a valid JWT. JWTRequired (not JWTRenew) is used here
 	// because the refresh cookie is scoped to /api/v1/auth; browsers will not send
@@ -424,6 +462,24 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/tenants/:tid/applications/:appID/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.DeletePermission, tidPermsWrite)
+
+	// Per-application MFA policy under the canonical family (issue #63) —
+	// owner (apps:read/apps:write, own tenant) and super_admin (tenant:manage,
+	// any tenant) manage each application's MFA mode; MFA policy is
+	// application configuration, so it rides the apps:* permissions.
+	adminGroup.GET("/tenants/:tid/applications/:appID/mfa", adminHandler.GetApplicationMFA, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, tidUsersWrite)
+
+	// White-label email senders under the canonical family (issue #63
+	// follow-on) — tenant-level sender plus optional per-application override;
+	// MFA code emails resolve application → tenant → global.
+	adminGroup.GET("/tenants/:tid/email-settings", adminHandler.GetEmailSender, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-settings", adminHandler.GetEmailSender, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
 
 	// End-user application users under the canonical family — each
 	// application manages its own isolated user base.
@@ -513,6 +569,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications/:appID/permissions", adminHandler.ListPermissions, permsRead)
 	adminGroup.PUT("/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, permsWrite)
 	adminGroup.DELETE("/applications/:appID/permissions/:pid", adminHandler.DeletePermission, permsWrite)
+
+	// Per-application MFA policy — flat aliases of the canonical
+	// /tenants/:tid/applications/:appID/mfa family (issue #63).
+	adminGroup.GET("/applications/:appID/mfa", adminHandler.GetApplicationMFA, appsRead)
+	adminGroup.PUT("/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appsWrite)
+	adminGroup.DELETE("/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, usersWrite)
+
+	// White-label email senders — flat aliases (tenant from JWT).
+	adminGroup.GET("/email-settings", adminHandler.GetEmailSender, appsRead)
+	adminGroup.PUT("/email-settings", adminHandler.UpsertEmailSender, appsWrite)
+	adminGroup.DELETE("/email-settings", adminHandler.DeleteEmailSender, appsWrite)
+	adminGroup.GET("/applications/:appID/email-settings", adminHandler.GetEmailSender, appsRead)
+	adminGroup.PUT("/applications/:appID/email-settings", adminHandler.UpsertEmailSender, appsWrite)
+	adminGroup.DELETE("/applications/:appID/email-settings", adminHandler.DeleteEmailSender, appsWrite)
 
 	// End-user application users — each application manages its own isolated
 	// user base (flat aliases of the canonical /tenants/:tid variants).

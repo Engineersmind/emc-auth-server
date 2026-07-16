@@ -95,7 +95,7 @@ func TestTOTPService_Enroll_ReturnsURIAndCodes(t *testing.T) {
 
 	userID := insertTOTPTestUser(t, ctx, pool, "enroll-uri@emc.local")
 
-	result, err := svc.Enroll(ctx, userID, tenantID, "enroll-uri@emc.local")
+	result, err := svc.Enroll(ctx, userID, tenantID, "enroll-uri@emc.local", "")
 	if err != nil {
 		t.Fatalf("Enroll() error = %v", err)
 	}
@@ -134,7 +134,7 @@ func TestTOTPService_VerifyAndActivate(t *testing.T) {
 
 	userID := insertTOTPTestUser(t, ctx, pool, "activate@emc.local")
 
-	result, err := svc.Enroll(ctx, userID, tenantID, "activate@emc.local")
+	result, err := svc.Enroll(ctx, userID, tenantID, "activate@emc.local", "")
 	if err != nil {
 		t.Fatalf("Enroll() error = %v", err)
 	}
@@ -181,7 +181,7 @@ func TestTOTPService_Verify_InvalidCode(t *testing.T) {
 
 	userID := insertTOTPTestUser(t, ctx, pool, "verify-invalid@emc.local")
 
-	result, err := svc.Enroll(ctx, userID, tenantID, "verify-invalid@emc.local")
+	result, err := svc.Enroll(ctx, userID, tenantID, "verify-invalid@emc.local", "")
 	if err != nil {
 		t.Fatalf("Enroll() error = %v", err)
 	}
@@ -225,7 +225,7 @@ func TestTOTPService_VerifyBackupCode_ConsumesCode(t *testing.T) {
 
 	userID := insertTOTPTestUser(t, ctx, pool, "backupcode@emc.local")
 
-	result, err := svc.Enroll(ctx, userID, tenantID, "backupcode@emc.local")
+	result, err := svc.Enroll(ctx, userID, tenantID, "backupcode@emc.local", "")
 	if err != nil {
 		t.Fatalf("Enroll() error = %v", err)
 	}
@@ -271,7 +271,7 @@ func TestTOTPService_Disable(t *testing.T) {
 
 	userID := insertTOTPTestUser(t, ctx, pool, "disable@emc.local")
 
-	result, err := svc.Enroll(ctx, userID, tenantID, "disable@emc.local")
+	result, err := svc.Enroll(ctx, userID, tenantID, "disable@emc.local", "")
 	if err != nil {
 		t.Fatalf("Enroll() error = %v", err)
 	}

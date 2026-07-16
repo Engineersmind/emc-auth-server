@@ -23,6 +23,8 @@ type AdminHandler struct {
 	svc         *admin.Service
 	appLimitSvc *auth.AppRateLimitService
 	appSvc      *auth.ApplicationService
+	totpSvc     *auth.TOTPService
+	senderSvc   *auth.EmailSenderService
 	corsSvc     *mw.TenantCORSService
 	audit       *audit.Logger
 	logger      zerolog.Logger
@@ -48,6 +50,18 @@ func (h *AdminHandler) WithCORS(svc *mw.TenantCORSService) *AdminHandler {
 // WithApplications attaches the ApplicationService for application CRUD handlers.
 func (h *AdminHandler) WithApplications(svc *auth.ApplicationService) *AdminHandler {
 	h.appSvc = svc
+	return h
+}
+
+// WithTOTP attaches the TOTPService for per-application MFA policy handlers.
+func (h *AdminHandler) WithTOTP(svc *auth.TOTPService) *AdminHandler {
+	h.totpSvc = svc
+	return h
+}
+
+// WithEmailSenders attaches the EmailSenderService for white-label sender handlers.
+func (h *AdminHandler) WithEmailSenders(svc *auth.EmailSenderService) *AdminHandler {
+	h.senderSvc = svc
 	return h
 }
 
@@ -2216,6 +2230,326 @@ func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 
 	h.auditAdmin(c, claims, audit.ActionAdminApplicationDeleted, "application", strconv.FormatInt(appID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "application deactivated"})
+}
+
+// ---------------------------------------------------------------------------
+// Per-application MFA policy (issue #63) — owner (apps:read/apps:write on the
+// own tenant) and super_admin (tenant:manage, any tenant) via the same
+// canonical /tenants/:tid/applications/:appID/mfa family + flat aliases.
+// ---------------------------------------------------------------------------
+
+// UpdateApplicationMFARequest is the body for PUT .../applications/:appID/mfa.
+// AllowedMethods omitted (null) keeps the existing method set; when present it
+// must be a non-empty subset of ["totp", "email"]. The magic-link fields
+// omitted (null) keep the stored values; enabling requires a redirect URL
+// (stored or provided).
+type UpdateApplicationMFARequest struct {
+	Mode                 string   `json:"mode"`
+	AllowedMethods       []string `json:"allowed_methods"`
+	MagicLinkEnabled     *bool    `json:"magic_link_enabled"`
+	MagicLinkRedirectURL *string  `json:"magic_link_redirect_url"`
+}
+
+// GetApplicationMFA handles GET /api/v1/applications/:appID/mfa and
+// GET /api/v1/tenants/:tid/applications/:appID/mfa.
+//
+// @Summary      Get application MFA policy
+// @Description  Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional) plus enrollment stats over the application's own user base.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID  path      string  true  "Application ID"
+// @Success      200    {object}  auth.MFAPolicy
+// @Failure      403    {object}  map[string]string
+// @Failure      404    {object}  map[string]string  "Application not found"
+// @Router       /api/v1/applications/{appID}/mfa [get]
+func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, ok := h.applicationOwnedByTenant(c, tenantID)
+	if !ok {
+		return nil
+	}
+
+	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: get application MFA policy failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get MFA policy"})
+	}
+	return c.JSON(http.StatusOK, policy)
+}
+
+// UpdateApplicationMFA handles PUT /api/v1/applications/:appID/mfa and
+// PUT /api/v1/tenants/:tid/applications/:appID/mfa.
+//
+// @Summary      Set application MFA policy
+// @Description  Sets the application's MFA mode and (optionally) its allowed methods. 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login until an admin resets them); 'optional' restores the default opt-in behaviour. allowed_methods omitted keeps the current set (default ["totp"]).
+// @Tags         admin-applications
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID  path      string                       true  "Application ID"
+// @Param        body   body      UpdateApplicationMFARequest  true  "MFA mode (disabled | optional | required) + optional allowed_methods subset of [totp, email]"
+// @Success      200    {object}  auth.MFAPolicy
+// @Failure      400    {object}  map[string]string  "Invalid mode"
+// @Failure      403    {object}  map[string]string
+// @Failure      404    {object}  map[string]string  "Application not found"
+// @Router       /api/v1/applications/{appID}/mfa [put]
+func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, ok := h.applicationOwnedByTenant(c, tenantID)
+	if !ok {
+		return nil
+	}
+
+	var req UpdateApplicationMFARequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	// Service tokens carry the public client_id in UserID — record no updater
+	// rather than a garbage id (same convention as auditAdmin).
+	var updatedBy *int64
+	if claims != nil {
+		if uid, perr := strconv.ParseInt(claims.UserID, 10, 64); perr == nil {
+			updatedBy = &uid
+		}
+	}
+
+	if err := h.totpSvc.SetAppMFAPolicy(c.Request().Context(), tenantID, appID, req.Mode, req.AllowedMethods, updatedBy); err != nil {
+		if errors.Is(err, auth.ErrInvalidMFAMode) || errors.Is(err, auth.ErrInvalidMFAMethods) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if errors.Is(err, auth.ErrAppNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: set application MFA policy failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})
+	}
+
+	if req.MagicLinkEnabled != nil || req.MagicLinkRedirectURL != nil {
+		if err := h.totpSvc.SetAppMagicLink(c.Request().Context(), tenantID, appID, req.MagicLinkEnabled, req.MagicLinkRedirectURL, updatedBy); err != nil {
+			if errors.Is(err, auth.ErrMagicLinkNotConfigured) {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+			}
+			if errors.Is(err, auth.ErrAppNotFound) {
+				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+			}
+			h.logger.Error().Err(err).Msg("admin: set application magic link failed")
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set magic link settings"})
+		}
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminMFAPolicyUpdated, "application", strconv.FormatInt(appID, 10))
+
+	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: reload application MFA policy failed")
+		return c.JSON(http.StatusOK, map[string]string{"message": "MFA policy updated"})
+	}
+	return c.JSON(http.StatusOK, policy)
+}
+
+// ResetUserMFA handles DELETE /api/v1/applications/:appID/users/:uid/mfa and
+// DELETE /api/v1/tenants/:tid/applications/:appID/users/:uid/mfa.
+//
+// @Summary      Reset a user's MFA enrollment
+// @Description  Removes the user's TOTP enrollment (support path for lost phone + backup codes). The user must belong to the application's own user base. If the application's MFA mode is 'required', the user is forced through enrollment again at their next login. Idempotent.
+// @Tags         admin-applications
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID  path      string  true  "Application ID"
+// @Param        uid    path      string  true  "User ID"
+// @Success      200    {object}  map[string]string
+// @Failure      403    {object}  map[string]string
+// @Failure      404    {object}  map[string]string  "Application or user not found"
+// @Router       /api/v1/applications/{appID}/users/{uid}/mfa [delete]
+func (h *AdminHandler) ResetUserMFA(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appID, ok := h.applicationOwnedByTenant(c, tenantID)
+	if !ok {
+		return nil
+	}
+
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	if err := h.totpSvc.ResetUserMFA(c.Request().Context(), tenantID, &appID, userID); err != nil {
+		if errors.Is(err, auth.ErrUserNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: reset user MFA failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to reset user MFA"})
+	}
+
+	h.auditAdmin(c, claims, audit.ActionAdminUserMFAReset, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "MFA enrollment reset — the user will set up MFA again according to the application's policy"})
+}
+
+// ---------------------------------------------------------------------------
+// White-label email senders (issue #63 follow-on) — transactional email (MFA
+// codes) resolves its sender application → tenant → global. Tenant-level
+// routes omit :appID; application-level routes carry it.
+// ---------------------------------------------------------------------------
+
+// UpsertEmailSenderRequest is the body for PUT .../email-settings.
+// SMTPPassword empty on update keeps the stored password.
+type UpsertEmailSenderRequest struct {
+	FromAddress  string `json:"from_address"`
+	SMTPHost     string `json:"smtp_host"`
+	SMTPPort     int    `json:"smtp_port"`
+	SMTPUsername string `json:"smtp_username"`
+	SMTPPassword string `json:"smtp_password"`
+	IsActive     *bool  `json:"is_active"`
+}
+
+// emailSenderScope resolves the tenant and optional application scope for the
+// email-sender handlers. Returns ok=false after writing the error response.
+func (h *AdminHandler) emailSenderScope(c echo.Context) (tenantID int64, appRowID *int64, claims *auth.Claims, ok bool) {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		_ = c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return 0, nil, nil, false
+	}
+	if c.Param("appID") != "" {
+		appID, owned := h.applicationOwnedByTenant(c, tenantID)
+		if !owned {
+			return 0, nil, nil, false
+		}
+		appRowID = &appID
+	}
+	return tenantID, appRowID, claims, true
+}
+
+// senderResource labels the audit resource for one scope.
+func senderResource(tenantID int64, appRowID *int64) (resourceType, resourceID string) {
+	if appRowID != nil {
+		return "application", strconv.FormatInt(*appRowID, 10)
+	}
+	return "tenant", strconv.FormatInt(tenantID, 10)
+}
+
+// GetEmailSender handles GET /api/v1/tenants/:tid/email-settings,
+// GET /api/v1/tenants/:tid/applications/:appID/email-settings and flat aliases.
+//
+// @Summary      Get email sender settings
+// @Description  Returns the white-label sender configured for the tenant (or one application). The SMTP password is never returned — has_password reports whether one is stored. 404 = no sender at this scope (the global server sender applies).
+// @Tags         admin-email-senders
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  auth.EmailSenderSettings
+// @Failure      403  {object}  map[string]string
+// @Failure      404  {object}  map[string]string  "No sender configured at this scope"
+// @Router       /api/v1/email-settings [get]
+func (h *AdminHandler) GetEmailSender(c echo.Context) error {
+	tenantID, appRowID, _, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+
+	settings, err := h.senderSvc.Get(c.Request().Context(), tenantID, appRowID)
+	if err != nil {
+		if errors.Is(err, auth.ErrSenderNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "no email sender configured at this scope — the global sender applies"})
+		}
+		h.logger.Error().Err(err).Msg("admin: get email sender failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get email sender settings"})
+	}
+	return c.JSON(http.StatusOK, settings)
+}
+
+// UpsertEmailSender handles PUT /api/v1/tenants/:tid/email-settings,
+// PUT /api/v1/tenants/:tid/applications/:appID/email-settings and flat aliases.
+//
+// @Summary      Set email sender settings
+// @Description  Creates or updates the white-label sender for the tenant (or one application). MFA code emails then go out From this address via this SMTP relay, with priority application → tenant → global; a relay failure falls back to the global sender. The SMTP password is stored encrypted (AES-256-GCM); omit it on update to keep the current one. The owner is responsible for SPF/DKIM on the sending domain.
+// @Tags         admin-email-senders
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      UpsertEmailSenderRequest  true  "Sender settings (from_address + smtp_host required)"
+// @Success      200   {object}  auth.EmailSenderSettings
+// @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string
+// @Router       /api/v1/email-settings [put]
+func (h *AdminHandler) UpsertEmailSender(c echo.Context) error {
+	tenantID, appRowID, claims, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+
+	var req UpsertEmailSenderRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	var updatedBy *int64
+	if claims != nil {
+		if uid, perr := strconv.ParseInt(claims.UserID, 10, 64); perr == nil {
+			updatedBy = &uid
+		}
+	}
+
+	settings, err := h.senderSvc.Upsert(c.Request().Context(), tenantID, appRowID, auth.UpsertSenderInput{
+		FromAddress:  req.FromAddress,
+		SMTPHost:     req.SMTPHost,
+		SMTPPort:     req.SMTPPort,
+		SMTPUsername: req.SMTPUsername,
+		SMTPPassword: req.SMTPPassword,
+		IsActive:     req.IsActive,
+	}, updatedBy)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidSender) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: upsert email sender failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save email sender settings"})
+	}
+
+	rt, rid := senderResource(tenantID, appRowID)
+	h.auditAdmin(c, claims, audit.ActionAdminEmailSenderUpdated, rt, rid)
+	return c.JSON(http.StatusOK, settings)
+}
+
+// DeleteEmailSender handles DELETE /api/v1/tenants/:tid/email-settings,
+// DELETE /api/v1/tenants/:tid/applications/:appID/email-settings and flat aliases.
+//
+// @Summary      Delete email sender settings
+// @Description  Removes the white-label sender at this scope; sends fall back to the next level (application → tenant → global).
+// @Tags         admin-email-senders
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  map[string]string
+// @Failure      403  {object}  map[string]string
+// @Failure      404  {object}  map[string]string  "No sender configured at this scope"
+// @Router       /api/v1/email-settings [delete]
+func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
+	tenantID, appRowID, claims, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+
+	if err := h.senderSvc.Delete(c.Request().Context(), tenantID, appRowID); err != nil {
+		if errors.Is(err, auth.ErrSenderNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "no email sender configured at this scope"})
+		}
+		h.logger.Error().Err(err).Msg("admin: delete email sender failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete email sender settings"})
+	}
+
+	rt, rid := senderResource(tenantID, appRowID)
+	h.auditAdmin(c, claims, audit.ActionAdminEmailSenderDeleted, rt, rid)
+	return c.JSON(http.StatusOK, map[string]string{"message": "email sender removed — sends fall back to the next level"})
 }
 
 // TenantGetStats handles GET /api/v1/tenants/:tid/stats.
