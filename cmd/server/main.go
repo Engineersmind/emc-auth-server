@@ -145,6 +145,7 @@ func main() {
 			SMTPFrom:                               cfg.SMTPFrom,
 			SMTPUsername:                           cfg.SMTPUsername,
 			SMTPPassword:                           cfg.SMTPPassword,
+			SMTPTLS:                                cfg.SMTPTLS,
 			CookieDomain:                           cfg.CookieDomain,
 			GlobalCORSOrigins:                      cfg.GlobalCORSOrigins,
 		},

@@ -840,6 +840,129 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/mfa": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional) plus enrollment stats over the application's own user base.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Get application MFA policy",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MFAPolicy"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets the application's MFA mode and (optionally) its allowed methods. 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login until an admin resets them); 'optional' restores the default opt-in behaviour. allowed_methods omitted keeps the current set (default [\"totp\"]).",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Set application MFA policy",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "MFA mode (disabled | optional | required) + optional allowed_methods subset of [totp, email]",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateApplicationMFARequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MFAPolicy"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid mode",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/roles": {
             "get": {
                 "security": [
@@ -1089,6 +1212,68 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/users/{uid}/mfa": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the user's TOTP enrollment (support path for lost phone + backup codes). The user must belong to the application's own user base. If the application's MFA mode is 'required', the user is forced through enrollment again at their next login. Idempotent.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Reset a user's MFA enrollment",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application or user not found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -1539,6 +1724,136 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/apps/login/magic": {
+            "post": {
+                "description": "Emails a single-use, 15-minute sign-in link to the account address if it exists in the application's user base. Always returns success for unknown emails (no account enumeration). Requires magic-link sign-in to be enabled on the application's auth policy.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Request a magic sign-in link",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Account email",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MagicLinkRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid application credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Magic link not enabled for this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/login/magic/verify": {
+            "post": {
+                "description": "Consumes the single-use token from the emailed link. The application's MFA policy still applies: the response is a token pair, an OTP challenge (requires_otp), or a forced-enrollment challenge (403 mfa_enrollment_required) — exactly like a password login.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Verify a magic sign-in link",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Token from the emailed link",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MagicLinkVerifyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid application credentials or invalid/expired link",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "MFA enrollment required",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/apps/register": {
             "post": {
                 "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed.",
@@ -1703,9 +2018,195 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/login/mfa/activate": {
+            "post": {
+                "description": "Verifies the first TOTP code for a pending enrollment, marks MFA active, and completes the login in the same step — the response carries the token pair. 5 incorrect codes invalidate the enrollment session.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Activate forced MFA enrollment and complete login",
+                "parameters": [
+                    {
+                        "description": "Enrollment token + first TOTP code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFAActivateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid code or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Attempt budget exhausted — restart login",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/login/mfa/email": {
+            "post": {
+                "description": "Sends a one-time code to the pending account's inbox for a login against a 'required'-MFA application. Submitting that code to /auth/login/mfa/activate enrolls the user in email MFA and completes the login. Available only when the application's allowed_methods include \"email\".",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Begin forced MFA enrollment via email",
+                "parameters": [
+                    {
+                        "description": "Enrollment token from the login response",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFAEmailPendingRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Email method not allowed for this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Re-send budget exhausted",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/login/mfa/enroll": {
+            "post": {
+                "description": "Exchanges the enrollment token returned by a login against a 'required'-MFA application for a TOTP secret (otpauth:// URI + backup codes). The token authorizes only this call and /auth/login/mfa/activate; no JWT is issued until activation completes.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Begin forced MFA enrollment",
+                "parameters": [
+                    {
+                        "description": "Enrollment token from the login response",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFAEnrollRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EnrollResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/login/otp": {
             "post": {
-                "description": "Submit the TOTP code (or backup code) to complete a two-step login.",
+                "description": "Submit the TOTP code (or backup code) to complete a two-step login. The session allows 5 incorrect codes before it is invalidated. Returns the full token pair (and sets auth cookies for browser clients).",
                 "consumes": [
                     "application/json"
                 ],
@@ -1745,6 +2246,79 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Attempt budget exhausted — restart login",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/login/otp/resend": {
+            "post": {
+                "description": "Re-sends the one-time email code for an open OTP challenge (max 3 re-sends per challenge). Only available when the challenge's methods include \"email\".",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Resend login email code",
+                "parameters": [
+                    {
+                        "description": "OTP session token",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.LoginOTPResendRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid or expired session",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Re-send budget exhausted",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -1989,7 +2563,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Disables TOTP for the current user. Requires a valid TOTP code or backup code.",
+                "description": "Disables TOTP for the current user. Requires a valid TOTP code or backup code. Rejected when the user's application has MFA mode 'required' — users cannot opt out of a mandated policy.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2023,6 +2597,15 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "MFA is required by the application's policy",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2084,6 +2667,299 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/otp/backup-codes": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces all remaining backup codes with a fresh set of 8 WITHOUT rotating the TOTP secret — the authenticator app keeps working. Requires a valid current TOTP or backup code. Every previous backup code is invalidated; the new plaintext codes are shown exactly once.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Regenerate backup codes",
+                "parameters": [
+                    {
+                        "description": "Current TOTP or backup code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.TOTPRegenerateCodesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Missing or invalid proof code",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/otp/email": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Disables email MFA for the current user. Requires a fresh emailed code (request one via POST /auth/otp/email/send). Rejected when it is the user's last second factor under a 'required' application policy.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Disable email MFA",
+                "parameters": [
+                    {
+                        "description": "Emailed verification code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.EmailMFACodeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid or expired code",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "MFA is required by the application's policy",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/otp/email/activate": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Verifies the emailed code and marks email MFA active. From then on, logins are challenged with a one-time code sent to the account's inbox.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Activate email MFA",
+                "parameters": [
+                    {
+                        "description": "Emailed verification code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.EmailMFACodeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid or expired code",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Attempt budget exhausted",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/otp/email/enroll": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Starts email-OTP enrollment: sends a verification code to the account's email address. Activate with POST /auth/otp/email/activate. Rejected when the application's MFA mode is 'disabled' or its policy does not allow the email method.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Enroll in email MFA",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "MFA disabled or email method not allowed for this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/otp/email/send": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sends a fresh one-time code to the account's inbox for an already-active email MFA enrollment — used as proof for self-service actions such as disabling email MFA.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Send an email MFA verification code",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Email MFA not active",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/otp/enroll": {
             "post": {
                 "security": [
@@ -2091,7 +2967,10 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Generates a TOTP secret and returns an otpauth:// URI plus backup codes.",
+                "description": "Generates a TOTP secret and returns an otpauth:// URI plus backup codes. The authenticator issuer is the owning application's name for application-scoped users. Rejected when the application's MFA mode is 'disabled'. Re-enrolling while active requires a valid current TOTP or backup code in the body.",
+                "consumes": [
+                    "application/json"
+                ],
                 "produces": [
                     "application/json"
                 ],
@@ -2099,11 +2978,64 @@ const docTemplate = `{
                     "AUTH"
                 ],
                 "summary": "Enroll in TOTP 2FA",
+                "parameters": [
+                    {
+                        "description": "Current code (required only when re-enrolling)",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.TOTPEnrollRequest"
+                        }
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/auth.EnrollResult"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "MFA disabled for this application, or missing re-enrollment proof",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/otp/status": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Get own MFA status",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.TOTPStatus"
                         }
                     },
                     "401": {
@@ -2444,6 +3376,148 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/email-settings": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the white-label sender configured for the tenant (or one application). The SMTP password is never returned — has_password reports whether one is stored. 404 = no sender at this scope (the global server sender applies).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-senders"
+                ],
+                "summary": "Get email sender settings",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EmailSenderSettings"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "No sender configured at this scope",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Creates or updates the white-label sender for the tenant (or one application). MFA code emails then go out From this address via this SMTP relay, with priority application → tenant → global; a relay failure falls back to the global sender. The SMTP password is stored encrypted (AES-256-GCM); omit it on update to keep the current one. The owner is responsible for SPF/DKIM on the sending domain.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-senders"
+                ],
+                "summary": "Set email sender settings",
+                "parameters": [
+                    {
+                        "description": "Sender settings (from_address + smtp_host required)",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpsertEmailSenderRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EmailSenderSettings"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the white-label sender at this scope; sends fall back to the next level (application → tenant → global).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-senders"
+                ],
+                "summary": "Delete email sender settings",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "No sender configured at this scope",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5164,6 +6238,39 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.EmailSenderSettings": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "description": "nil = tenant-level",
+                    "type": "string"
+                },
+                "from_address": {
+                    "type": "string"
+                },
+                "has_password": {
+                    "type": "boolean"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "smtp_host": {
+                    "type": "string"
+                },
+                "smtp_port": {
+                    "type": "integer"
+                },
+                "smtp_username": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.EnrollResult": {
             "type": "object",
             "properties": {
@@ -5174,6 +6281,47 @@ const docTemplate = `{
                     }
                 },
                 "otp_uri": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.MFAPolicy": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "application_id": {
+                    "type": "string"
+                },
+                "email_enrolled_users": {
+                    "type": "integer"
+                },
+                "enrolled_users": {
+                    "description": "Enrollment stats over the application's own isolated user base — for the\nowner dashboard. Pending = TOTP enrolled but never activated.",
+                    "type": "integer"
+                },
+                "magic_link_enabled": {
+                    "description": "Passwordless magic-link sign-in (opt-in; the redirect URL is the\napplication frontend that receives ?token=…).",
+                    "type": "boolean"
+                },
+                "magic_link_redirect_url": {
+                    "type": "string"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "pending_enrollments": {
+                    "type": "integer"
+                },
+                "total_users": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "description": "UpdatedAt is nil when no explicit policy row exists (implicit 'optional').",
                     "type": "string"
                 }
             }
@@ -5227,6 +6375,23 @@ const docTemplate = `{
                 },
                 "updated_at": {
                     "type": "string"
+                }
+            }
+        },
+        "auth.TOTPStatus": {
+            "type": "object",
+            "properties": {
+                "active": {
+                    "type": "boolean"
+                },
+                "backup_codes_remaining": {
+                    "type": "integer"
+                },
+                "email_active": {
+                    "type": "boolean"
+                },
+                "enrolled": {
+                    "type": "boolean"
                 }
             }
         },
@@ -5427,6 +6592,14 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.EmailMFACodeRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.ForgotPasswordRequest": {
             "type": "object",
             "properties": {
@@ -5457,6 +6630,14 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.LoginOTPResendRequest": {
+            "type": "object",
+            "properties": {
+                "otp_session_token": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.LoginRequest": {
             "type": "object",
             "required": [
@@ -5476,6 +6657,49 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "refresh_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.MFAActivateRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                },
+                "enrollment_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.MFAEmailPendingRequest": {
+            "type": "object",
+            "properties": {
+                "enrollment_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.MFAEnrollRequest": {
+            "type": "object",
+            "properties": {
+                "enrollment_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.MagicLinkRequest": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.MagicLinkVerifyRequest": {
+            "type": "object",
+            "properties": {
+                "token": {
                     "type": "string"
                 }
             }
@@ -5591,10 +6815,46 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.TOTPEnrollRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.TOTPRegenerateCodesRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.TokenRequest": {
             "type": "object",
             "properties": {
                 "grant_type": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpdateApplicationMFARequest": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "magic_link_enabled": {
+                    "type": "boolean"
+                },
+                "magic_link_redirect_url": {
+                    "type": "string"
+                },
+                "mode": {
                     "type": "string"
                 }
             }
@@ -5672,6 +6932,29 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "last_name": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpsertEmailSenderRequest": {
+            "type": "object",
+            "properties": {
+                "from_address": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "smtp_host": {
+                    "type": "string"
+                },
+                "smtp_password": {
+                    "type": "string"
+                },
+                "smtp_port": {
+                    "type": "integer"
+                },
+                "smtp_username": {
                     "type": "string"
                 }
             }

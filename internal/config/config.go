@@ -22,6 +22,10 @@ type Config struct {
 	SMTPFrom     string
 	SMTPUsername string
 	SMTPPassword string
+	// SMTPTLS overrides TLS mode for the global sender: "ssl" (implicit TLS,
+	// port 465), "starttls" (mandatory, port 587), "opportunistic", or "none"
+	// (local relays only). Empty derives from the port. Set via SMTP_TLS.
+	SMTPTLS string
 
 	// AppBaseURL is prepended to the reset token link in emails.
 	// Example: "https://auth.emc.local"
@@ -72,6 +76,7 @@ func Load() *Config {
 		SMTPFrom:                               getEnv("SMTP_FROM", "no-reply@emc.local"),
 		SMTPUsername:                           getEnv("SMTP_USERNAME", ""),
 		SMTPPassword:                           getEnv("SMTP_PASSWORD", ""),
+		SMTPTLS:                                getEnv("SMTP_TLS", ""),
 		AppBaseURL:                             getEnv("APP_BASE_URL", "http://localhost:9090"),
 		TOTPEncryptionKey:                      getEnv("TOTP_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKey:         getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", ""),

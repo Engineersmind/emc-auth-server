@@ -368,4 +368,53 @@ func TestGitHubLoginFlowIntegration(t *testing.T) {
 			t.Fatalf("err = %v, want ErrOAuthLinkConflict (takeover gate)", err)
 		}
 	})
+
+	t.Run("second distinct provider account sharing a verified email is rejected, not logged in", func(t *testing.T) {
+		// A verified LOCAL user already has a linked GitHub identity
+		// (provider_sub=111).
+		var localID int64
+		err := env.pool.QueryRow(ctx, `
+			INSERT INTO users (tenant_id, email, first_name, last_name, application_id, is_active, email_verified)
+			VALUES ($1, 'shared.mailbox@example.com', '', '', $2, true, true) RETURNING id
+		`, env.tenantID, env.appRowID).Scan(&localID)
+		if err != nil {
+			t.Fatalf("seed verified user: %v", err)
+		}
+		sg.setIdentity(
+			githubUser{ID: 111, Login: "first-owner", Name: "First Owner"},
+			[]githubEmail{{Email: "shared.mailbox@example.com", Primary: true, Verified: true}},
+		)
+		result, err := env.callback(t, env.startLogin(t))
+		if err != nil {
+			t.Fatalf("HandleCallback (first account): %v", err)
+		}
+		if result.Outcome != "linked" || result.UserID != localID {
+			t.Fatalf("outcome=%q user=%d, want linked/%d", result.Outcome, result.UserID, localID)
+		}
+
+		// A SECOND, distinct GitHub account (provider_sub=222) temporarily
+		// reports the same verified primary email — e.g. mid email-change on
+		// GitHub's side, or an attacker who controls both accounts. It must
+		// NOT be linked onto localID (that would let sub=222 authenticate as
+		// localID going forward) and must NOT silently return a "login" for
+		// localID either.
+		sg.setIdentity(
+			githubUser{ID: 222, Login: "second-owner", Name: "Second Owner"},
+			[]githubEmail{{Email: "shared.mailbox@example.com", Primary: true, Verified: true}},
+		)
+		if _, err := env.callback(t, env.startLogin(t)); !errors.Is(err, ErrOAuthLinkConflict) {
+			t.Fatalf("err = %v, want ErrOAuthLinkConflict (cross-account takeover gate)", err)
+		}
+
+		var n int
+		if err := env.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM user_identities
+			WHERE tenant_id = $1 AND provider = 'github' AND provider_sub = '222'
+		`, env.tenantID).Scan(&n); err != nil {
+			t.Fatalf("count identities for sub=222: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("rejected cross-account link created %d rows for provider_sub=222", n)
+		}
+	})
 }

@@ -73,6 +73,27 @@ const (
 	// Auth — machine-to-machine client_credentials grant
 	ActionAuthClientCredentials = "auth.client_credentials"
 
+	// Auth — MFA/TOTP lifecycle (issue #63)
+	ActionAuthMFAEnrolled         = "auth.mfa_enrolled"
+	ActionAuthMFAActivated        = "auth.mfa_activated"
+	ActionAuthMFADisabled         = "auth.mfa_disabled"
+	ActionAuthMFAChallengeFailed  = "auth.mfa_challenge_failed"
+	ActionAuthMFACodesRegenerated = "auth.mfa_backup_codes_regenerated"
+	ActionAuthMFAEmailEnrolled    = "auth.mfa_email_enrolled"
+	ActionAuthMFAEmailActivated   = "auth.mfa_email_activated"
+	ActionAuthMFAEmailDisabled    = "auth.mfa_email_disabled"
+
+	// Auth — passwordless magic-link sign-in (issue #63 follow-on)
+	ActionAuthMagicLinkRequested = "auth.magic_link_requested"
+
+	// Admin — per-application MFA policy management (issue #63)
+	ActionAdminMFAPolicyUpdated = "admin.mfa_policy_updated"
+	ActionAdminUserMFAReset     = "admin.user_mfa_reset"
+
+	// Admin — white-label email sender management (issue #63 follow-on)
+	ActionAdminEmailSenderUpdated = "admin.email_sender_updated"
+	ActionAdminEmailSenderDeleted = "admin.email_sender_deleted"
+
 	// Auth — social login (issue #64 Google, issue #66 GitHub). These
 	// constants document the emitted action values; handlers derive them per
 	// provider via SocialLoginAction and friends.

@@ -176,11 +176,11 @@ func (d *githubDriver) apiGET(ctx context.Context, accessToken, path string, out
 	req.Header.Set("User-Agent", "emc-auth-server")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	// G704 false positive: apiBaseURL is the githubAPIBaseURL constant in
+	// G107 false positive: apiBaseURL is the githubAPIBaseURL constant in
 	// production and path is a caller-supplied literal ("/user",
 	// "/user/emails") — no request-derived data reaches the URL. Only the
 	// WithGitHubEndpoints test hook overrides the base (httptest servers).
-	resp, err := d.httpClient.Do(req) //nolint:gosec
+	resp, err := d.httpClient.Do(req) //nolint:gosec // G107: apiBaseURL is a compile-time constant
 	if err != nil {
 		return fmt.Errorf("github %s: %w", path, err)
 	}

@@ -346,6 +346,20 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 		// callbacks for the same account: both requests resolve to the same
 		// user above; whichever INSERT lands second is a no-op instead of a
 		// unique-index violation, and that request is a plain login.
+		//
+		// The table also carries user_identities_user_provider_key, a UNIQUE
+		// index on (user_id, provider) (migration 00046): a user may hold at
+		// most one identity per provider. That index is what stops a second,
+		// DIFFERENT provider account (distinct provider_sub) that happens to
+		// share this verified email — e.g. during a provider-side email
+		// change, or an attacker controlling two accounts — from being linked
+		// onto this user once someone else's identity already occupies that
+		// provider slot. Without disambiguating which index caused the
+		// no-op, a bare "0 rows affected" would be treated as the benign race
+		// above and hand the caller a login as this user: an account
+		// takeover. So on a no-op we re-check for the row this exact
+		// provider_sub should have produced; only that shape is the benign
+		// race — anything else is rejected.
 		tag, err := s.pool.Exec(ctx, `
 			INSERT INTO user_identities
 			    (user_id, tenant_id, application_id, provider, provider_sub, provider_email)
@@ -356,6 +370,27 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 			return 0, "", fmt.Errorf("link identity: %w", err)
 		}
 		if tag.RowsAffected() == 0 {
+			var existingUserID int64
+			checkErr := s.pool.QueryRow(ctx, `
+				SELECT user_id
+				FROM   user_identities
+				WHERE  tenant_id = $1 AND application_id = $2
+				  AND  provider = $3 AND provider_sub = $4
+			`, st.TenantID, st.AppRowID, st.Provider, ident.Sub).Scan(&existingUserID)
+			if checkErr != nil {
+				if errors.Is(checkErr, pgx.ErrNoRows) {
+					// The no-op was NOT the same-account race: this
+					// provider_sub was never inserted, so the conflict came
+					// from user_identities_user_provider_key — this user
+					// already holds a different identity for this provider.
+					// Reject rather than silently logging in as userID.
+					return 0, "", ErrOAuthLinkConflict
+				}
+				return 0, "", fmt.Errorf("verify identity link: %w", checkErr)
+			}
+			if existingUserID != userID {
+				return 0, "", ErrOAuthLinkConflict
+			}
 			// A concurrent request linked this identity first.
 			return userID, "login", nil
 		}

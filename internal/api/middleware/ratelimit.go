@@ -257,6 +257,58 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	}
 }
 
+// OTPRateLimiter rate-limits the OTP-challenge completion endpoints
+// (/auth/login/otp, /auth/login/mfa/enroll, /auth/login/mfa/activate).
+// These carry no email and no client credentials — the only stable identifiers
+// are the caller IP and the opaque session token from the body, so both get a
+// bucket. The Redis-side per-session attempt cap (auth.MaxOTPAttempts) is the
+// hard stop against single-session code brute force; this limiter bounds
+// endpoint volume (many-session and token-guessing traffic) before it reaches
+// Redis.
+//
+// The per-IP bucket is deliberately separate from LoginRateLimiter's ("ip:"
+// vs "otp-ip:") — a legitimate two-step login spends password attempts and
+// OTP attempts from independent budgets. Twice the login rate, because one
+// login (1 request) legitimately fans out to enroll + activate + mistyped
+// retries.
+func OTPRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			ipLimiter := ipStore.getOrCreate("otp-ip:"+ip, cfg.PerIPRate*2)
+			if !ipLimiter.Allow() {
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many OTP attempts from your IP address",
+					"retry_after": "60",
+				})
+			}
+
+			if token := otpSessionTokenFromBody(c); token != "" {
+				if len(token) > maxRateLimitEmailLen {
+					token = token[:maxRateLimitEmailLen]
+				}
+				sessLimiter := tenantStore.getOrCreate("otpsess:"+token, cfg.PerTenantRate)
+				if !sessLimiter.Allow() {
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSON(http.StatusTooManyRequests, map[string]string{
+						"error":       "too many OTP attempts for this session",
+						"retry_after": "60",
+					})
+				}
+			}
+
+			return next(c)
+		}
+	}
+}
+
 // OAuthRateLimiter rate-limits the social-login browser redirect endpoints
 // (GET /oauth/:provider/login and /oauth/:provider/callback, issue #64).
 // Neither LoginRateLimiter (JSON-body email key) nor TokenRateLimiter (Basic
@@ -300,6 +352,35 @@ func OAuthRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 			return next(c)
 		}
 	}
+}
+
+// otpSessionTokenFromBody peeks the pre-auth session token out of an OTP
+// endpoint body without consuming it (same technique as loginEmailFromBody).
+// Both field names are checked because /auth/login/otp uses
+// otp_session_token and /auth/login/mfa/* use enrollment_token.
+func otpSessionTokenFromBody(c echo.Context) string {
+	req := c.Request()
+	if req.Body == nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(req.Body, 1<<16))
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(data))
+	if err != nil {
+		return ""
+	}
+
+	var payload struct {
+		OTPSessionToken string `json:"otp_session_token"`
+		EnrollmentToken string `json:"enrollment_token"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return ""
+	}
+	if payload.OTPSessionToken != "" {
+		return payload.OTPSessionToken
+	}
+	return payload.EnrollmentToken
 }
 
 // tokenClientID extracts the client_id from a token request for rate-limit
