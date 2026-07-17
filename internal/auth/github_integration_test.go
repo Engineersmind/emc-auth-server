@@ -352,6 +352,34 @@ func TestGitHubLoginFlowIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("mixed-case LOCAL email links to lowercase github email", func(t *testing.T) {
+		// The GitHub driver always lowercases the provider email before it
+		// reaches resolveUser, so the previous subtest's local row happened
+		// to already be lowercase and never exercised a case mismatch. Here
+		// the LOCAL row is the mixed-case side — this is what an exact-match
+		// lookup misses and LOWER(email) = LOWER($3) fixes.
+		var localID int64
+		err := env.pool.QueryRow(ctx, `
+			INSERT INTO users (tenant_id, email, first_name, last_name, application_id, is_active, email_verified)
+			VALUES ($1, 'Local.Mixed.Case@Example.com', '', '', $2, true, true) RETURNING id
+		`, env.tenantID, env.appRowID).Scan(&localID)
+		if err != nil {
+			t.Fatalf("seed verified user: %v", err)
+		}
+
+		sg.setIdentity(
+			githubUser{ID: 89, Login: "localmixedcase", Name: "Local Mixed Case"},
+			[]githubEmail{{Email: "local.mixed.case@example.com", Primary: true, Verified: true}},
+		)
+		result, err := env.callback(t, env.startLogin(t))
+		if err != nil {
+			t.Fatalf("HandleCallback: %v", err)
+		}
+		if result.Outcome != "linked" || result.UserID != localID {
+			t.Fatalf("outcome=%q user=%d, want linked/%d — mixed-case LOCAL email must link, not duplicate", result.Outcome, result.UserID, localID)
+		}
+	})
+
 	t.Run("unverified LOCAL account is a takeover gate", func(t *testing.T) {
 		_, err := env.pool.Exec(ctx, `
 			INSERT INTO users (tenant_id, email, first_name, last_name, application_id, is_active, email_verified)
