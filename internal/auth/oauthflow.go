@@ -203,23 +203,43 @@ func (s *OAuthLoginService) BuildAuthURL(ctx context.Context, providerName, clie
 // with the same state always fails — single-use is enforced at the Redis
 // layer, not by TTL alone. Exposed to the handler so provider error callbacks
 // (e.g. consent denied) can still recover the validated redirect target.
+//
+// The provider match is checked BEFORE the state is deleted: a request that
+// lands on the wrong provider's callback route with an otherwise-valid state
+// (accidental cross-provider hit, or a state value leaked/replayed onto the
+// wrong path) must not burn the state — the legitimate provider's callback
+// still needs to be able to consume it.
 func (s *OAuthLoginService) ConsumeState(ctx context.Context, providerName, state string) (*OAuthState, error) {
 	if state == "" {
 		return nil, ErrOAuthStateInvalid
 	}
-	data, err := s.redisCli.GetDel(ctx, oauthStateKey(state)).Bytes()
+	key := oauthStateKey(state)
+	peek, err := s.redisCli.Get(ctx, key).Bytes()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, ErrOAuthStateInvalid
+		}
+		return nil, fmt.Errorf("read oauth state: %w", err)
+	}
+	var st OAuthState
+	if err := json.Unmarshal(peek, &st); err != nil {
+		return nil, fmt.Errorf("decode oauth state: %w", err)
+	}
+	if st.Provider != providerName {
+		return nil, ErrOAuthStateInvalid
+	}
+	// Provider matches — now atomically consume. A concurrent request for
+	// the SAME provider racing this one sees redis.Nil here and correctly
+	// fails as already-consumed (single-use).
+	data, err := s.redisCli.GetDel(ctx, key).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrOAuthStateInvalid
 		}
 		return nil, fmt.Errorf("consume oauth state: %w", err)
 	}
-	var st OAuthState
 	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("decode oauth state: %w", err)
-	}
-	if st.Provider != providerName {
-		return nil, ErrOAuthStateInvalid
 	}
 	return &st, nil
 }
@@ -330,12 +350,17 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 		return 0, "", fmt.Errorf("lookup identity: %w", err)
 	}
 
-	// 2. Auto-link by verified email — app-scoped users only.
+	// 2. Auto-link by verified email — app-scoped users only. Case-insensitive:
+	// local registration does not normalize email casing (plain TEXT column,
+	// no lowercasing on insert), so a locally-registered "John.Doe@Example.com"
+	// must still match a provider identity reporting "john.doe@example.com" —
+	// an exact-match comparison here would miss it and JIT-provision a
+	// duplicate account instead of linking to the existing one.
 	var emailVerified bool
 	err = s.pool.QueryRow(ctx, `
 		SELECT id, email_verified
 		FROM   users
-		WHERE  tenant_id = $1 AND application_id = $2 AND email = $3
+		WHERE  tenant_id = $1 AND application_id = $2 AND LOWER(email) = LOWER($3)
 		  AND  is_active = true AND deleted_at IS NULL
 	`, st.TenantID, st.AppRowID, ident.Email).Scan(&userID, &emailVerified)
 	if err == nil {

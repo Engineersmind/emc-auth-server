@@ -417,4 +417,23 @@ func TestGitHubLoginFlowIntegration(t *testing.T) {
 			t.Fatalf("rejected cross-account link created %d rows for provider_sub=222", n)
 		}
 	})
+
+	t.Run("ConsumeState with the wrong provider does not burn the state", func(t *testing.T) {
+		state := env.startLogin(t)
+
+		// Hitting the wrong provider's callback route with a valid GitHub
+		// state must be rejected WITHOUT deleting it — the real GitHub
+		// callback must still be able to consume it afterwards.
+		if _, err := env.svc.ConsumeState(context.Background(), ProviderGoogle, state); !errors.Is(err, ErrOAuthStateInvalid) {
+			t.Fatalf("wrong-provider ConsumeState err = %v, want ErrOAuthStateInvalid", err)
+		}
+
+		sg.setIdentity(
+			githubUser{ID: 333, Login: "state-survives", Name: "State Survives"},
+			[]githubEmail{{Email: "state.survives@example.com", Primary: true, Verified: true}},
+		)
+		if _, err := env.callback(t, state); err != nil {
+			t.Fatalf("HandleCallback after wrong-provider probe: %v, want state still consumable", err)
+		}
+	})
 }
