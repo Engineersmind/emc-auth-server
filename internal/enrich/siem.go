@@ -125,6 +125,7 @@ func (s *WebhookSink) post(events []audit.Event) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	//nolint:gosec // URL is operator-configured (AUDIT_SIEM_WEBHOOK_URL), never user-supplied.
 	resp, err := s.client.Do(req)
 	if err != nil {
 		metrics.AuditEnrichmentErrors.WithLabelValues("siem_post").Inc()

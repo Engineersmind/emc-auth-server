@@ -231,6 +231,7 @@ func (l *Logger) copyBatch(batch []Event) error {
 		// Zero HTTPStatus → NULL (unknown), never a literal 0 status code.
 		var httpStatus any
 		if e.HTTPStatus != 0 {
+			//nolint:gosec // HTTP status codes are always 100–599, well within int16.
 			httpStatus = int16(e.HTTPStatus)
 		}
 		meta := e.Metadata
@@ -307,7 +308,7 @@ func chainHash(prevHash string, e Event, status string, httpStatus int) string {
 		b.WriteString(e.AgentID.String())
 	}
 	b.WriteByte('|')
-	b.WriteString(fmt.Sprintf("%s|", derefInt(e.ApplicationID)))
+	fmt.Fprintf(&b, "%s|", derefInt(e.ApplicationID))
 	b.WriteString(e.ResourceType)
 	b.WriteByte('|')
 	b.WriteString(e.ResourceID)

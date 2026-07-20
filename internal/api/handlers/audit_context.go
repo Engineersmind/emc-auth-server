@@ -264,18 +264,6 @@ func (h *AuthHandler) auditFailure(c echo.Context, e audit.Event, err error) {
 	h.auditEvent(c, e)
 }
 
-// auditFailure records a failed operation for the admin handler.
-func (h *AdminHandler) auditFailure(c echo.Context, e audit.Event, err error) {
-	applyFailure(&e, err)
-	h.auditEvent(c, e)
-}
-
-// auditFailure records a failed operation for the OAuth handler.
-func (h *OAuthHandler) auditFailure(c echo.Context, e audit.Event, err error) {
-	applyFailure(&e, err)
-	h.auditEvent(c, e)
-}
-
 // auditEvent enriches and logs an event for the admin handler.
 func (h *AdminHandler) auditEvent(c echo.Context, e audit.Event) {
 	logOrStage(c, h.audit, e)
