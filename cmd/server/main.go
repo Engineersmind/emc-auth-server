@@ -33,7 +33,10 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/docs" // swagger generated docs
 	"github.com/engineersmind/emc-auth-server/internal/api"
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/config"
+	"github.com/engineersmind/emc-auth-server/internal/enrich"
+	"github.com/engineersmind/emc-auth-server/internal/security/risk"
 	"github.com/engineersmind/emc-auth-server/internal/store"
 	"github.com/engineersmind/emc-auth-server/internal/telemetry"
 	"github.com/engineersmind/emc-auth-server/migrations"
@@ -123,6 +126,44 @@ func main() {
 		docs.SwaggerInfo.Host = "localhost:" + cfg.Port
 	}
 
+	// Optional GeoIP resolver for audit location enrichment. Disabled (nil)
+	// when GEOIP_DATABASE_PATH is empty — the .mmdb is licensed and not shipped.
+	geoResolver, err := enrich.NewGeoIPResolver(cfg.GeoIPDatabasePath)
+	if err != nil {
+		logger.Warn().Err(err).Msg("geoip: database unavailable — audit location enrichment disabled")
+	}
+	if geoResolver != nil {
+		defer func() {
+			if cerr := geoResolver.Close(); cerr != nil {
+				logger.Warn().Err(cerr).Msg("geoip: close failed")
+			}
+		}()
+	}
+
+	// Optional SIEM stream — forwards every persisted audit batch to a webhook.
+	// Disabled (nil) when AUDIT_SIEM_WEBHOOK_URL is empty.
+	siemSink := enrich.NewWebhookSink(cfg.AuditSIEMWebhookURL, logger)
+	if siemSink != nil {
+		defer siemSink.Close()
+	}
+
+	// Async audit logger — owned here so shutdown can drain its buffer
+	// after the HTTP server stops and before the DB pool closes.
+	auditOpts := []audit.Option{
+		audit.WithRiskAssessor(risk.New(pool, cfg.UntrustedIPCIDRs, logger)),
+	}
+	if geoResolver != nil {
+		auditOpts = append(auditOpts, audit.WithGeoIP(geoResolver))
+	}
+	if siemSink != nil {
+		auditOpts = append(auditOpts, audit.WithSink(siemSink))
+	}
+	auditLog := audit.New(pool, logger, auditOpts...)
+
+	// Background retention purge (no-op when AUDIT_RETENTION_DAYS <= 0).
+	stopRetention := auditLog.StartRetention(cfg.AuditRetentionDays)
+	defer stopRetention()
+
 	// Echo instance
 	e := echo.New()
 	e.HideBanner = true
@@ -133,6 +174,7 @@ func main() {
 		Logger: logger,
 		Pool:   pool,
 		Redis:  rdb,
+		Audit:  auditLog,
 		Config: api.RoutesConfig{
 			JWTIssuer:                              cfg.JWTIssuer,
 			Env:                                    cfg.Env,
@@ -148,6 +190,7 @@ func main() {
 			SMTPTLS:                                cfg.SMTPTLS,
 			CookieDomain:                           cfg.CookieDomain,
 			GlobalCORSOrigins:                      cfg.GlobalCORSOrigins,
+			AuditCaptureResponseBody:               cfg.AuditCaptureResponseBody,
 		},
 	})
 
@@ -177,6 +220,11 @@ func main() {
 	defer cancel()
 	if err := s.Shutdown(timeoutCtx); err != nil {
 		logger.Error().Err(err).Msg("shutdown error")
+	}
+	// Drain buffered audit events now that no new requests can arrive —
+	// must complete before the deferred pool.Close() invalidates connections.
+	if err := auditLog.Close(timeoutCtx); err != nil {
+		logger.Warn().Err(err).Msg("audit drain incomplete at shutdown")
 	}
 	// Flush OTel exporters and Sentry buffer before exit
 	if err := otelShutdown(timeoutCtx); err != nil {

@@ -1,0 +1,194 @@
+// Package risk assesses security signals for login-type audit events, matching
+// the dimensions a full IdP surfaces (Auth0's riskAssessment): new device,
+// impossible travel, and untrusted IP. It reads only existing audit history —
+// no new tables — and is best-effort: any query error yields a "not flagged"
+// result rather than blocking the audit write.
+package risk
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"net"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/audit"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
+)
+
+// lookback bounds the device-history window: a device unseen for this long is
+// treated as new. impossibleSpeed is the km/h threshold above which two logins
+// are geographically impossible for one human.
+const (
+	lookback        = 90 * 24 * time.Hour
+	impossibleSpeed = 900.0 // km/h — faster than any commercial flight
+	minTravelKM     = 100.0 // ignore tiny hops (geo/IP jitter)
+	assessTimeout   = 2 * time.Second
+)
+
+// Assessor implements audit.RiskAssessor over the audit_logs history.
+type Assessor struct {
+	pool      *pgxpool.Pool
+	untrusted []*net.IPNet
+	logger    zerolog.Logger
+}
+
+// New builds an Assessor. untrustedCIDRs is an optional denylist; malformed
+// entries are skipped with a warning. A nil pool disables history-based signals
+// (new_device / impossible_travel) while still evaluating untrusted_ip.
+func New(pool *pgxpool.Pool, untrustedCIDRs []string, logger zerolog.Logger) *Assessor {
+	nets := make([]*net.IPNet, 0, len(untrustedCIDRs))
+	for _, c := range untrustedCIDRs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			logger.Warn().Str("cidr", c).Msg("risk: ignoring malformed UNTRUSTED_IP_CIDRS entry")
+			continue
+		}
+		nets = append(nets, n)
+	}
+	return &Assessor{pool: pool, untrusted: nets, logger: logger}
+}
+
+// Assess implements audit.RiskAssessor.
+func (a *Assessor) Assess(ctx context.Context, in audit.RiskInput) map[string]any {
+	ctx, cancel := context.WithTimeout(ctx, assessTimeout)
+	defer cancel()
+
+	untrusted := a.isUntrustedIP(in.IPAddress)
+	newDevice := a.isNewDevice(ctx, in)
+	impossible := a.isImpossibleTravel(ctx, in)
+
+	if newDevice {
+		metrics.RiskSignals.WithLabelValues("new_device").Inc()
+	}
+	if impossible {
+		metrics.RiskSignals.WithLabelValues("impossible_travel").Inc()
+	}
+	if untrusted {
+		metrics.RiskSignals.WithLabelValues("untrusted_ip").Inc()
+	}
+
+	return map[string]any{
+		"new_device":        newDevice,
+		"impossible_travel": impossible,
+		"untrusted_ip":      untrusted,
+		"score":             score(newDevice, impossible, untrusted),
+	}
+}
+
+// score collapses the boolean signals into a coarse level for quick filtering.
+func score(newDevice, impossible, untrusted bool) string {
+	switch {
+	case impossible || untrusted:
+		return "high"
+	case newDevice:
+		return "medium"
+	default:
+		return "low"
+	}
+}
+
+func (a *Assessor) isUntrustedIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	for _, n := range a.untrusted {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNewDevice reports whether this user has NOT successfully logged in with this
+// exact User-Agent within the lookback window. Unknown (no user / no UA / query
+// error) is treated as not-new to avoid false alarms.
+func (a *Assessor) isNewDevice(ctx context.Context, in audit.RiskInput) bool {
+	if a.pool == nil || in.UserID == nil || in.UserAgent == "" {
+		return false
+	}
+	var seen bool
+	err := a.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM audit_logs
+			WHERE user_id = $1 AND action = $2 AND status = 'success'
+			  AND user_agent = $3 AND created_at > $4
+		)`,
+		*in.UserID, audit.ActionAuthLogin, in.UserAgent, time.Now().Add(-lookback),
+	).Scan(&seen)
+	if err != nil {
+		a.logger.Debug().Err(err).Msg("risk: new-device lookup failed")
+		return false
+	}
+	return !seen
+}
+
+// isImpossibleTravel compares the current login location against the user's most
+// recent prior login location and the time between them. Flags when the implied
+// travel speed exceeds impossibleSpeed. Requires geo on both ends; missing geo
+// (disabled/private IP) yields false.
+func (a *Assessor) isImpossibleTravel(ctx context.Context, in audit.RiskInput) bool {
+	if a.pool == nil || in.UserID == nil || in.Geo == nil {
+		return false
+	}
+	if in.Geo.Latitude == 0 && in.Geo.Longitude == 0 {
+		return false
+	}
+
+	var prevMeta []byte
+	var prevAt time.Time
+	err := a.pool.QueryRow(ctx, `
+		SELECT metadata, created_at FROM audit_logs
+		WHERE user_id = $1 AND action = $2 AND status = 'success'
+		  AND metadata ? 'location'
+		ORDER BY created_at DESC
+		LIMIT 1`,
+		*in.UserID, audit.ActionAuthLogin,
+	).Scan(&prevMeta, &prevAt)
+	if err != nil {
+		return false // no prior located login (or query error) → cannot judge
+	}
+
+	var prev struct {
+		Location struct {
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+		} `json:"location"`
+	}
+	if err := json.Unmarshal(prevMeta, &prev); err != nil {
+		return false
+	}
+	if prev.Location.Latitude == 0 && prev.Location.Longitude == 0 {
+		return false
+	}
+
+	distKM := haversineKM(
+		prev.Location.Latitude, prev.Location.Longitude,
+		in.Geo.Latitude, in.Geo.Longitude,
+	)
+	if distKM < minTravelKM {
+		return false
+	}
+	hours := time.Since(prevAt).Hours()
+	if hours <= 0 {
+		return true // same instant, different continents
+	}
+	return distKM/hours > impossibleSpeed
+}
+
+// haversineKM returns the great-circle distance between two lat/lon points.
+func haversineKM(lat1, lon1, lat2, lon2 float64) float64 {
+	const earthRadiusKM = 6371.0
+	dLat := radians(lat2 - lat1)
+	dLon := radians(lon2 - lon1)
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(radians(lat1))*math.Cos(radians(lat2))*
+			math.Sin(dLon/2)*math.Sin(dLon/2)
+	return earthRadiusKM * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+func radians(deg float64) float64 { return deg * math.Pi / 180 }
