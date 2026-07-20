@@ -231,8 +231,7 @@ func (l *Logger) copyBatch(batch []Event) error {
 		// Zero HTTPStatus → NULL (unknown), never a literal 0 status code.
 		var httpStatus any
 		if e.HTTPStatus != 0 {
-			//nolint:gosec // HTTP status codes are always 100–599, well within int16.
-			httpStatus = int16(e.HTTPStatus)
+			httpStatus = int16(e.HTTPStatus) // #nosec G115 -- HTTP status codes are 100–599, well within int16
 		}
 		meta := e.Metadata
 		if shed {
