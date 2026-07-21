@@ -376,7 +376,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns all per-app rate limit configs for the caller's tenant. Requires admin:access.",
+                "description": "Returns all per-app rate limit configs for the tenant. Requires apps:read.",
                 "produces": [
                     "application/json"
                 ],
@@ -391,160 +391,6 @@ const docTemplate = `{
                             "type": "array",
                             "items": {
                                 "$ref": "#/definitions/auth.AppRateLimit"
-                            }
-                        }
-                    }
-                }
-            },
-            "post": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "description": "Sets a custom per-minute request limit for an application identified by X-App-ID. Requires admin:access.",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "admin-rate-limits"
-                ],
-                "summary": "Create app rate limit",
-                "parameters": [
-                    {
-                        "description": "App limit config",
-                        "name": "body",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/handlers.AppLimitRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "201": {
-                        "description": "Created",
-                        "schema": {
-                            "$ref": "#/definitions/auth.AppRateLimit"
-                        }
-                    },
-                    "400": {
-                        "description": "Bad Request",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "409": {
-                        "description": "app_id already has a rate limit config",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    }
-                }
-            }
-        },
-        "/api/v1/app-limits/{app_id}": {
-            "put": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "description": "Updates the rate limit config for an existing app_id in the tenant. Requires admin:access.",
-                "consumes": [
-                    "application/json"
-                ],
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "admin-rate-limits"
-                ],
-                "summary": "Update app rate limit",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "App ID",
-                        "name": "app_id",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "description": "Updated limit config",
-                        "name": "body",
-                        "in": "body",
-                        "required": true,
-                        "schema": {
-                            "$ref": "#/definitions/handlers.AppLimitRequest"
-                        }
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "$ref": "#/definitions/auth.AppRateLimit"
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    }
-                }
-            },
-            "delete": {
-                "security": [
-                    {
-                        "BearerAuth": []
-                    }
-                ],
-                "description": "Removes the custom rate limit for an app_id; it falls back to the default limit. Requires admin:access.",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "admin-rate-limits"
-                ],
-                "summary": "Delete app rate limit",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "App ID",
-                        "name": "app_id",
-                        "in": "path",
-                        "required": true
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
-                        }
-                    },
-                    "404": {
-                        "description": "Not Found",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
                             }
                         }
                     }
@@ -953,6 +799,146 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/rate-limit": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the custom per-minute limit for the application. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's rate limit",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppRateLimit"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Creates or updates the per-minute request limit for the application. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's rate limit",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Limit config",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppLimitRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppRateLimit"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the custom rate limit; the app falls back to the default. Requires apps:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Delete an application's rate limit",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -6141,8 +6127,8 @@ const docTemplate = `{
         "auth.AppRateLimit": {
             "type": "object",
             "properties": {
-                "app_id": {
-                    "type": "string"
+                "application_id": {
+                    "type": "integer"
                 },
                 "burst": {
                     "type": "integer"
@@ -6157,7 +6143,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "tenant_id": {
-                    "type": "string"
+                    "type": "integer"
                 },
                 "updated_at": {
                     "type": "string"
@@ -6415,9 +6401,6 @@ const docTemplate = `{
         "handlers.AppLimitRequest": {
             "type": "object",
             "properties": {
-                "app_id": {
-                    "type": "string"
-                },
                 "burst": {
                     "type": "integer"
                 },
