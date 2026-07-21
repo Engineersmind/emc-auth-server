@@ -59,8 +59,11 @@ func (s *AppRateLimitService) SetAppLimit(ctx context.Context, tenantID, applica
 	if rpm <= 0 {
 		rpm = DefaultRequestsPerMinute
 	}
+	// An unspecified burst follows the rate rather than jumping to the global
+	// default — a caller who sets "2 requests/minute" and no burst expects a
+	// hard cap near 2, not a 10-request head start.
 	if burst <= 0 {
-		burst = DefaultBurst
+		burst = rpm
 	}
 
 	var limit AppRateLimit
