@@ -1699,7 +1699,7 @@ const userEnrichmentColumns = `
 	        WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id) AS last_login_at,
 	       (SELECT COUNT(*) FROM audit_logs al
 	        WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
-	          AND al.action = 'auth.login' AND al.status = 'success') AS logins_count,
+	          AND al.action = 'auth.login') AS logins_count,
 	       EXISTS (SELECT 1 FROM user_credentials uc
 	               WHERE uc.user_id = u.id AND uc.deleted_at IS NULL) AS has_password,
 	       (SELECT COALESCE(array_agg(ui.provider ORDER BY ui.provider), '{}')
