@@ -1356,14 +1356,14 @@ func (s *Service) GetUserDetail(ctx context.Context, tenantID int64, application
 	// MFA status. Both tables are keyed by user_id; absence = not enrolled.
 	var backupCodes []string
 	if err := s.pool.QueryRow(ctx, `
-		SELECT is_active, backup_codes FROM totp_secrets WHERE user_id = $1
-	`, userID).Scan(&d.MFA.TOTPEnabled, &backupCodes); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		SELECT is_active, backup_codes FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&d.MFA.TOTPEnabled, &backupCodes); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("user detail: totp: %w", err)
 	}
 	d.MFA.BackupCodesRemaining = len(backupCodes)
 	if err := s.pool.QueryRow(ctx, `
-		SELECT is_active FROM email_mfa_settings WHERE user_id = $1
-	`, userID).Scan(&d.MFA.EmailEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		SELECT is_active FROM email_mfa_settings WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&d.MFA.EmailEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("user detail: email mfa: %w", err)
 	}
 
@@ -1372,16 +1372,20 @@ func (s *Service) GetUserDetail(ctx context.Context, tenantID int64, application
 	if err := s.pool.QueryRow(ctx, `
 		SELECT COUNT(DISTINCT session_family_id)
 		FROM refresh_tokens
-		WHERE user_id = $1 AND revoked_at IS NULL AND deleted_at IS NULL AND expires_at > NOW()
-	`, userID).Scan(&d.ActiveSessions); err != nil {
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL AND deleted_at IS NULL AND expires_at > NOW()
+	`, userID, tenantID).Scan(&d.ActiveSessions); err != nil {
 		return nil, fmt.Errorf("user detail: sessions: %w", err)
 	}
 
-	// Linked federated identities.
+	// Linked federated identities. Scoped to the tenant and, when an application
+	// filter is in effect, to that application (user_identities is app-owned).
 	rows, err := s.pool.Query(ctx, `
 		SELECT provider, provider_email, created_at
-		FROM user_identities WHERE user_id = $1 ORDER BY created_at
-	`, userID)
+		FROM user_identities
+		WHERE user_id = $1 AND tenant_id = $2
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+		ORDER BY created_at
+	`, userID, tenantID, applicationID)
 	if err != nil {
 		return nil, fmt.Errorf("user detail: identities: %w", err)
 	}
@@ -1425,8 +1429,8 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 	if !active {
 		if _, err := tx.Exec(ctx, `
 			UPDATE refresh_tokens SET revoked_at = NOW()
-			WHERE user_id = $1 AND revoked_at IS NULL
-		`, userID); err != nil {
+			WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+		`, userID, tenantID); err != nil {
 			return nil, fmt.Errorf("revoke tokens on block: %w", err)
 		}
 	}
@@ -1544,14 +1548,14 @@ func (s *Service) GetUserMFA(ctx context.Context, tenantID int64, applicationID 
 	var status UserMFAStatus
 	var backupCodes []string
 	if err := s.pool.QueryRow(ctx, `
-		SELECT is_active, backup_codes FROM totp_secrets WHERE user_id = $1
-	`, userID).Scan(&status.TOTPEnabled, &backupCodes); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		SELECT is_active, backup_codes FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&status.TOTPEnabled, &backupCodes); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("get user mfa: totp: %w", err)
 	}
 	status.BackupCodesRemaining = len(backupCodes)
 	if err := s.pool.QueryRow(ctx, `
-		SELECT is_active FROM email_mfa_settings WHERE user_id = $1
-	`, userID).Scan(&status.EmailEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		SELECT is_active FROM email_mfa_settings WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&status.EmailEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("get user mfa: email: %w", err)
 	}
 	return &status, nil
@@ -1594,8 +1598,8 @@ func (s *Service) SetUserPassword(ctx context.Context, tenantID int64, applicati
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE user_id = $1 AND revoked_at IS NULL
-	`, userID); err != nil {
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, userID, tenantID); err != nil {
 		return fmt.Errorf("revoke tokens on password set: %w", err)
 	}
 	return tx.Commit(ctx)
@@ -1701,9 +1705,9 @@ const userEnrichmentColumns = `
 	        WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
 	          AND al.action = 'auth.login') AS logins_count,
 	       EXISTS (SELECT 1 FROM user_credentials uc
-	               WHERE uc.user_id = u.id AND uc.deleted_at IS NULL) AS has_password,
+	               WHERE uc.user_id = u.id AND uc.tenant_id = u.tenant_id AND uc.deleted_at IS NULL) AS has_password,
 	       (SELECT COALESCE(array_agg(ui.provider ORDER BY ui.provider), '{}')
-	        FROM user_identities ui WHERE ui.user_id = u.id) AS providers`
+	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers`
 
 // buildConnections merges the password credential and federated providers
 // into the public Connections list ("password", "google", ...).

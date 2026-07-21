@@ -1475,7 +1475,7 @@ func (h *AdminHandler) SetUserStatus(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Param        id   path      string  true  "User ID"
-// @Success      200  {array}   admin.UserSession
+// @Success      200  {object}  map[string][]admin.UserSession
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/users/{id}/sessions [get]
 func (h *AdminHandler) ListUserSessions(c echo.Context) error {
