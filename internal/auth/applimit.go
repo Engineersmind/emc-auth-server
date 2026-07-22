@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -138,10 +140,14 @@ func (s *AppRateLimitService) ListAppLimits(ctx context.Context, tenantID int64)
 }
 
 // DeleteAppLimit removes a rate limit config; the app falls back to the default.
+// This is a hard delete: app_rate_limits is mutable configuration (not an audit
+// trail), and a soft delete would leave orphaned rows accumulating across every
+// delete→re-create cycle, since the upsert's partial unique index only covers
+// live rows and never reclaims the tombstones.
 func (s *AppRateLimitService) DeleteAppLimit(ctx context.Context, tenantID, applicationID int64) error {
 	tag, err := s.pool.Exec(ctx, `
-		UPDATE app_rate_limits SET deleted_at = NOW(), updated_at = NOW()
-		WHERE application_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		DELETE FROM app_rate_limits
+		WHERE application_id = $1 AND tenant_id = $2
 	`, applicationID, tenantID)
 	if err != nil {
 		return fmt.Errorf("delete app_rate_limit: %w", err)
@@ -157,7 +163,11 @@ func (s *AppRateLimitService) DeleteAppLimit(ctx context.Context, tenantID, appl
 // 60s Redis cache. Falls back to DefaultRequestsPerMinute/DefaultBurst when no
 // custom config exists or on cache/DB error (fail-open).
 func (s *AppRateLimitService) GetLimit(ctx context.Context, tenantID, applicationID int64) (rpm, burst int) {
-	if applicationID <= 0 {
+	// Both ids must be positive. A zero/negative tenant_id (e.g. an oauth_clients
+	// row with a broken tenant_id) would otherwise build the shared cache key
+	// "rate:applimit:0:<appID>", letting apps across tenants collide in one
+	// bucket — cross-tenant contamination. Mirror the applicationID guard.
+	if applicationID <= 0 || tenantID <= 0 {
 		return DefaultRequestsPerMinute, DefaultBurst
 	}
 
@@ -179,6 +189,15 @@ func (s *AppRateLimitService) GetLimit(ctx context.Context, tenantID, applicatio
 	`, applicationID, tenantID).Scan(&dbRPM, &dbBurst)
 
 	if dbErr != nil || dbRPM <= 0 {
+		// ErrNoRows is the normal "no custom limit" case — silent. A real DB
+		// error (pool exhaustion, timeout) is logged: on a Redis outage every
+		// request reaches this DB path, and a silent failure there would hide a
+		// cascading overload behind the fail-open default.
+		if dbErr != nil && !errors.Is(dbErr, pgx.ErrNoRows) {
+			s.logger.Warn().Err(dbErr).
+				Int64("tenant_id", tenantID).Int64("application_id", applicationID).
+				Msg("applimit: DB lookup failed — using default limit")
+		}
 		dbRPM = DefaultRequestsPerMinute
 		dbBurst = DefaultBurst
 	}
@@ -204,7 +223,12 @@ func (s *AppRateLimitService) GetLimitForClientID(ctx context.Context, clientID 
 		return 0, 0, 0, 0, false
 	}
 
-	mapKey := "rate:applimit:cmap:" + clientID
+	// Hash the client_id into the cache key: client_id is read straight from an
+	// untrusted Basic-auth header, so a very long or crafted value would
+	// otherwise flow verbatim into the Redis keyspace. A fixed-width SHA-256
+	// digest bounds the key and removes any injection surface.
+	sum := sha256.Sum256([]byte(clientID))
+	mapKey := "rate:applimit:cmap:" + hex.EncodeToString(sum[:])
 	if data, err := s.redisCli.Get(ctx, mapKey).Bytes(); err == nil {
 		var cached struct {
 			TenantID int64 `json:"t"`

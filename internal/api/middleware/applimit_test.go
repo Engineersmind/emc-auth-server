@@ -39,7 +39,7 @@ func appLimitEnv(t *testing.T) (echo.MiddlewareFunc, *auth.AppRateLimitService, 
 	appID, _ := strconv.ParseInt(app.ID, 10, 64)
 
 	svc := auth.NewAppRateLimitService(pool, rdb, logger)
-	return middleware.AppRateLimiter(svc, rdb), svc, tenantID, appID
+	return middleware.AppRateLimiter(svc, rdb, logger), svc, tenantID, appID
 }
 
 // runWithClaims sends one request through the middleware with the given claims

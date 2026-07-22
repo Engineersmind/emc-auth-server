@@ -293,11 +293,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// the JWT app_id (oauth_clients.id) + tenant_id claims. It MUST run after a
 	// JWT middleware has populated claims, so it is applied per authenticated
 	// group below (adminGroup + the JWT-renew protected auth routes), NOT globally.
-	appRateLimit := mw.AppRateLimiter(appLimitSvc, deps.Redis)
+	appRateLimit := mw.AppRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
 
 	// appClientRateLimit enforces the same per-app limit on the Basic-auth
 	// application endpoints (token + /apps/*), keyed on the client_id.
-	appClientRateLimit := mw.AppClientRateLimiter(appLimitSvc, deps.Redis)
+	appClientRateLimit := mw.AppClientRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
 
 	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
 	e.Use(mw.TenantCORS(corsSvc))
@@ -391,6 +391,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// it to non-auth paths, so transparent renewal is impossible. Browser
 	// clients must call /auth/session/refresh when they receive 401 token_expired,
 	// then retry the admin request.
+	// appRateLimit is a pass-through for first-party admin/tenant tokens: those
+	// JWTs are minted with an empty app_id claim (only application-scoped end-user
+	// tokens carry a numeric app_id), and AppRateLimiter skips any request whose
+	// app_id is empty. So mounting it here cannot rate-limit an operator out of
+	// the rate-limit CRUD routes below — the limiter only ever engages for
+	// application-scoped traffic, never for the admin console's own calls.
 	adminGroup := apiV1.Group("", mw.JWTRequired(jwtSvc), appRateLimit)
 
 	// Ping (smoke test — requires admin:access)

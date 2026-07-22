@@ -8,6 +8,7 @@ import (
 	"github.com/go-redis/redis_rate/v10"
 	"github.com/labstack/echo/v4"
 	redisv9 "github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 )
@@ -28,7 +29,7 @@ import (
 // Enforcement counters live in Redis so the limit is global across replicas.
 // If Redis errors, the request is allowed (fail-open) to avoid a Redis outage
 // taking down all authenticated traffic.
-func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client) echo.MiddlewareFunc {
+func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
 	limiter := redis_rate.NewLimiter(redisCli)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
@@ -38,17 +39,25 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client) ech
 				return next(c) // no application context — skip per-app limiting
 			}
 
+			// Malformed claims fail open (a broken token must not take down all
+			// authenticated traffic) but are logged: a misconfigured issuer or a
+			// crafted claim silently bypassing per-app limits would otherwise be
+			// invisible.
 			appID, err := strconv.ParseInt(claims.AppID, 10, 64)
 			if err != nil || appID <= 0 {
-				return next(c) // malformed app_id claim — nothing to key on
+				logger.Warn().Str("app_id", claims.AppID).
+					Msg("applimit: skipped — malformed app_id claim (fail-open)")
+				return next(c)
 			}
 			tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 			if err != nil {
+				logger.Warn().Str("tenant_id", claims.TenantID).Int64("app_id", appID).
+					Msg("applimit: skipped — malformed tenant_id claim (fail-open)")
 				return next(c)
 			}
 
 			rpm, burst := svc.GetLimit(c.Request().Context(), tenantID, appID)
-			return enforceAppLimit(c, next, limiter, "app:", tenantID, appID, rpm, burst)
+			return enforceAppLimit(c, next, limiter, logger, "app:", tenantID, appID, rpm, burst)
 		}
 	}
 }
@@ -69,7 +78,7 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client) ech
 //
 // Requests with no Basic client_id, or a client_id that maps to no live
 // application, are passed through (the per-IP TokenRateLimiter still applies).
-func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client) echo.MiddlewareFunc {
+func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
 	limiter := redis_rate.NewLimiter(redisCli)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
@@ -82,7 +91,7 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 			if !ok {
 				return next(c)
 			}
-			return enforceAppLimit(c, next, limiter, "appauth:", tenantID, appID, rpm, burst)
+			return enforceAppLimit(c, next, limiter, logger, "appauth:", tenantID, appID, rpm, burst)
 		}
 	}
 }
@@ -92,7 +101,7 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 // use distinct prefixes so they never share a bucket), setting X-RateLimit-*
 // headers and returning 429 when the bucket is empty. Redis errors fail open so
 // an outage never blocks all traffic.
-func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.Limiter, keyPrefix string, tenantID, appID int64, rpm, burst int) error {
+func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.Limiter, logger zerolog.Logger, keyPrefix string, tenantID, appID int64, rpm, burst int) error {
 	rateKey := keyPrefix + strconv.FormatInt(tenantID, 10) + ":" + strconv.FormatInt(appID, 10)
 	res, err := limiter.Allow(c.Request().Context(), rateKey, redis_rate.Limit{
 		Rate:   rpm,
@@ -100,7 +109,11 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 		Period: time.Minute,
 	})
 	if err != nil {
-		return next(c) // Redis unavailable — fail open.
+		// Redis unavailable — fail open, but log so a silent bypass of all
+		// per-app limits during an outage is observable.
+		logger.Warn().Err(err).Int64("tenant_id", tenantID).Int64("application_id", appID).
+			Msg("applimit: Redis error — allowing request (fail-open)")
+		return next(c)
 	}
 
 	c.Response().Header().Set("X-RateLimit-Limit", strconv.Itoa(rpm))
