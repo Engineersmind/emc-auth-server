@@ -142,7 +142,7 @@ func main() {
 
 	// Optional SIEM stream — forwards every persisted audit batch to a webhook.
 	// Disabled (nil) when AUDIT_SIEM_WEBHOOK_URL is empty.
-	siemSink := enrich.NewWebhookSink(cfg.AuditSIEMWebhookURL, logger)
+	siemSink := enrich.NewWebhookSink(cfg.AuditSIEMWebhookURL, cfg.AuditSIEMWebhookSecret, logger)
 	if siemSink != nil {
 		defer siemSink.Close()
 	}

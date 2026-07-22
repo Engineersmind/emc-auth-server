@@ -560,13 +560,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Audit logs — tenant-scoped (audit:read) and system-wide (tenant:manage).
 	// List (summary) + detail-by-id, mirroring the list → drill-down UX.
 	adminGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs, auditRead)
-	adminGroup.GET("/audit-logs/export", adminHandler.ExportAuditLogs, auditRead)
+	// Expensive compliance endpoints carry a per-tenant rate limit on top of JWT:
+	// export streams up to maxExportRows and verify recomputes the whole chain.
+	auditMaintLimit := mw.AuditMaintenanceRateLimiter(0)
+	adminGroup.GET("/audit-logs/export", adminHandler.ExportAuditLogs, auditRead, auditMaintLimit)
 	adminGroup.GET("/audit-logs/:id", adminHandler.GetTenantAuditLogByID, auditRead)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
 	tenantMgmt.GET("/audit-logs/system/:id", adminHandler.GetSystemAuditLogByID)
-	// Compliance surfaces — super_admin only (tenant:manage).
-	tenantMgmt.GET("/audit-logs/verify", adminHandler.VerifyAuditChain)
-	tenantMgmt.POST("/audit-logs/erase-user", adminHandler.EraseUserAudit)
+	// Compliance surfaces — super_admin only (tenant:manage), rate-limited per tenant.
+	tenantMgmt.GET("/audit-logs/verify", adminHandler.VerifyAuditChain, auditMaintLimit)
+	tenantMgmt.POST("/audit-logs/erase-user", adminHandler.EraseUserAudit, auditMaintLimit)
 
 	// Application management — apps:read / apps:write (tenant from JWT claims)
 	adminGroup.POST("/applications", adminHandler.CreateApplication, appsWrite)

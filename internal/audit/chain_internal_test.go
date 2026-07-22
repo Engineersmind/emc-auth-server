@@ -69,6 +69,7 @@ func TestChainHash_IgnoresPII(t *testing.T) {
 	erased.IPAddress = ""
 	erased.UserAgent = "[erased]"
 	erased.Metadata = nil
+	erased.UserID = nil // GDPR erasure NULLs user_id (re-identification defence)
 	afterErase := chainHash("p", erased, StatusSuccess, 200)
 
 	if withPII != afterErase {

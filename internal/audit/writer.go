@@ -214,7 +214,7 @@ func (l *Logger) copyBatch(batch []Event) error {
 	// Shed the expensive per-event enrichment (geo/risk/stats DB work) when the
 	// queue is backing up, so a burst degrades enrichment detail before it
 	// degrades event durability. The core row + hash chain are always written.
-	shed := len(l.queue) >= cap(l.queue)*sheddingThresholdPct/100
+	shed := len(l.queue)*100 >= cap(l.queue)*sheddingThresholdPct
 
 	rows := make([][]any, len(batch))
 	for i, e := range batch {
@@ -245,10 +245,14 @@ func (l *Logger) copyBatch(batch []Event) error {
 
 		// Tamper-evidence: chain each row to the previous. The hash covers the
 		// non-PII security skeleton only, so GDPR pseudonymization of PII fields
-		// never breaks chain verification.
+		// (including user_id) never breaks chain verification. chainMu guards the
+		// chain state — the worker is the only flush-path writer, but the
+		// maintenance path resets chainSeeded from another goroutine.
+		l.chainMu.Lock()
 		prevHash := l.lastHash
 		rowHash := chainHash(prevHash, e, status, e.HTTPStatus)
 		l.lastHash = rowHash
+		l.chainMu.Unlock()
 
 		rows[i] = []any{
 			e.TenantID, e.UserID, agentID, e.ApplicationID,
@@ -274,23 +278,30 @@ func (l *Logger) copyBatch(batch []Event) error {
 // give each replica its own chain partition — otherwise concurrent writers
 // interleave and the linear chain is not meaningful.
 func (l *Logger) seedChain(ctx context.Context) {
-	if l.chainSeeded {
+	l.chainMu.Lock()
+	seeded := l.chainSeeded
+	l.chainSeeded = true
+	l.chainMu.Unlock()
+	if seeded {
 		return
 	}
-	l.chainSeeded = true
 	var last *string
 	err := l.pool.QueryRow(ctx,
 		`SELECT row_hash FROM audit_logs WHERE row_hash IS NOT NULL ORDER BY id DESC LIMIT 1`,
 	).Scan(&last)
 	if err == nil && last != nil {
+		l.chainMu.Lock()
 		l.lastHash = *last
+		l.chainMu.Unlock()
 	}
 }
 
 // chainHash computes the SHA-256 tamper-evidence hash for a row: the previous
 // row's hash folded over the event's non-PII security skeleton. PII/erasable
-// fields (actor_email, ip_address, user_agent, metadata) are deliberately
-// excluded so GDPR pseudonymization can scrub them without breaking the chain.
+// fields (actor_email, ip_address, user_agent, metadata, and user_id) are
+// deliberately excluded so GDPR pseudonymization can scrub them — including
+// NULLing user_id to defeat re-identification via a users JOIN — without
+// breaking chain verification.
 func chainHash(prevHash string, e Event, status string, httpStatus int) string {
 	var b strings.Builder
 	b.WriteString(prevHash)
@@ -302,7 +313,7 @@ func chainHash(prevHash string, e Event, status string, httpStatus int) string {
 	b.WriteString(status)
 	b.WriteByte('|')
 	fmt.Fprintf(&b, "%d|", httpStatus)
-	fmt.Fprintf(&b, "%s|%s|", derefInt(e.TenantID), derefInt(e.UserID))
+	fmt.Fprintf(&b, "%s|", derefInt(e.TenantID))
 	if e.AgentID != nil {
 		b.WriteString(e.AgentID.String())
 	}

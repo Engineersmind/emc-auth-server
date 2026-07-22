@@ -19,7 +19,10 @@ func (l *Logger) PurgeOlderThan(ctx context.Context, retentionDays int) (int64, 
 		return 0, fmt.Errorf("purge audit logs: %w", err)
 	}
 	// A purge can truncate the tail of the hash chain; re-seed on next flush.
+	// Guarded by chainMu since the flush worker reads chainSeeded concurrently.
+	l.chainMu.Lock()
 	l.chainSeeded = false
+	l.chainMu.Unlock()
 	return purged, nil
 }
 
@@ -34,18 +37,24 @@ func (l *Logger) PseudonymizeUser(ctx context.Context, userID int64) (int64, err
 	return affected, nil
 }
 
+// retentionStartupDelay defers the first retention purge past the deploy
+// window. Running eagerly on every process start would fire a mass DELETE (up
+// to 5 minutes of DB work) right as a new build is stabilising — exactly when
+// the deploy is most fragile. Delaying the first run avoids that without
+// materially changing retention behaviour (the purge is a daily job anyway).
+const retentionStartupDelay = 30 * time.Minute
+
 // StartRetention launches a background worker that purges audit rows older than
 // retentionDays once per day. A no-op when retentionDays <= 0. The returned
 // stop function ends the worker. Failures are logged and retried next tick —
-// retention lag never affects auth.
+// retention lag never affects auth. The first purge is deferred by
+// retentionStartupDelay so a deploy never triggers an immediate mass delete.
 func (l *Logger) StartRetention(retentionDays int) (stop func()) {
 	if retentionDays <= 0 {
 		return func() {}
 	}
 	done := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
 		run := func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
@@ -58,7 +67,19 @@ func (l *Logger) StartRetention(retentionDays int) (stop func()) {
 				l.logger.Info().Int64("purged", purged).Int("retention_days", retentionDays).Msg("audit retention purge")
 			}
 		}
-		run() // once at startup
+
+		// Wait out the startup delay first (interruptible by shutdown).
+		startup := time.NewTimer(retentionStartupDelay)
+		defer startup.Stop()
+		select {
+		case <-startup.C:
+			run()
+		case <-done:
+			return
+		}
+
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:

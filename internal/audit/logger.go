@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -295,9 +296,12 @@ type Logger struct {
 	// (nil = risk enrichment disabled).
 	risk RiskAssessor
 
-	// Tamper-evidence hash chain (writer.go). Worker-goroutine-only state, so
-	// no locking: lastHash is the row_hash of the most recently written row;
-	// chainSeeded records whether it has been initialised from the DB tail.
+	// Tamper-evidence hash chain (writer.go). lastHash is the row_hash of the
+	// most recently written row; chainSeeded records whether it has been
+	// initialised from the DB tail. The worker goroutine is the only writer on
+	// the flush path, but the maintenance path (PurgeOlderThan) resets
+	// chainSeeded from another goroutine, so all access is guarded by chainMu.
+	chainMu     sync.Mutex
 	lastHash    string
 	chainSeeded bool
 

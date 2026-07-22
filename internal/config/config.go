@@ -85,8 +85,16 @@ type Config struct {
 
 	// AuditSIEMWebhookURL, when set, streams every persisted audit event as a
 	// JSON POST to this URL (Datadog/Splunk/S3-proxy/generic webhook). Empty
-	// disables streaming. Set via AUDIT_SIEM_WEBHOOK_URL.
+	// disables streaming. Must be https and resolve to a public IP — private,
+	// loopback, and link-local targets are rejected at startup (SSRF guard).
+	// Set via AUDIT_SIEM_WEBHOOK_URL.
 	AuditSIEMWebhookURL string
+
+	// AuditSIEMWebhookSecret, when set, signs every outbound SIEM payload with
+	// HMAC-SHA256 in the X-EMC-Audit-Signature header so the receiver can
+	// authenticate the stream. Empty leaves payloads unsigned. Set via
+	// AUDIT_SIEM_WEBHOOK_SECRET.
+	AuditSIEMWebhookSecret string
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -116,6 +124,7 @@ func Load() *Config {
 		AuditCaptureResponseBody:               getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
 		AuditRetentionDays:                     mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
 		AuditSIEMWebhookURL:                    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
+		AuditSIEMWebhookSecret:                 getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
 	}
 }
 

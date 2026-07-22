@@ -1614,7 +1614,10 @@ type EraseUserAuditRequest struct {
 // @Success      200   {object}  map[string]any
 // @Router       /api/v1/audit-logs/erase-user [post]
 func (h *AdminHandler) EraseUserAudit(c echo.Context) error {
-	claims, _ := claimsFromCtx(c)
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
 	var req EraseUserAuditRequest
 	if err := c.Bind(&req); err != nil || req.UserID == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "user_id is required"})
@@ -1629,9 +1632,7 @@ func (h *AdminHandler) EraseUserAudit(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to erase user audit PII"})
 	}
 	// Record the erasure itself as an (immutable) audit event.
-	if claims != nil {
-		h.auditAdmin(c, claims, audit.ActionAdminUserAuditErased, "user", req.UserID)
-	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserAuditErased, "user", req.UserID)
 	return c.JSON(http.StatusOK, map[string]any{"rows_pseudonymized": affected})
 }
 

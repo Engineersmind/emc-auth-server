@@ -60,6 +60,11 @@ $$;
 -- the (non-PII) security event trail intact. Only the erasable fields are
 -- touched; the tamper-evidence hash chain is computed over the non-PII skeleton
 -- (see internal/audit), so this does NOT break chain verification.
+--
+-- user_id is NULLed too: leaving it intact would make an "erased" row instantly
+-- re-identifiable via JOIN users ON users.id = audit_logs.user_id. user_id is
+-- deliberately excluded from the hash skeleton (chainHash), so nulling it does
+-- not break verification.
 -- Returns the number of rows pseudonymized.
 CREATE OR REPLACE FUNCTION pseudonymize_user_audit(target_user_id bigint)
 RETURNS bigint
@@ -75,6 +80,7 @@ BEGIN
     SET actor_email = '[erased]',
         ip_address  = NULL,
         user_agent  = '[erased]',
+        user_id     = NULL,
         metadata    = jsonb_strip_nulls(
           COALESCE(metadata, '{}'::jsonb)
             - 'response_body' - 'location' - 'stats'

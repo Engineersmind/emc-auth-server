@@ -8,8 +8,15 @@ package enrich
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"syscall"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -26,6 +33,7 @@ const (
 // WebhookSink implements audit.Sink by POSTing batches to an HTTP endpoint.
 type WebhookSink struct {
 	url    string
+	secret string
 	client *http.Client
 	ch     chan []audit.Event
 	done   chan struct{}
@@ -36,13 +44,28 @@ type WebhookSink struct {
 // NewWebhookSink starts the streaming worker. Returns nil when url is empty
 // (streaming disabled) so callers can pass the result straight to
 // audit.WithSink without a nil check tripping the option.
-func NewWebhookSink(url string, logger zerolog.Logger) *WebhookSink {
-	if url == "" {
+//
+// The URL is validated at startup: it must be https and must not resolve to a
+// private/loopback/link-local address (SSRF guard against metadata endpoints
+// and internal admin ports). An invalid URL disables streaming (returns nil)
+// with a warning rather than starting a worker that can never deliver. When
+// secret is set, every payload is signed with HMAC-SHA256 so the receiver can
+// authenticate the stream; an unsigned stream is warned about at startup.
+func NewWebhookSink(rawURL, secret string, logger zerolog.Logger) *WebhookSink {
+	if rawURL == "" {
 		return nil
 	}
+	if err := validateWebhookURL(rawURL); err != nil {
+		logger.Error().Err(err).Msg("audit siem: AUDIT_SIEM_WEBHOOK_URL rejected — streaming disabled")
+		return nil
+	}
+	if secret == "" {
+		logger.Warn().Msg("audit siem: AUDIT_SIEM_WEBHOOK_SECRET is empty — outbound stream is unsigned")
+	}
 	s := &WebhookSink{
-		url:    url,
-		client: &http.Client{Timeout: siemTimeout},
+		url:    rawURL,
+		secret: secret,
+		client: &http.Client{Timeout: siemTimeout, Transport: ssrfSafeTransport()},
 		ch:     make(chan []audit.Event, siemQueueSize),
 		done:   make(chan struct{}),
 		closed: make(chan struct{}),
@@ -50,6 +73,60 @@ func NewWebhookSink(url string, logger zerolog.Logger) *WebhookSink {
 	}
 	go s.run()
 	return s
+}
+
+// validateWebhookURL enforces https and rejects a URL whose host resolves to a
+// non-public address, blocking SSRF to metadata/loopback/internal targets.
+func validateWebhookURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("unparseable URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("scheme must be https, got %q", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("missing host")
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve host %q: %w", host, err)
+	}
+	for _, ip := range ips {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("host %q resolves to a non-public address %s", host, ip)
+		}
+	}
+	return nil
+}
+
+// isBlockedIP reports whether an IP is one no outbound webhook should reach.
+func isBlockedIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+}
+
+// ssrfSafeTransport returns an http.Transport whose dialer rejects any
+// connection to a blocked address. The Control hook runs after DNS resolution
+// with the concrete remote IP, so it also defeats DNS-rebinding (a host that
+// passed the startup check but later resolves to 169.254.169.254).
+func ssrfSafeTransport() *http.Transport {
+	d := &net.Dialer{
+		Timeout: 10 * time.Second,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || isBlockedIP(ip) {
+				return fmt.Errorf("audit siem: blocked connection to non-public address %s", address)
+			}
+			return nil
+		},
+	}
+	return &http.Transport{DialContext: d.DialContext}
 }
 
 // Emit enqueues a batch for streaming; drops (and counts) when the buffer is
@@ -125,7 +202,15 @@ func (s *WebhookSink) post(events []audit.Event) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	//nolint:gosec // URL is operator-configured (AUDIT_SIEM_WEBHOOK_URL), never user-supplied.
+	// Authenticate the stream: HMAC-SHA256 over the exact bytes sent, so the
+	// receiver can verify the payload originated from us and was not tampered.
+	if s.secret != "" {
+		mac := hmac.New(sha256.New, []byte(s.secret))
+		mac.Write(body)
+		req.Header.Set("X-EMC-Audit-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
+	// URL is operator-configured (AUDIT_SIEM_WEBHOOK_URL), validated https at
+	// startup, and the transport's dialer rejects any private/loopback target.
 	resp, err := s.client.Do(req)
 	if err != nil {
 		metrics.AuditEnrichmentErrors.WithLabelValues("siem_post").Inc()

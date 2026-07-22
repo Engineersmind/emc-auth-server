@@ -164,11 +164,25 @@ func safeResponseBody(raw []byte, contentType string) any {
 // not be persisted in the audit trail. Case-insensitive substring match.
 var piiKeyParts = []string{
 	"email", "phone", "mobile", "first_name", "last_name", "full_name",
-	"address", "dob", "birth", "ssn", "national_id", "tax_id", "postal", "zip",
+	"given_name", "family_name", "address", "dob", "birth", "ssn",
+	"national_id", "tax_id", "postal", "zip",
+	// OIDC standard claims that carry personal data (relevant when
+	// AUDIT_CAPTURE_RESPONSE_BODY=all captures an id-token/userinfo body).
+	"picture", "locale", "profile", "birthdate",
+}
+
+// piiKeyExact matches OIDC claim keys too short/ambiguous for a substring rule
+// ("sub" would hit "subject"/"subscription"; "name" would hit "app_name").
+var piiKeyExact = map[string]bool{
+	"sub":  true,
+	"name": true,
 }
 
 func isPIIKey(key string) bool {
 	k := strings.ToLower(key)
+	if piiKeyExact[k] {
+		return true
+	}
 	for _, part := range piiKeyParts {
 		if strings.Contains(k, part) {
 			return true

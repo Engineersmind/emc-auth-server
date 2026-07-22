@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/mssola/useragent"
 	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
@@ -104,27 +105,66 @@ func (a *Assessor) isUntrustedIP(ipStr string) bool {
 	return false
 }
 
-// isNewDevice reports whether this user has NOT successfully logged in with this
-// exact User-Agent within the lookback window. Unknown (no user / no UA / query
-// error) is treated as not-new to avoid false alarms.
+// deviceScanLimit bounds how many recent distinct User-Agents are pulled for
+// the new-device comparison — enough to cover a user's real device set without
+// scanning unbounded history.
+const deviceScanLimit = 200
+
+// isNewDevice reports whether this user has NOT successfully logged in from a
+// device with the same browser + OS family within the lookback window. Matching
+// on the parsed (browser, OS) family rather than the exact User-Agent string
+// avoids a false "new device" on every browser auto-update (which bumps the
+// version inside the UA) and is not defeated by trivial UA-string churn.
+// Unknown (no user / no UA / query error) is treated as not-new to avoid false
+// alarms.
 func (a *Assessor) isNewDevice(ctx context.Context, in audit.RiskInput) bool {
 	if a.pool == nil || in.UserID == nil || in.UserAgent == "" {
 		return false
 	}
-	var seen bool
-	err := a.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM audit_logs
-			WHERE user_id = $1 AND action = $2 AND status = 'success'
-			  AND user_agent = $3 AND created_at > $4
-		)`,
-		*in.UserID, audit.ActionAuthLogin, in.UserAgent, time.Now().Add(-lookback),
-	).Scan(&seen)
+	curBrowser, curOS := deviceFamily(in.UserAgent)
+	if curBrowser == "" && curOS == "" {
+		return false // unparseable UA — cannot judge, so don't flag
+	}
+	rows, err := a.pool.Query(ctx, `
+		SELECT DISTINCT user_agent FROM audit_logs
+		WHERE user_id = $1 AND action = $2 AND status = 'success'
+		  AND user_agent <> '' AND created_at > $3
+		ORDER BY user_agent
+		LIMIT $4`,
+		*in.UserID, audit.ActionAuthLogin, time.Now().Add(-lookback), deviceScanLimit,
+	)
 	if err != nil {
 		a.logger.Debug().Err(err).Msg("risk: new-device lookup failed")
 		return false
 	}
-	return !seen
+	defer rows.Close()
+	for rows.Next() {
+		var ua string
+		if err := rows.Scan(&ua); err != nil {
+			a.logger.Debug().Err(err).Msg("risk: new-device scan failed")
+			return false
+		}
+		b, o := deviceFamily(ua)
+		if b == curBrowser && o == curOS {
+			return false // same device family seen before — not new
+		}
+	}
+	if err := rows.Err(); err != nil {
+		a.logger.Debug().Err(err).Msg("risk: new-device iteration failed")
+		return false
+	}
+	return true
+}
+
+// deviceFamily reduces a User-Agent to its (browser name, OS) pair — the stable
+// device identity that survives version bumps.
+func deviceFamily(raw string) (browser, os string) {
+	ua := useragent.New(raw)
+	if ua == nil {
+		return "", ""
+	}
+	name, _ := ua.Browser()
+	return name, ua.OS()
 }
 
 // isImpossibleTravel compares the current login location against the user's most
