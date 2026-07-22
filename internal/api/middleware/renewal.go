@@ -114,7 +114,35 @@ func JWTRenew(
 			// ── Step 3: rotate with distributed lock ─────────────────────────
 			result, grace, refreshErr := authSvc.RefreshWithLock(c.Request().Context(), refreshCookie.Value, redisCli)
 			if refreshErr != nil {
+				// Attribute the failure to the token's owner when it resolves to a
+				// real account (expired/replayed included); unknown tokens stay
+				// anonymous. logFailure builds, attributes, and emits the event.
+				logFailure := func(action, reason string, httpStatus int) {
+					ev := audit.Event{
+						Action:       action,
+						AuthMethod:   audit.AuthMethodRefreshToken,
+						ResourceType: "session",
+						IPAddress:    c.RealIP(),
+						UserAgent:    c.Request().UserAgent(),
+						Status:       audit.StatusFailure,
+						HTTPStatus:   httpStatus,
+						RequestID:    c.Response().Header().Get(echo.HeaderXRequestID),
+						Metadata: map[string]any{
+							"reason":     reason,
+							"error_code": reason,
+							"http_route": c.Path(),
+						},
+					}
+					if owner, ok := authSvc.ResolveTokenOwner(c.Request().Context(), refreshCookie.Value); ok {
+						ev.UserID = &owner.UserID
+						ev.TenantID = &owner.TenantID
+						ev.ActorEmail = owner.Email
+					}
+					auditLog.Log(c.Request().Context(), ev)
+				}
+
 				if errors.Is(refreshErr, auth.ErrServiceUnavailable) {
+					logFailure(audit.ActionAuthTokenRefreshFailed, "service_unavailable", http.StatusServiceUnavailable)
 					return c.JSON(http.StatusServiceUnavailable, map[string]string{
 						"error": "service temporarily unavailable — please retry",
 						"code":  "service_unavailable",
@@ -126,16 +154,13 @@ func JWTRenew(
 						Str("ip", c.RealIP()).
 						Str("path", c.Request().URL.Path).
 						Msg("renewal: replay detected — session family revoked")
-					auditLog.Log(c.Request().Context(), audit.Event{
-						Action:    audit.ActionAuthReplayDetected,
-						IPAddress: c.RealIP(),
-						UserAgent: c.Request().UserAgent(),
-					})
+					logFailure(audit.ActionAuthReplayDetected, "refresh_token_reuse", http.StatusUnauthorized)
 					return c.JSON(http.StatusUnauthorized, map[string]string{
 						"error": "session terminated — security event detected",
 						"code":  "unauthenticated",
 					})
 				}
+				logFailure(audit.ActionAuthTokenRefreshFailed, "invalid_refresh_token", http.StatusUnauthorized)
 				return c.JSON(http.StatusUnauthorized, map[string]string{
 					"error": "session expired",
 					"code":  "unauthenticated",
@@ -165,14 +190,19 @@ func JWTRenew(
 			c.Set(userContextKey, newClaims)
 
 			// ── Step 6: audit ─────────────────────────────────────────────────
-			tid, uid := claimsToAuditIDs(newClaims)
+			tid, uid, appID := claimsToAuditIDs(newClaims)
 			auditLog.Log(c.Request().Context(), audit.Event{
-				TenantID:     tid,
-				UserID:       uid,
-				Action:       audit.ActionAuthTokenRefresh,
-				ResourceType: "session",
-				IPAddress:    c.RealIP(),
-				UserAgent:    c.Request().UserAgent(),
+				TenantID:      tid,
+				UserID:        uid,
+				ApplicationID: appID,
+				Action:        audit.ActionAuthTokenRefresh,
+				AuthMethod:    audit.AuthMethodRefreshToken,
+				ResourceType:  "session",
+				IPAddress:     c.RealIP(),
+				UserAgent:     c.Request().UserAgent(),
+				HTTPStatus:    http.StatusOK,
+				RequestID:     c.Response().Header().Get(echo.HeaderXRequestID),
+				Metadata:      map[string]any{"http_route": c.Path()},
 			})
 
 			return next(c)
@@ -194,12 +224,15 @@ func graceToAuthClaims(g *auth.GraceResult) *auth.Claims {
 
 // claimsToAuditIDs parses the string UserID / TenantID in JWT claims into
 // the *int64 pointers that audit.Event expects.
-func claimsToAuditIDs(c *auth.Claims) (tenantID, userID *int64) {
+func claimsToAuditIDs(c *auth.Claims) (tenantID, userID, appID *int64) {
 	if t, err := strconv.ParseInt(c.TenantID, 10, 64); err == nil {
 		tenantID = &t
 	}
 	if u, err := strconv.ParseInt(c.UserID, 10, 64); err == nil {
 		userID = &u
 	}
-	return tenantID, userID
+	if a, err := strconv.ParseInt(c.AppID, 10, 64); err == nil {
+		appID = &a
+	}
+	return tenantID, userID, appID
 }

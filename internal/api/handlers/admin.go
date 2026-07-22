@@ -1485,12 +1485,169 @@ func (h *AdminHandler) GetSystemAuditLogs(c echo.Context) error {
 	return c.JSON(http.StatusOK, result)
 }
 
+// GetTenantAuditLogByID handles GET /api/v1/admin/audit-logs/:id — full detail
+// of one row, scoped to the caller's tenant.
+//
+// @Summary      Tenant audit log detail
+// @Description  Returns the full detail of a single audit event (all metadata expanded), scoped to the caller's tenant. Requires admin:access.
+// @Tags         admin-audit
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      int  true  "Audit log ID"
+// @Success      200  {object}  audit.LogEntry
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/audit-logs/{id} [get]
+func (h *AdminHandler) GetTenantAuditLogByID(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+	}
+	return h.getAuditLogByID(c, &tenantID)
+}
+
+// GetSystemAuditLogByID handles GET /api/v1/admin/audit-logs/system/:id —
+// full detail of any row across all tenants (super_admin only).
+//
+// @Summary      System-wide audit log detail
+// @Description  Returns the full detail of a single audit event across ALL tenants. Requires tenant:manage.
+// @Tags         admin-audit
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      int  true  "Audit log ID"
+// @Success      200  {object}  audit.LogEntry
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/audit-logs/system/{id} [get]
+func (h *AdminHandler) GetSystemAuditLogByID(c echo.Context) error {
+	return h.getAuditLogByID(c, nil)
+}
+
+// getAuditLogByID is the shared detail lookup. tenantScope nil = system-wide.
+func (h *AdminHandler) getAuditLogByID(c echo.Context, tenantScope *int64) error {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid audit log id"})
+	}
+	entry, err := h.audit.GetByID(c.Request().Context(), id, tenantScope)
+	if err != nil {
+		if errors.Is(err, audit.ErrLogNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "audit log not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: audit log detail lookup failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load audit log"})
+	}
+	return c.JSON(http.StatusOK, entry)
+}
+
+// VerifyAuditChain handles GET /api/v1/audit-logs/verify — recomputes the
+// tamper-evidence hash chain and reports whether the trail is intact.
+// super_admin only (tenant:manage), since the chain is global.
+//
+// @Summary      Verify audit trail integrity
+// @Description  Recomputes the tamper-evidence hash chain over recent rows and reports whether any row was altered, deleted, or reordered. Requires tenant:manage.
+// @Tags         admin-audit
+// @Produce      json
+// @Security     BearerAuth
+// @Param        limit  query     int  false  "Max recent rows to verify (default 10000)"
+// @Success      200    {object}  audit.VerifyResult
+// @Router       /api/v1/audit-logs/verify [get]
+func (h *AdminHandler) VerifyAuditChain(c echo.Context) error {
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	res, err := h.audit.VerifyChain(c.Request().Context(), limit)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: audit chain verify failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to verify audit chain"})
+	}
+	return c.JSON(http.StatusOK, res)
+}
+
+// ExportAuditLogs handles GET /api/v1/audit-logs/export — streams the tenant's
+// filtered audit trail as CSV for compliance/evidence. Requires audit:read.
+//
+// @Summary      Export audit logs (CSV)
+// @Tags         admin-audit
+// @Produce      text/csv
+// @Security     BearerAuth
+// @Success      200  {string}  string  "CSV"
+// @Router       /api/v1/audit-logs/export [get]
+func (h *AdminHandler) ExportAuditLogs(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	tenantID, err := tenantIDFromClaims(claims)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+	}
+	p := auditQueryParams(c)
+	p.TenantID = &tenantID
+
+	c.Response().Header().Set(echo.HeaderContentType, "text/csv")
+	c.Response().Header().Set(echo.HeaderContentDisposition, `attachment; filename="audit-logs.csv"`)
+	c.Response().WriteHeader(http.StatusOK)
+	if err := h.audit.ExportCSV(c.Request().Context(), p, c.Response().Writer); err != nil {
+		h.logger.Error().Err(err).Msg("admin: audit export failed")
+		// Headers already sent; nothing more we can do but stop.
+		return nil
+	}
+	return nil
+}
+
+// EraseUserAuditRequest is the body for the GDPR erasure endpoint.
+type EraseUserAuditRequest struct {
+	UserID string `json:"user_id"`
+}
+
+// EraseUserAudit handles POST /api/v1/audit-logs/erase-user — GDPR right-to-erasure:
+// pseudonymizes one user's PII across the audit trail while preserving the
+// (non-PII) security event trail and the tamper-evidence chain. tenant:manage.
+//
+// @Summary      Erase a user's PII from the audit trail (GDPR)
+// @Tags         admin-audit
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      EraseUserAuditRequest  true  "Target user id"
+// @Success      200   {object}  map[string]any
+// @Router       /api/v1/audit-logs/erase-user [post]
+func (h *AdminHandler) EraseUserAudit(c echo.Context) error {
+	claims, ok := claimsFromCtx(c)
+	if !ok {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	}
+	var req EraseUserAuditRequest
+	if err := c.Bind(&req); err != nil || req.UserID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "user_id is required"})
+	}
+	uid, err := strconv.ParseInt(req.UserID, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user_id"})
+	}
+	affected, err := h.audit.PseudonymizeUser(c.Request().Context(), uid)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: audit erasure failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to erase user audit PII"})
+	}
+	// Record the erasure itself as an (immutable) audit event.
+	h.auditAdmin(c, claims, audit.ActionAdminUserAuditErased, "user", req.UserID)
+	return c.JSON(http.StatusOK, map[string]any{"rows_pseudonymized": affected})
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 // auditAdmin logs an admin action with caller identity from JWT claims.
 func (h *AdminHandler) auditAdmin(c echo.Context, claims *auth.Claims, action, resourceType, resourceID string) {
+	h.auditAdminApp(c, claims, action, resourceType, resourceID, nil)
+}
+
+// auditAdminApp logs an admin action attributed to a specific application,
+// so it appears in that application's Logs tab. appID nil = tenant-level.
+func (h *AdminHandler) auditAdminApp(c echo.Context, claims *auth.Claims, action, resourceType, resourceID string, appID *int64) {
 	if claims == nil {
 		return
 	}
@@ -1501,15 +1658,16 @@ func (h *AdminHandler) auditAdmin(c echo.Context, claims *auth.Claims, action, r
 	if uid, err := strconv.ParseInt(claims.UserID, 10, 64); err == nil {
 		uidPtr = &uid
 	}
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     &tid,
-		UserID:       uidPtr,
-		ActorEmail:   claims.Email,
-		Action:       action,
-		ResourceType: resourceType,
-		ResourceID:   resourceID,
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	h.auditEvent(c, audit.Event{
+		TenantID:      &tid,
+		UserID:        uidPtr,
+		ApplicationID: appID,
+		ActorEmail:    claims.Email,
+		Action:        action,
+		ResourceType:  resourceType,
+		ResourceID:    resourceID,
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 }
 
@@ -1518,11 +1676,14 @@ func auditQueryParams(c echo.Context) audit.QueryParams {
 	page, _ := strconv.Atoi(c.QueryParam("page"))
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	p := audit.QueryParams{
-		Action:  c.QueryParam("action"),
-		UserID:  c.QueryParam("user_id"),
-		AgentID: c.QueryParam("agent_id"),
-		Page:    page,
-		Limit:   limit,
+		Action:        c.QueryParam("action"),
+		UserID:        c.QueryParam("user_id"),
+		AgentID:       c.QueryParam("agent_id"),
+		ApplicationID: c.QueryParam("application_id"),
+		Status:        c.QueryParam("status"),
+		AuthMethod:    c.QueryParam("auth_method"),
+		Page:          page,
+		Limit:         limit,
 	}
 	if from := c.QueryParam("from"); from != "" {
 		if t, err := time.Parse(time.RFC3339, from); err == nil {
@@ -2036,7 +2197,7 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create application"})
 	}
 
-	h.auditAdmin(c, claims, audit.ActionAdminApplicationCreated, "application", result.ID)
+	h.auditAdminApp(c, claims, audit.ActionAdminApplicationCreated, "application", result.ID, appIDFromClaim(result.ID))
 	return c.JSON(http.StatusCreated, result)
 }
 
@@ -2154,7 +2315,7 @@ func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update application"})
 	}
 
-	h.auditAdmin(c, claims, audit.ActionAdminApplicationUpdated, "application", app.ID)
+	h.auditAdminApp(c, claims, audit.ActionAdminApplicationUpdated, "application", app.ID, appIDFromClaim(app.ID))
 	return c.JSON(http.StatusOK, app)
 }
 
@@ -2191,7 +2352,7 @@ func (h *AdminHandler) RotateApplicationSecret(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to rotate secret"})
 	}
 
-	h.auditAdmin(c, claims, audit.ActionAdminApplicationSecretRotated, "application", result.ID)
+	h.auditAdminApp(c, claims, audit.ActionAdminApplicationSecretRotated, "application", result.ID, appIDFromClaim(result.ID))
 	return c.JSON(http.StatusOK, result)
 }
 
@@ -2228,7 +2389,7 @@ func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to deactivate application"})
 	}
 
-	h.auditAdmin(c, claims, audit.ActionAdminApplicationDeleted, "application", strconv.FormatInt(appID, 10))
+	h.auditAdminApp(c, claims, audit.ActionAdminApplicationDeleted, "application", strconv.FormatInt(appID, 10), &appID)
 	return c.JSON(http.StatusOK, map[string]string{"message": "application deactivated"})
 }
 
@@ -2345,7 +2506,7 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		}
 	}
 
-	h.auditAdmin(c, claims, audit.ActionAdminMFAPolicyUpdated, "application", strconv.FormatInt(appID, 10))
+	h.auditAdminApp(c, claims, audit.ActionAdminMFAPolicyUpdated, "application", strconv.FormatInt(appID, 10), &appID)
 
 	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
 	if err != nil {
@@ -2392,7 +2553,7 @@ func (h *AdminHandler) ResetUserMFA(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to reset user MFA"})
 	}
 
-	h.auditAdmin(c, claims, audit.ActionAdminUserMFAReset, "user", strconv.FormatInt(userID, 10))
+	h.auditAdminApp(c, claims, audit.ActionAdminUserMFAReset, "user", strconv.FormatInt(userID, 10), &appID)
 	return c.JSON(http.StatusOK, map[string]string{"message": "MFA enrollment reset — the user will set up MFA again according to the application's policy"})
 }
 
@@ -2517,7 +2678,7 @@ func (h *AdminHandler) UpsertEmailSender(c echo.Context) error {
 	}
 
 	rt, rid := senderResource(tenantID, appRowID)
-	h.auditAdmin(c, claims, audit.ActionAdminEmailSenderUpdated, rt, rid)
+	h.auditAdminApp(c, claims, audit.ActionAdminEmailSenderUpdated, rt, rid, appRowID)
 	return c.JSON(http.StatusOK, settings)
 }
 
@@ -2548,7 +2709,7 @@ func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
 	}
 
 	rt, rid := senderResource(tenantID, appRowID)
-	h.auditAdmin(c, claims, audit.ActionAdminEmailSenderDeleted, rt, rid)
+	h.auditAdminApp(c, claims, audit.ActionAdminEmailSenderDeleted, rt, rid, appRowID)
 	return c.JSON(http.StatusOK, map[string]string{"message": "email sender removed — sends fall back to the next level"})
 }
 

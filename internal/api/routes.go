@@ -29,6 +29,10 @@ type Deps struct {
 	Logger zerolog.Logger
 	Pool   *pgxpool.Pool
 	Redis  *redis.Client
+	// Audit is the async audit logger. main.go owns its lifecycle (Close on
+	// shutdown drains buffered events). When nil, RegisterRoutes creates one
+	// internally — convenient for tests, but its buffer is not drained on exit.
+	Audit  *audit.Logger
 	Config RoutesConfig
 }
 
@@ -62,6 +66,8 @@ type RoutesConfig struct {
 	// GlobalCORSOrigins are the allowed browser origins for slug-less endpoints
 	// (e.g. /auth/login), which have no tenant to look up a per-tenant list by.
 	GlobalCORSOrigins []string
+	// AuditCaptureResponseBody gates response-body capture: "off" | "failures" | "all".
+	AuditCaptureResponseBody string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -240,8 +246,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithSenders(senderSvc)
 	authSvc.WithEmailMFA(emailMFASvc)
 
-	// Audit logger — shared by both auth and admin handlers
-	auditLog := audit.New(deps.Pool, deps.Logger)
+	// Audit logger — shared by both auth and admin handlers. Prefer the
+	// caller-owned instance (main.go closes it on shutdown to drain the
+	// async buffer); fall back to a local one for tests.
+	auditLog := deps.Audit
+	if auditLog == nil {
+		auditLog = audit.New(deps.Pool, deps.Logger)
+	}
+
+	// Capture the real response status + (redacted) body and attach them to each
+	// request's audit events. Registered here (after auditLog exists) so it wraps
+	// the response writer before any handler runs. Body capture is gated by
+	// config (default "failures") and always redacts secrets + PII.
+	e.Use(mw.AuditCapture(auditLog, deps.Config.AuditCaptureResponseBody))
 
 	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain)
 
@@ -540,9 +557,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/stats", adminHandler.GetStats, statsRead)
 	tenantMgmt.GET("/stats/system", adminHandler.GetSystemStats)
 
-	// Audit logs — tenant-scoped (audit:read) and system-wide (tenant:manage)
+	// Audit logs — tenant-scoped (audit:read) and system-wide (tenant:manage).
+	// List (summary) + detail-by-id, mirroring the list → drill-down UX.
 	adminGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs, auditRead)
+	// Expensive compliance endpoints carry a per-tenant rate limit on top of JWT:
+	// export streams up to maxExportRows and verify recomputes the whole chain.
+	auditMaintLimit := mw.AuditMaintenanceRateLimiter(0)
+	adminGroup.GET("/audit-logs/export", adminHandler.ExportAuditLogs, auditRead, auditMaintLimit)
+	adminGroup.GET("/audit-logs/:id", adminHandler.GetTenantAuditLogByID, auditRead)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
+	tenantMgmt.GET("/audit-logs/system/:id", adminHandler.GetSystemAuditLogByID)
+	// Compliance surfaces — super_admin only (tenant:manage), rate-limited per tenant.
+	tenantMgmt.GET("/audit-logs/verify", adminHandler.VerifyAuditChain, auditMaintLimit)
+	tenantMgmt.POST("/audit-logs/erase-user", adminHandler.EraseUserAudit, auditMaintLimit)
 
 	// Application management — apps:read / apps:write (tenant from JWT claims)
 	adminGroup.POST("/applications", adminHandler.CreateApplication, appsWrite)

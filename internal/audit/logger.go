@@ -1,5 +1,11 @@
 // Package audit provides structured audit logging for all auth and admin events.
 // Every security-relevant action writes a row to the audit_logs table.
+//
+// Writes are asynchronous: Log() enqueues onto a bounded in-memory buffer and
+// returns immediately; a single background worker batch-inserts via COPY
+// (see writer.go). Under overload the pipeline drops events (counted in
+// Prometheus) rather than ever blocking or failing an auth request.
+//
 // Two query surfaces are exposed:
 //   - Tenant-scoped: admin sees only their own tenant's events
 //   - System-wide:   super_admin sees events across all tenants
@@ -7,13 +13,20 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -23,14 +36,15 @@ import (
 
 const (
 	// Auth events
-	ActionAuthRegister          = "auth.register"
-	ActionAuthLogin             = "auth.login"
-	ActionAuthLoginFailed       = "auth.login_failed"
-	ActionAuthLogout            = "auth.logout"
-	ActionAuthTokenRefresh      = "auth.token_refresh"
-	ActionAuthPasswordResetReq  = "auth.password_reset_requested"
-	ActionAuthPasswordResetDone = "auth.password_reset_completed"
-	ActionAuthReplayDetected    = "auth.replay_detected"
+	ActionAuthRegister           = "auth.register"
+	ActionAuthLogin              = "auth.login"
+	ActionAuthLoginFailed        = "auth.login_failed"
+	ActionAuthLogout             = "auth.logout"
+	ActionAuthTokenRefresh       = "auth.token_refresh"
+	ActionAuthTokenRefreshFailed = "auth.token_refresh_failed"
+	ActionAuthPasswordResetReq   = "auth.password_reset_requested"
+	ActionAuthPasswordResetDone  = "auth.password_reset_completed"
+	ActionAuthReplayDetected     = "auth.replay_detected"
 
 	// Admin — tenant management
 	ActionAdminTenantCreated     = "admin.tenant_created"
@@ -71,7 +85,18 @@ const (
 	ActionAdminApplicationSecretRotated = "admin.application_secret_rotated"
 
 	// Auth — machine-to-machine client_credentials grant
-	ActionAuthClientCredentials = "auth.client_credentials"
+	ActionAuthClientCredentials       = "auth.client_credentials"
+	ActionAuthClientCredentialsFailed = "auth.client_credentials_failed"
+
+	// Auth — API key / management-token lifecycle (issue #66 follow-on)
+	ActionAuthAPIKeyCreated         = "auth.api_key_created"
+	ActionAuthAPIKeyRevoked         = "auth.api_key_revoked"
+	ActionAuthManagementToken       = "auth.management_token_issued"
+	ActionAuthManagementTokenFailed = "auth.management_token_failed"
+
+	// Auth — MFA brute-force lockout + email-code delivery
+	ActionAuthMFALockedOut     = "auth.mfa_locked_out"
+	ActionAuthMFAEmailCodeSent = "auth.mfa_email_code_sent"
 
 	// Auth — MFA/TOTP lifecycle (issue #63)
 	ActionAuthMFAEnrolled         = "auth.mfa_enrolled"
@@ -105,6 +130,33 @@ const (
 
 	// Admin — user identity management
 	ActionAdminUserIdentityUnlinked = "admin.user_identity_unlinked"
+
+	// Admin — audit maintenance (compliance)
+	ActionAdminUserAuditErased = "admin.user_audit_erased"
+)
+
+// Event outcome — the `status` column. Derived from the action at enqueue time
+// when the caller does not set it explicitly.
+const (
+	StatusSuccess = "success"
+	StatusFailure = "failure"
+)
+
+// Auth method — the `auth_method` column. The credential/mechanism a caller
+// used, mirroring Auth0's connection/strategy/grant_type dimension. Empty for
+// events that are not a credential exchange (admin CRUD, config changes).
+const (
+	AuthMethodPassword          = "password"
+	AuthMethodGoogle            = "google-oauth2"
+	AuthMethodMagicLink         = "magic_link"
+	AuthMethodTOTP              = "totp"
+	AuthMethodEmailOTP          = "email_otp"
+	AuthMethodBackupCode        = "backup_code"
+	AuthMethodMFA               = "mfa" // factor not distinguishable at the call site
+	AuthMethodClientCredentials = "client_credentials"
+	AuthMethodRefreshToken      = "refresh_token"
+	AuthMethodAPIKey            = "api_key"
+	AuthMethodAgent             = "agent"
 )
 
 // ---------------------------------------------------------------------------
@@ -119,6 +171,9 @@ type Event struct {
 	UserID *int64
 	// AgentID is the agent that performed the action. Nil for human-initiated events (08-03).
 	AgentID *uuid.UUID
+	// ApplicationID is the oauth_clients.id the action occurred under.
+	// Nil for tenant-level events with no application context.
+	ApplicationID *int64
 	// ActorEmail is the email of the actor (denormalized at log time).
 	ActorEmail string
 	// Action is one of the Action* constants above.
@@ -131,6 +186,29 @@ type Event struct {
 	IPAddress string
 	// UserAgent is the caller's User-Agent header.
 	UserAgent string
+	// Status is the outcome — StatusSuccess or StatusFailure. Empty is
+	// treated as success by the writer.
+	Status string
+	// HTTPStatus is the HTTP response code served for this event (200/401/…).
+	// Zero means "unknown" and is persisted as NULL. Auth0's response status.
+	HTTPStatus int
+	// AuthMethod is the credential/mechanism used — one of the AuthMethod*
+	// constants (password, google-oauth2, totp, client_credentials, …). Empty
+	// for events that are not a credential exchange (e.g. admin CRUD).
+	AuthMethod string
+	// RequestID correlates this event with the same request's structured
+	// logs and traces. Empty for events with no request context.
+	RequestID string
+	// Metadata is an event-specific detail payload (HTTP method/route,
+	// failure reason, changed fields, …). Secret-looking keys are redacted
+	// and the serialized form is size-capped before it is written, so it is
+	// always safe to pass request-derived data here.
+	Metadata map[string]any
+
+	// createdAt is stamped by Log() at enqueue time so the persisted
+	// created_at reflects when the event happened, not when the async
+	// batch flushed (up to flushInterval later).
+	createdAt time.Time
 }
 
 // ---------------------------------------------------------------------------
@@ -139,17 +217,25 @@ type Event struct {
 
 // LogEntry is a single audit log row returned by the query endpoints.
 type LogEntry struct {
-	ID           string    `json:"id"`
-	TenantID     *string   `json:"tenant_id"`
-	TenantSlug   *string   `json:"tenant_slug"`
-	UserID       *string   `json:"user_id"`
-	AgentID      *string   `json:"agent_id,omitempty"`
-	ActorEmail   string    `json:"actor_email"`
-	Action       string    `json:"action"`
-	ResourceType string    `json:"resource_type"`
-	ResourceID   string    `json:"resource_id"`
-	IPAddress    string    `json:"ip_address"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID              string          `json:"id"`
+	TenantID        *string         `json:"tenant_id"`
+	TenantSlug      *string         `json:"tenant_slug"`
+	UserID          *string         `json:"user_id"`
+	AgentID         *string         `json:"agent_id,omitempty"`
+	ApplicationID   *string         `json:"application_id,omitempty"`
+	ApplicationName *string         `json:"application_name,omitempty"`
+	ActorEmail      string          `json:"actor_email"`
+	Action          string          `json:"action"`
+	AuthMethod      string          `json:"auth_method,omitempty"`
+	ResourceType    string          `json:"resource_type"`
+	ResourceID      string          `json:"resource_id"`
+	IPAddress       string          `json:"ip_address"`
+	UserAgent       string          `json:"user_agent,omitempty"`
+	Status          string          `json:"status"`
+	HTTPStatus      *int            `json:"http_status,omitempty"`
+	RequestID       string          `json:"request_id,omitempty"`
+	Metadata        json.RawMessage `json:"metadata,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
 }
 
 // LogsPage wraps a paginated audit log result.
@@ -168,39 +254,156 @@ type QueryParams struct {
 	Action   string
 	UserID   string
 	AgentID  string // optional UUID string; filters to events by a specific agent (08-03)
-	From     *time.Time
-	To       *time.Time
-	Page     int
-	Limit    int
+	// ApplicationID filters to events under one application. Combined with
+	// TenantID it can only narrow the tenant scope, never widen it — an ID
+	// from another tenant simply matches zero rows.
+	ApplicationID string
+	// Status filters by outcome — "success" or "failure". Empty = all.
+	Status string
+	// AuthMethod filters by credential/mechanism (one of the AuthMethod*
+	// constants). Empty = all.
+	AuthMethod string
+	From       *time.Time
+	To         *time.Time
+	Page       int
+	Limit      int
 }
 
 // ---------------------------------------------------------------------------
 // Logger
 // ---------------------------------------------------------------------------
 
-// Logger writes audit events to the audit_logs table.
+// Logger accepts audit events on the request path and persists them
+// asynchronously — see writer.go for the batching pipeline. Log() never
+// blocks and never returns an error: under sustained overload the pipeline
+// degrades by dropping events (counted in Prometheus), never by slowing
+// or failing an auth operation.
 type Logger struct {
 	pool   *pgxpool.Pool
 	logger zerolog.Logger
+
+	// Async pipeline state (writer.go).
+	queue         chan Event
+	quit          chan struct{} // closed by Close() to stop the worker
+	done          chan struct{} // closed by the worker after the final flush
+	closed        atomic.Bool
+	batchSize     int
+	flushInterval time.Duration
+
+	// geo is an optional IP→location resolver (nil = geo enrichment disabled).
+	geo GeoResolver
+	// risk is an optional security-signal assessor for login-type events
+	// (nil = risk enrichment disabled).
+	risk RiskAssessor
+
+	// Tamper-evidence hash chain (writer.go). lastHash is the row_hash of the
+	// most recently written row; chainSeeded records whether it has been
+	// initialised from the DB tail. The worker goroutine is the only writer on
+	// the flush path, but the maintenance path (PurgeOlderThan) resets
+	// chainSeeded from another goroutine, so all access is guarded by chainMu.
+	chainMu     sync.Mutex
+	lastHash    string
+	chainSeeded bool
+
+	// sink is an optional external stream (SIEM) fed each persisted batch
+	// (nil = streaming disabled).
+	sink Sink
 }
 
-// New creates an audit Logger.
-func New(pool *pgxpool.Pool, logger zerolog.Logger) *Logger {
-	return &Logger{pool: pool, logger: logger}
+// Option customises the async pipeline. Production code uses the defaults;
+// options exist mainly so tests can force small buffers and long intervals.
+type Option func(*Logger)
+
+// WithQueueSize sets the in-memory event buffer capacity.
+func WithQueueSize(n int) Option {
+	return func(l *Logger) {
+		if n > 0 {
+			l.queue = make(chan Event, n)
+		}
+	}
 }
 
-// Log writes an audit event. Errors are logged but never propagated to callers —
-// an audit failure must never block an auth operation.
-func (l *Logger) Log(ctx context.Context, e Event) {
-	_, err := l.pool.Exec(ctx, `
-		INSERT INTO audit_logs
-		  (tenant_id, user_id, agent_id, actor_email, action, resource_type, resource_id, ip_address, user_agent)
-		VALUES
-		  ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`, e.TenantID, e.UserID, e.AgentID, e.ActorEmail, e.Action,
-		e.ResourceType, e.ResourceID, e.IPAddress, e.UserAgent)
-	if err != nil {
-		l.logger.Error().Err(err).Str("action", e.Action).Msg("audit: failed to write log entry")
+// WithBatchSize sets how many events trigger an immediate flush.
+func WithBatchSize(n int) Option {
+	return func(l *Logger) {
+		if n > 0 {
+			l.batchSize = n
+		}
+	}
+}
+
+// WithFlushInterval sets the maximum time an event waits before being flushed.
+func WithFlushInterval(d time.Duration) Option {
+	return func(l *Logger) {
+		if d > 0 {
+			l.flushInterval = d
+		}
+	}
+}
+
+// WithGeoIP enables IP→location enrichment. Pass nil (or omit) to leave geo
+// enrichment off — the common case when no GeoIP database is configured.
+func WithGeoIP(r GeoResolver) Option {
+	return func(l *Logger) {
+		l.geo = r
+	}
+}
+
+// WithRiskAssessor enables security-signal enrichment for login-type events.
+// Pass nil (or omit) to leave risk assessment off.
+func WithRiskAssessor(r RiskAssessor) Option {
+	return func(l *Logger) {
+		l.risk = r
+	}
+}
+
+// WithSink streams each persisted batch to an external destination (SIEM).
+// Pass nil (or omit) to leave streaming off.
+func WithSink(s Sink) Option {
+	return func(l *Logger) {
+		l.sink = s
+	}
+}
+
+// New creates an audit Logger and starts its background writer.
+// Call Close() during shutdown to flush buffered events.
+func New(pool *pgxpool.Pool, logger zerolog.Logger, opts ...Option) *Logger {
+	l := &Logger{
+		pool:          pool,
+		logger:        logger,
+		queue:         make(chan Event, defaultQueueSize),
+		quit:          make(chan struct{}),
+		done:          make(chan struct{}),
+		batchSize:     defaultBatchSize,
+		flushInterval: defaultFlushInterval,
+	}
+	for _, opt := range opts {
+		opt(l)
+	}
+	go l.run()
+	return l
+}
+
+// Log enqueues an audit event for asynchronous persistence and returns
+// immediately. The ctx parameter is retained for API compatibility; the
+// actual write runs on the background worker with its own context, so
+// request cancellation never cancels an audit write.
+//
+// Degradation contract: if the buffer is full (DB overwhelmed or down) or
+// the logger is closed, the event is dropped and counted — never blocking
+// the caller.
+func (l *Logger) Log(_ context.Context, e Event) {
+	if l.closed.Load() {
+		metrics.AuditEventsDropped.WithLabelValues("shutdown").Inc()
+		return
+	}
+	e.createdAt = time.Now().UTC()
+	select {
+	case l.queue <- e:
+		metrics.AuditQueueDepth.Set(float64(len(l.queue)))
+	default:
+		metrics.AuditEventsDropped.WithLabelValues("queue_full").Inc()
+		l.logger.Warn().Str("action", e.Action).Msg("audit: buffer full — event dropped")
 	}
 }
 
@@ -259,6 +462,62 @@ func (l *Logger) Stats(ctx context.Context, tenantID *int64) (*StatsResult, erro
 
 // ---------------------------------------------------------------------------
 
+// rowScanner is satisfied by both pgx.Rows and pgx.Row, so scanLogEntry can
+// serve the list Query (many rows) and GetByID (single row) from one place.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanLogEntry reads one row in the exact column order of the shared SELECT
+// (see Query / GetByID). Keeping the projection and the scan in lockstep here
+// avoids the positional drift that bit the CopyFrom path.
+func scanLogEntry(row rowScanner) (*LogEntry, error) {
+	var e LogEntry
+	var tenantID, userID, applicationID *int64
+	var agentID *uuid.UUID
+	var tenantSlug, appName *string
+	var httpStatus *int16
+	var logID int64
+	var metadata []byte
+	if err := row.Scan(
+		&logID, &tenantID, &tenantSlug, &userID, &agentID, &applicationID,
+		&appName, &e.ActorEmail, &e.Action, &e.AuthMethod, &e.ResourceType,
+		&e.ResourceID, &e.IPAddress, &e.UserAgent,
+		&e.Status, &httpStatus, &e.RequestID, &metadata, &e.CreatedAt,
+	); err != nil {
+		return nil, fmt.Errorf("audit scan: %w", err)
+	}
+	// Pass metadata through as raw JSON; omit the empty object so the client
+	// can treat "no detail" uniformly.
+	if len(metadata) > 0 && string(metadata) != "{}" {
+		e.Metadata = json.RawMessage(metadata)
+	}
+	e.ID = strconv.FormatInt(logID, 10)
+	if tenantID != nil {
+		s := strconv.FormatInt(*tenantID, 10)
+		e.TenantID = &s
+	}
+	if userID != nil {
+		s := strconv.FormatInt(*userID, 10)
+		e.UserID = &s
+	}
+	if agentID != nil {
+		s := agentID.String()
+		e.AgentID = &s
+	}
+	if applicationID != nil {
+		s := strconv.FormatInt(*applicationID, 10)
+		e.ApplicationID = &s
+	}
+	if httpStatus != nil {
+		s := int(*httpStatus)
+		e.HTTPStatus = &s
+	}
+	e.TenantSlug = tenantSlug
+	e.ApplicationName = appName
+	return &e, nil
+}
+
 // Query returns a paginated, filtered list of audit log entries.
 // When p.TenantID is set, results are scoped to that tenant only.
 // When p.TenantID is nil, results span all tenants (system-wide view).
@@ -299,6 +558,21 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 			where += fmt.Sprintf(" AND al.agent_id = $%d", len(args))
 		}
 	}
+	if p.ApplicationID != "" {
+		appID, err := strconv.ParseInt(p.ApplicationID, 10, 64)
+		if err == nil {
+			args = append(args, appID)
+			where += fmt.Sprintf(" AND al.application_id = $%d", len(args))
+		}
+	}
+	if p.Status != "" {
+		args = append(args, p.Status)
+		where += fmt.Sprintf(" AND al.status = $%d", len(args))
+	}
+	if p.AuthMethod != "" {
+		args = append(args, p.AuthMethod)
+		where += fmt.Sprintf(" AND al.auth_method = $%d", len(args))
+	}
 	if p.From != nil {
 		args = append(args, *p.From)
 		where += fmt.Sprintf(" AND al.created_at >= $%d", len(args))
@@ -319,11 +593,13 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 	offsetArg := len(args)
 
 	querySQL := fmt.Sprintf(`
-		SELECT al.id, al.tenant_id, t.slug, al.user_id, al.agent_id,
-		       al.actor_email, al.action, al.resource_type,
-		       al.resource_id, al.ip_address, al.created_at
+		SELECT al.id, al.tenant_id, t.slug, al.user_id, al.agent_id, al.application_id,
+		       oc.name, al.actor_email, al.action, al.auth_method, al.resource_type,
+		       al.resource_id, COALESCE(host(al.ip_address), ''), al.user_agent,
+		       al.status, al.http_status, al.request_id, al.metadata, al.created_at
 		FROM audit_logs al
 		LEFT JOIN tenants t ON t.id = al.tenant_id
+		LEFT JOIN oauth_clients oc ON oc.id = al.application_id
 		%s
 		ORDER BY al.created_at DESC
 		LIMIT $%d OFFSET $%d
@@ -337,34 +613,11 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 
 	var logs []LogEntry
 	for rows.Next() {
-		var e LogEntry
-		var tenantID *int64
-		var userID *int64
-		var agentID *uuid.UUID
-		var tenantSlug *string
-		var logID int64
-		if err := rows.Scan(
-			&logID, &tenantID, &tenantSlug, &userID, &agentID,
-			&e.ActorEmail, &e.Action, &e.ResourceType,
-			&e.ResourceID, &e.IPAddress, &e.CreatedAt,
-		); err != nil {
-			return nil, fmt.Errorf("audit scan: %w", err)
+		e, err := scanLogEntry(rows)
+		if err != nil {
+			return nil, err
 		}
-		e.ID = strconv.FormatInt(logID, 10)
-		if tenantID != nil {
-			s := strconv.FormatInt(*tenantID, 10)
-			e.TenantID = &s
-		}
-		if userID != nil {
-			s := strconv.FormatInt(*userID, 10)
-			e.UserID = &s
-		}
-		if agentID != nil {
-			s := agentID.String()
-			e.AgentID = &s
-		}
-		e.TenantSlug = tenantSlug
-		logs = append(logs, e)
+		logs = append(logs, *e)
 	}
 	if logs == nil {
 		logs = []LogEntry{}
@@ -383,4 +636,40 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 		Page:       p.Page,
 		TotalPages: totalPages,
 	}, nil
+}
+
+// ErrLogNotFound is returned by GetByID when no row matches (or the row is
+// outside the caller's tenant scope — the two are indistinguishable on purpose,
+// so a tenant admin can't probe for the existence of another tenant's rows).
+var ErrLogNotFound = fmt.Errorf("audit log not found")
+
+// GetByID returns the full detail of a single audit row for the drill-down
+// view. When tenantScope is non-nil the row must belong to that tenant, so a
+// tenant admin cannot read another tenant's events; pass nil for the
+// system-wide (super-admin) view.
+func (l *Logger) GetByID(ctx context.Context, id int64, tenantScope *int64) (*LogEntry, error) {
+	args := []any{id}
+	scope := ""
+	if tenantScope != nil {
+		args = append(args, *tenantScope)
+		scope = " AND al.tenant_id = $2"
+	}
+	row := l.pool.QueryRow(ctx, `
+		SELECT al.id, al.tenant_id, t.slug, al.user_id, al.agent_id, al.application_id,
+		       oc.name, al.actor_email, al.action, al.auth_method, al.resource_type,
+		       al.resource_id, COALESCE(host(al.ip_address), ''), al.user_agent,
+		       al.status, al.http_status, al.request_id, al.metadata, al.created_at
+		FROM audit_logs al
+		LEFT JOIN tenants t ON t.id = al.tenant_id
+		LEFT JOIN oauth_clients oc ON oc.id = al.application_id
+		WHERE al.id = $1`+scope, args...)
+
+	e, err := scanLogEntry(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrLogNotFound
+		}
+		return nil, err
+	}
+	return e, nil
 }
