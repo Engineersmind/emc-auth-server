@@ -89,13 +89,15 @@ func validateWebhookURL(rawURL string) error {
 	if host == "" {
 		return fmt.Errorf("missing host")
 	}
-	ips, err := net.LookupIP(host)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve host %q: %w", host, err)
 	}
 	for _, ip := range ips {
-		if isBlockedIP(ip) {
-			return fmt.Errorf("host %q resolves to a non-public address %s", host, ip)
+		if isBlockedIP(ip.IP) {
+			return fmt.Errorf("host %q resolves to a non-public address %s", host, ip.IP)
 		}
 	}
 	return nil
@@ -210,7 +212,9 @@ func (s *WebhookSink) post(events []audit.Event) {
 		req.Header.Set("X-EMC-Audit-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
 	}
 	// URL is operator-configured (AUDIT_SIEM_WEBHOOK_URL), validated https at
-	// startup, and the transport's dialer rejects any private/loopback target.
+	// startup, and the transport's dialer rejects any private/loopback target
+	// on every dial (defeating DNS-rebinding) — so the SSRF surface is closed.
+	//nolint:gosec // G704: destination is https-validated + dialer blocks non-public IPs per connection.
 	resp, err := s.client.Do(req)
 	if err != nil {
 		metrics.AuditEnrichmentErrors.WithLabelValues("siem_post").Inc()
