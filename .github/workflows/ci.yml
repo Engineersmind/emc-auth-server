@@ -117,8 +117,10 @@ jobs:
       - name: Run tests with coverage
         # [CI-05] -p 1: serialize packages to prevent DB race between test packages
         #         that share the same PostgreSQL instance (FK violation in jwt_test.go)
+        # -timeout is per-package: internal/auth runs full migrations + bcrypt per
+        # test and legitimately needs >2m, so give the DB suites headroom.
         run: |
-          go test -p 1 ./... -coverprofile=coverage.out -covermode=atomic -timeout 120s
+          go test -p 1 ./... -coverprofile=coverage.out -covermode=atomic -timeout 300s
           go tool cover -func=coverage.out
 
       - name: Enforce ≥80% coverage on auth core

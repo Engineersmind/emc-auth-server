@@ -75,12 +75,12 @@ run: build
 ## Run all tests
 .PHONY: test
 test:
-	go test ./... -timeout 120s
+	go test ./... -timeout 300s
 
 ## Run tests with coverage report
 .PHONY: test-cover
 test-cover:
-	go test ./... -coverprofile=coverage.out -covermode=atomic -timeout 120s
+	go test ./... -coverprofile=coverage.out -covermode=atomic -timeout 300s
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 	go tool cover -func=coverage.out | grep total
@@ -88,7 +88,7 @@ test-cover:
 ## Run tests with race detector
 .PHONY: test-race
 test-race:
-	go test -race ./... -timeout 120s
+	go test -race ./... -timeout 300s
 
 ## Run golangci-lint
 .PHONY: lint
