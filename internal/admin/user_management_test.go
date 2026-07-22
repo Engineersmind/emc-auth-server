@@ -290,6 +290,7 @@ func TestUserManagement_AppScopeIsolation(t *testing.T) {
 	ctx := context.Background()
 	// Tenant-level user; querying through the app scope must not find them.
 	userID := createTestUser(t, f, "scoped@example.com")
+	famID := seedRefreshToken(t, f, userID, "Chrome", time.Hour)
 
 	if _, err := f.svc.GetUserDetail(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("GetUserDetail(wrong app scope) error = %v, want ErrNotFound", err)
@@ -300,7 +301,102 @@ func TestUserManagement_AppScopeIsolation(t *testing.T) {
 	if _, err := f.svc.ListUserSessions(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("ListUserSessions(wrong app scope) error = %v, want ErrNotFound", err)
 	}
+	if _, err := f.svc.GetUserMFA(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("GetUserMFA(wrong app scope) error = %v, want ErrNotFound", err)
+	}
+	if err := f.svc.RevokeUserSession(ctx, f.tenantID, &f.appID, userID, famID); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("RevokeUserSession(wrong app scope) error = %v, want ErrNotFound", err)
+	}
+	if _, err := f.svc.RevokeAllUserSessions(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("RevokeAllUserSessions(wrong app scope) error = %v, want ErrNotFound", err)
+	}
 	if err := f.svc.SetUserPassword(ctx, f.tenantID, &f.appID, userID, "NewStr0ngPass!"); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("SetUserPassword(wrong app scope) error = %v, want ErrNotFound", err)
+	}
+}
+
+// createSecondTenantUser provisions a distinct tenant B with one user and one
+// live session, returning tenant B's id, the user's id, and the session family
+// id. Used to prove that tenant A's service can never reach tenant B's rows.
+func createSecondTenantUser(t *testing.T, f adminFixture, slug, email string) (tenantB, userB, famB int64) {
+	t.Helper()
+	ctx := context.Background()
+	res, err := f.svc.CreateTenant(ctx, admin.CreateTenantInput{
+		Name:       slug,
+		Slug:       slug,
+		OwnerEmail: "owner-" + slug + "@example.com",
+	})
+	if err != nil {
+		t.Fatalf("CreateTenant(%s): %v", slug, err)
+	}
+	tenantB = parseID(t, res.Tenant.ID)
+
+	u, err := f.svc.CreateUser(ctx, tenantB, nil, email, "Str0ngPass!", "Other", "Tenant", nil)
+	if err != nil {
+		t.Fatalf("CreateUser(tenant B): %v", err)
+	}
+	userB = parseID(t, u.ID)
+
+	err = f.pool.QueryRow(ctx, `
+		INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, user_agent, session_family_id)
+		VALUES ($1, $2, $3, NOW() + interval '1 hour', 'Chrome', 0)
+		RETURNING id
+	`, userB, tenantB, fmt.Sprintf("hash-b-%d", time.Now().UnixNano())).Scan(&famB)
+	if err != nil {
+		t.Fatalf("seed tenant B refresh token: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx,
+		`UPDATE refresh_tokens SET session_family_id = id WHERE id = $1`, famB); err != nil {
+		t.Fatalf("set tenant B session family: %v", err)
+	}
+	return tenantB, userB, famB
+}
+
+// TestUserManagement_CrossTenantIsolation proves every user-management method
+// refuses to touch another tenant's user: called with tenant A's id but tenant
+// B's user id, all seven return ErrNotFound and mutate nothing.
+func TestUserManagement_CrossTenantIsolation(t *testing.T) {
+	f := newAdminFixture(t) // f.tenantID is tenant A
+	ctx := context.Background()
+	_, userB, famB := createSecondTenantUser(t, f, "tenantb", "userb@example.com")
+
+	// Enroll MFA for user B so a leak would actually surface data, not just a miss.
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO totp_secrets (user_id, tenant_id, secret_enc, is_active, backup_codes)
+		SELECT $1, tenant_id, 'enc', true, ARRAY['a'] FROM users WHERE id = $1
+	`, userB); err != nil {
+		t.Fatalf("seed tenant B totp: %v", err)
+	}
+
+	if _, err := f.svc.GetUserDetail(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("GetUserDetail(cross-tenant) error = %v, want ErrNotFound", err)
+	}
+	if _, err := f.svc.SetUserActive(ctx, f.tenantID, nil, userB, false); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("SetUserActive(cross-tenant) error = %v, want ErrNotFound", err)
+	}
+	if _, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("ListUserSessions(cross-tenant) error = %v, want ErrNotFound", err)
+	}
+	if _, err := f.svc.GetUserMFA(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("GetUserMFA(cross-tenant) error = %v, want ErrNotFound", err)
+	}
+	if err := f.svc.RevokeUserSession(ctx, f.tenantID, nil, userB, famB); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("RevokeUserSession(cross-tenant) error = %v, want ErrNotFound", err)
+	}
+	if _, err := f.svc.RevokeAllUserSessions(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("RevokeAllUserSessions(cross-tenant) error = %v, want ErrNotFound", err)
+	}
+	if err := f.svc.SetUserPassword(ctx, f.tenantID, nil, userB, "NewStr0ngPass!"); !errors.Is(err, admin.ErrNotFound) {
+		t.Errorf("SetUserPassword(cross-tenant) error = %v, want ErrNotFound", err)
+	}
+
+	// Tenant B's session must still be live — nothing was revoked cross-tenant.
+	var live int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userB).Scan(&live); err != nil {
+		t.Fatalf("count tenant B tokens: %v", err)
+	}
+	if live != 1 {
+		t.Errorf("tenant B live tokens = %d, want 1 (cross-tenant calls must not revoke)", live)
 	}
 }

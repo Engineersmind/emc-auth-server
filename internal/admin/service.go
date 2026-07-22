@@ -229,8 +229,11 @@ type UserIdentity struct {
 // LastLoginAt/LoginsCount/Connections live on the embedded UserResult.
 type UserDetail struct {
 	UserResult
-	EmailVerified  bool           `json:"email_verified"`
-	TokenVersion   int            `json:"token_version"`
+	EmailVerified bool `json:"email_verified"`
+	// TokenVersion is the internal JWT-invalidation counter. Loaded for internal
+	// use but never serialized — exposing it would leak the invalidation
+	// mechanism to API clients (the admin UI has no use for it).
+	TokenVersion   int            `json:"-"`
 	UpdatedAt      time.Time      `json:"updated_at"`
 	ActiveSessions int            `json:"active_sessions"`
 	MFA            UserMFAStatus  `json:"mfa"`
@@ -1454,7 +1457,7 @@ func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicat
 		FROM refresh_tokens
 		WHERE user_id = $1 AND tenant_id = $2
 		  AND revoked_at IS NULL AND deleted_at IS NULL AND expires_at > NOW()
-		ORDER BY session_family_id, created_at DESC
+		ORDER BY session_family_id, last_used_at DESC NULLS LAST, created_at DESC
 	`, userID, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
@@ -1492,6 +1495,15 @@ func sessionActivity(s UserSession) time.Time {
 
 // RevokeUserSession revokes a single session family belonging to the user.
 // Returns ErrNotFound if no live token in that family belongs to the user.
+//
+// Unlike RevokeAllUserSessions / SetUserActive / SetUserPassword, this does NOT
+// bump token_version: that counter is global to the user, so bumping it would
+// invalidate the access tokens of every OTHER session too — the opposite of a
+// single-session revoke. The access token is not session-scoped (the JWT
+// carries no family id), so it cannot be selectively invalidated; revoking the
+// refresh-token family stops the session from being renewed, and the already
+// issued access token dies at its short natural expiry. Use RevokeAllUserSessions
+// for immediate, account-wide invalidation.
 func (s *Service) RevokeUserSession(ctx context.Context, tenantID int64, applicationID *int64, userID, familyID int64) error {
 	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
 		return err

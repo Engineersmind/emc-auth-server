@@ -1451,6 +1451,12 @@ func (h *AdminHandler) SetUserStatus(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "is_active is required"})
 	}
 
+	// Guard against self-lockout: an admin must not be able to disable their own
+	// account (which would revoke their tokens and immediately lock them out).
+	if !*req.IsActive && claims != nil && claims.UserID == strconv.FormatInt(userID, 10) {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "cannot change your own status"})
+	}
+
 	result, err := h.svc.SetUserActive(c.Request().Context(), tenantID, appScope, userID, *req.IsActive)
 	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
