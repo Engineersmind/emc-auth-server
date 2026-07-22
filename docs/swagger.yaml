@@ -3951,6 +3951,133 @@ paths:
       summary: Activity feed for a target tenant
       tags:
       - admin-cross-tenant
+  /api/v1/tenants/{tid}/app-limits:
+    get:
+      description: Returns all per-app rate limit configs for the tenant. Requires
+        apps:read.
+      parameters:
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.AppRateLimit'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List app rate limits
+      tags:
+      - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/rate-limit:
+    delete:
+      description: Removes the custom rate limit; the app falls back to the default.
+        Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete an application's rate limit
+      tags:
+      - admin-rate-limits
+    get:
+      description: Returns the custom per-minute limit for the application. Requires
+        apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get an application's rate limit
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the per-minute request limit for the application.
+        Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      - description: Limit config
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AppLimitRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an application's rate limit
+      tags:
+      - admin-rate-limits
   /api/v1/tenants/{tid}/roles:
     get:
       description: Returns all roles (with permissions) belonging to the specified

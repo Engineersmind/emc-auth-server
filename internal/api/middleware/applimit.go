@@ -48,7 +48,7 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client) ech
 			}
 
 			rpm, burst := svc.GetLimit(c.Request().Context(), tenantID, appID)
-			return enforceAppLimit(c, next, limiter, tenantID, appID, rpm, burst)
+			return enforceAppLimit(c, next, limiter, "app:", tenantID, appID, rpm, burst)
 		}
 	}
 }
@@ -56,10 +56,16 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client) ech
 // AppClientRateLimiter is the pre-auth counterpart of AppRateLimiter for the
 // Basic-auth application endpoints (client_credentials token, /auth/apps/*),
 // where the caller is identified by the client_id in the Authorization: Basic
-// header rather than a JWT. It resolves the client_id to its application and
-// enforces the SAME per-app bucket as AppRateLimiter, so a limit configured for
-// an application governs both the app's auth calls here and its token's
-// subsequent API calls uniformly.
+// header rather than a JWT, applying the application's configured limit to those
+// auth calls.
+//
+// It uses a SEPARATE bucket namespace ("appauth:") from the JWT-authenticated
+// API limiter ("app:"). The client_id is a public identifier read before the
+// client_secret is verified, so sharing one bucket would let anyone who knows a
+// client_id drain the application's authenticated API quota by sending bogus
+// auth requests (a cross-surface DoS). With separate buckets, pre-auth guessing
+// can at most throttle the auth endpoints — and that is already bounded per IP
+// by TokenRateLimiter, which runs ahead of this middleware.
 //
 // Requests with no Basic client_id, or a client_id that maps to no live
 // application, are passed through (the per-IP TokenRateLimiter still applies).
@@ -76,17 +82,18 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 			if !ok {
 				return next(c)
 			}
-			return enforceAppLimit(c, next, limiter, tenantID, appID, rpm, burst)
+			return enforceAppLimit(c, next, limiter, "appauth:", tenantID, appID, rpm, burst)
 		}
 	}
 }
 
 // enforceAppLimit applies one token-bucket check against the per-application
-// Redis counter (shared key space across the JWT and client_id entry points),
-// setting X-RateLimit-* headers and returning 429 when the bucket is empty.
-// Redis errors fail open so an outage never blocks all traffic.
-func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.Limiter, tenantID, appID int64, rpm, burst int) error {
-	rateKey := "app:" + strconv.FormatInt(tenantID, 10) + ":" + strconv.FormatInt(appID, 10)
+// Redis counter under keyPrefix (JWT API traffic and pre-auth client_id traffic
+// use distinct prefixes so they never share a bucket), setting X-RateLimit-*
+// headers and returning 429 when the bucket is empty. Redis errors fail open so
+// an outage never blocks all traffic.
+func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.Limiter, keyPrefix string, tenantID, appID int64, rpm, burst int) error {
+	rateKey := keyPrefix + strconv.FormatInt(tenantID, 10) + ":" + strconv.FormatInt(appID, 10)
 	res, err := limiter.Allow(c.Request().Context(), rateKey, redis_rate.Limit{
 		Rate:   rpm,
 		Burst:  burst,

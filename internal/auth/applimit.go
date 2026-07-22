@@ -88,8 +88,8 @@ func (s *AppRateLimitService) SetAppLimit(ctx context.Context, tenantID, applica
 	return &limit, nil
 }
 
-// GetAppLimit returns the configured limit for one application, or pgx.ErrNoRows
-// when none is set (the app then runs at the server default).
+// GetAppLimit returns the configured limit for one application, or
+// ErrAppLimitNotFound when none is set (the app then runs at the server default).
 func (s *AppRateLimitService) GetAppLimit(ctx context.Context, tenantID, applicationID int64) (*AppRateLimit, error) {
 	var limit AppRateLimit
 	err := s.pool.QueryRow(ctx, `

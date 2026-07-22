@@ -1628,8 +1628,10 @@ type AppLimitRequest struct {
 // @Tags         admin-rate-limits
 // @Produce      json
 // @Security     BearerAuth
+// @Param        tid  path      string  false  "Tenant ID (super_admin cross-tenant mirror)"
 // @Success      200  {array}   auth.AppRateLimit
 // @Router       /api/v1/app-limits [get]
+// @Router       /api/v1/tenants/{tid}/app-limits [get]
 func (h *AdminHandler) ListAppLimits(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
@@ -1653,10 +1655,12 @@ func (h *AdminHandler) ListAppLimits(c echo.Context) error {
 // @Tags         admin-rate-limits
 // @Produce      json
 // @Security     BearerAuth
-// @Param        appID  path      string  true  "Application ID"
+// @Param        appID  path      string  true   "Application ID"
+// @Param        tid    path      string  false  "Tenant ID (super_admin cross-tenant mirror)"
 // @Success      200    {object}  auth.AppRateLimit
 // @Failure      404    {object}  map[string]string
 // @Router       /api/v1/applications/{appID}/rate-limit [get]
+// @Router       /api/v1/tenants/{tid}/applications/{appID}/rate-limit [get]
 func (h *AdminHandler) GetAppLimit(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
@@ -1687,11 +1691,13 @@ func (h *AdminHandler) GetAppLimit(c echo.Context) error {
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        appID  path      string           true  "Application ID"
-// @Param        body   body      AppLimitRequest  true  "Limit config"
+// @Param        appID  path      string           true   "Application ID"
+// @Param        tid    path      string           false  "Tenant ID (super_admin cross-tenant mirror)"
+// @Param        body   body      AppLimitRequest  true   "Limit config"
 // @Success      200    {object}  auth.AppRateLimit
 // @Failure      400    {object}  map[string]string
 // @Router       /api/v1/applications/{appID}/rate-limit [put]
+// @Router       /api/v1/tenants/{tid}/applications/{appID}/rate-limit [put]
 func (h *AdminHandler) SetAppLimit(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
@@ -1724,10 +1730,12 @@ func (h *AdminHandler) SetAppLimit(c echo.Context) error {
 // @Tags         admin-rate-limits
 // @Produce      json
 // @Security     BearerAuth
-// @Param        appID  path      string  true  "Application ID"
+// @Param        appID  path      string  true   "Application ID"
+// @Param        tid    path      string  false  "Tenant ID (super_admin cross-tenant mirror)"
 // @Success      200    {object}  map[string]string
 // @Failure      404    {object}  map[string]string
 // @Router       /api/v1/applications/{appID}/rate-limit [delete]
+// @Router       /api/v1/tenants/{tid}/applications/{appID}/rate-limit [delete]
 func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
