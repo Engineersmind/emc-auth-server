@@ -1496,7 +1496,7 @@ func sessionActivity(s UserSession) time.Time {
 // RevokeUserSession revokes a single session family belonging to the user.
 // Returns ErrNotFound if no live token in that family belongs to the user.
 //
-// Unlike RevokeAllUserSessions / SetUserActive / SetUserPassword, this does NOT
+// Unlike RevokeAllUserSessions / SetUserActive, this does NOT
 // bump token_version: that counter is global to the user, so bumping it would
 // invalidate the access tokens of every OTHER session too — the opposite of a
 // single-session revoke. The access token is not session-scoped (the JWT
@@ -1571,50 +1571,6 @@ func (s *Service) GetUserMFA(ctx context.Context, tenantID int64, applicationID 
 		return nil, fmt.Errorf("get user mfa: email: %w", err)
 	}
 	return &status, nil
-}
-
-// SetUserPassword directly sets a user's password (admin action, distinct from
-// the email-dispatch ForcePasswordReset). Bumps token_version and revokes all
-// live refresh tokens so old sessions cannot outlive the change. Users with no
-// user_credentials row (federated-only accounts) return ErrNotFound.
-func (s *Service) SetUserPassword(ctx context.Context, tenantID int64, applicationID *int64, userID int64, password string) error {
-	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
-		return err
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), auth.BcryptCost)
-	if err != nil {
-		return fmt.Errorf("hash password: %w", err)
-	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin set-password tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	ct, err := tx.Exec(ctx, `
-		UPDATE user_credentials SET password_hash = $1, updated_at = NOW()
-		WHERE user_id = $2 AND tenant_id = $3
-	`, string(hash), userID, tenantID)
-	if err != nil {
-		return fmt.Errorf("set password: %w", err)
-	}
-	if ct.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE users SET token_version = token_version + 1, updated_at = NOW()
-		WHERE id = $1 AND tenant_id = $2
-	`, userID, tenantID); err != nil {
-		return fmt.Errorf("bump token version: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-	`, userID, tenantID); err != nil {
-		return fmt.Errorf("revoke tokens on password set: %w", err)
-	}
-	return tx.Commit(ctx)
 }
 
 // ---------------------------------------------------------------------------

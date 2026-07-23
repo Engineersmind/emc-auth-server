@@ -1377,11 +1377,6 @@ type SetUserStatusRequest struct {
 	IsActive *bool `json:"is_active"`
 }
 
-// SetUserPasswordRequest is the body for POST .../users/:id/set-password.
-type SetUserPasswordRequest struct {
-	Password string `json:"password"`
-}
-
 // GetAdminUserDetail handles GET .../users/:id/detail.
 //
 // @Summary      Get enriched user detail
@@ -1621,53 +1616,6 @@ func (h *AdminHandler) GetUserMFAStatus(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get MFA status"})
 	}
 	return c.JSON(http.StatusOK, status)
-}
-
-// SetUserPassword handles POST .../users/:id/set-password.
-//
-// @Summary      Set a user's password directly
-// @Description  Sets a new password for the user without an email round-trip, revoking all sessions. Requires users:write.
-// @Tags         admin-users
-// @Accept       json
-// @Produce      json
-// @Security     BearerAuth
-// @Param        id    path      string                  true  "User ID"
-// @Param        body  body      SetUserPasswordRequest  true  "New password"
-// @Success      200   {object}  map[string]string
-// @Failure      400   {object}  map[string]string
-// @Failure      404   {object}  map[string]string
-// @Router       /api/v1/users/{id}/set-password [post]
-func (h *AdminHandler) SetUserPassword(c echo.Context) error {
-	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
-	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
-	}
-	appScope, ok := h.optionalAppScope(c, tenantID)
-	if !ok {
-		return nil
-	}
-	userID, err := userIDFromPath(c)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
-	}
-
-	var req SetUserPasswordRequest
-	if err := c.Bind(&req); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
-	}
-	if len(req.Password) < 8 {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
-	}
-
-	if err := h.svc.SetUserPassword(c.Request().Context(), tenantID, appScope, userID, req.Password); err != nil {
-		if errors.Is(err, admin.ErrNotFound) {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found or has no password credentials"})
-		}
-		h.logger.Error().Err(err).Msg("admin: set user password failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set password"})
-	}
-	h.auditAdmin(c, claims, audit.ActionAdminUserPasswordSet, "user", strconv.FormatInt(userID, 10))
-	return c.JSON(http.StatusOK, map[string]string{"message": "password updated"})
 }
 
 // ---------------------------------------------------------------------------

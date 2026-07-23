@@ -57,7 +57,6 @@ const (
 	ActionAdminForcePasswordReset = "admin.force_password_reset"
 	ActionAdminUserBlocked        = "admin.user_blocked"
 	ActionAdminUserUnblocked      = "admin.user_unblocked"
-	ActionAdminUserPasswordSet    = "admin.user_password_set"
 	ActionAdminUserSessionRevoked = "admin.user_session_revoked"
 	ActionAdminUserSessionsPurged = "admin.user_sessions_purged"
 

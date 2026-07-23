@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
 )
@@ -244,47 +243,6 @@ func TestGetUserMFA_NotEnrolled(t *testing.T) {
 	}
 }
 
-func TestSetUserPassword_UpdatesHashAndRevokesTokens(t *testing.T) {
-	f := newAdminFixture(t)
-	ctx := context.Background()
-	userID := createTestUser(t, f, "setpw@example.com")
-	seedRefreshToken(t, f, userID, "Chrome", time.Hour)
-
-	if err := f.svc.SetUserPassword(ctx, f.tenantID, nil, userID, "NewStr0ngPass!"); err != nil {
-		t.Fatalf("SetUserPassword() error = %v", err)
-	}
-
-	var hash string
-	if err := f.pool.QueryRow(ctx, `SELECT password_hash FROM user_credentials WHERE user_id = $1`, userID).Scan(&hash); err != nil {
-		t.Fatalf("read hash: %v", err)
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte("NewStr0ngPass!")); err != nil {
-		t.Error("stored hash does not match the new password")
-	}
-
-	var liveTokens int
-	if err := f.pool.QueryRow(ctx, `SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL`, userID).Scan(&liveTokens); err != nil {
-		t.Fatalf("count tokens: %v", err)
-	}
-	if liveTokens != 0 {
-		t.Errorf("live refresh tokens after password set = %d, want 0", liveTokens)
-	}
-}
-
-func TestSetUserPassword_FederatedOnlyUserRejected(t *testing.T) {
-	f := newAdminFixture(t)
-	ctx := context.Background()
-	userID := createTestUser(t, f, "fed@example.com")
-	// Simulate a federated-only account: no credentials row.
-	if _, err := f.pool.Exec(ctx, `DELETE FROM user_credentials WHERE user_id = $1`, userID); err != nil {
-		t.Fatalf("delete credentials: %v", err)
-	}
-
-	if err := f.svc.SetUserPassword(ctx, f.tenantID, nil, userID, "NewStr0ngPass!"); !errors.Is(err, admin.ErrNotFound) {
-		t.Fatalf("SetUserPassword(no credentials) error = %v, want ErrNotFound", err)
-	}
-}
-
 func TestUserManagement_AppScopeIsolation(t *testing.T) {
 	f := newAdminFixture(t)
 	ctx := context.Background()
@@ -309,9 +267,6 @@ func TestUserManagement_AppScopeIsolation(t *testing.T) {
 	}
 	if _, err := f.svc.RevokeAllUserSessions(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("RevokeAllUserSessions(wrong app scope) error = %v, want ErrNotFound", err)
-	}
-	if err := f.svc.SetUserPassword(ctx, f.tenantID, &f.appID, userID, "NewStr0ngPass!"); !errors.Is(err, admin.ErrNotFound) {
-		t.Errorf("SetUserPassword(wrong app scope) error = %v, want ErrNotFound", err)
 	}
 }
 
@@ -385,9 +340,6 @@ func TestUserManagement_CrossTenantIsolation(t *testing.T) {
 	}
 	if _, err := f.svc.RevokeAllUserSessions(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("RevokeAllUserSessions(cross-tenant) error = %v, want ErrNotFound", err)
-	}
-	if err := f.svc.SetUserPassword(ctx, f.tenantID, nil, userB, "NewStr0ngPass!"); !errors.Is(err, admin.ErrNotFound) {
-		t.Errorf("SetUserPassword(cross-tenant) error = %v, want ErrNotFound", err)
 	}
 
 	// Tenant B's session must still be live — nothing was revoked cross-tenant.
