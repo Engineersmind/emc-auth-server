@@ -1369,6 +1369,256 @@ func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 }
 
 // ---------------------------------------------------------------------------
+// User detail & lifecycle (Auth0-style admin user management)
+// ---------------------------------------------------------------------------
+
+// SetUserStatusRequest is the body for PUT .../users/:id/status.
+type SetUserStatusRequest struct {
+	IsActive *bool `json:"is_active"`
+}
+
+// GetAdminUserDetail handles GET .../users/:id/detail.
+//
+// @Summary      Get enriched user detail
+// @Description  Returns a user's profile plus MFA status, linked identities, active-session count, and last activity. Requires users:read.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  admin.UserDetail
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/detail [get]
+func (h *AdminHandler) GetAdminUserDetail(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	result, err := h.svc.GetUserDetail(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: get user detail failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get user detail"})
+	}
+	return c.JSON(http.StatusOK, result)
+}
+
+// SetUserStatus handles PUT .../users/:id/status.
+//
+// @Summary      Block or unblock a user
+// @Description  Sets a user's active status. Blocking (is_active=false) revokes all sessions and invalidates issued tokens. Requires users:write.
+// @Tags         admin-users
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      string                true  "User ID"
+// @Param        body  body      SetUserStatusRequest  true  "Desired status"
+// @Success      200   {object}  admin.UserResult
+// @Failure      400   {object}  map[string]string
+// @Failure      404   {object}  map[string]string
+// @Router       /api/v1/users/{id}/status [put]
+func (h *AdminHandler) SetUserStatus(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	var req SetUserStatusRequest
+	if err := c.Bind(&req); err != nil || req.IsActive == nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "is_active is required"})
+	}
+
+	// Guard against self-lockout: an admin must not be able to disable their own
+	// account (which would revoke their tokens and immediately lock them out).
+	if !*req.IsActive && claims != nil && claims.UserID == strconv.FormatInt(userID, 10) {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": "cannot change your own status"})
+	}
+
+	result, err := h.svc.SetUserActive(c.Request().Context(), tenantID, appScope, userID, *req.IsActive)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: set user status failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update user status"})
+	}
+	action := audit.ActionAdminUserUnblocked
+	if !*req.IsActive {
+		action = audit.ActionAdminUserBlocked
+	}
+	h.auditAdmin(c, claims, action, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, result)
+}
+
+// ListUserSessions handles GET .../users/:id/sessions.
+//
+// @Summary      List a user's active sessions
+// @Description  Returns the user's active sessions (one per session family) with IP, user agent, and last activity. Requires users:read.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  map[string][]admin.UserSession
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/sessions [get]
+func (h *AdminHandler) ListUserSessions(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	sessions, err := h.svc.ListUserSessions(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: list user sessions failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list sessions"})
+	}
+	return c.JSON(http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+// RevokeUserSession handles DELETE .../users/:id/sessions/:familyID.
+//
+// @Summary      Revoke a single user session
+// @Description  Revokes one session family for the user. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id        path      string  true  "User ID"
+// @Param        familyID  path      string  true  "Session family ID"
+// @Success      200       {object}  map[string]string
+// @Failure      404       {object}  map[string]string
+// @Router       /api/v1/users/{id}/sessions/{familyID} [delete]
+func (h *AdminHandler) RevokeUserSession(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+	familyID, err := strconv.ParseInt(c.Param("familyID"), 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid session id"})
+	}
+
+	if err := h.svc.RevokeUserSession(c.Request().Context(), tenantID, appScope, userID, familyID); err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user or session not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: revoke user session failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke session"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserSessionRevoked, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "session revoked"})
+}
+
+// RevokeAllUserSessions handles DELETE .../users/:id/sessions.
+//
+// @Summary      Revoke all of a user's sessions
+// @Description  Revokes every active session and invalidates issued tokens, signing the user out everywhere. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/sessions [delete]
+func (h *AdminHandler) RevokeAllUserSessions(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	count, err := h.svc.RevokeAllUserSessions(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: revoke all user sessions failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke sessions"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserSessionsPurged, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]any{"message": "all sessions revoked", "revoked": count})
+}
+
+// GetUserMFAStatus handles GET .../users/:id/mfa.
+//
+// @Summary      Get a user's MFA status
+// @Description  Returns the user's enrolled MFA methods and remaining backup codes. Requires users:read.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  admin.UserMFAStatus
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/mfa [get]
+func (h *AdminHandler) GetUserMFAStatus(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	status, err := h.svc.GetUserMFA(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: get user mfa failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get MFA status"})
+	}
+	return c.JSON(http.StatusOK, status)
+}
+
+// ---------------------------------------------------------------------------
 // Monitoring stats endpoints
 // ---------------------------------------------------------------------------
 

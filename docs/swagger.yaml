@@ -122,10 +122,88 @@ definitions:
       total_pages:
         type: integer
     type: object
+  admin.UserDetail:
+    properties:
+      active_sessions:
+        type: integer
+      application_id:
+        type: string
+      connections:
+        description: |-
+          Connections lists how this user can sign in: "password" when a
+          credentials row exists, plus every linked federated provider (Auth0's
+          "Connection" column).
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      email:
+        type: string
+      email_verified:
+        type: boolean
+      first_name:
+        type: string
+      id:
+        type: string
+      identities:
+        items:
+          $ref: '#/definitions/admin.UserIdentity'
+        type: array
+      is_active:
+        type: boolean
+      last_login_at:
+        description: LastLoginAt is the most recent session activity (Auth0's "Latest
+          Login").
+        type: string
+      last_name:
+        type: string
+      logins_count:
+        description: |-
+          LoginsCount is the number of successful logins on record (audit-derived,
+          Auth0's stats.loginsCount equivalent).
+        type: integer
+      mfa:
+        $ref: '#/definitions/admin.UserMFAStatus'
+      role:
+        type: string
+      role_id:
+        type: string
+      tenant_id:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  admin.UserIdentity:
+    properties:
+      created_at:
+        type: string
+      provider:
+        type: string
+      provider_email:
+        type: string
+    type: object
+  admin.UserMFAStatus:
+    properties:
+      backup_codes_remaining:
+        type: integer
+      email_enabled:
+        type: boolean
+      totp_enabled:
+        type: boolean
+    type: object
   admin.UserResult:
     properties:
       application_id:
         type: string
+      connections:
+        description: |-
+          Connections lists how this user can sign in: "password" when a
+          credentials row exists, plus every linked federated provider (Auth0's
+          "Connection" column).
+        items:
+          type: string
+        type: array
       created_at:
         type: string
       email:
@@ -136,13 +214,37 @@ definitions:
         type: string
       is_active:
         type: boolean
+      last_login_at:
+        description: LastLoginAt is the most recent session activity (Auth0's "Latest
+          Login").
+        type: string
       last_name:
         type: string
+      logins_count:
+        description: |-
+          LoginsCount is the number of successful logins on record (audit-derived,
+          Auth0's stats.loginsCount equivalent).
+        type: integer
       role:
         type: string
       role_id:
         type: string
       tenant_id:
+        type: string
+    type: object
+  admin.UserSession:
+    properties:
+      created_at:
+        type: string
+      expires_at:
+        type: string
+      ip_address:
+        type: string
+      last_used_at:
+        type: string
+      session_family_id:
+        type: string
+      user_agent:
         type: string
     type: object
   admin.UsersPage:
@@ -765,6 +867,11 @@ definitions:
     required:
     - email
     - password
+    type: object
+  handlers.SetUserStatusRequest:
+    properties:
+      is_active:
+        type: boolean
     type: object
   handlers.SlugCheckResponse:
     properties:
@@ -4473,6 +4580,34 @@ paths:
       summary: Update user
       tags:
       - admin-users
+  /api/v1/users/{id}/detail:
+    get:
+      description: Returns a user's profile plus MFA status, linked identities, active-session
+        count, and last activity. Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserDetail'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get enriched user detail
+      tags:
+      - admin-users
   /api/v1/users/{id}/force-password-reset:
     post:
       description: Sends a password reset email to the specified user. Requires admin:access.
@@ -4567,6 +4702,34 @@ paths:
       summary: Unlink a social identity from a user
       tags:
       - oauth
+  /api/v1/users/{id}/mfa:
+    get:
+      description: Returns the user's enrolled MFA methods and remaining backup codes.
+        Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserMFAStatus'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get a user's MFA status
+      tags:
+      - admin-users
   /api/v1/users/{id}/role:
     put:
       consumes:
@@ -4608,6 +4771,143 @@ paths:
       security:
       - BearerAuth: []
       summary: Assign role to user
+      tags:
+      - admin-users
+  /api/v1/users/{id}/sessions:
+    delete:
+      description: Revokes every active session and invalidates issued tokens, signing
+        the user out everywhere. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke all of a user's sessions
+      tags:
+      - admin-users
+    get:
+      description: Returns the user's active sessions (one per session family) with
+        IP, user agent, and last activity. Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              items:
+                $ref: '#/definitions/admin.UserSession'
+              type: array
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List a user's active sessions
+      tags:
+      - admin-users
+  /api/v1/users/{id}/sessions/{familyID}:
+    delete:
+      description: Revokes one session family for the user. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Session family ID
+        in: path
+        name: familyID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke a single user session
+      tags:
+      - admin-users
+  /api/v1/users/{id}/status:
+    put:
+      consumes:
+      - application/json
+      description: Sets a user's active status. Blocking (is_active=false) revokes
+        all sessions and invalidates issued tokens. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Desired status
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SetUserStatusRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Block or unblock a user
       tags:
       - admin-users
   /health:

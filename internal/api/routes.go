@@ -470,6 +470,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/users/:uid/mfa", adminHandler.GetUserMFAStatus, tidUsersRead)
 
 	// Application management under the canonical family — same handlers as
 	// the flat /applications aliases; the :tid path param overrides the JWT
@@ -523,6 +529,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, tidUsersRead)
 
 	// Tenant stats + activity feed (EMC-004 tenant overview page).
 	adminGroup.GET("/tenants/:tid/stats", adminHandler.TenantGetStats, tidStatsRead)
@@ -563,6 +575,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/users/:id/role", adminHandler.AssignUserRole, usersWrite)
 	adminGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser, usersWrite)
 	adminGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
+	adminGroup.GET("/users/:id/detail", adminHandler.GetAdminUserDetail, usersRead)
+	adminGroup.PUT("/users/:id/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.GET("/users/:id/sessions", adminHandler.ListUserSessions, usersRead)
+	adminGroup.DELETE("/users/:id/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
+	adminGroup.DELETE("/users/:id/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)
+	adminGroup.GET("/users/:id/mfa", adminHandler.GetUserMFAStatus, usersRead)
 
 	// API key management — apps:read / apps:write (keys are machine credentials) (03-03)
 	adminGroup.POST("/api-keys", authHandler.CreateAPIKey, appsWrite)
@@ -636,6 +654,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, usersWrite)
 	adminGroup.POST("/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
 	adminGroup.DELETE("/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, usersRead)
+	adminGroup.PUT("/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, usersRead)
+	adminGroup.DELETE("/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
+	adminGroup.DELETE("/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, usersRead)
 
 	// Per-app rate limit management — apps:read / apps:write (08-02).
 	// Keyed on the numeric application id (oauth_clients.id), consistent with

@@ -69,6 +69,10 @@ const (
 	ActionAdminUserDeleted        = "admin.user_deleted"
 	ActionAdminUserRoleAssigned   = "admin.user_role_assigned"
 	ActionAdminForcePasswordReset = "admin.force_password_reset"
+	ActionAdminUserBlocked        = "admin.user_blocked"
+	ActionAdminUserUnblocked      = "admin.user_unblocked"
+	ActionAdminUserSessionRevoked = "admin.user_session_revoked"
+	ActionAdminUserSessionsPurged = "admin.user_sessions_purged"
 
 	// Admin — per-app rate limit management (08-02)
 	ActionAdminAppLimitCreated = "admin.app_limit_created"
