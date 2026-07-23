@@ -1052,13 +1052,13 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	}
 
 	var email, roleName string
-	var roleID *int64
+	var roleID, applicationID *int64
 	err = s.pool.QueryRow(ctx, `
-		SELECT u.email, COALESCE(r.name, ''), u.role_id
+		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&email, &roleName, &roleID)
+	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("user not found or inactive")
@@ -1072,7 +1072,18 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		perms = []string{}
 	}
 
-	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, "")
+	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, appIDClaim(applicationID))
+}
+
+// appIDClaim renders a nullable users.application_id into the string form used
+// for the JWT app_id claim: the decimal id for application-scoped users, or ""
+// for tenant-level users. Keeping this consistent with Login/Register ensures a
+// token's application context survives every refresh rotation.
+func appIDClaim(applicationID *int64) string {
+	if applicationID == nil {
+		return ""
+	}
+	return strconv.FormatInt(*applicationID, 10)
 }
 
 // gracePeriod is the window in which a concurrent rotation is not treated as a replay.
@@ -1269,13 +1280,13 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	// Fresh user load from DB — catches suspensions, role changes, or email bans
 	// that occurred during the access token's lifetime (key security gate).
 	var email, roleName string
-	var roleID *int64
+	var roleID, applicationID *int64
 	err = s.pool.QueryRow(ctx, `
-		SELECT u.email, COALESCE(r.name, ''), u.role_id
+		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&email, &roleName, &roleID)
+	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, fmt.Errorf("user not found or inactive")
@@ -1289,7 +1300,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		perms = []string{}
 	}
 
-	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, "")
+	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, appIDClaim(applicationID))
 	return result, nil, err
 }
 

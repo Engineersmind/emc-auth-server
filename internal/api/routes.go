@@ -268,7 +268,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithAPIKeys(apiKeySvc).
 		WithApplications(appSvc).
 		WithCookieConfig(cookieCfg).
-		WithJWT(jwtSvc)
+		WithJWT(jwtSvc).
+		WithRedis(deps.Redis)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)

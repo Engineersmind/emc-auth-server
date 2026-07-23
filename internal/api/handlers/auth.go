@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/labstack/echo/v4"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
@@ -32,6 +33,7 @@ type AuthHandler struct {
 	audit     *audit.Logger
 	logger    zerolog.Logger
 	cookieCfg mw.CookieConfig
+	redisCli  *redis.Client // per-family refresh lock; nil degrades to lock-free replay detection
 }
 
 // NewAuthHandler creates an AuthHandler.
@@ -73,6 +75,14 @@ func (h *AuthHandler) WithApplications(appSvc *auth.ApplicationService) *AuthHan
 // WithJWT attaches a JWTService to the handler (needed for management token endpoint).
 func (h *AuthHandler) WithJWT(jwtSvc *auth.JWTService) *AuthHandler {
 	h.jwtSvc = jwtSvc
+	return h
+}
+
+// WithRedis attaches the Redis client used by the explicit refresh endpoints to
+// acquire the per-family rotation lock (see AuthService.RefreshWithLock). When
+// nil, refresh still detects replay but cannot serialize concurrent rotations.
+func (h *AuthHandler) WithRedis(redisCli *redis.Client) *AuthHandler {
+	h.redisCli = redisCli
 	return h
 }
 
@@ -861,7 +871,7 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "refresh token missing"})
 	}
 
-	result, err := h.svc.Refresh(c.Request().Context(), req.RefreshToken)
+	result, grace, err := h.svc.RefreshWithLock(c.Request().Context(), req.RefreshToken, h.redisCli)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("refresh failed")
 		action := audit.ActionAuthTokenRefreshFailed
@@ -884,7 +894,21 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
 		}
+		if errors.Is(err, auth.ErrServiceUnavailable) {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})
+		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token refresh failed"})
+	}
+
+	// A concurrent request already rotated this token family within the grace
+	// window. There is no fresh token pair to hand back to this caller — the
+	// sibling request's response carries the new tokens. Signal the collision
+	// so the client uses that pair rather than treating this as an error.
+	if grace != nil {
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error": "refresh already completed by a concurrent request",
+			"code":  "concurrent_refresh",
+		})
 	}
 
 	tid, uid, appID := claimsFromToken(result.AccessToken)
@@ -2006,7 +2030,7 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "refresh cookie missing or expired"})
 	}
 
-	result, err := h.svc.Refresh(c.Request().Context(), cookie.Value)
+	result, grace, err := h.svc.RefreshWithLock(c.Request().Context(), cookie.Value, h.redisCli)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("session refresh failed")
 		action := audit.ActionAuthTokenRefreshFailed
@@ -2030,7 +2054,20 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
 		}
+		if errors.Is(err, auth.ErrServiceUnavailable) {
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})
+		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token refresh failed"})
+	}
+
+	// Concurrent rotation already completed within the grace window; the sibling
+	// request's response carries the fresh cookies. Signal the collision so the
+	// client relies on those cookies instead of treating this as a hard failure.
+	if grace != nil {
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error": "refresh already completed by a concurrent request",
+			"code":  "concurrent_refresh",
+		})
 	}
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
