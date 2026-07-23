@@ -1152,6 +1152,40 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, familyID int64) (*Gr
 	}, nil
 }
 
+// TokenOwner is the resolved identity behind a refresh token, used to attribute
+// a *failed* refresh/replay event in the audit trail. It is looked up by token
+// hash regardless of the token's revoked/expired state, so a replayed or
+// expired token can still be tied to the account whose session it belonged to.
+type TokenOwner struct {
+	UserID   int64
+	TenantID int64
+	Email    string
+}
+
+// ResolveTokenOwner returns the account a refresh token belongs to, if the token
+// hash matches a stored row (revoked or expired included). Returns (nil, false)
+// for a token that never existed — those failures stay legitimately anonymous
+// in the audit trail rather than being attributed to a guessed identity.
+//
+// Read-only, single indexed lookup by token_hash; only called on the refresh
+// *failure* path (rare, rate-limited), so it adds no cost to successful refresh.
+func (s *AuthService) ResolveTokenOwner(ctx context.Context, rawToken string) (*TokenOwner, bool) {
+	if rawToken == "" {
+		return nil, false
+	}
+	var o TokenOwner
+	err := s.pool.QueryRow(ctx, `
+		SELECT rt.user_id, rt.tenant_id, COALESCE(u.email, '')
+		FROM refresh_tokens rt
+		LEFT JOIN users u ON u.id = rt.user_id
+		WHERE rt.token_hash = $1
+	`, HashToken(rawToken)).Scan(&o.UserID, &o.TenantID, &o.Email)
+	if err != nil {
+		return nil, false
+	}
+	return &o, true
+}
+
 // RefreshWithLock rotates a refresh token with a distributed Redis lock.
 //
 // Compared with Refresh, it adds three safety layers:

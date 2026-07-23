@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // AuthHandler holds HTTP handlers for auth endpoints.
@@ -202,15 +205,17 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
 
-	tid, uid := claimsFromToken(result.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		ActorEmail:   req.Email,
-		Action:       audit.ActionAuthRegister,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		ActorEmail:    req.Email,
+		Action:        audit.ActionAuthRegister,
+		AuthMethod:    audit.AuthMethodPassword,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
@@ -245,13 +250,14 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("login failed")
-		h.audit.Log(c.Request().Context(), audit.Event{
+		h.auditFailure(c, audit.Event{
 			ActorEmail:   req.Email,
 			Action:       audit.ActionAuthLoginFailed,
+			AuthMethod:   audit.AuthMethodPassword,
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
-		})
+		}, err)
 		if containsMsg(err, "invalid credentials") {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		}
@@ -265,15 +271,17 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
 	}
 
-	tid, uid := claimsFromToken(result.Token.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		ActorEmail:   req.Email,
-		Action:       audit.ActionAuthLogin,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.Token.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		ActorEmail:    req.Email,
+		Action:        audit.ActionAuthLogin,
+		AuthMethod:    audit.AuthMethodPassword,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
@@ -368,15 +376,17 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
 
-	tid, uid := claimsFromToken(result.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		ActorEmail:   req.Email,
-		Action:       audit.ActionAuthRegister,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		ActorEmail:    req.Email,
+		Action:        audit.ActionAuthRegister,
+		AuthMethod:    audit.AuthMethodPassword,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
@@ -418,13 +428,16 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("app login failed")
-		h.audit.Log(c.Request().Context(), audit.Event{
+		ev := audit.Event{
 			ActorEmail:   req.Email,
 			Action:       audit.ActionAuthLoginFailed,
+			AuthMethod:   audit.AuthMethodPassword,
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
-		})
+		}
+		attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
+		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrInvalidClient) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 		}
@@ -444,15 +457,17 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
 	}
 
-	tid, uid := claimsFromToken(result.Token.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		ActorEmail:   req.Email,
-		Action:       audit.ActionAuthLogin,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.Token.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		ActorEmail:    req.Email,
+		Action:        audit.ActionAuthLogin,
+		AuthMethod:    audit.AuthMethodPassword,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
@@ -505,9 +520,10 @@ func (h *AuthHandler) AppMagicLink(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not send sign-in link"})
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		ActorEmail:   req.Email,
 		Action:       audit.ActionAuthMagicLinkRequested,
+		AuthMethod:   audit.AuthMethodMagicLink,
 		ResourceType: "user",
 		IPAddress:    c.RealIP(),
 		UserAgent:    c.Request().UserAgent(),
@@ -549,12 +565,15 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 	result, err := h.svc.VerifyMagicLink(c.Request().Context(), clientID, clientSecret, req.Token)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("magic link verify failed")
-		h.audit.Log(c.Request().Context(), audit.Event{
+		ev := audit.Event{
 			Action:       audit.ActionAuthLoginFailed,
+			AuthMethod:   audit.AuthMethodMagicLink,
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
-		})
+		}
+		attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
+		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrInvalidClient) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 		}
@@ -571,14 +590,16 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
 	}
 
-	tid, uid := claimsFromToken(result.Token.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		Action:       audit.ActionAuthLogin,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.Token.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		Action:        audit.ActionAuthLogin,
+		AuthMethod:    audit.AuthMethodMagicLink,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
@@ -619,12 +640,20 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("login OTP failed")
-		h.audit.Log(c.Request().Context(), audit.Event{
-			Action:       audit.ActionAuthMFAChallengeFailed,
+		action := audit.ActionAuthMFAChallengeFailed
+		metrics.MFAChallenges.WithLabelValues("mfa", "failure").Inc()
+		if errors.Is(err, auth.ErrTooManyOTPAttempts) {
+			action = audit.ActionAuthMFALockedOut
+			metrics.MFALockouts.Inc()
+		}
+		h.auditFailure(c, audit.Event{
+			Action:       action,
+			AuthMethod:   audit.AuthMethodMFA,
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
-		})
+			Metadata:     map[string]any{"transaction_id": transactionID(req.OTPSessionToken)},
+		}, err)
 		if errors.Is(err, auth.ErrTooManyOTPAttempts) {
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		}
@@ -634,14 +663,18 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "OTP login failed"})
 	}
 
-	tid, uid := claimsFromToken(result.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		Action:       audit.ActionAuthLogin,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	metrics.MFAChallenges.WithLabelValues("mfa", "success").Inc()
+	tid, uid, appID := claimsFromToken(result.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		Action:        audit.ActionAuthLogin,
+		AuthMethod:    audit.AuthMethodMFA,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
+		Metadata:      map[string]any{"transaction_id": transactionID(req.OTPSessionToken)},
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
@@ -687,14 +720,16 @@ func (h *AuthHandler) MFAEnrollPending(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "MFA enrollment failed"})
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     &session.TenantID,
-		UserID:       &session.UserID,
-		ActorEmail:   session.Email,
-		Action:       audit.ActionAuthMFAEnrolled,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	h.auditEvent(c, audit.Event{
+		TenantID:      &session.TenantID,
+		UserID:        &session.UserID,
+		ApplicationID: appIDFromClaim(session.AppID),
+		ActorEmail:    session.Email,
+		Action:        audit.ActionAuthMFAEnrolled,
+		AuthMethod:    audit.AuthMethodTOTP,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	return c.JSON(http.StatusOK, result)
@@ -731,14 +766,17 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 		h.logger.Warn().Err(err).Msg("pending MFA activate failed")
 		event := audit.Event{
 			Action:       audit.ActionAuthMFAChallengeFailed,
+			AuthMethod:   audit.AuthMethodTOTP,
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
+			Metadata:     map[string]any{"phase": "enrollment"},
 		}
 		if session != nil {
 			event.TenantID, event.UserID, event.ActorEmail = &session.TenantID, &session.UserID, session.Email
+			event.ApplicationID = appIDFromClaim(session.AppID)
 		}
-		h.audit.Log(c.Request().Context(), event)
+		h.auditFailure(c, event, err)
 
 		if errors.Is(err, auth.ErrTooManyOTPAttempts) {
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
@@ -752,23 +790,27 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "MFA activation failed"})
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     &session.TenantID,
-		UserID:       &session.UserID,
-		ActorEmail:   session.Email,
-		Action:       audit.ActionAuthMFAActivated,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	h.auditEvent(c, audit.Event{
+		TenantID:      &session.TenantID,
+		UserID:        &session.UserID,
+		ApplicationID: appIDFromClaim(session.AppID),
+		ActorEmail:    session.Email,
+		Action:        audit.ActionAuthMFAActivated,
+		AuthMethod:    audit.AuthMethodTOTP,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     &session.TenantID,
-		UserID:       &session.UserID,
-		ActorEmail:   session.Email,
-		Action:       audit.ActionAuthLogin,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	h.auditEvent(c, audit.Event{
+		TenantID:      &session.TenantID,
+		UserID:        &session.UserID,
+		ApplicationID: appIDFromClaim(session.AppID),
+		ActorEmail:    session.Email,
+		Action:        audit.ActionAuthLogin,
+		AuthMethod:    audit.AuthMethodTOTP,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
@@ -832,13 +874,21 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 	result, grace, err := h.svc.RefreshWithLock(c.Request().Context(), req.RefreshToken, h.redisCli)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("refresh failed")
+		action := audit.ActionAuthTokenRefreshFailed
+		if errors.Is(err, auth.ErrTokenReplay) {
+			action = audit.ActionAuthReplayDetected
+		}
+		ev := audit.Event{
+			Action:       action,
+			AuthMethod:   audit.AuthMethodRefreshToken,
+			ResourceType: "session",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		}
+		attachTokenOwner(c.Request().Context(), &ev, h.svc, req.RefreshToken)
+		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			h.audit.Log(c.Request().Context(), audit.Event{
-				Action:    audit.ActionAuthReplayDetected,
-				IPAddress: c.RealIP(),
-				UserAgent: c.Request().UserAgent(),
-			})
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
@@ -861,14 +911,16 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		})
 	}
 
-	tid, uid := claimsFromToken(result.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		Action:       audit.ActionAuthTokenRefresh,
-		ResourceType: "session",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		Action:        audit.ActionAuthTokenRefresh,
+		AuthMethod:    audit.AuthMethodRefreshToken,
+		ResourceType:  "session",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
@@ -911,11 +963,17 @@ func (h *AuthHandler) Logout(c echo.Context) error {
 
 	clearAuthCookies(c, h.cookieCfg)
 
-	h.audit.Log(c.Request().Context(), audit.Event{
-		Action:    audit.ActionAuthLogout,
-		IPAddress: c.RealIP(),
-		UserAgent: c.Request().UserAgent(),
-	})
+	ev := audit.Event{
+		Action:       audit.ActionAuthLogout,
+		AuthMethod:   audit.AuthMethodRefreshToken,
+		ResourceType: "session",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	}
+	// Attribute the logout to the token's owner (resolves even though it was just
+	// revoked); an unknown token leaves it anonymous.
+	attachTokenOwner(c.Request().Context(), &ev, h.svc, req.RefreshToken)
+	h.auditEvent(c, ev)
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "logged out"})
 }
@@ -956,7 +1014,7 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("forgot-password: unexpected service error")
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		ActorEmail:   req.Email,
 		Action:       audit.ActionAuthPasswordResetReq,
 		ResourceType: "user",
@@ -1013,7 +1071,7 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "password reset failed"})
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		Action:       audit.ActionAuthPasswordResetDone,
 		ResourceType: "user",
 		IPAddress:    c.RealIP(),
@@ -1079,7 +1137,7 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "TOTP enrollment failed"})
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		TenantID:     &tenantID,
 		UserID:       &userID,
 		ActorEmail:   claims.Email,
@@ -1132,7 +1190,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 	}
 
 	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		TenantID:     &tenantID,
 		UserID:       &userID,
 		ActorEmail:   claims.Email,
@@ -1232,7 +1290,7 @@ func (h *AuthHandler) TOTPRegenerateCodes(c echo.Context) error {
 	}
 
 	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		TenantID:     &tenantID,
 		UserID:       &userID,
 		ActorEmail:   claims.Email,
@@ -1266,7 +1324,7 @@ func mfaClaimIDs(c echo.Context) (claims *auth.Claims, userID, tenantID int64, o
 
 // auditMFA logs an MFA lifecycle event for the authenticated user.
 func (h *AuthHandler) auditMFA(c echo.Context, tenantID, userID int64, email, action string) {
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		TenantID:     &tenantID,
 		UserID:       &userID,
 		ActorEmail:   email,
@@ -1575,7 +1633,7 @@ func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		TenantID:     &tenantID,
 		UserID:       &userID,
 		ActorEmail:   claims.Email,
@@ -1628,6 +1686,18 @@ func (h *AuthHandler) CreateAPIKey(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("create API key failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create API key"})
 	}
+
+	h.auditEvent(c, audit.Event{
+		TenantID:     &tenantID,
+		UserID:       parseUserID(claims.UserID),
+		ActorEmail:   claims.Email,
+		Action:       audit.ActionAuthAPIKeyCreated,
+		AuthMethod:   audit.AuthMethodAPIKey,
+		ResourceType: "api_key",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+		Metadata:     map[string]any{"name": req.Name, "permissions": req.Permissions},
+	})
 
 	return c.JSON(http.StatusCreated, result)
 }
@@ -1694,6 +1764,18 @@ func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke API key"})
 	}
 
+	h.auditEvent(c, audit.Event{
+		TenantID:     &tenantID,
+		UserID:       parseUserID(claims.UserID),
+		ActorEmail:   claims.Email,
+		Action:       audit.ActionAuthAPIKeyRevoked,
+		AuthMethod:   audit.AuthMethodAPIKey,
+		ResourceType: "api_key",
+		ResourceID:   strconv.FormatInt(keyID, 10),
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+	})
+
 	return c.JSON(http.StatusOK, map[string]string{"message": "API key revoked"})
 }
 
@@ -1732,6 +1814,14 @@ func (h *AuthHandler) ManagementToken(c echo.Context) error {
 
 	identity, err := h.apiKeySvc.AuthenticateAPIKey(c.Request().Context(), rawKey)
 	if err != nil {
+		metrics.APIKeyAuth.WithLabelValues("failure").Inc()
+		h.auditFailure(c, audit.Event{
+			Action:       audit.ActionAuthManagementTokenFailed,
+			AuthMethod:   audit.AuthMethodAPIKey,
+			ResourceType: "api_key",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+		}, err)
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or revoked API key"})
 	}
 
@@ -1741,6 +1831,18 @@ func (h *AuthHandler) ManagementToken(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to issue management token"})
 	}
 
+	metrics.APIKeyAuth.WithLabelValues("success").Inc()
+	metrics.TokensIssued.WithLabelValues("management").Inc()
+	h.auditEvent(c, audit.Event{
+		TenantID:     &identity.TenantID,
+		Action:       audit.ActionAuthManagementToken,
+		AuthMethod:   audit.AuthMethodAPIKey,
+		ResourceType: "api_key",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+		Metadata:     map[string]any{"permissions": identity.Permissions},
+	})
+
 	return c.JSON(http.StatusOK, map[string]any{
 		"access_token": token,
 		"token_type":   "Bearer",
@@ -1748,6 +1850,27 @@ func (h *AuthHandler) ManagementToken(c echo.Context) error {
 		"permissions":  identity.Permissions,
 		"tenant_id":    strconv.FormatInt(identity.TenantID, 10),
 	})
+}
+
+// transactionID derives a stable, non-sensitive correlation id from a
+// pending-login token (e.g. the OTP session token) so every step of one login
+// flow — the failed OTP retries and the final success — shares a thread, like
+// Auth0's transaction_id. The raw token is never stored; only a short hash.
+func transactionID(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return "txn_" + hex.EncodeToString(sum[:6])
+}
+
+// parseUserID converts a JWT UserID claim to *int64, or nil when it is not a
+// real users.id (e.g. service tokens carry a public client_id there).
+func parseUserID(s string) *int64 {
+	if id, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return &id
+	}
+	return nil
 }
 
 // containsMsg is a simple substring check for error classification.
@@ -1771,22 +1894,24 @@ func includesSubstr(s, sub string) bool {
 }
 
 // claimsFromToken decodes the JWT payload without signature verification to extract
-// tenant_id and user_id for audit logging. Safe on tokens we just generated.
-func claimsFromToken(tokenStr string) (tenantID, userID *int64) {
+// tenant_id, user_id, and app_id for audit logging. Safe on tokens we just generated.
+// appID is nil for tenant-level tokens (empty app_id claim).
+func claimsFromToken(tokenStr string) (tenantID, userID, appID *int64) {
 	parts := strings.Split(tokenStr, ".")
 	if len(parts) != 3 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var c struct {
 		TenantID string `json:"tenant_id"`
 		UserID   string `json:"user_id"`
+		AppID    string `json:"app_id"`
 	}
 	if err := json.Unmarshal(payload, &c); err != nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if tid, err := strconv.ParseInt(c.TenantID, 10, 64); err == nil {
 		tenantID = &tid
@@ -1794,7 +1919,22 @@ func claimsFromToken(tokenStr string) (tenantID, userID *int64) {
 	if uid, err := strconv.ParseInt(c.UserID, 10, 64); err == nil {
 		userID = &uid
 	}
-	return tenantID, userID
+	appID = appIDFromClaim(c.AppID)
+	return tenantID, userID, appID
+}
+
+// appIDFromClaim parses the string-encoded oauth_clients.id carried in the
+// JWT app_id claim (and OTP session state). Returns nil when the claim is
+// empty or not numeric — i.e. no application context.
+func appIDFromClaim(s string) *int64 {
+	if s == "" {
+		return nil
+	}
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &id
 }
 
 // ---------------------------------------------------------------------------
@@ -1832,13 +1972,15 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("session login failed")
-		h.audit.Log(c.Request().Context(), audit.Event{
+		h.auditFailure(c, audit.Event{
 			ActorEmail:   req.Email,
 			Action:       audit.ActionAuthLoginFailed,
+			AuthMethod:   audit.AuthMethodPassword,
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
-		})
+			Metadata:     map[string]any{"flow": "session"},
+		}, err)
 		if containsMsg(err, "invalid credentials") {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 		}
@@ -1854,15 +1996,17 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
 
-	tid, uid := claimsFromToken(result.Token.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		ActorEmail:   req.Email,
-		Action:       audit.ActionAuthLogin,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.Token.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		ActorEmail:    req.Email,
+		Action:        audit.ActionAuthLogin,
+		AuthMethod:    audit.AuthMethodPassword,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	return c.JSON(http.StatusOK, map[string]string{
@@ -1889,13 +2033,22 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 	result, grace, err := h.svc.RefreshWithLock(c.Request().Context(), cookie.Value, h.redisCli)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("session refresh failed")
+		action := audit.ActionAuthTokenRefreshFailed
+		if errors.Is(err, auth.ErrTokenReplay) {
+			action = audit.ActionAuthReplayDetected
+		}
+		ev := audit.Event{
+			Action:       action,
+			AuthMethod:   audit.AuthMethodRefreshToken,
+			ResourceType: "session",
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+			Metadata:     map[string]any{"flow": "session"},
+		}
+		attachTokenOwner(c.Request().Context(), &ev, h.svc, cookie.Value)
+		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			h.audit.Log(c.Request().Context(), audit.Event{
-				Action:    audit.ActionAuthReplayDetected,
-				IPAddress: c.RealIP(),
-				UserAgent: c.Request().UserAgent(),
-			})
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
@@ -1919,14 +2072,16 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
 
-	tid, uid := claimsFromToken(result.AccessToken)
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     tid,
-		UserID:       uid,
-		Action:       audit.ActionAuthTokenRefresh,
-		ResourceType: "session",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	tid, uid, appID := claimsFromToken(result.AccessToken)
+	h.auditEvent(c, audit.Event{
+		TenantID:      tid,
+		UserID:        uid,
+		ApplicationID: appID,
+		Action:        audit.ActionAuthTokenRefresh,
+		AuthMethod:    audit.AuthMethodRefreshToken,
+		ResourceType:  "session",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
 	return c.JSON(http.StatusOK, map[string]string{
@@ -1944,16 +2099,23 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 // @Success      200  {object}  map[string]string
 // @Router       /api/v1/auth/session/logout [post]
 func (h *AuthHandler) SessionLogout(c echo.Context) error {
+	var refreshToken string
 	if cookie, err := c.Cookie(mw.RefreshTokenCookie); err == nil && cookie.Value != "" {
-		_ = h.svc.Logout(c.Request().Context(), cookie.Value)
+		refreshToken = cookie.Value
+		_ = h.svc.Logout(c.Request().Context(), refreshToken)
 	}
 	clearAuthCookies(c, h.cookieCfg)
 
-	h.audit.Log(c.Request().Context(), audit.Event{
-		Action:    audit.ActionAuthLogout,
-		IPAddress: c.RealIP(),
-		UserAgent: c.Request().UserAgent(),
-	})
+	ev := audit.Event{
+		Action:       audit.ActionAuthLogout,
+		AuthMethod:   audit.AuthMethodRefreshToken,
+		ResourceType: "session",
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+		Metadata:     map[string]any{"flow": "session"},
+	}
+	attachTokenOwner(c.Request().Context(), &ev, h.svc, refreshToken)
+	h.auditEvent(c, ev)
 
 	return c.JSON(http.StatusOK, map[string]string{"message": "logged out"})
 }
@@ -2043,6 +2205,19 @@ func (h *AuthHandler) Token(c echo.Context) error {
 
 	tenantID, appID, err := h.appSvc.AuthenticateClient(c.Request().Context(), req.ClientID, req.ClientSecret)
 	if err != nil {
+		ev := audit.Event{
+			Action:       audit.ActionAuthClientCredentialsFailed,
+			AuthMethod:   audit.AuthMethodClientCredentials,
+			ResourceType: "oauth_client",
+			ResourceID:   req.ClientID,
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+			Metadata:     map[string]any{"grant_type": req.GrantType},
+		}
+		// Attribute to the target application when the client_id is real (a
+		// wrong-secret attempt against a known app); unknown ids stay un-attributed.
+		attachAppContext(c.Request().Context(), &ev, h.appSvc, req.ClientID)
+		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrInvalidClient) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 		}
@@ -2056,13 +2231,17 @@ func (h *AuthHandler) Token(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token generation failed"})
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     &tenantID,
-		Action:       audit.ActionAuthClientCredentials,
-		ResourceType: "oauth_client",
-		ResourceID:   strconv.FormatInt(appID, 10),
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	metrics.TokensIssued.WithLabelValues(audit.AuthMethodClientCredentials).Inc()
+	h.auditEvent(c, audit.Event{
+		TenantID:      &tenantID,
+		ApplicationID: &appID,
+		Action:        audit.ActionAuthClientCredentials,
+		AuthMethod:    audit.AuthMethodClientCredentials,
+		ResourceType:  "oauth_client",
+		ResourceID:    strconv.FormatInt(appID, 10),
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
+		Metadata:      map[string]any{"grant_type": req.GrantType},
 	})
 
 	return c.JSON(http.StatusOK, map[string]interface{}{

@@ -437,6 +437,26 @@ func (s *ApplicationService) ValidateClientID(ctx context.Context, tenantID int6
 	return id, nil
 }
 
+// ResolveClient looks up an application by its public client_id alone (no
+// secret check), returning the tenant id and application row id. Used only to
+// attribute audit events for application-scoped flows — including failures —
+// so the trail always carries the tenant + application the request targeted.
+// Cheap indexed lookup; ok=false when the client_id is unknown.
+func (s *ApplicationService) ResolveClient(ctx context.Context, clientID string) (tenantID, appID int64, ok bool) {
+	if clientID == "" {
+		return 0, 0, false
+	}
+	err := s.pool.QueryRow(ctx, `
+		SELECT tenant_id, id
+		FROM   oauth_clients
+		WHERE  client_id = $1 AND deleted_at IS NULL
+	`, clientID).Scan(&tenantID, &appID)
+	if err != nil {
+		return 0, 0, false
+	}
+	return tenantID, appID, true
+}
+
 // AuthenticateClient validates client_id + client_secret for the
 // client_credentials grant. Returns the tenant id and application row id.
 func (s *ApplicationService) AuthenticateClient(ctx context.Context, clientID, clientSecret string) (tenantID, appID int64, err error) {

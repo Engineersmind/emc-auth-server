@@ -1,0 +1,71 @@
+# Prometheus alerting rules for the auth server's audit pipeline and auth
+# anomalies. Wire an Alertmanager receiver to route these to Slack/PagerDuty.
+#
+# All series are exported by the app at /metrics (namespace emc_auth).
+groups:
+  - name: emc_auth_audit_pipeline
+    rules:
+      # The audit pipeline is designed to drop events rather than block auth.
+      # Any sustained drop means the trail is incomplete — investigate DB health
+      # or scale the writer.
+      - alert: AuditEventsDropped
+        expr: increase(emc_auth_audit_events_dropped_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning, component: audit }
+        annotations:
+          summary: "Audit events are being dropped ({{ $value }} in 5m)"
+          description: "reason={{ $labels.reason }}. The audit trail is losing events — check DB health and queue depth."
+
+      # Buffer filling up is the leading indicator before drops start.
+      - alert: AuditQueueBacklog
+        expr: emc_auth_audit_queue_depth > 8000
+        for: 2m
+        labels: { severity: warning, component: audit }
+        annotations:
+          summary: "Audit write queue is backing up (depth {{ $value }})"
+          description: "The async writer is not draining fast enough; drops are imminent. Check DB latency."
+
+      - alert: AuditFlushSlow
+        expr: histogram_quantile(0.99, rate(emc_auth_audit_flush_duration_seconds_bucket[5m])) > 3
+        for: 5m
+        labels: { severity: warning, component: audit }
+        annotations:
+          summary: "Audit batch flush p99 is slow ({{ $value }}s)"
+          description: "COPY/enrichment is slow; approaching the 5s flush timeout beyond which batches drop."
+
+      - alert: AuditEnrichmentErrors
+        expr: increase(emc_auth_audit_enrichment_errors_total[15m]) > 50
+        for: 10m
+        labels: { severity: info, component: audit }
+        annotations:
+          summary: "Elevated audit enrichment errors (stage={{ $labels.stage }})"
+          description: "Geo/UA/risk/stats/SIEM enrichment is failing or shedding; core rows still persist."
+
+  - name: emc_auth_security
+    rules:
+      # A spike in failed logins can indicate credential stuffing.
+      - alert: HighFailedLoginRate
+        expr: sum(rate(emc_auth_operations_total{operation=~"login.*",outcome="failure"}[5m])) > 5
+        for: 10m
+        labels: { severity: warning, component: security }
+        annotations:
+          summary: "High failed-login rate ({{ $value | humanize }}/s)"
+          description: "Sustained failed logins across the fleet — possible credential stuffing / brute force."
+
+      # MFA lockouts trip when the OTP attempt budget is exhausted.
+      - alert: MFALockoutSpike
+        expr: increase(emc_auth_mfa_lockouts_total[10m]) > 10
+        for: 5m
+        labels: { severity: warning, component: security }
+        annotations:
+          summary: "MFA lockout spike ({{ $value }} in 10m)"
+          description: "Many MFA sessions hit the attempt cap — possible targeted attack or a broken client."
+
+      # Any high-confidence risk signal firing repeatedly is worth a look.
+      - alert: RiskSignalsElevated
+        expr: increase(emc_auth_risk_signals_total{signal=~"impossible_travel|untrusted_ip"}[15m]) > 5
+        for: 10m
+        labels: { severity: warning, component: security }
+        annotations:
+          summary: "Elevated risk signals ({{ $labels.signal }})"
+          description: "Impossible-travel / untrusted-IP logins are elevated — review the audit trail."
