@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
+	"sort"
 	"strconv"
 	"time"
 
@@ -191,6 +192,15 @@ type UserResult struct {
 	RoleID        *string   `json:"role_id"`
 	IsActive      bool      `json:"is_active"`
 	CreatedAt     time.Time `json:"created_at"`
+	// LastLoginAt is the most recent session activity (Auth0's "Latest Login").
+	LastLoginAt *time.Time `json:"last_login_at"`
+	// LoginsCount is the number of successful logins on record (audit-derived,
+	// Auth0's stats.loginsCount equivalent).
+	LoginsCount int `json:"logins_count"`
+	// Connections lists how this user can sign in: "password" when a
+	// credentials row exists, plus every linked federated provider (Auth0's
+	// "Connection" column).
+	Connections []string `json:"connections"`
 }
 
 // UsersPage wraps a paginated user list.
@@ -199,6 +209,45 @@ type UsersPage struct {
 	Total      int          `json:"total"`
 	Page       int          `json:"page"`
 	TotalPages int          `json:"total_pages"`
+}
+
+// UserMFAStatus summarizes a user's enrolled second factors.
+type UserMFAStatus struct {
+	TOTPEnabled          bool `json:"totp_enabled"`
+	EmailEnabled         bool `json:"email_enabled"`
+	BackupCodesRemaining int  `json:"backup_codes_remaining"`
+}
+
+// UserIdentity is a linked federated (social) identity.
+type UserIdentity struct {
+	Provider      string    `json:"provider"`
+	ProviderEmail *string   `json:"provider_email,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// UserDetail is the enriched single-user view for the admin detail page.
+// LastLoginAt/LoginsCount/Connections live on the embedded UserResult.
+type UserDetail struct {
+	UserResult
+	EmailVerified bool `json:"email_verified"`
+	// TokenVersion is the internal JWT-invalidation counter. Loaded for internal
+	// use but never serialized — exposing it would leak the invalidation
+	// mechanism to API clients (the admin UI has no use for it).
+	TokenVersion   int            `json:"-"`
+	UpdatedAt      time.Time      `json:"updated_at"`
+	ActiveSessions int            `json:"active_sessions"`
+	MFA            UserMFAStatus  `json:"mfa"`
+	Identities     []UserIdentity `json:"identities"`
+}
+
+// UserSession is one active refresh-token session family for a user.
+type UserSession struct {
+	SessionFamilyID string     `json:"session_family_id"`
+	IPAddress       *string    `json:"ip_address,omitempty"`
+	UserAgent       string     `json:"user_agent"`
+	CreatedAt       time.Time  `json:"created_at"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	ExpiresAt       time.Time  `json:"expires_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,9 +1102,14 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		return nil, fmt.Errorf("count users: %w", err)
 	}
 
+	// The enrichment subqueries (last login, login count, connections) run per
+	// returned row (≤100), each index-backed: refresh_tokens (user_id,
+	// tenant_id), audit_logs (tenant_id, user_id), user_identities (user_id),
+	// user_credentials (user_id PK).
 	rows, err := s.pool.Query(ctx, `
 		SELECT u.id, u.tenant_id, u.application_id, u.email, u.first_name, u.last_name,
-		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at
+		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at,
+		       `+userEnrichmentColumns+`
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.tenant_id = $1
@@ -1075,8 +1129,11 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		var u UserResult
 		var id, tid int64
 		var appID, roleID *int64
+		var hasPassword bool
+		var providers []string
 		if err := rows.Scan(&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
-			&u.Role, &roleID, &u.IsActive, &u.CreatedAt); err != nil {
+			&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
+			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		u.ID = strconv.FormatInt(id, 10)
@@ -1089,6 +1146,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 			rs := strconv.FormatInt(*roleID, 10)
 			u.RoleID = &rs
 		}
+		u.Connections = buildConnections(hasPassword, providers)
 		users = append(users, u)
 	}
 	if users == nil {
@@ -1279,6 +1337,242 @@ func (s *Service) ForcePasswordReset(ctx context.Context, tenantID int64, applic
 	return s.resetSvc.ForgotPassword(ctx, tenantSlug, email)
 }
 
+// GetUserDetail returns the enriched single-user view (profile + MFA status,
+// linked identities, active-session count, last login). applicationID carries
+// the same optional scope filter as GetUser.
+func (s *Service) GetUserDetail(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserDetail, error) {
+	base, err := s.getUserByID(ctx, tenantID, applicationID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	d := &UserDetail{UserResult: *base, Identities: []UserIdentity{}}
+
+	// Profile extras straight off the users row.
+	if err := s.pool.QueryRow(ctx, `
+		SELECT email_verified, token_version, updated_at
+		FROM users WHERE id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&d.EmailVerified, &d.TokenVersion, &d.UpdatedAt); err != nil {
+		return nil, fmt.Errorf("user detail: profile: %w", err)
+	}
+
+	// MFA status. Both tables are keyed by user_id; absence = not enrolled.
+	var backupCodes []string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT is_active, backup_codes FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&d.MFA.TOTPEnabled, &backupCodes); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("user detail: totp: %w", err)
+	}
+	d.MFA.BackupCodesRemaining = len(backupCodes)
+	if err := s.pool.QueryRow(ctx, `
+		SELECT is_active FROM email_mfa_settings WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&d.MFA.EmailEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("user detail: email mfa: %w", err)
+	}
+
+	// Active-session count (LastLoginAt already comes with the base row and
+	// covers revoked/expired sessions too).
+	if err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT session_family_id)
+		FROM refresh_tokens
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL AND deleted_at IS NULL AND expires_at > NOW()
+	`, userID, tenantID).Scan(&d.ActiveSessions); err != nil {
+		return nil, fmt.Errorf("user detail: sessions: %w", err)
+	}
+
+	// Linked federated identities. Scoped to the tenant and, when an application
+	// filter is in effect, to that application (user_identities is app-owned).
+	rows, err := s.pool.Query(ctx, `
+		SELECT provider, provider_email, created_at
+		FROM user_identities
+		WHERE user_id = $1 AND tenant_id = $2
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+		ORDER BY created_at
+	`, userID, tenantID, applicationID)
+	if err != nil {
+		return nil, fmt.Errorf("user detail: identities: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id UserIdentity
+		if err := rows.Scan(&id.Provider, &id.ProviderEmail, &id.CreatedAt); err != nil {
+			return nil, fmt.Errorf("user detail: scan identity: %w", err)
+		}
+		d.Identities = append(d.Identities, id)
+	}
+	return d, rows.Err()
+}
+
+// SetUserActive blocks (active=false) or unblocks (active=true) a user.
+// Blocking bumps token_version and revokes every live refresh token so the
+// user is signed out everywhere immediately. Returns the refreshed user row.
+func (s *Service) SetUserActive(ctx context.Context, tenantID int64, applicationID *int64, userID int64, active bool) (*UserResult, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin set-active tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// token_version bump only when blocking — invalidates issued access tokens.
+	ct, err := tx.Exec(ctx, `
+		UPDATE users
+		SET is_active = $1,
+		    token_version = CASE WHEN $1 THEN token_version ELSE token_version + 1 END,
+		    updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+		  AND ($4::BIGINT IS NULL OR application_id = $4)
+	`, active, userID, tenantID, applicationID)
+	if err != nil {
+		return nil, fmt.Errorf("set user active: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return nil, ErrNotFound
+	}
+
+	if !active {
+		if _, err := tx.Exec(ctx, `
+			UPDATE refresh_tokens SET revoked_at = NOW()
+			WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+		`, userID, tenantID); err != nil {
+			return nil, fmt.Errorf("revoke tokens on block: %w", err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit set-active: %w", err)
+	}
+	return s.getUserByID(ctx, tenantID, applicationID, userID)
+}
+
+// ListUserSessions returns the user's active (non-revoked, unexpired) sessions,
+// one row per session family, most-recently-active first.
+func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64) ([]UserSession, error) {
+	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT ON (session_family_id)
+		       session_family_id, host(ip_address), user_agent, created_at, last_used_at, expires_at
+		FROM refresh_tokens
+		WHERE user_id = $1 AND tenant_id = $2
+		  AND revoked_at IS NULL AND deleted_at IS NULL AND expires_at > NOW()
+		ORDER BY session_family_id, last_used_at DESC NULLS LAST, created_at DESC
+	`, userID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	defer rows.Close()
+
+	sessions := []UserSession{}
+	for rows.Next() {
+		var sess UserSession
+		var familyID int64
+		var ip *string
+		if err := rows.Scan(&familyID, &ip, &sess.UserAgent, &sess.CreatedAt, &sess.LastUsedAt, &sess.ExpiresAt); err != nil {
+			return nil, fmt.Errorf("scan session: %w", err)
+		}
+		sess.SessionFamilyID = strconv.FormatInt(familyID, 10)
+		sess.IPAddress = ip
+		sessions = append(sessions, sess)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Sort most-recently-active first (DISTINCT ON forced a family-id order).
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessionActivity(sessions[i]).After(sessionActivity(sessions[j]))
+	})
+	return sessions, nil
+}
+
+func sessionActivity(s UserSession) time.Time {
+	if s.LastUsedAt != nil {
+		return *s.LastUsedAt
+	}
+	return s.CreatedAt
+}
+
+// RevokeUserSession revokes a single session family belonging to the user.
+// Returns ErrNotFound if no live token in that family belongs to the user.
+//
+// Unlike RevokeAllUserSessions / SetUserActive, this does NOT
+// bump token_version: that counter is global to the user, so bumping it would
+// invalidate the access tokens of every OTHER session too — the opposite of a
+// single-session revoke. The access token is not session-scoped (the JWT
+// carries no family id), so it cannot be selectively invalidated; revoking the
+// refresh-token family stops the session from being renewed, and the already
+// issued access token dies at its short natural expiry. Use RevokeAllUserSessions
+// for immediate, account-wide invalidation.
+func (s *Service) RevokeUserSession(ctx context.Context, tenantID int64, applicationID *int64, userID, familyID int64) error {
+	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
+		return err
+	}
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW()
+		WHERE session_family_id = $1 AND user_id = $2 AND tenant_id = $3 AND revoked_at IS NULL
+	`, familyID, userID, tenantID)
+	if err != nil {
+		return fmt.Errorf("revoke session: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RevokeAllUserSessions revokes every live refresh token for the user and bumps
+// token_version, signing them out everywhere. Returns the number of tokens revoked.
+func (s *Service) RevokeAllUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (int64, error) {
+	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
+		return 0, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin revoke-all tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	ct, err := tx.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW()
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, userID, tenantID)
+	if err != nil {
+		return 0, fmt.Errorf("revoke all sessions: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE users SET token_version = token_version + 1, updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2
+	`, userID, tenantID); err != nil {
+		return 0, fmt.Errorf("bump token version: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit revoke-all: %w", err)
+	}
+	return ct.RowsAffected(), nil
+}
+
+// GetUserMFA returns just the user's MFA enrollment status.
+func (s *Service) GetUserMFA(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserMFAStatus, error) {
+	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
+		return nil, err
+	}
+	var status UserMFAStatus
+	var backupCodes []string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT is_active, backup_codes FROM totp_secrets WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&status.TOTPEnabled, &backupCodes); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("get user mfa: totp: %w", err)
+	}
+	status.BackupCodesRemaining = len(backupCodes)
+	if err := s.pool.QueryRow(ctx, `
+		SELECT is_active FROM email_mfa_settings WHERE user_id = $1 AND tenant_id = $2
+	`, userID, tenantID).Scan(&status.EmailEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("get user mfa: email: %w", err)
+	}
+	return &status, nil
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -1368,13 +1662,41 @@ func scanTenantRow(row pgxScanner) (TenantResult, error) {
 	return t, nil
 }
 
+// userEnrichmentColumns are the Auth0-style per-user stats selected alongside
+// the base row: latest login, successful-login count, and sign-in connections.
+// Requires the users table aliased as u.
+const userEnrichmentColumns = `
+	       (SELECT MAX(COALESCE(rt.last_used_at, rt.created_at))
+	        FROM refresh_tokens rt
+	        WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id) AS last_login_at,
+	       (SELECT COUNT(*) FROM audit_logs al
+	        WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
+	          AND al.action = 'auth.login') AS logins_count,
+	       EXISTS (SELECT 1 FROM user_credentials uc
+	               WHERE uc.user_id = u.id AND uc.tenant_id = u.tenant_id AND uc.deleted_at IS NULL) AS has_password,
+	       (SELECT COALESCE(array_agg(ui.provider ORDER BY ui.provider), '{}')
+	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers`
+
+// buildConnections merges the password credential and federated providers
+// into the public Connections list ("password", "google", ...).
+func buildConnections(hasPassword bool, providers []string) []string {
+	connections := make([]string, 0, len(providers)+1)
+	if hasPassword {
+		connections = append(connections, "password")
+	}
+	return append(connections, providers...)
+}
+
 func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserResult, error) {
 	var u UserResult
 	var id, tid int64
 	var appID, roleID *int64
+	var hasPassword bool
+	var providers []string
 	err := s.pool.QueryRow(ctx, `
 		SELECT u.id, u.tenant_id, u.application_id, u.email, u.first_name, u.last_name,
-		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at
+		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at,
+		       `+userEnrichmentColumns+`
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
@@ -1382,6 +1704,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 	`, userID, tenantID, applicationID).Scan(
 		&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
+		&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1399,6 +1722,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 		rs := strconv.FormatInt(*roleID, 10)
 		u.RoleID = &rs
 	}
+	u.Connections = buildConnections(hasPassword, providers)
 	return &u, nil
 }
 

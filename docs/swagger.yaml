@@ -122,10 +122,88 @@ definitions:
       total_pages:
         type: integer
     type: object
+  admin.UserDetail:
+    properties:
+      active_sessions:
+        type: integer
+      application_id:
+        type: string
+      connections:
+        description: |-
+          Connections lists how this user can sign in: "password" when a
+          credentials row exists, plus every linked federated provider (Auth0's
+          "Connection" column).
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      email:
+        type: string
+      email_verified:
+        type: boolean
+      first_name:
+        type: string
+      id:
+        type: string
+      identities:
+        items:
+          $ref: '#/definitions/admin.UserIdentity'
+        type: array
+      is_active:
+        type: boolean
+      last_login_at:
+        description: LastLoginAt is the most recent session activity (Auth0's "Latest
+          Login").
+        type: string
+      last_name:
+        type: string
+      logins_count:
+        description: |-
+          LoginsCount is the number of successful logins on record (audit-derived,
+          Auth0's stats.loginsCount equivalent).
+        type: integer
+      mfa:
+        $ref: '#/definitions/admin.UserMFAStatus'
+      role:
+        type: string
+      role_id:
+        type: string
+      tenant_id:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  admin.UserIdentity:
+    properties:
+      created_at:
+        type: string
+      provider:
+        type: string
+      provider_email:
+        type: string
+    type: object
+  admin.UserMFAStatus:
+    properties:
+      backup_codes_remaining:
+        type: integer
+      email_enabled:
+        type: boolean
+      totp_enabled:
+        type: boolean
+    type: object
   admin.UserResult:
     properties:
       application_id:
         type: string
+      connections:
+        description: |-
+          Connections lists how this user can sign in: "password" when a
+          credentials row exists, plus every linked federated provider (Auth0's
+          "Connection" column).
+        items:
+          type: string
+        type: array
       created_at:
         type: string
       email:
@@ -136,13 +214,37 @@ definitions:
         type: string
       is_active:
         type: boolean
+      last_login_at:
+        description: LastLoginAt is the most recent session activity (Auth0's "Latest
+          Login").
+        type: string
       last_name:
         type: string
+      logins_count:
+        description: |-
+          LoginsCount is the number of successful logins on record (audit-derived,
+          Auth0's stats.loginsCount equivalent).
+        type: integer
       role:
         type: string
       role_id:
         type: string
       tenant_id:
+        type: string
+    type: object
+  admin.UserSession:
+    properties:
+      created_at:
+        type: string
+      expires_at:
+        type: string
+      ip_address:
+        type: string
+      last_used_at:
+        type: string
+      session_family_id:
+        type: string
+      user_agent:
         type: string
     type: object
   admin.UsersPage:
@@ -340,8 +442,8 @@ definitions:
     type: object
   auth.AppRateLimit:
     properties:
-      app_id:
-        type: string
+      application_id:
+        type: integer
       burst:
         type: integer
       created_at:
@@ -351,7 +453,7 @@ definitions:
       requests_per_minute:
         type: integer
       tenant_id:
-        type: string
+        type: integer
       updated_at:
         type: string
     type: object
@@ -526,8 +628,6 @@ definitions:
     type: object
   handlers.AppLimitRequest:
     properties:
-      app_id:
-        type: string
       burst:
         type: integer
       description:
@@ -767,6 +867,11 @@ definitions:
     required:
     - email
     - password
+    type: object
+  handlers.SetUserStatusRequest:
+    properties:
+      is_active:
+        type: boolean
     type: object
   handlers.SlugCheckResponse:
     properties:
@@ -1149,8 +1254,8 @@ paths:
       - api-keys
   /api/v1/app-limits:
     get:
-      description: Returns all per-app rate limit configs for the caller's tenant.
-        Requires admin:access.
+      description: Returns all per-app rate limit configs for the tenant. Requires
+        apps:read.
       produces:
       - application/json
       responses:
@@ -1163,107 +1268,6 @@ paths:
       security:
       - BearerAuth: []
       summary: List app rate limits
-      tags:
-      - admin-rate-limits
-    post:
-      consumes:
-      - application/json
-      description: Sets a custom per-minute request limit for an application identified
-        by X-App-ID. Requires admin:access.
-      parameters:
-      - description: App limit config
-        in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/handlers.AppLimitRequest'
-      produces:
-      - application/json
-      responses:
-        "201":
-          description: Created
-          schema:
-            $ref: '#/definitions/auth.AppRateLimit'
-        "400":
-          description: Bad Request
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-        "409":
-          description: app_id already has a rate limit config
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-      security:
-      - BearerAuth: []
-      summary: Create app rate limit
-      tags:
-      - admin-rate-limits
-  /api/v1/app-limits/{app_id}:
-    delete:
-      description: Removes the custom rate limit for an app_id; it falls back to the
-        default limit. Requires admin:access.
-      parameters:
-      - description: App ID
-        in: path
-        name: app_id
-        required: true
-        type: string
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-        "404":
-          description: Not Found
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-      security:
-      - BearerAuth: []
-      summary: Delete app rate limit
-      tags:
-      - admin-rate-limits
-    put:
-      consumes:
-      - application/json
-      description: Updates the rate limit config for an existing app_id in the tenant.
-        Requires admin:access.
-      parameters:
-      - description: App ID
-        in: path
-        name: app_id
-        required: true
-        type: string
-      - description: Updated limit config
-        in: body
-        name: body
-        required: true
-        schema:
-          $ref: '#/definitions/handlers.AppLimitRequest'
-      produces:
-      - application/json
-      responses:
-        "200":
-          description: OK
-          schema:
-            $ref: '#/definitions/auth.AppRateLimit'
-        "404":
-          description: Not Found
-          schema:
-            additionalProperties:
-              type: string
-            type: object
-      security:
-      - BearerAuth: []
-      summary: Update app rate limit
       tags:
       - admin-rate-limits
   /api/v1/applications:
@@ -1543,6 +1547,98 @@ paths:
       summary: Set application MFA policy
       tags:
       - admin-applications
+  /api/v1/applications/{appID}/rate-limit:
+    delete:
+      description: Removes the custom rate limit; the app falls back to the default.
+        Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete an application's rate limit
+      tags:
+      - admin-rate-limits
+    get:
+      description: Returns the custom per-minute limit for the application. Requires
+        apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get an application's rate limit
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the per-minute request limit for the application.
+        Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Limit config
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AppLimitRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an application's rate limit
+      tags:
+      - admin-rate-limits
   /api/v1/applications/{appID}/roles:
     get:
       description: Returns all roles scoped to the given application with their permission
@@ -3962,6 +4058,133 @@ paths:
       summary: Activity feed for a target tenant
       tags:
       - admin-cross-tenant
+  /api/v1/tenants/{tid}/app-limits:
+    get:
+      description: Returns all per-app rate limit configs for the tenant. Requires
+        apps:read.
+      parameters:
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.AppRateLimit'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List app rate limits
+      tags:
+      - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/rate-limit:
+    delete:
+      description: Removes the custom rate limit; the app falls back to the default.
+        Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete an application's rate limit
+      tags:
+      - admin-rate-limits
+    get:
+      description: Returns the custom per-minute limit for the application. Requires
+        apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get an application's rate limit
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the per-minute request limit for the application.
+        Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      - description: Limit config
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AppLimitRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppRateLimit'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an application's rate limit
+      tags:
+      - admin-rate-limits
   /api/v1/tenants/{tid}/roles:
     get:
       description: Returns all roles (with permissions) belonging to the specified
@@ -4357,6 +4580,34 @@ paths:
       summary: Update user
       tags:
       - admin-users
+  /api/v1/users/{id}/detail:
+    get:
+      description: Returns a user's profile plus MFA status, linked identities, active-session
+        count, and last activity. Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserDetail'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get enriched user detail
+      tags:
+      - admin-users
   /api/v1/users/{id}/force-password-reset:
     post:
       description: Sends a password reset email to the specified user. Requires admin:access.
@@ -4451,6 +4702,34 @@ paths:
       summary: Unlink a social identity from a user
       tags:
       - oauth
+  /api/v1/users/{id}/mfa:
+    get:
+      description: Returns the user's enrolled MFA methods and remaining backup codes.
+        Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserMFAStatus'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get a user's MFA status
+      tags:
+      - admin-users
   /api/v1/users/{id}/role:
     put:
       consumes:
@@ -4492,6 +4771,143 @@ paths:
       security:
       - BearerAuth: []
       summary: Assign role to user
+      tags:
+      - admin-users
+  /api/v1/users/{id}/sessions:
+    delete:
+      description: Revokes every active session and invalidates issued tokens, signing
+        the user out everywhere. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke all of a user's sessions
+      tags:
+      - admin-users
+    get:
+      description: Returns the user's active sessions (one per session family) with
+        IP, user agent, and last activity. Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              items:
+                $ref: '#/definitions/admin.UserSession'
+              type: array
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List a user's active sessions
+      tags:
+      - admin-users
+  /api/v1/users/{id}/sessions/{familyID}:
+    delete:
+      description: Revokes one session family for the user. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Session family ID
+        in: path
+        name: familyID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke a single user session
+      tags:
+      - admin-users
+  /api/v1/users/{id}/status:
+    put:
+      consumes:
+      - application/json
+      description: Sets a user's active status. Blocking (is_active=false) revokes
+        all sessions and invalidates issued tokens. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Desired status
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SetUserStatusRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Block or unblock a user
       tags:
       - admin-users
   /health:

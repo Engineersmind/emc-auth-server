@@ -10,6 +10,7 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // OAuthHandler holds HTTP handlers for social login (issue #64): the browser
@@ -116,18 +117,20 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 
 	// st.Provider is validated server-stored state, safe to label audit
 	// actions with (auth.google_login, auth.github_login, ...).
-	h.audit.Log(ctx, audit.Event{
+	metrics.SocialLogin.WithLabelValues(st.Provider, "success").Inc()
+	h.auditEvent(c, audit.Event{
 		TenantID:     &result.TenantID,
 		UserID:       &result.UserID,
 		ActorEmail:   result.Email,
 		Action:       audit.SocialLoginAction(st.Provider),
+		AuthMethod:   audit.SocialAuthMethod(st.Provider),
 		ResourceType: "user",
 		ResourceID:   strconv.FormatInt(result.UserID, 10),
 		IPAddress:    c.RealIP(),
 		UserAgent:    c.Request().UserAgent(),
 	})
 	if result.Outcome == "linked" {
-		h.audit.Log(ctx, audit.Event{
+		h.auditEvent(c, audit.Event{
 			TenantID:     &result.TenantID,
 			UserID:       &result.UserID,
 			ActorEmail:   result.Email,
@@ -154,15 +157,18 @@ func (h *OAuthHandler) auditLoginFailed(c echo.Context, st *auth.OAuthState, rea
 	}
 	e := audit.Event{
 		Action:       audit.SocialLoginFailedAction(provider),
+		AuthMethod:   audit.SocialAuthMethod(provider),
 		ResourceType: "user",
 		ResourceID:   reason,
 		IPAddress:    c.RealIP(),
 		UserAgent:    c.Request().UserAgent(),
+		Metadata:     map[string]any{"reason": reason, "error_code": reason, "provider": c.Param("provider")},
 	}
 	if st != nil {
 		e.TenantID = &st.TenantID
 	}
-	h.audit.Log(c.Request().Context(), e)
+	metrics.SocialLogin.WithLabelValues(provider, "failure").Inc()
+	h.auditEvent(c, e)
 }
 
 // OAuthExchangeRequest is the payload for POST /api/v1/auth/oauth/exchange.
@@ -306,7 +312,7 @@ func (h *OAuthHandler) UnlinkUserIdentity(c echo.Context) error {
 		}
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
+	h.auditEvent(c, audit.Event{
 		TenantID:     &tenantID,
 		ActorEmail:   claims.Email,
 		Action:       audit.ActionAdminUserIdentityUnlinked,
@@ -362,14 +368,15 @@ func (h *OAuthHandler) UpsertProviderConfig(c echo.Context) error {
 		}
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     &tenantID,
-		ActorEmail:   claims.Email,
-		Action:       audit.ActionAdminIdPConfigUpdated,
-		ResourceType: "application",
-		ResourceID:   c.Param("appID") + ":" + detail.Provider,
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	h.auditEvent(c, audit.Event{
+		TenantID:      &tenantID,
+		ApplicationID: &appID,
+		ActorEmail:    claims.Email,
+		Action:        audit.ActionAdminIdPConfigUpdated,
+		ResourceType:  "application",
+		ResourceID:    c.Param("appID") + ":" + detail.Provider,
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 	return c.JSON(http.StatusOK, detail)
 }
@@ -425,14 +432,15 @@ func (h *OAuthHandler) DeleteProviderConfig(c echo.Context) error {
 		}
 	}
 
-	h.audit.Log(c.Request().Context(), audit.Event{
-		TenantID:     &tenantID,
-		ActorEmail:   claims.Email,
-		Action:       audit.ActionAdminIdPConfigDeleted,
-		ResourceType: "application",
-		ResourceID:   c.Param("appID") + ":" + provider,
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+	h.auditEvent(c, audit.Event{
+		TenantID:      &tenantID,
+		ApplicationID: &appID,
+		ActorEmail:    claims.Email,
+		Action:        audit.ActionAdminIdPConfigDeleted,
+		ResourceType:  "application",
+		ResourceID:    c.Param("appID") + ":" + provider,
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 	return c.NoContent(http.StatusNoContent)
 }

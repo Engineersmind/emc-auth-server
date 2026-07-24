@@ -1052,13 +1052,13 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	}
 
 	var email, roleName string
-	var roleID *int64
+	var roleID, applicationID *int64
 	err = s.pool.QueryRow(ctx, `
-		SELECT u.email, COALESCE(r.name, ''), u.role_id
+		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&email, &roleName, &roleID)
+	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("user not found or inactive")
@@ -1072,7 +1072,18 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		perms = []string{}
 	}
 
-	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, "")
+	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, appIDClaim(applicationID))
+}
+
+// appIDClaim renders a nullable users.application_id into the string form used
+// for the JWT app_id claim: the decimal id for application-scoped users, or ""
+// for tenant-level users. Keeping this consistent with Login/Register ensures a
+// token's application context survives every refresh rotation.
+func appIDClaim(applicationID *int64) string {
+	if applicationID == nil {
+		return ""
+	}
+	return strconv.FormatInt(*applicationID, 10)
 }
 
 // gracePeriod is the window in which a concurrent rotation is not treated as a replay.
@@ -1139,6 +1150,40 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, familyID int64) (*Gr
 		Role:        roleName,
 		Permissions: perms,
 	}, nil
+}
+
+// TokenOwner is the resolved identity behind a refresh token, used to attribute
+// a *failed* refresh/replay event in the audit trail. It is looked up by token
+// hash regardless of the token's revoked/expired state, so a replayed or
+// expired token can still be tied to the account whose session it belonged to.
+type TokenOwner struct {
+	UserID   int64
+	TenantID int64
+	Email    string
+}
+
+// ResolveTokenOwner returns the account a refresh token belongs to, if the token
+// hash matches a stored row (revoked or expired included). Returns (nil, false)
+// for a token that never existed — those failures stay legitimately anonymous
+// in the audit trail rather than being attributed to a guessed identity.
+//
+// Read-only, single indexed lookup by token_hash; only called on the refresh
+// *failure* path (rare, rate-limited), so it adds no cost to successful refresh.
+func (s *AuthService) ResolveTokenOwner(ctx context.Context, rawToken string) (*TokenOwner, bool) {
+	if rawToken == "" {
+		return nil, false
+	}
+	var o TokenOwner
+	err := s.pool.QueryRow(ctx, `
+		SELECT rt.user_id, rt.tenant_id, COALESCE(u.email, '')
+		FROM refresh_tokens rt
+		LEFT JOIN users u ON u.id = rt.user_id
+		WHERE rt.token_hash = $1
+	`, HashToken(rawToken)).Scan(&o.UserID, &o.TenantID, &o.Email)
+	if err != nil {
+		return nil, false
+	}
+	return &o, true
 }
 
 // RefreshWithLock rotates a refresh token with a distributed Redis lock.
@@ -1235,13 +1280,13 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	// Fresh user load from DB — catches suspensions, role changes, or email bans
 	// that occurred during the access token's lifetime (key security gate).
 	var email, roleName string
-	var roleID *int64
+	var roleID, applicationID *int64
 	err = s.pool.QueryRow(ctx, `
-		SELECT u.email, COALESCE(r.name, ''), u.role_id
+		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&email, &roleName, &roleID)
+	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, fmt.Errorf("user not found or inactive")
@@ -1255,7 +1300,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		perms = []string{}
 	}
 
-	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, "")
+	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, appIDClaim(applicationID))
 	return result, nil, err
 }
 

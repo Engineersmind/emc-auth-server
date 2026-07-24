@@ -738,3 +738,117 @@ func TestAppUserIsolation(t *testing.T) {
 		t.Error("generic Login() authenticated an app-scoped user — must require the app's credentials")
 	}
 }
+
+// newAppRefreshFixture builds a service with an attached ApplicationService and
+// the JWTService needed to Verify issued tokens, plus a registered application.
+func newAppRefreshFixture(t *testing.T) (*auth.AuthService, *auth.JWTService, *auth.AppResult, context.Context) {
+	t.Helper()
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	appSvc := auth.NewApplicationService(pool, logger)
+	app, err := appSvc.CreateApplication(ctx, tenantID, "refresh-app", "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication() error = %v", err)
+	}
+
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
+	return svc, jwtSvc, app, ctx
+}
+
+// TestRefreshWithLock_PreservesAppID is the regression test for issue #82: an
+// application-scoped user's app_id claim must survive token rotation. Before the
+// fix the refreshed access token was reissued with an empty AppID, silently
+// dropping app context (and with it app-scoped RBAC/MFA/rate-limit gating) after
+// a single refresh.
+func TestRefreshWithLock_PreservesAppID(t *testing.T) {
+	svc, jwtSvc, app, ctx := newAppRefreshFixture(t)
+
+	reg, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        uniqueEmail("refresh-appid"),
+		Password:     "Password123!",
+	})
+	if err != nil {
+		t.Fatalf("Register(app credentials) error = %v", err)
+	}
+
+	// Sanity: the original access token carries the application id.
+	origClaims, err := jwtSvc.Verify(ctx, reg.AccessToken)
+	if err != nil {
+		t.Fatalf("Verify(original) error = %v", err)
+	}
+	if origClaims.AppID != app.ID {
+		t.Fatalf("original token AppID = %q, want %q", origClaims.AppID, app.ID)
+	}
+
+	// Rotate (nil Redis → lock-free, but rotation and app-id threading are
+	// identical to the locked path).
+	result, grace, err := svc.RefreshWithLock(ctx, reg.RefreshToken, nil)
+	if err != nil {
+		t.Fatalf("RefreshWithLock() error = %v", err)
+	}
+	if grace != nil {
+		t.Fatal("RefreshWithLock() returned an unexpected grace result on first rotation")
+	}
+
+	newClaims, err := jwtSvc.Verify(ctx, result.AccessToken)
+	if err != nil {
+		t.Fatalf("Verify(rotated) error = %v", err)
+	}
+	if newClaims.AppID != app.ID {
+		t.Errorf("rotated token AppID = %q, want %q — application context did not survive refresh", newClaims.AppID, app.ID)
+	}
+}
+
+// TestRefreshWithLock_ReplayRevokesFamily verifies that replaying an
+// already-rotated refresh token through the locked path is detected as a replay
+// (not a generic invalid-token error) and revokes the entire session family —
+// the guarantee issue #82 requires the explicit /auth/refresh endpoint to have.
+func TestRefreshWithLock_ReplayRevokesFamily(t *testing.T) {
+	svc, _, app, ctx := newAppRefreshFixture(t)
+	rdb := testhelper.NewTestRedis(t)
+
+	reg, err := svc.Register(ctx, auth.RegisterInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        uniqueEmail("refresh-replay-lock"),
+		Password:     "Password123!",
+	})
+	if err != nil {
+		t.Fatalf("Register(app credentials) error = %v", err)
+	}
+
+	// First rotation consumes the original token and issues a fresh pair.
+	rotated, grace, err := svc.RefreshWithLock(ctx, reg.RefreshToken, rdb)
+	if err != nil {
+		t.Fatalf("first RefreshWithLock() error = %v", err)
+	}
+	if grace != nil {
+		t.Fatal("unexpected grace result on first rotation")
+	}
+
+	// Replaying the original (now revoked) token must be flagged as a replay.
+	if _, _, err = svc.RefreshWithLock(ctx, reg.RefreshToken, rdb); !errors.Is(err, auth.ErrTokenReplay) {
+		t.Fatalf("replay RefreshWithLock() error = %v, want auth.ErrTokenReplay", err)
+	}
+
+	// The still-valid rotated sibling must now be dead too — the whole family
+	// was revoked by the replay response.
+	if _, _, err = svc.RefreshWithLock(ctx, rotated.RefreshToken, rdb); err == nil {
+		t.Fatal("sibling token still valid after replay — session family was not revoked")
+	}
+}

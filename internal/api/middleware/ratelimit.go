@@ -13,6 +13,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"golang.org/x/time/rate"
+
+	"github.com/engineersmind/emc-auth-server/internal/auth"
 )
 
 // RateLimitConfig holds the parameters for the login rate limiter.
@@ -98,7 +100,12 @@ var (
 	// client_id keys can never collide with tenant/email keys — isolation is
 	// structural, not dependent on a string prefix convention.
 	oauthClientStore = &limiterStore{}
-	cleanupOnce      sync.Once
+	// auditMaintStore buckets the expensive compliance endpoints (CSV export,
+	// chain verify, GDPR erase) per tenant — each request can stream tens of
+	// thousands of rows or recompute a 100k-row hash chain, so a tenant admin
+	// must not be able to fan out concurrent calls against the DB.
+	auditMaintStore = &limiterStore{}
+	cleanupOnce     sync.Once
 )
 
 // startCleanup starts a background goroutine that evicts stale limiter entries
@@ -113,6 +120,7 @@ func startCleanup() {
 				ipStore.cleanup(10 * time.Minute)
 				tenantStore.cleanup(10 * time.Minute)
 				oauthClientStore.cleanup(10 * time.Minute)
+				auditMaintStore.cleanup(10 * time.Minute)
 			}
 		}()
 	})
@@ -126,6 +134,48 @@ func ResetStoresForTest() {
 	ipStore.store.Range(func(k, _ any) bool { ipStore.store.Delete(k); return true })
 	tenantStore.store.Range(func(k, _ any) bool { tenantStore.store.Delete(k); return true })
 	oauthClientStore.store.Range(func(k, _ any) bool { oauthClientStore.store.Delete(k); return true })
+	auditMaintStore.store.Range(func(k, _ any) bool { auditMaintStore.store.Delete(k); return true })
+}
+
+// defaultAuditMaintRate is the per-tenant per-minute cap on the expensive audit
+// compliance endpoints when no explicit rate is supplied.
+const defaultAuditMaintRate = 10
+
+// AuditMaintenanceRateLimiter bounds the cost of the audit compliance endpoints
+// (CSV export, chain verify, GDPR erase) per tenant. These are JWT-protected but
+// individually expensive — a single export streams up to maxExportRows and holds
+// a DB connection, and verify recomputes the whole hash chain — so unlimited
+// concurrent calls from one tenant admin could exhaust the pool. The bucket is
+// keyed on the caller's tenant (from JWT claims, set by JWTRequired which always
+// runs first on these groups); it falls back to the client IP if claims are
+// somehow absent. perMinute <= 0 uses defaultAuditMaintRate.
+func AuditMaintenanceRateLimiter(perMinute int) echo.MiddlewareFunc {
+	startCleanup()
+	if perMinute <= 0 {
+		perMinute = defaultAuditMaintRate
+	}
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			key := "audit-maint:"
+			if claims, ok := c.Get("user").(*auth.Claims); ok && claims != nil && claims.TenantID != "" {
+				key += "tenant:" + claims.TenantID
+			} else {
+				ip := c.RealIP()
+				if ip == "" {
+					ip = c.Request().RemoteAddr
+				}
+				key += "ip:" + ip
+			}
+			if !auditMaintStore.getOrCreate(key, perMinute).Allow() {
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many audit compliance requests — slow down",
+					"retry_after": "60",
+				})
+			}
+			return next(c)
+		}
+	}
 }
 
 // LoginRateLimiter returns an Echo middleware that enforces two-level rate limiting

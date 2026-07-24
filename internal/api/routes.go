@@ -29,6 +29,10 @@ type Deps struct {
 	Logger zerolog.Logger
 	Pool   *pgxpool.Pool
 	Redis  *redis.Client
+	// Audit is the async audit logger. main.go owns its lifecycle (Close on
+	// shutdown drains buffered events). When nil, RegisterRoutes creates one
+	// internally — convenient for tests, but its buffer is not drained on exit.
+	Audit  *audit.Logger
 	Config RoutesConfig
 }
 
@@ -62,6 +66,8 @@ type RoutesConfig struct {
 	// GlobalCORSOrigins are the allowed browser origins for slug-less endpoints
 	// (e.g. /auth/login), which have no tenant to look up a per-tenant list by.
 	GlobalCORSOrigins []string
+	// AuditCaptureResponseBody gates response-body capture: "off" | "failures" | "all".
+	AuditCaptureResponseBody string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -240,8 +246,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithSenders(senderSvc)
 	authSvc.WithEmailMFA(emailMFASvc)
 
-	// Audit logger — shared by both auth and admin handlers
-	auditLog := audit.New(deps.Pool, deps.Logger)
+	// Audit logger — shared by both auth and admin handlers. Prefer the
+	// caller-owned instance (main.go closes it on shutdown to drain the
+	// async buffer); fall back to a local one for tests.
+	auditLog := deps.Audit
+	if auditLog == nil {
+		auditLog = audit.New(deps.Pool, deps.Logger)
+	}
+
+	// Capture the real response status + (redacted) body and attach them to each
+	// request's audit events. Registered here (after auditLog exists) so it wraps
+	// the response writer before any handler runs. Body capture is gated by
+	// config (default "failures") and always redacts secrets + PII.
+	e.Use(mw.AuditCapture(auditLog, deps.Config.AuditCaptureResponseBody))
 
 	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain)
 
@@ -251,7 +268,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithAPIKeys(apiKeySvc).
 		WithApplications(appSvc).
 		WithCookieConfig(cookieCfg).
-		WithJWT(jwtSvc)
+		WithJWT(jwtSvc).
+		WithRedis(deps.Redis)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
@@ -289,8 +307,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
 	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
 
-	// AppRateLimiter middleware — enforces per-app token-bucket limits (reads X-App-ID header).
-	e.Use(mw.AppRateLimiter(appLimitSvc, deps.Redis))
+	// AppRateLimiter middleware — enforces per-app token-bucket limits keyed on
+	// the JWT app_id (oauth_clients.id) + tenant_id claims. It MUST run after a
+	// JWT middleware has populated claims, so it is applied per authenticated
+	// group below (adminGroup + the JWT-renew protected auth routes), NOT globally.
+	appRateLimit := mw.AppRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
+
+	// appClientRateLimit enforces the same per-app limit on the Basic-auth
+	// application endpoints (token + /apps/*), keyed on the client_id.
+	appClientRateLimit := mw.AppClientRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
 
 	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
 	e.Use(mw.TenantCORS(corsSvc))
@@ -336,22 +361,24 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Client credentials token endpoint — machine-to-machine auth (no user).
 	// TokenRateLimiter keys per client_id (not email) so each M2M client gets
-	// an isolated bucket instead of all sharing one email-less fallback bucket.
-	authGroup.POST("/token", authHandler.Token, mw.TokenRateLimiter(rlCfg))
+	// an isolated bucket instead of all sharing one email-less fallback bucket;
+	// appClientRateLimit layers the tenant-configured per-app limit on top,
+	// keyed on the same client_id → application.
+	authGroup.POST("/token", authHandler.Token, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
 	// Application-authenticated end-user register/login (Auth0-style
 	// integration): the calling application authenticates itself via
 	// Authorization: Basic, and gets its own isolated end-user base, distinct
 	// from /register and /login above (which are tenant-level, first-party
 	// only). Rate-limited per client_id — same reasoning as /token.
-	authGroup.POST("/apps/register", authHandler.AppRegister, mw.TokenRateLimiter(rlCfg))
-	authGroup.POST("/apps/login", authHandler.AppLogin, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/register", authHandler.AppRegister, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	authGroup.POST("/apps/login", authHandler.AppLogin, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
 	// Passwordless magic-link sign-in (issue #63 follow-on) — per-application
 	// opt-in. The link replaces only the password step: verification runs the
 	// same MFA gate as /apps/login, so a 'required' app still challenges.
-	authGroup.POST("/apps/login/magic", authHandler.AppMagicLink, mw.TokenRateLimiter(rlCfg))
-	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/login/magic", authHandler.AppMagicLink, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates
@@ -360,11 +387,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	jwtRenew := mw.JWTRenew(jwtSvc, authSvc, deps.Redis, cookieCfg, auditLog, deps.Logger)
 
 	// Auth routes — protected with transparent renewal (AUTH-09)
-	authGroup.GET("/me", authHandler.Me, jwtRenew)
-	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew)
+	authGroup.GET("/me", authHandler.Me, jwtRenew, appRateLimit)
+	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
 
 	// TOTP management — protected (03-01)
-	otpGroup := authGroup.Group("/otp", jwtRenew)
+	otpGroup := authGroup.Group("/otp", jwtRenew, appRateLimit)
 	otpGroup.POST("/enroll", authHandler.TOTPEnroll)
 	otpGroup.POST("/activate", authHandler.TOTPActivate)
 	otpGroup.GET("/status", authHandler.TOTPStatus)                 // all-method MFA state + backup codes remaining
@@ -382,7 +409,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// it to non-auth paths, so transparent renewal is impossible. Browser
 	// clients must call /auth/session/refresh when they receive 401 token_expired,
 	// then retry the admin request.
-	adminGroup := apiV1.Group("", mw.JWTRequired(jwtSvc))
+	// appRateLimit is a pass-through for first-party admin/tenant tokens: those
+	// JWTs are minted with an empty app_id claim (only application-scoped end-user
+	// tokens carry a numeric app_id), and AppRateLimiter skips any request whose
+	// app_id is empty. So mounting it here cannot rate-limit an operator out of
+	// the rate-limit CRUD routes below — the limiter only ever engages for
+	// application-scoped traffic, never for the admin console's own calls.
+	adminGroup := apiV1.Group("", mw.JWTRequired(jwtSvc), appRateLimit)
 
 	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {
@@ -437,6 +470,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/users/:uid/mfa", adminHandler.GetUserMFAStatus, tidUsersRead)
 
 	// Application management under the canonical family — same handlers as
 	// the flat /applications aliases; the :tid path param overrides the JWT
@@ -490,6 +529,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, tidUsersRead)
 
 	// Tenant stats + activity feed (EMC-004 tenant overview page).
 	adminGroup.GET("/tenants/:tid/stats", adminHandler.TenantGetStats, tidStatsRead)
@@ -530,6 +575,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/users/:id/role", adminHandler.AssignUserRole, usersWrite)
 	adminGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser, usersWrite)
 	adminGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
+	adminGroup.GET("/users/:id/detail", adminHandler.GetAdminUserDetail, usersRead)
+	adminGroup.PUT("/users/:id/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.GET("/users/:id/sessions", adminHandler.ListUserSessions, usersRead)
+	adminGroup.DELETE("/users/:id/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
+	adminGroup.DELETE("/users/:id/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)
+	adminGroup.GET("/users/:id/mfa", adminHandler.GetUserMFAStatus, usersRead)
 
 	// API key management — apps:read / apps:write (keys are machine credentials) (03-03)
 	adminGroup.POST("/api-keys", authHandler.CreateAPIKey, appsWrite)
@@ -540,9 +591,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/stats", adminHandler.GetStats, statsRead)
 	tenantMgmt.GET("/stats/system", adminHandler.GetSystemStats)
 
-	// Audit logs — tenant-scoped (audit:read) and system-wide (tenant:manage)
+	// Audit logs — tenant-scoped (audit:read) and system-wide (tenant:manage).
+	// List (summary) + detail-by-id, mirroring the list → drill-down UX.
 	adminGroup.GET("/audit-logs", adminHandler.GetTenantAuditLogs, auditRead)
+	// Expensive compliance endpoints carry a per-tenant rate limit on top of JWT:
+	// export streams up to maxExportRows and verify recomputes the whole chain.
+	auditMaintLimit := mw.AuditMaintenanceRateLimiter(0)
+	adminGroup.GET("/audit-logs/export", adminHandler.ExportAuditLogs, auditRead, auditMaintLimit)
+	adminGroup.GET("/audit-logs/:id", adminHandler.GetTenantAuditLogByID, auditRead)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
+	tenantMgmt.GET("/audit-logs/system/:id", adminHandler.GetSystemAuditLogByID)
+	// Compliance surfaces — super_admin only (tenant:manage), rate-limited per tenant.
+	tenantMgmt.GET("/audit-logs/verify", adminHandler.VerifyAuditChain, auditMaintLimit)
+	tenantMgmt.POST("/audit-logs/erase-user", adminHandler.EraseUserAudit, auditMaintLimit)
 
 	// Application management — apps:read / apps:write (tenant from JWT claims)
 	adminGroup.POST("/applications", adminHandler.CreateApplication, appsWrite)
@@ -593,12 +654,27 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, usersWrite)
 	adminGroup.POST("/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
 	adminGroup.DELETE("/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, usersRead)
+	adminGroup.PUT("/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, usersRead)
+	adminGroup.DELETE("/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
+	adminGroup.DELETE("/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, usersRead)
 
-	// Per-app rate limit management — apps:read / apps:write (08-02)
-	adminGroup.POST("/app-limits", adminHandler.CreateAppLimit, appsWrite)
+	// Per-app rate limit management — apps:read / apps:write (08-02).
+	// Keyed on the numeric application id (oauth_clients.id), consistent with
+	// the /applications/:appID family and the JWT app_id claim. PUT upserts the
+	// single limit for the app; GET/DELETE read/clear it. ListAppLimits returns
+	// every configured limit for the caller's tenant.
 	adminGroup.GET("/app-limits", adminHandler.ListAppLimits, appsRead)
-	adminGroup.PUT("/app-limits/:app_id", adminHandler.UpdateAppLimit, appsWrite)
-	adminGroup.DELETE("/app-limits/:app_id", adminHandler.DeleteAppLimit, appsWrite)
+	adminGroup.GET("/applications/:appID/rate-limit", adminHandler.GetAppLimit, appsRead)
+	adminGroup.PUT("/applications/:appID/rate-limit", adminHandler.SetAppLimit, appsWrite)
+	adminGroup.DELETE("/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, appsWrite)
+	// Cross-tenant / tenant-scoped mirror for super_admin (:tid overrides the JWT tenant).
+	adminGroup.GET("/tenants/:tid/app-limits", adminHandler.ListAppLimits, tidAppsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/rate-limit", adminHandler.GetAppLimit, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/rate-limit", adminHandler.SetAppLimit, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, tidAppsWrite)
 
 	// SAML admin config — saml:manage (04-01)
 	adminGroup.GET("/saml-config", samlHandler.GetSAMLConfig, samlManage)
