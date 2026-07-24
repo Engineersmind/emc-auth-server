@@ -133,6 +133,7 @@ func (s *AuthService) RequestMagicLink(ctx context.Context, clientID, clientSecr
 	// send (and drop the pending token so no unusable link is left behind).
 	if !s.emailSvc.tmplSvc.IsTypeEnabled(ctx, tenantID, &appRowID, mailer.TemplateMagicLink) {
 		s.logger.Info().Int64("tenant_id", tenantID).Msg("magic-link template disabled at this scope — not sending")
+		auditEmailSuppressed(ctx, s.emailSvc.audit, tenantID, &appRowID, mailer.TemplateMagicLink)
 		s.redisCli.Del(ctx, magicLinkKey(raw)) //nolint:errcheck
 		return nil
 	}

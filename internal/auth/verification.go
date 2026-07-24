@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
@@ -38,6 +39,7 @@ type VerificationService struct {
 	mailer     mailer.Mailer
 	senderSvc  *EmailSenderService
 	tmplSvc    *EmailTemplateService
+	audit      *audit.Logger
 	appBaseURL string
 	logger     zerolog.Logger
 }
@@ -56,6 +58,12 @@ func (s *VerificationService) WithSenders(senderSvc *EmailSenderService) *Verifi
 // WithTemplates wires the per-scope template resolver.
 func (s *VerificationService) WithTemplates(tmplSvc *EmailTemplateService) *VerificationService {
 	s.tmplSvc = tmplSvc
+	return s
+}
+
+// WithAudit wires the audit logger so suppressed sends are recorded. Optional.
+func (s *VerificationService) WithAudit(a *audit.Logger) *VerificationService {
+	s.audit = a
 	return s
 }
 
@@ -80,6 +88,7 @@ func (s *VerificationService) SendVerification(ctx context.Context, tenantID int
 	// Suppression: if the verification template is disabled at this scope, skip.
 	if !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplateEmailVerification) {
 		s.logger.Info().Int64("tenant_id", tenantID).Msg("verification template disabled at this scope — not sending")
+		auditEmailSuppressed(ctx, s.audit, tenantID, appRowID, mailer.TemplateEmailVerification)
 		return
 	}
 
@@ -177,6 +186,7 @@ func (s *VerificationService) VerifyEmail(ctx context.Context, rawToken string) 
 		}
 	} else {
 		s.logger.Info().Int64("tenant_id", tenantID).Msg("welcome template disabled at this scope — not sending")
+		auditEmailSuppressed(ctx, s.audit, tenantID, appRowID, mailer.TemplateWelcome)
 	}
 	return nil
 }

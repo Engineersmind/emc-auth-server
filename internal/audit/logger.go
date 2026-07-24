@@ -122,6 +122,11 @@ const (
 	// Admin — white-label email sender management (issue #63 follow-on)
 	ActionAdminEmailSenderUpdated = "admin.email_sender_updated"
 	ActionAdminEmailSenderDeleted = "admin.email_sender_deleted"
+	ActionAdminEmailTestSent      = "admin.email_test_sent"
+
+	// Auth — a transactional email was suppressed because its template is
+	// disabled at the resolved scope (application → tenant).
+	ActionAuthEmailSuppressed = "auth.email_suppressed"
 
 	// Admin — per-scope email template management
 	ActionAdminEmailTemplateUpdated = "admin.email_template_updated"

@@ -12,6 +12,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
@@ -54,6 +55,7 @@ type EmailMFAService struct {
 	mailer    mailer.Mailer
 	senderSvc *EmailSenderService   // nil = always use the global sender
 	tmplSvc   *EmailTemplateService // nil = always use the built-in template
+	audit     *audit.Logger         // nil = suppression not audited
 	logger    zerolog.Logger
 }
 
@@ -66,6 +68,12 @@ func NewEmailMFAService(pool *pgxpool.Pool, redisCli *redis.Client, m mailer.Mai
 // the application's or tenant's own sender when one is configured.
 func (s *EmailMFAService) WithSenders(senderSvc *EmailSenderService) *EmailMFAService {
 	s.senderSvc = senderSvc
+	return s
+}
+
+// WithAudit wires the audit logger so suppressed sends are recorded. Optional.
+func (s *EmailMFAService) WithAudit(a *audit.Logger) *EmailMFAService {
+	s.audit = a
 	return s
 }
 
@@ -121,6 +129,7 @@ func (s *EmailMFAService) mintAndSend(ctx context.Context, key, email, appName s
 	// (and drop the pending code so no unusable code is left behind).
 	if !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplateMFACode) {
 		s.logger.Info().Int64("tenant_id", tenantID).Msg("MFA-code template disabled at this scope — not sending")
+		auditEmailSuppressed(ctx, s.audit, tenantID, appRowID, mailer.TemplateMFACode)
 		s.redis.Del(ctx, key) //nolint:errcheck
 		return nil
 	}

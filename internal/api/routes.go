@@ -277,6 +277,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		auditLog = audit.New(deps.Pool, deps.Logger)
 	}
 
+	// Wire the audit logger into the send services so a template-disabled
+	// suppression is recorded (auth.email_suppressed), giving operators a trail
+	// when an email is intentionally not sent.
+	resetSvc.WithAudit(auditLog)
+	verifSvc.WithAudit(auditLog)
+	emailMFASvc.WithAudit(auditLog)
+
 	// Capture the real response status + (redacted) body and attach them to each
 	// request's audit events. Registered here (after auditLog exists) so it wraps
 	// the response writer before any handler runs. Body capture is gated by
@@ -369,7 +376,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, mw.OTPRateLimiter(rlCfg)) // forced enrollment: first code → tokens
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
-	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
+	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
 	// Email verification — link is clicked (GET) from the email; resend is
@@ -547,11 +554,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/tenants/:tid/email-settings", adminHandler.GetEmailSender, tidAppsRead)
 	adminGroup.PUT("/tenants/:tid/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
-	adminGroup.POST("/tenants/:tid/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite)
+	adminGroup.POST("/tenants/:tid/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.GET("/tenants/:tid/applications/:appID/email-settings", adminHandler.GetEmailSender, tidAppsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
-	adminGroup.POST("/tenants/:tid/applications/:appID/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
 
 	// Per-scope email templates (Auth0-style) — same guards as senders.
 	adminGroup.GET("/tenants/:tid/email-templates", adminHandler.ListEmailTemplates, tidAppsRead)
@@ -684,11 +691,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/email-settings", adminHandler.GetEmailSender, appsRead)
 	adminGroup.PUT("/email-settings", adminHandler.UpsertEmailSender, appsWrite)
 	adminGroup.DELETE("/email-settings", adminHandler.DeleteEmailSender, appsWrite)
-	adminGroup.POST("/email-settings/test", adminHandler.SendTestEmail, appsWrite)
+	adminGroup.POST("/email-settings/test", adminHandler.SendTestEmail, appsWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.GET("/applications/:appID/email-settings", adminHandler.GetEmailSender, appsRead)
 	adminGroup.PUT("/applications/:appID/email-settings", adminHandler.UpsertEmailSender, appsWrite)
 	adminGroup.DELETE("/applications/:appID/email-settings", adminHandler.DeleteEmailSender, appsWrite)
-	adminGroup.POST("/applications/:appID/email-settings/test", adminHandler.SendTestEmail, appsWrite)
+	adminGroup.POST("/applications/:appID/email-settings/test", adminHandler.SendTestEmail, appsWrite, mw.TokenRateLimiter(rlCfg))
 
 	// Flat email-template aliases (tenant from JWT).
 	adminGroup.GET("/email-templates", adminHandler.ListEmailTemplates, appsRead)

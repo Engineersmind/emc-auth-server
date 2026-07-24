@@ -2986,10 +2986,11 @@ func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "email sender removed — sends fall back to the next level"})
 }
 
-// SendTestEmailRequest is the body for POST .../email-settings/test.
+// SendTestEmailRequest is the body for POST .../email-settings/test. The
+// recipient is NOT accepted from the client — a test email is always sent to the
+// authenticated admin's own address, so this endpoint can never be abused as an
+// open relay to arbitrary addresses.
 type SendTestEmailRequest struct {
-	// To is the recipient; empty falls back to the requesting admin's own email.
-	To string `json:"to"`
 	// TemplateType selects which template to render (empty = email_verification).
 	TemplateType string `json:"template_type"`
 }
@@ -2997,14 +2998,15 @@ type SendTestEmailRequest struct {
 // SendTestEmail handles POST .../email-settings/test and flat aliases: it sends
 // a sample email through the sender resolved for this scope (application →
 // tenant → global), so an admin can verify the provider configuration works.
+// The email is always delivered to the requesting admin's own address.
 //
 // @Summary      Send a test email
-// @Description  Sends a sample email using the sender resolved for this scope (application → tenant → global) and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The recipient defaults to the requesting admin's own email.
+// @Description  Sends a sample email using the sender resolved for this scope (application → tenant → global) and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The recipient is always the requesting admin's own email — an arbitrary recipient cannot be supplied.
 // @Tags         admin-email-senders
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      SendTestEmailRequest  false  "Recipient + template type"
+// @Param        body  body      SendTestEmailRequest  false  "Template type"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
@@ -3021,12 +3023,14 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	to := strings.TrimSpace(req.To)
-	if to == "" && claims != nil {
-		to = claims.Email
+	// Recipient is always the authenticated admin — never client-supplied — so
+	// this endpoint cannot be used to relay mail to arbitrary addresses.
+	to := ""
+	if claims != nil {
+		to = strings.TrimSpace(claims.Email)
 	}
 	if _, err := mail.ParseAddress(to); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "a valid recipient email is required"})
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "your account has no valid email address to send the test to"})
 	}
 
 	tt := mailer.TemplateType(req.TemplateType)
@@ -3050,6 +3054,8 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		return c.JSON(http.StatusBadGateway, map[string]string{"error": "failed to send test email: " + err.Error()})
 	}
 
+	rt, rid := senderResource(tenantID, appRowID)
+	h.auditAdminApp(c, claims, audit.ActionAdminEmailTestSent, rt, rid, appRowID)
 	return c.JSON(http.StatusOK, map[string]string{"message": "test email sent to " + to})
 }
 

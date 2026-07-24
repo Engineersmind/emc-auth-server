@@ -1089,11 +1089,13 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 
 	tenantID, appID, err := h.appSvc.AuthenticateClient(c.Request().Context(), id, secret)
 	if err != nil {
-		if errors.Is(err, auth.ErrInvalidClient) {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
+		// Do not reveal whether the client_id exists or the secret was wrong —
+		// return the same generic 200 as an unknown email, extending the
+		// enumeration protection (RESET-03) to the client credential check.
+		if !errors.Is(err, auth.ErrInvalidClient) {
+			h.logger.Error().Err(err).Msg("forgot-password: client authentication failed")
 		}
-		h.logger.Error().Err(err).Msg("forgot-password: client authentication failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "authentication failed"})
+		return c.JSON(http.StatusOK, genericOK)
 	}
 
 	var req ForgotPasswordRequest

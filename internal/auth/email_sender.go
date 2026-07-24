@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/mail"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -111,6 +112,20 @@ func (in *UpsertSenderInput) validate(hasStoredSecret bool) error {
 		return ErrInvalidSender
 	}
 	if _, err := mail.ParseAddress(in.FromAddress); err != nil {
+		return ErrInvalidSender
+	}
+	// Reply-to (optional) must be a single valid address with no embedded CRLF —
+	// a newline here would be an email-header-injection vector.
+	if in.ReplyTo != "" {
+		if strings.ContainsAny(in.ReplyTo, "\r\n") {
+			return ErrInvalidSender
+		}
+		if _, err := mail.ParseAddress(in.ReplyTo); err != nil {
+			return ErrInvalidSender
+		}
+	}
+	// Logo URL (optional) must be an https:// URL — no http/data/javascript.
+	if in.LogoURL != "" && !strings.HasPrefix(strings.ToLower(in.LogoURL), "https://") {
 		return ErrInvalidSender
 	}
 	switch in.Provider {

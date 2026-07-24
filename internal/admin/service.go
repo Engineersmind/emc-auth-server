@@ -1334,7 +1334,9 @@ func (s *Service) ForcePasswordReset(ctx context.Context, tenantID int64, applic
 	}
 
 	s.logger.Info().Str("user_id", strconv.FormatInt(userID, 10)).Int64("tenant_id", tenantID).Msg("admin: force password reset dispatched")
-	return s.resetSvc.ForgotPassword(ctx, tenantID, appRowID, email)
+	// Admin force-reset always sends, even if the tenant/app disabled the
+	// password-reset template — an operator action must not be silently dropped.
+	return s.resetSvc.ForgotPasswordForced(ctx, tenantID, appRowID, email)
 }
 
 // GetUserDetail returns the enriched single-user view (profile + MFA status,

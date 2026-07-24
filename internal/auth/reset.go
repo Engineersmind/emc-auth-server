@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
@@ -25,6 +26,7 @@ type ResetService struct {
 	mailer     mailer.Mailer
 	senderSvc  *EmailSenderService
 	tmplSvc    *EmailTemplateService
+	audit      *audit.Logger
 	appBaseURL string
 	logger     zerolog.Logger
 }
@@ -54,15 +56,50 @@ func (s *ResetService) WithTemplates(tmplSvc *EmailTemplateService) *ResetServic
 	return s
 }
 
+// WithAudit wires the audit logger so suppressed sends are recorded. Optional.
+func (s *ResetService) WithAudit(a *audit.Logger) *ResetService {
+	s.audit = a
+	return s
+}
+
+// auditEmailSuppressed records that a transactional email was not sent because
+// its template is disabled at the resolved scope. Nil-safe.
+func auditEmailSuppressed(ctx context.Context, a *audit.Logger, tenantID int64, appRowID *int64, tt mailer.TemplateType) {
+	if a == nil {
+		return
+	}
+	a.Log(ctx, audit.Event{
+		TenantID:      &tenantID,
+		ApplicationID: appRowID,
+		Action:        audit.ActionAuthEmailSuppressed,
+		ResourceType:  "email_template",
+		ResourceID:    string(tt),
+		Metadata:      map[string]any{"template_type": string(tt)},
+	})
+}
+
 // ForgotPassword generates a time-limited reset token and emails it to the
 // user, scoped to the authenticated application (appRowID). The caller
 // authenticates the application via client_id/client_secret and passes the
 // resolved tenant + application. ALWAYS returns nil to prevent email
 // enumeration (RESET-03).
 func (s *ResetService) ForgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string) error {
-	// Suppression: if the reset template is disabled at this scope, don't send.
-	if !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordReset) {
+	return s.forgotPassword(ctx, tenantID, appRowID, email, true)
+}
+
+// ForgotPasswordForced is the admin-initiated variant (ForcePasswordReset): it
+// ignores the template disable flag so a super-admin force-reset always sends,
+// regardless of the tenant/app template configuration.
+func (s *ResetService) ForgotPasswordForced(ctx context.Context, tenantID int64, appRowID *int64, email string) error {
+	return s.forgotPassword(ctx, tenantID, appRowID, email, false)
+}
+
+func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string, honorSuppression bool) error {
+	// Suppression: if the reset template is disabled at this scope, don't send —
+	// unless this is an admin-forced reset (honorSuppression=false).
+	if honorSuppression && !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordReset) {
 		s.logger.Info().Int64("tenant_id", tenantID).Msg("forgot-password: reset template disabled at this scope — not sending")
+		auditEmailSuppressed(ctx, s.audit, tenantID, appRowID, mailer.TemplatePasswordReset)
 		return nil
 	}
 
