@@ -23,6 +23,8 @@ const ResetTokenTTL = 15 * time.Minute
 type ResetService struct {
 	pool       *pgxpool.Pool
 	mailer     mailer.Mailer
+	senderSvc  *EmailSenderService
+	tmplSvc    *EmailTemplateService
 	appBaseURL string
 	logger     zerolog.Logger
 }
@@ -37,31 +39,40 @@ func NewResetService(pool *pgxpool.Pool, m mailer.Mailer, appBaseURL string, log
 	}
 }
 
-// ForgotPassword generates a time-limited reset token and emails it to the user.
-// ALWAYS returns nil to prevent email enumeration (RESET-03).
-func (s *ResetService) ForgotPassword(ctx context.Context, tenantSlug, email string) error {
-	var tenantID int64
-	err := s.pool.QueryRow(ctx,
-		`SELECT id FROM tenants WHERE slug = $1 AND is_active = true`,
-		tenantSlug,
-	).Scan(&tenantID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			s.logger.Debug().Str("tenant_slug", tenantSlug).Msg("forgot-password: tenant not found, silently succeeding")
-			return nil
-		}
-		return fmt.Errorf("resolve tenant for forgot-password: %w", err)
+// WithSenders wires the white-label sender resolver so reset emails use the
+// tenant's configured sender/branding. Optional: without it, reset always uses
+// the global sender (today's behaviour).
+func (s *ResetService) WithSenders(senderSvc *EmailSenderService) *ResetService {
+	s.senderSvc = senderSvc
+	return s
+}
+
+// WithTemplates wires the per-scope template resolver so reset emails use the
+// tenant's/application's customized template when one is configured. Optional.
+func (s *ResetService) WithTemplates(tmplSvc *EmailTemplateService) *ResetService {
+	s.tmplSvc = tmplSvc
+	return s
+}
+
+// ForgotPassword generates a time-limited reset token and emails it to the
+// user, scoped to the authenticated application (appRowID). The caller
+// authenticates the application via client_id/client_secret and passes the
+// resolved tenant + application. ALWAYS returns nil to prevent email
+// enumeration (RESET-03).
+func (s *ResetService) ForgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string) error {
+	// Suppression: if the reset template is disabled at this scope, don't send.
+	if !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordReset) {
+		s.logger.Info().Int64("tenant_id", tenantID).Msg("forgot-password: reset template disabled at this scope — not sending")
+		return nil
 	}
 
-	// Tenant-level users only (application_id IS NULL): the same email may hold
-	// independent accounts in multiple applications of this tenant, and this
-	// slug-based flow has no application context to disambiguate — resetting an
-	// arbitrary match would change the wrong account's password. App-scoped
-	// users reset through their application's own integration.
+	// Scope the lookup to the authenticated application: an email may hold
+	// independent accounts in different applications of the same tenant, so the
+	// application_id disambiguates which account to reset.
 	var userID int64
-	err = s.pool.QueryRow(ctx,
-		`SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND application_id IS NULL AND is_active = true AND deleted_at IS NULL`,
-		tenantID, email,
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM users WHERE tenant_id = $1 AND email = $2 AND application_id IS NOT DISTINCT FROM $3 AND is_active = true AND deleted_at IS NULL`,
+		tenantID, email, appRowID,
 	).Scan(&userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -86,18 +97,36 @@ func (s *ResetService) ForgotPassword(ctx context.Context, tenantSlug, email str
 	}
 
 	resetLink := fmt.Sprintf("%s/api/v1/auth/reset-password?token=%s", s.appBaseURL, rawToken)
+	msg := mailer.ResetEmail{
+		To:        email,
+		ResetLink: resetLink,
+	}
 
-	if err := s.mailer.SendReset(ctx, mailer.ResetEmail{
-		To:         email,
-		ResetLink:  resetLink,
-		TenantSlug: tenantSlug,
-	}); err != nil {
-		s.logger.Error().Err(err).Str("email", email).Msg("forgot-password: email dispatch failed")
+	// Resolve the sender for this application (application → tenant → global). A
+	// broken sender must never block a password reset, so fall back to the global
+	// sender and log — same policy as the MFA/magic-link paths.
+	var sender *mailer.SMTPConfig
+	if s.senderSvc != nil {
+		sender, err = s.senderSvc.Resolve(ctx, tenantID, appRowID)
+		if err != nil {
+			s.logger.Warn().Err(err).Int64("tenant_id", tenantID).Msg("forgot-password: sender resolution failed — using global sender")
+			sender = nil
+		}
+	}
+	tmpl := s.tmplSvc.ResolveTemplate(ctx, tenantID, appRowID, mailer.TemplatePasswordReset)
+
+	sendErr := s.mailer.SendReset(ctx, sender, tmpl, msg)
+	if sendErr != nil && sender != nil {
+		s.logger.Warn().Err(sendErr).Str("from", sender.From).Msg("forgot-password: white-label sender failed — retrying via global sender")
+		sendErr = s.mailer.SendReset(ctx, nil, tmpl, msg)
+	}
+	if sendErr != nil {
+		s.logger.Error().Err(sendErr).Str("email", email).Msg("forgot-password: email dispatch failed")
 		return nil
 	}
 
 	s.logger.Info().
-		Str("tenant", tenantSlug).
+		Int64("tenant_id", tenantID).
 		Str("user_id", strconv.FormatInt(userID, 10)).
 		Msg("forgot-password: reset token issued")
 

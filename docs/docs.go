@@ -6858,11 +6858,23 @@ const docTemplate = `{
                 "from_address": {
                     "type": "string"
                 },
+                "from_name": {
+                    "type": "string"
+                },
                 "has_password": {
                     "type": "boolean"
                 },
                 "is_active": {
                     "type": "boolean"
+                },
+                "logo_url": {
+                    "type": "string"
+                },
+                "product_name": {
+                    "type": "string"
+                },
+                "reply_to": {
+                    "type": "string"
                 },
                 "smtp_host": {
                     "type": "string"
@@ -6873,7 +6885,13 @@ const docTemplate = `{
                 "smtp_username": {
                     "type": "string"
                 },
+                "subject_prefix": {
+                    "type": "string"
+                },
                 "tenant_id": {
+                    "type": "string"
+                },
+                "tls_mode": {
                     "type": "string"
                 },
                 "updated_at": {
@@ -7557,8 +7575,21 @@ const docTemplate = `{
                 "from_address": {
                     "type": "string"
                 },
+                "from_name": {
+                    "description": "Branding (all optional).",
+                    "type": "string"
+                },
                 "is_active": {
                     "type": "boolean"
+                },
+                "logo_url": {
+                    "type": "string"
+                },
+                "product_name": {
+                    "type": "string"
+                },
+                "reply_to": {
+                    "type": "string"
                 },
                 "smtp_host": {
                     "type": "string"
@@ -7570,6 +7601,13 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "smtp_username": {
+                    "type": "string"
+                },
+                "subject_prefix": {
+                    "type": "string"
+                },
+                "tls_mode": {
+                    "description": "TLSMode: \"ssl\" | \"starttls\" | \"opportunistic\" | \"none\" (empty = derive from port).",
                     "type": "string"
                 }
             }

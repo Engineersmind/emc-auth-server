@@ -25,8 +25,9 @@ import (
 type AuthHandler struct {
 	svc       *auth.AuthService
 	resetSvc  *auth.ResetService
-	totpSvc   *auth.TOTPService     // nil when TOTP not configured
-	emailSvc  *auth.EmailMFAService // nil when email MFA not configured
+	verifSvc  *auth.VerificationService // nil when email verification not configured
+	totpSvc   *auth.TOTPService         // nil when TOTP not configured
+	emailSvc  *auth.EmailMFAService     // nil when email MFA not configured
 	apiKeySvc *auth.APIKeyService
 	appSvc    *auth.ApplicationService // nil until WithApplications is called
 	jwtSvc    *auth.JWTService
@@ -51,6 +52,79 @@ func (h *AuthHandler) WithTOTP(totpSvc *auth.TOTPService) *AuthHandler {
 func (h *AuthHandler) WithEmailMFA(emailSvc *auth.EmailMFAService) *AuthHandler {
 	h.emailSvc = emailSvc
 	return h
+}
+
+// WithVerification attaches a VerificationService for the email-verification
+// endpoints (verify + resend).
+func (h *AuthHandler) WithVerification(verifSvc *auth.VerificationService) *AuthHandler {
+	h.verifSvc = verifSvc
+	return h
+}
+
+// VerifyEmail handles GET /api/v1/auth/verify-email?token=... — the link
+// emailed on registration. Marks the address verified and triggers a welcome
+// email. Single-use; a reused or expired token returns 400.
+//
+// @Summary      Verify email address
+// @Description  Confirms ownership of an email address via the token from the verification link. Single-use.
+// @Tags         AUTH
+// @Produce      json
+// @Param        token  query     string  true  "Verification token"
+// @Success      200    {object}  map[string]string
+// @Failure      400    {object}  map[string]string
+// @Router       /api/v1/auth/verify-email [get]
+func (h *AuthHandler) VerifyEmail(c echo.Context) error {
+	if h.verifSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email verification is not configured"})
+	}
+	token := c.QueryParam("token")
+	if token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "token is required"})
+	}
+	if err := h.verifSvc.VerifyEmail(c.Request().Context(), token); err != nil {
+		if errors.Is(err, auth.ErrInvalidVerificationToken) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired verification link"})
+		}
+		h.logger.Error().Err(err).Msg("auth: verify email failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to verify email"})
+	}
+	return c.JSON(http.StatusOK, map[string]string{"message": "email verified"})
+}
+
+// ResendVerificationRequest is the body for POST /api/v1/auth/resend-verification.
+type ResendVerificationRequest struct {
+	Email string `json:"email" validate:"required,email"`
+}
+
+// ResendVerification handles POST /api/v1/auth/resend-verification. The tenant
+// comes from the X-Tenant-Slug header. Enumeration-safe: always 200.
+//
+// @Summary      Resend verification email
+// @Description  Re-sends the email-verification link for an unverified tenant-level user. Always returns 200 to prevent account enumeration.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        X-Tenant-Slug  header    string                     true  "Tenant slug"
+// @Param        body           body      ResendVerificationRequest  true  "Email to resend to"
+// @Success      200            {object}  map[string]string
+// @Router       /api/v1/auth/resend-verification [post]
+func (h *AuthHandler) ResendVerification(c echo.Context) error {
+	if h.verifSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email verification is not configured"})
+	}
+	tenantSlug := c.Request().Header.Get("X-Tenant-Slug")
+	var req ResendVerificationRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	if tenantSlug == "" || req.Email == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "tenant slug and email are required"})
+	}
+	if err := h.verifSvc.ResendVerification(c.Request().Context(), tenantSlug, req.Email); err != nil {
+		h.logger.Error().Err(err).Msg("auth: resend verification failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to process request"})
+	}
+	return c.JSON(http.StatusOK, map[string]string{"message": "if the account exists and is unverified, a verification email has been sent"})
 }
 
 // WithAPIKeys attaches an APIKeyService to the handler.
@@ -986,45 +1060,62 @@ type ForgotPasswordRequest struct {
 // ForgotPassword handles POST /api/v1/auth/forgot-password (RESET-01, RESET-03).
 //
 // @Summary      Request password reset
-// @Description  Sends a reset link to the email address. ALWAYS returns 200 regardless of whether the email is registered (prevents email enumeration).
+// @Description  Sends a reset link to the email address for the authenticated application's user. The application authenticates with Authorization: Basic base64(client_id:client_secret) — this identifies both the tenant and application, scoping the reset to that app's account. ALWAYS returns 200 for a valid client regardless of whether the email is registered (prevents email enumeration).
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
-// @Param        X-Tenant-Slug  header    string                 true  "Tenant slug"
+// @Param        Authorization  header    string                 true  "Basic base64(client_id:client_secret)"
 // @Param        body           body      ForgotPasswordRequest  true  "Email address"
 // @Success      200            {object}  map[string]string
+// @Failure      401            {object}  map[string]string  "Invalid client credentials"
 // @Router       /api/v1/auth/forgot-password [post]
 func (h *AuthHandler) ForgotPassword(c echo.Context) error {
-	slug, ok := tenantSlugFromCtx(c)
+	genericOK := map[string]string{
+		"message": "if that email address is registered, a password reset link has been sent",
+	}
+
+	// Authenticate the requesting application via client_id/client_secret. This
+	// identifies the tenant + application, scoping the reset to that app's user.
+	id, secret, ok, err := clientCredentialsFromBasicAuth(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	}
 	if !ok {
-		h.logger.Debug().Msg("forgot-password: missing X-Tenant-Slug header")
-		return c.JSON(http.StatusOK, map[string]string{
-			"message": "if that email address is registered, a password reset link has been sent",
-		})
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Authorization: Basic base64(client_id:client_secret) header is required"})
+	}
+	if h.appSvc == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "application service not configured"})
+	}
+
+	tenantID, appID, err := h.appSvc.AuthenticateClient(c.Request().Context(), id, secret)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidClient) {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
+		}
+		h.logger.Error().Err(err).Msg("forgot-password: client authentication failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "authentication failed"})
 	}
 
 	var req ForgotPasswordRequest
 	if err := c.Bind(&req); err != nil || req.Email == "" {
-		return c.JSON(http.StatusOK, map[string]string{
-			"message": "if that email address is registered, a password reset link has been sent",
-		})
+		return c.JSON(http.StatusOK, genericOK)
 	}
 
-	if err := h.resetSvc.ForgotPassword(c.Request().Context(), slug, req.Email); err != nil {
+	if err := h.resetSvc.ForgotPassword(c.Request().Context(), tenantID, &appID, req.Email); err != nil {
 		h.logger.Error().Err(err).Msg("forgot-password: unexpected service error")
 	}
 
 	h.auditEvent(c, audit.Event{
-		ActorEmail:   req.Email,
-		Action:       audit.ActionAuthPasswordResetReq,
-		ResourceType: "user",
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+		TenantID:      &tenantID,
+		ApplicationID: &appID,
+		ActorEmail:    req.Email,
+		Action:        audit.ActionAuthPasswordResetReq,
+		ResourceType:  "user",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 
-	return c.JSON(http.StatusOK, map[string]string{
-		"message": "if that email address is registered, a password reset link has been sent",
-	})
+	return c.JSON(http.StatusOK, genericOK)
 }
 
 // ResetPasswordRequest is the JSON body for POST /api/v1/auth/reset-password.

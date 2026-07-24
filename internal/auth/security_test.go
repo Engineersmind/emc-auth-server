@@ -138,18 +138,25 @@ func TestEmailEnumeration_ForgotPassword(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
+	// Resolve the seeded tenant id (registration is tenant-level, application_id NULL).
+	pool := testhelper.NewTestDB(t)
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc'`).Scan(&tenantID); err != nil {
+		t.Fatalf("tenant id: %v", err)
+	}
+
 	// Call 1: registered email — must return nil.
-	if err := resetSvc.ForgotPassword(ctx, "emc", registeredEmail); err != nil {
+	if err := resetSvc.ForgotPassword(ctx, tenantID, nil, registeredEmail); err != nil {
 		t.Errorf("ForgotPassword(registered email) = %v; want nil to prevent email enumeration", err)
 	}
 
 	// Call 2: unregistered email in a real tenant — must return nil.
-	if err := resetSvc.ForgotPassword(ctx, "emc", "notregistered@sec.test"); err != nil {
+	if err := resetSvc.ForgotPassword(ctx, tenantID, nil, "notregistered@sec.test"); err != nil {
 		t.Errorf("ForgotPassword(unregistered email) = %v; want nil to prevent email enumeration", err)
 	}
 
-	// Call 3: non-existent tenant — must return nil (RESET-03 silent success).
-	if err := resetSvc.ForgotPassword(ctx, "no-such-tenant", "any@email.com"); err != nil {
+	// Call 3: non-existent tenant id — must return nil (RESET-03 silent success).
+	if err := resetSvc.ForgotPassword(ctx, 999999, nil, "any@email.com"); err != nil {
 		t.Errorf("ForgotPassword(non-existent tenant) = %v; want nil to prevent email enumeration", err)
 	}
 }

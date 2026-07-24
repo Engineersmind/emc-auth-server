@@ -22,10 +22,11 @@ const BcryptCost = 12
 type AuthService struct {
 	pool     *pgxpool.Pool
 	jwtSvc   *JWTService
-	totpSvc  *TOTPService        // nil when TOTP not configured
-	emailSvc *EmailMFAService    // nil when email MFA not configured
-	redisCli *redis.Client       // used for OTP session storage
-	appSvc   *ApplicationService // nil when application context is not needed
+	totpSvc  *TOTPService         // nil when TOTP not configured
+	emailSvc *EmailMFAService     // nil when email MFA not configured
+	redisCli *redis.Client        // used for OTP session storage
+	appSvc   *ApplicationService  // nil when application context is not needed
+	verifSvc *VerificationService // nil when email verification is not configured
 	logger   zerolog.Logger
 }
 
@@ -53,6 +54,14 @@ func (s *AuthService) WithApplications(appSvc *ApplicationService) *AuthService 
 // verify emailed one-time codes for users enrolled in the email method.
 func (s *AuthService) WithEmailMFA(emailSvc *EmailMFAService) *AuthService {
 	s.emailSvc = emailSvc
+	return s
+}
+
+// WithVerification attaches a VerificationService so self-service registration
+// dispatches an email-verification link. Optional — without it, registration
+// behaves as before (no verification email).
+func (s *AuthService) WithVerification(verifSvc *VerificationService) *AuthService {
+	s.verifSvc = verifSvc
 	return s
 }
 
@@ -365,6 +374,16 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit register: %w", err)
+	}
+
+	// Dispatch an email-verification link (best-effort — never blocks or fails
+	// the registration). Google/social sign-ups arrive pre-verified elsewhere.
+	if s.verifSvc != nil {
+		appName := ""
+		if appRowID != nil {
+			appName = s.appNameByID(ctx, appID)
+		}
+		s.verifSvc.SendVerification(ctx, tenantID, appRowID, userID, in.Email, appName)
 	}
 
 	perms, err := s.loadPermissions(ctx, userID, tenantID)

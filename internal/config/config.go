@@ -15,10 +15,23 @@ type Config struct {
 	Env         string
 	JWTIssuer   string
 
-	// SMTP configuration for password reset emails (RESET-01).
-	// In development (Env=development), emails are logged to console instead.
-	SMTPHost     string
-	SMTPPort     int
+	// EmailProvider selects the GLOBAL email transport: "sendgrid" or "smtp".
+	// Empty is inferred: "sendgrid" when SENDGRID_API_KEY is set, else "smtp"
+	// when SMTP_HOST is set, else a console log-only dev mailer. Set via EMAIL_PROVIDER.
+	EmailProvider string
+	// SendGridAPIKey is the global SendGrid API key (provider="sendgrid").
+	// Set via SENDGRID_API_KEY.
+	SendGridAPIKey string
+	// EmailFromName is the optional display name on the global From header.
+	// Set via EMAIL_FROM_NAME.
+	EmailFromName string
+
+	// SMTP configuration for the global SMTP provider (password reset, MFA,
+	// verification, magic link). In development with no provider configured,
+	// emails are logged to console instead.
+	SMTPHost string
+	SMTPPort int
+	// SMTPFrom is the global From address for both providers. Set via SMTP_FROM.
 	SMTPFrom     string
 	SMTPUsername string
 	SMTPPassword string
@@ -107,6 +120,9 @@ func Load() *Config {
 		LogLevel:                               getEnv("LOG_LEVEL", "info"),
 		Env:                                    getEnv("ENV", "development"),
 		JWTIssuer:                              getEnv("JWT_ISSUER", "https://auth.emc.local"),
+		EmailProvider:                          getEnv("EMAIL_PROVIDER", ""),
+		SendGridAPIKey:                         getEnv("SENDGRID_API_KEY", ""),
+		EmailFromName:                          getEnv("EMAIL_FROM_NAME", ""),
 		SMTPHost:                               getEnv("SMTP_HOST", ""),
 		SMTPPort:                               smtpPort,
 		SMTPFrom:                               getEnv("SMTP_FROM", "no-reply@emc.local"),

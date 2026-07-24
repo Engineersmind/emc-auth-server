@@ -123,6 +123,10 @@ const (
 	ActionAdminEmailSenderUpdated = "admin.email_sender_updated"
 	ActionAdminEmailSenderDeleted = "admin.email_sender_deleted"
 
+	// Admin — per-scope email template management
+	ActionAdminEmailTemplateUpdated = "admin.email_template_updated"
+	ActionAdminEmailTemplateDeleted = "admin.email_template_deleted"
+
 	// Auth — social login (issue #64)
 	ActionAuthGoogleLogin       = "auth.google_login"
 	ActionAuthGoogleLoginFailed = "auth.google_login_failed"

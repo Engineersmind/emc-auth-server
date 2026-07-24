@@ -129,6 +129,14 @@ func (s *AuthService) RequestMagicLink(ctx context.Context, clientID, clientSecr
 		return err
 	}
 
+	// Suppression: if the magic-link template is disabled at this scope, don't
+	// send (and drop the pending token so no unusable link is left behind).
+	if !s.emailSvc.tmplSvc.IsTypeEnabled(ctx, tenantID, &appRowID, mailer.TemplateMagicLink) {
+		s.logger.Info().Int64("tenant_id", tenantID).Msg("magic-link template disabled at this scope — not sending")
+		s.redisCli.Del(ctx, magicLinkKey(raw)) //nolint:errcheck
+		return nil
+	}
+
 	msg := mailer.MagicLinkEmail{
 		To:         email,
 		Link:       link,
@@ -136,10 +144,11 @@ func (s *AuthService) RequestMagicLink(ctx context.Context, clientID, clientSecr
 		TTLMinutes: int(MagicLinkTTL.Minutes()),
 	}
 	sender := s.resolveEmailSender(ctx, tenantID, &appRowID)
-	if err := s.emailSvc.mailer.SendMagicLink(ctx, sender, msg); err != nil {
+	tmpl := s.emailSvc.tmplSvc.ResolveTemplate(ctx, tenantID, &appRowID, mailer.TemplateMagicLink)
+	if err := s.emailSvc.mailer.SendMagicLink(ctx, sender, tmpl, msg); err != nil {
 		if sender != nil {
 			s.logger.Warn().Err(err).Str("from", sender.From).Msg("white-label sender failed for magic link — retrying via global sender")
-			err = s.emailSvc.mailer.SendMagicLink(ctx, nil, msg)
+			err = s.emailSvc.mailer.SendMagicLink(ctx, nil, tmpl, msg)
 		}
 		if err != nil {
 			s.redisCli.Del(ctx, magicLinkKey(raw)) //nolint:errcheck

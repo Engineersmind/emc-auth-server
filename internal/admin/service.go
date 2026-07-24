@@ -1318,14 +1318,14 @@ func (s *Service) DeleteUser(ctx context.Context, tenantID int64, applicationID 
 // ForcePasswordReset dispatches a password reset email to the specified user,
 // with the same optional application scope filter as GetUser.
 func (s *Service) ForcePasswordReset(ctx context.Context, tenantID int64, applicationID *int64, userID int64) error {
-	var email, tenantSlug string
+	var email string
+	var appRowID *int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT u.email, t.slug
+		SELECT u.email, u.application_id
 		FROM users u
-		JOIN tenants t ON t.id = u.tenant_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
 		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
-	`, userID, tenantID, applicationID).Scan(&email, &tenantSlug)
+	`, userID, tenantID, applicationID).Scan(&email, &appRowID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -1333,8 +1333,8 @@ func (s *Service) ForcePasswordReset(ctx context.Context, tenantID int64, applic
 		return fmt.Errorf("lookup user for force reset: %w", err)
 	}
 
-	s.logger.Info().Str("user_id", strconv.FormatInt(userID, 10)).Str("tenant", tenantSlug).Msg("admin: force password reset dispatched")
-	return s.resetSvc.ForgotPassword(ctx, tenantSlug, email)
+	s.logger.Info().Str("user_id", strconv.FormatInt(userID, 10)).Int64("tenant_id", tenantID).Msg("admin: force password reset dispatched")
+	return s.resetSvc.ForgotPassword(ctx, tenantID, appRowID, email)
 }
 
 // GetUserDetail returns the enriched single-user view (profile + MFA status,

@@ -52,7 +52,8 @@ type EmailMFAService struct {
 	pool      *pgxpool.Pool
 	redis     *redis.Client
 	mailer    mailer.Mailer
-	senderSvc *EmailSenderService // nil = always use the global sender
+	senderSvc *EmailSenderService   // nil = always use the global sender
+	tmplSvc   *EmailTemplateService // nil = always use the built-in template
 	logger    zerolog.Logger
 }
 
@@ -65,6 +66,13 @@ func NewEmailMFAService(pool *pgxpool.Pool, redisCli *redis.Client, m mailer.Mai
 // the application's or tenant's own sender when one is configured.
 func (s *EmailMFAService) WithSenders(senderSvc *EmailSenderService) *EmailMFAService {
 	s.senderSvc = senderSvc
+	return s
+}
+
+// WithTemplates attaches the per-scope template resolver so MFA-code emails use
+// the application's/tenant's customized template when one is configured.
+func (s *EmailMFAService) WithTemplates(tmplSvc *EmailTemplateService) *EmailMFAService {
+	s.tmplSvc = tmplSvc
 	return s
 }
 
@@ -109,6 +117,14 @@ func (s *EmailMFAService) mintAndSend(ctx context.Context, key, email, appName s
 	}
 	s.redis.Del(ctx, key+":attempts") //nolint:errcheck
 
+	// Suppression: if the MFA-code template is disabled at this scope, don't send
+	// (and drop the pending code so no unusable code is left behind).
+	if !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplateMFACode) {
+		s.logger.Info().Int64("tenant_id", tenantID).Msg("MFA-code template disabled at this scope — not sending")
+		s.redis.Del(ctx, key) //nolint:errcheck
+		return nil
+	}
+
 	msg := mailer.MFACodeEmail{
 		To:         email,
 		Code:       code,
@@ -125,10 +141,12 @@ func (s *EmailMFAService) mintAndSend(ctx context.Context, key, email, appName s
 		}
 	}
 
-	err = s.mailer.SendMFACodeFrom(ctx, sender, msg)
+	tmpl := s.tmplSvc.ResolveTemplate(ctx, tenantID, appRowID, mailer.TemplateMFACode)
+
+	err = s.mailer.SendMFACode(ctx, sender, tmpl, msg)
 	if err != nil && sender != nil {
 		s.logger.Warn().Err(err).Str("from", sender.From).Msg("white-label sender failed — retrying via global sender")
-		err = s.mailer.SendMFACodeFrom(ctx, nil, msg)
+		err = s.mailer.SendMFACode(ctx, nil, tmpl, msg)
 	}
 	if err != nil {
 		// The code is unusable if the user never received it — remove it so a
