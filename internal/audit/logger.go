@@ -275,7 +275,7 @@ type LogEntry struct {
 	Status          string          `json:"status"`
 	HTTPStatus      *int            `json:"http_status,omitempty"`
 	RequestID       string          `json:"request_id,omitempty"`
-	Metadata        json.RawMessage `json:"metadata,omitempty"`
+	Metadata        json.RawMessage `json:"metadata,omitempty" swaggertype:"object"`
 	CreatedAt       time.Time       `json:"created_at"`
 }
 

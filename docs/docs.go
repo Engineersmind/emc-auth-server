@@ -1588,6 +1588,69 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/audit-logs/erase-user": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Erase a user's PII from the audit trail (GDPR)",
+                "parameters": [
+                    {
+                        "description": "Target user id",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.EraseUserAuditRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/export": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "text/csv"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Export audit logs (CSV)",
+                "responses": {
+                    "200": {
+                        "description": "CSV",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/audit-logs/system": {
             "get": {
                 "security": [
@@ -1646,6 +1709,125 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/audit.LogsPage"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/system/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the full detail of a single audit event across ALL tenants. Requires tenant:manage.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "System-wide audit log detail",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Audit log ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.LogEntry"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/verify": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Recomputes the tamper-evidence hash chain over recent rows and reports whether any row was altered, deleted, or reordered. Requires tenant:manage.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Verify audit trail integrity",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Max recent rows to verify (default 10000)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.VerifyResult"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the full detail of a single audit event (all metadata expanded), scoped to the caller's tenant. Requires admin:access.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Tenant audit log detail",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Audit log ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.LogEntry"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
@@ -3038,7 +3220,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/refresh": {
             "post": {
-                "description": "Issues a new access + refresh token pair and immediately invalidates the old refresh token.",
+                "description": "Issues a new access + refresh token pair and immediately invalidates the old refresh token.\nBody-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:\n409 (` + "`" + `concurrent_refresh` + "`" + `) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.\n503 means the session store (Redis) is temporarily unavailable — the client should retry.",
                 "consumes": [
                     "application/json"
                 ],
@@ -3078,6 +3260,24 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "concurrent_refresh — sibling request already rotated the family; no token pair returned",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "session store unavailable — retry",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3282,7 +3482,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/session/refresh": {
             "post": {
-                "description": "Rotates the access and refresh tokens using the refresh cookie.",
+                "description": "Rotates the access and refresh tokens using the refresh cookie.\n409 (` + "`" + `concurrent_refresh` + "`" + `) signals a sibling request already rotated the family within the grace window (the fresh cookies are on that sibling's response); 503 signals the session store (Redis) is temporarily unavailable — retry.",
                 "produces": [
                     "application/json"
                 ],
@@ -3302,6 +3502,24 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "concurrent_refresh — sibling request already rotated the family",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "session store unavailable — retry",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -6490,13 +6708,31 @@ const docTemplate = `{
                 "agent_id": {
                     "type": "string"
                 },
+                "application_id": {
+                    "type": "string"
+                },
+                "application_name": {
+                    "type": "string"
+                },
+                "auth_method": {
+                    "type": "string"
+                },
                 "created_at": {
                     "type": "string"
+                },
+                "http_status": {
+                    "type": "integer"
                 },
                 "id": {
                     "type": "string"
                 },
                 "ip_address": {
+                    "type": "string"
+                },
+                "metadata": {
+                    "type": "object"
+                },
+                "request_id": {
                     "type": "string"
                 },
                 "resource_id": {
@@ -6505,10 +6741,16 @@ const docTemplate = `{
                 "resource_type": {
                     "type": "string"
                 },
+                "status": {
+                    "type": "string"
+                },
                 "tenant_id": {
                     "type": "string"
                 },
                 "tenant_slug": {
+                    "type": "string"
+                },
+                "user_agent": {
                     "type": "string"
                 },
                 "user_id": {
@@ -6559,6 +6801,27 @@ const docTemplate = `{
                 },
                 "total_audit_events": {
                     "type": "integer"
+                }
+            }
+        },
+        "audit.VerifyResult": {
+            "type": "object",
+            "properties": {
+                "broken_at_id": {
+                    "description": "BrokenAtID is the id of the first row whose hash/linkage failed, when any.",
+                    "type": "string"
+                },
+                "checked": {
+                    "description": "Checked is the number of rows verified.",
+                    "type": "integer"
+                },
+                "detail": {
+                    "description": "Detail is a human-readable description of the break (or \"ok\").",
+                    "type": "string"
+                },
+                "intact": {
+                    "description": "Intact is true when every checked row's hash and linkage verified.",
+                    "type": "boolean"
                 }
             }
         },
@@ -7203,6 +7466,14 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "code": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.EraseUserAuditRequest": {
+            "type": "object",
+            "properties": {
+                "user_id": {
                     "type": "string"
                 }
             }

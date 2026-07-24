@@ -268,19 +268,35 @@ definitions:
         type: string
       agent_id:
         type: string
+      application_id:
+        type: string
+      application_name:
+        type: string
+      auth_method:
+        type: string
       created_at:
         type: string
+      http_status:
+        type: integer
       id:
         type: string
       ip_address:
+        type: string
+      metadata:
+        type: object
+      request_id:
         type: string
       resource_id:
         type: string
       resource_type:
         type: string
+      status:
+        type: string
       tenant_id:
         type: string
       tenant_slug:
+        type: string
+      user_agent:
         type: string
       user_id:
         type: string
@@ -314,6 +330,22 @@ definitions:
         type: array
       total_audit_events:
         type: integer
+    type: object
+  audit.VerifyResult:
+    properties:
+      broken_at_id:
+        description: BrokenAtID is the id of the first row whose hash/linkage failed,
+          when any.
+        type: string
+      checked:
+        description: Checked is the number of rows verified.
+        type: integer
+      detail:
+        description: Detail is a human-readable description of the break (or "ok").
+        type: string
+      intact:
+        description: Intact is true when every checked row's hash and linkage verified.
+        type: boolean
     type: object
   auth.APIKeyResult:
     properties:
@@ -745,6 +777,11 @@ definitions:
   handlers.EmailMFACodeRequest:
     properties:
       code:
+        type: string
+    type: object
+  handlers.EraseUserAuditRequest:
+    properties:
+      user_id:
         type: string
     type: object
   handlers.ForgotPasswordRequest:
@@ -2063,6 +2100,72 @@ paths:
       summary: Tenant audit log
       tags:
       - admin-audit
+  /api/v1/audit-logs/{id}:
+    get:
+      description: Returns the full detail of a single audit event (all metadata expanded),
+        scoped to the caller's tenant. Requires admin:access.
+      parameters:
+      - description: Audit log ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.LogEntry'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Tenant audit log detail
+      tags:
+      - admin-audit
+  /api/v1/audit-logs/erase-user:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Target user id
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.EraseUserAuditRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Erase a user's PII from the audit trail (GDPR)
+      tags:
+      - admin-audit
+  /api/v1/audit-logs/export:
+    get:
+      produces:
+      - text/csv
+      responses:
+        "200":
+          description: CSV
+          schema:
+            type: string
+      security:
+      - BearerAuth: []
+      summary: Export audit logs (CSV)
+      tags:
+      - admin-audit
   /api/v1/audit-logs/system:
     get:
       description: Returns paginated audit events across ALL tenants. Requires tenant:manage
@@ -2102,6 +2205,55 @@ paths:
       security:
       - BearerAuth: []
       summary: System-wide audit log
+      tags:
+      - admin-audit
+  /api/v1/audit-logs/system/{id}:
+    get:
+      description: Returns the full detail of a single audit event across ALL tenants.
+        Requires tenant:manage.
+      parameters:
+      - description: Audit log ID
+        in: path
+        name: id
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.LogEntry'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: System-wide audit log detail
+      tags:
+      - admin-audit
+  /api/v1/audit-logs/verify:
+    get:
+      description: Recomputes the tamper-evidence hash chain over recent rows and
+        reports whether any row was altered, deleted, or reordered. Requires tenant:manage.
+      parameters:
+      - description: Max recent rows to verify (default 10000)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/audit.VerifyResult'
+      security:
+      - BearerAuth: []
+      summary: Verify audit trail integrity
       tags:
       - admin-audit
   /api/v1/auth/apps/login:
@@ -3052,8 +3204,11 @@ paths:
     post:
       consumes:
       - application/json
-      description: Issues a new access + refresh token pair and immediately invalidates
-        the old refresh token.
+      description: |-
+        Issues a new access + refresh token pair and immediately invalidates the old refresh token.
+        Body-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:
+        409 (`concurrent_refresh`) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.
+        503 means the session store (Redis) is temporarily unavailable — the client should retry.
       parameters:
       - description: Refresh token
         in: body
@@ -3076,6 +3231,19 @@ paths:
             type: object
         "401":
           description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: concurrent_refresh — sibling request already rotated the family;
+            no token pair returned
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: session store unavailable — retry
           schema:
             additionalProperties:
               type: string
@@ -3216,7 +3384,9 @@ paths:
       - auth-session
   /api/v1/auth/session/refresh:
     post:
-      description: Rotates the access and refresh tokens using the refresh cookie.
+      description: |-
+        Rotates the access and refresh tokens using the refresh cookie.
+        409 (`concurrent_refresh`) signals a sibling request already rotated the family within the grace window (the fresh cookies are on that sibling's response); 503 signals the session store (Redis) is temporarily unavailable — retry.
       produces:
       - application/json
       responses:
@@ -3228,6 +3398,18 @@ paths:
             type: object
         "401":
           description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: concurrent_refresh — sibling request already rotated the family
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: session store unavailable — retry
           schema:
             additionalProperties:
               type: string
