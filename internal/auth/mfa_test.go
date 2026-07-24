@@ -21,19 +21,24 @@ import (
 // captureMailer records MFA code emails instead of sending them, so tests can
 // read the plaintext codes and assert which sender was resolved.
 type captureMailer struct {
-	mu      sync.Mutex
-	sent    []mailer.MFACodeEmail
-	links   []mailer.MagicLinkEmail
-	senders []*mailer.SMTPConfig // parallel to sends; nil = global sender
+	mu            sync.Mutex
+	sent          []mailer.MFACodeEmail
+	links         []mailer.MagicLinkEmail
+	resets        []mailer.ResetEmail
+	verifications []mailer.VerificationEmail
+	welcomes      []mailer.WelcomeEmail
+	senders       []*mailer.SMTPConfig // parallel to sends; nil = global sender
 }
 
-func (m *captureMailer) SendReset(ctx context.Context, e mailer.ResetEmail) error { return nil }
-
-func (m *captureMailer) SendMFACode(ctx context.Context, e mailer.MFACodeEmail) error {
-	return m.SendMFACodeFrom(ctx, nil, e)
+func (m *captureMailer) SendReset(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.ResetEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resets = append(m.resets, e)
+	m.senders = append(m.senders, sender)
+	return nil
 }
 
-func (m *captureMailer) SendMFACodeFrom(ctx context.Context, sender *mailer.SMTPConfig, e mailer.MFACodeEmail) error {
+func (m *captureMailer) SendMFACode(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.MFACodeEmail) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.sent = append(m.sent, e)
@@ -41,10 +46,40 @@ func (m *captureMailer) SendMFACodeFrom(ctx context.Context, sender *mailer.SMTP
 	return nil
 }
 
-func (m *captureMailer) SendMagicLink(ctx context.Context, sender *mailer.SMTPConfig, e mailer.MagicLinkEmail) error {
+func (m *captureMailer) SendMagicLink(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.MagicLinkEmail) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.links = append(m.links, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendVerification(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.VerificationEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.verifications = append(m.verifications, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendWelcome(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.WelcomeEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.welcomes = append(m.welcomes, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendPasswordChanged(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.PasswordChangedEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendTest(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, _ mailer.TemplateType, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.senders = append(m.senders, sender)
 	return nil
 }

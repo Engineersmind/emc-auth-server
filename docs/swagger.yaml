@@ -513,17 +513,29 @@ definitions:
         type: string
       from_address:
         type: string
+      from_name:
+        type: string
       has_password:
         type: boolean
       is_active:
         type: boolean
+      logo_url:
+        type: string
+      product_name:
+        type: string
+      reply_to:
+        type: string
       smtp_host:
         type: string
       smtp_port:
         type: integer
       smtp_username:
         type: string
+      subject_prefix:
+        type: string
       tenant_id:
+        type: string
+      tls_mode:
         type: string
       updated_at:
         type: string
@@ -972,8 +984,17 @@ definitions:
     properties:
       from_address:
         type: string
+      from_name:
+        description: Branding (all optional).
+        type: string
       is_active:
         type: boolean
+      logo_url:
+        type: string
+      product_name:
+        type: string
+      reply_to:
+        type: string
       smtp_host:
         type: string
       smtp_password:
@@ -981,6 +1002,12 @@ definitions:
       smtp_port:
         type: integer
       smtp_username:
+        type: string
+      subject_prefix:
+        type: string
+      tls_mode:
+        description: 'TLSMode: "ssl" | "starttls" | "opportunistic" | "none" (empty
+          = derive from port).'
         type: string
     type: object
   handlers.UpsertProviderConfigRequest:

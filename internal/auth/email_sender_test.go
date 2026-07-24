@@ -100,6 +100,46 @@ func TestEmailSender_PriorityResolution(t *testing.T) {
 	}
 }
 
+// TestEmailSender_BrandingRoundTrip proves the branding + TLS fields persist
+// through Upsert and come back on both Get and Resolve.
+func TestEmailSender_BrandingRoundTrip(t *testing.T) {
+	f := newMFAFixture(t)
+
+	if _, err := f.senderSvc.Upsert(f.ctx, f.tenantID, nil, auth.UpsertSenderInput{
+		FromAddress:   "no-reply@acme.com",
+		SMTPHost:      "smtp.acme.com",
+		SMTPPort:      465,
+		TLSMode:       "ssl",
+		FromName:      "Acme Security",
+		ReplyTo:       "support@acme.com",
+		ProductName:   "Acme Cloud",
+		LogoURL:       "https://acme.com/logo.png",
+		SubjectPrefix: "[Acme]",
+	}, nil); err != nil {
+		t.Fatalf("Upsert(branding): %v", err)
+	}
+
+	got, err := f.senderSvc.Get(f.ctx, f.tenantID, nil)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.FromName != "Acme Security" || got.ReplyTo != "support@acme.com" ||
+		got.ProductName != "Acme Cloud" || got.LogoURL != "https://acme.com/logo.png" ||
+		got.SubjectPrefix != "[Acme]" || got.TLSMode != "ssl" {
+		t.Errorf("Get branding = %+v, want the values just set", got)
+	}
+
+	sender, err := f.senderSvc.Resolve(f.ctx, f.tenantID, nil)
+	if err != nil || sender == nil {
+		t.Fatalf("Resolve: %+v, %v", sender, err)
+	}
+	if sender.FromName != "Acme Security" || sender.ReplyTo != "support@acme.com" ||
+		sender.ProductName != "Acme Cloud" || sender.LogoURL != "https://acme.com/logo.png" ||
+		sender.SubjectPrefix != "[Acme]" || sender.TLSMode != "ssl" {
+		t.Errorf("Resolve branding = %+v, want the values just set", sender)
+	}
+}
+
 // TestEmailMFA_CodesUseResolvedSender proves MFA code emails actually go out
 // via the priority-resolved sender.
 func TestEmailMFA_CodesUseResolvedSender(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"net/mail"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -16,6 +17,7 @@ import (
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
 // AdminHandler holds handlers for all Admin API endpoints.
@@ -25,6 +27,8 @@ type AdminHandler struct {
 	appSvc      *auth.ApplicationService
 	totpSvc     *auth.TOTPService
 	senderSvc   *auth.EmailSenderService
+	tmplSvc     *auth.EmailTemplateService
+	mailer      mailer.Mailer
 	corsSvc     *mw.TenantCORSService
 	audit       *audit.Logger
 	logger      zerolog.Logger
@@ -62,6 +66,18 @@ func (h *AdminHandler) WithTOTP(svc *auth.TOTPService) *AdminHandler {
 // WithEmailSenders attaches the EmailSenderService for white-label sender handlers.
 func (h *AdminHandler) WithEmailSenders(svc *auth.EmailSenderService) *AdminHandler {
 	h.senderSvc = svc
+	return h
+}
+
+// WithEmailTemplates attaches the EmailTemplateService for template handlers.
+func (h *AdminHandler) WithEmailTemplates(svc *auth.EmailTemplateService) *AdminHandler {
+	h.tmplSvc = svc
+	return h
+}
+
+// WithMailer attaches the Mailer used to send test emails.
+func (h *AdminHandler) WithMailer(m mailer.Mailer) *AdminHandler {
+	h.mailer = m
 	return h
 }
 
@@ -2802,12 +2818,25 @@ func (h *AdminHandler) ResetUserMFA(c echo.Context) error {
 // UpsertEmailSenderRequest is the body for PUT .../email-settings.
 // SMTPPassword empty on update keeps the stored password.
 type UpsertEmailSenderRequest struct {
+	// Provider: "smtp" (default) or "sendgrid".
+	Provider     string `json:"provider"`
 	FromAddress  string `json:"from_address"`
 	SMTPHost     string `json:"smtp_host"`
 	SMTPPort     int    `json:"smtp_port"`
 	SMTPUsername string `json:"smtp_username"`
 	SMTPPassword string `json:"smtp_password"`
-	IsActive     *bool  `json:"is_active"`
+	// APIKey is the SendGrid API key (provider="sendgrid"); write-only. Empty on
+	// update keeps the stored key. Response exposes only has_api_key.
+	APIKey string `json:"api_key"`
+	// TLSMode: "ssl" | "starttls" | "opportunistic" | "none" (empty = derive from port).
+	TLSMode string `json:"tls_mode"`
+	// Branding (all optional).
+	FromName      string `json:"from_name"`
+	ReplyTo       string `json:"reply_to"`
+	ProductName   string `json:"product_name"`
+	LogoURL       string `json:"logo_url"`
+	SubjectPrefix string `json:"subject_prefix"`
+	IsActive      *bool  `json:"is_active"`
 }
 
 // emailSenderScope resolves the tenant and optional application scope for the
@@ -2898,12 +2927,20 @@ func (h *AdminHandler) UpsertEmailSender(c echo.Context) error {
 	}
 
 	settings, err := h.senderSvc.Upsert(c.Request().Context(), tenantID, appRowID, auth.UpsertSenderInput{
-		FromAddress:  req.FromAddress,
-		SMTPHost:     req.SMTPHost,
-		SMTPPort:     req.SMTPPort,
-		SMTPUsername: req.SMTPUsername,
-		SMTPPassword: req.SMTPPassword,
-		IsActive:     req.IsActive,
+		Provider:      req.Provider,
+		FromAddress:   req.FromAddress,
+		SMTPHost:      req.SMTPHost,
+		SMTPPort:      req.SMTPPort,
+		SMTPUsername:  req.SMTPUsername,
+		SMTPPassword:  req.SMTPPassword,
+		APIKey:        req.APIKey,
+		TLSMode:       req.TLSMode,
+		FromName:      req.FromName,
+		ReplyTo:       req.ReplyTo,
+		ProductName:   req.ProductName,
+		LogoURL:       req.LogoURL,
+		SubjectPrefix: req.SubjectPrefix,
+		IsActive:      req.IsActive,
 	}, updatedBy)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidSender) {
@@ -2947,6 +2984,225 @@ func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
 	rt, rid := senderResource(tenantID, appRowID)
 	h.auditAdminApp(c, claims, audit.ActionAdminEmailSenderDeleted, rt, rid, appRowID)
 	return c.JSON(http.StatusOK, map[string]string{"message": "email sender removed — sends fall back to the next level"})
+}
+
+// SendTestEmailRequest is the body for POST .../email-settings/test. The
+// recipient is NOT accepted from the client — a test email is always sent to the
+// authenticated admin's own address, so this endpoint can never be abused as an
+// open relay to arbitrary addresses.
+type SendTestEmailRequest struct {
+	// TemplateType selects which template to render (empty = email_verification).
+	TemplateType string `json:"template_type"`
+}
+
+// SendTestEmail handles POST .../email-settings/test and flat aliases: it sends
+// a sample email through the sender resolved for this scope (application →
+// tenant → global), so an admin can verify the provider configuration works.
+// The email is always delivered to the requesting admin's own address.
+//
+// @Summary      Send a test email
+// @Description  Sends a sample email using the sender resolved for this scope (application → tenant → global) and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The recipient is always the requesting admin's own email — an arbitrary recipient cannot be supplied.
+// @Tags         admin-email-senders
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      SendTestEmailRequest  false  "Template type"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string
+// @Failure      502   {object}  map[string]string  "Delivery failed"
+// @Router       /api/v1/email-settings/test [post]
+func (h *AdminHandler) SendTestEmail(c echo.Context) error {
+	tenantID, appRowID, claims, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+
+	var req SendTestEmailRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	// Recipient is always the authenticated admin — never client-supplied — so
+	// this endpoint cannot be used to relay mail to arbitrary addresses.
+	to := ""
+	if claims != nil {
+		to = strings.TrimSpace(claims.Email)
+	}
+	if _, err := mail.ParseAddress(to); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "your account has no valid email address to send the test to"})
+	}
+
+	tt := mailer.TemplateType(req.TemplateType)
+	if req.TemplateType == "" {
+		tt = mailer.TemplateEmailVerification
+	} else if !mailer.ValidTemplateType(tt) {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown template type"})
+	}
+
+	// Resolve the effective sender + template override for this scope. A nil
+	// sender means the global server sender applies.
+	sender, err := h.senderSvc.Resolve(c.Request().Context(), tenantID, appRowID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: resolve sender for test email failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to resolve email sender"})
+	}
+	tmpl := h.tmplSvc.ResolveTemplate(c.Request().Context(), tenantID, appRowID, tt)
+
+	if err := h.mailer.SendTest(c.Request().Context(), sender, tmpl, tt, to); err != nil {
+		h.logger.Error().Err(err).Str("to", to).Msg("admin: test email send failed")
+		return c.JSON(http.StatusBadGateway, map[string]string{"error": "failed to send test email: " + err.Error()})
+	}
+
+	rt, rid := senderResource(tenantID, appRowID)
+	h.auditAdminApp(c, claims, audit.ActionAdminEmailTestSent, rt, rid, appRowID)
+	return c.JSON(http.StatusOK, map[string]string{"message": "test email sent to " + to})
+}
+
+// ---------------------------------------------------------------------------
+// Per-scope email templates. Resolution mirrors senders (application → tenant →
+// built-in default). Guarded by the same apps:read / apps:write route guards, so
+// only a tenant owner or a super_admin may read/write them.
+// ---------------------------------------------------------------------------
+
+// UpsertEmailTemplateRequest is the body for PUT .../email-templates/:type.
+type UpsertEmailTemplateRequest struct {
+	Subject  string `json:"subject"`
+	HTMLBody string `json:"html_body"`
+	TextBody string `json:"text_body"`
+	IsActive *bool  `json:"is_active"`
+}
+
+// ListEmailTemplates handles GET .../email-templates: every template type with
+// its stored override if present, otherwise the built-in default.
+//
+// @Summary      List email templates
+// @Description  Returns every customizable email template at this scope. Rows with is_default=true are the built-in defaults (no override stored).
+// @Tags         admin-email-templates
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {array}   auth.EmailTemplate
+// @Router       /api/v1/email-templates [get]
+func (h *AdminHandler) ListEmailTemplates(c echo.Context) error {
+	tenantID, appRowID, _, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+	list, err := h.tmplSvc.List(c.Request().Context(), tenantID, appRowID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: list email templates failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list email templates"})
+	}
+	return c.JSON(http.StatusOK, list)
+}
+
+// GetEmailTemplate handles GET .../email-templates/:type.
+//
+// @Summary      Get one email template
+// @Description  Returns the stored template for a type, or the built-in default (is_default=true) when none is configured.
+// @Tags         admin-email-templates
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  auth.EmailTemplate
+// @Failure      400  {object}  map[string]string  "Unknown template type"
+// @Router       /api/v1/email-templates/{type} [get]
+func (h *AdminHandler) GetEmailTemplate(c echo.Context) error {
+	tenantID, appRowID, _, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+	tt := mailer.TemplateType(c.Param("type"))
+	tmpl, err := h.tmplSvc.Get(c.Request().Context(), tenantID, appRowID, tt)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidTemplateType) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: get email template failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get email template"})
+	}
+	return c.JSON(http.StatusOK, tmpl)
+}
+
+// UpsertEmailTemplate handles PUT .../email-templates/:type.
+//
+// @Summary      Set an email template
+// @Description  Creates or updates the template for a type at this scope. subject/html_body/text_body are Go-template source with variables like {{.Link}}, {{.Code}}, {{.ProductName}}, {{.AppName}}, {{.TTLMinutes}}. Invalid template syntax is rejected.
+// @Tags         admin-email-templates
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        body  body      UpsertEmailTemplateRequest  true  "Template content"
+// @Success      200   {object}  auth.EmailTemplate
+// @Failure      400   {object}  map[string]string
+// @Router       /api/v1/email-templates/{type} [put]
+func (h *AdminHandler) UpsertEmailTemplate(c echo.Context) error {
+	tenantID, appRowID, claims, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+	tt := mailer.TemplateType(c.Param("type"))
+	var req UpsertEmailTemplateRequest
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+
+	var updatedBy *int64
+	if claims != nil {
+		if uid, perr := strconv.ParseInt(claims.UserID, 10, 64); perr == nil {
+			updatedBy = &uid
+		}
+	}
+
+	tmpl, err := h.tmplSvc.Upsert(c.Request().Context(), tenantID, appRowID, tt, auth.UpsertTemplateInput{
+		Subject:  req.Subject,
+		HTMLBody: req.HTMLBody,
+		TextBody: req.TextBody,
+		IsActive: req.IsActive,
+	}, updatedBy)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidTemplateType) || errors.Is(err, auth.ErrInvalidTemplate) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: upsert email template failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save email template"})
+	}
+
+	rt, rid := senderResource(tenantID, appRowID)
+	h.auditAdmin(c, claims, audit.ActionAdminEmailTemplateUpdated, rt, rid)
+	return c.JSON(http.StatusOK, tmpl)
+}
+
+// DeleteEmailTemplate handles DELETE .../email-templates/:type, reverting the
+// scope to the built-in default (or the next level up).
+//
+// @Summary      Delete an email template
+// @Description  Removes the template override at this scope; sends revert to the next level (application → tenant → built-in default).
+// @Tags         admin-email-templates
+// @Produce      json
+// @Security     BearerAuth
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string  "No override configured at this scope"
+// @Router       /api/v1/email-templates/{type} [delete]
+func (h *AdminHandler) DeleteEmailTemplate(c echo.Context) error {
+	tenantID, appRowID, claims, ok := h.emailSenderScope(c)
+	if !ok {
+		return nil
+	}
+	tt := mailer.TemplateType(c.Param("type"))
+	if err := h.tmplSvc.Delete(c.Request().Context(), tenantID, appRowID, tt); err != nil {
+		if errors.Is(err, auth.ErrInvalidTemplateType) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		if errors.Is(err, auth.ErrTemplateNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "no template override configured at this scope"})
+		}
+		h.logger.Error().Err(err).Msg("admin: delete email template failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete email template"})
+	}
+
+	rt, rid := senderResource(tenantID, appRowID)
+	h.auditAdmin(c, claims, audit.ActionAdminEmailTemplateDeleted, rt, rid)
+	return c.JSON(http.StatusOK, map[string]string{"message": "email template removed — reverts to the next level"})
 }
 
 // TenantGetStats handles GET /api/v1/tenants/:tid/stats.

@@ -71,10 +71,13 @@ services:
       SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
       GLOBAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090,https://emc-auth.senie.ai"
       # ── Email ──────────────────────────────────────────────────────────────
-      # Values interpolate from the repo .env (SMTP_HOST, SMTP_USERNAME, ...).
-      # If .env sets a real provider (e.g. smtp.gmail.com) that is used; with no
-      # overrides these fall back to the Mailpit catcher (http://localhost:8025).
+      # Values interpolate from the repo .env. Leave EMAIL_PROVIDER empty for
+      # local dev so it infers SMTP → the Mailpit catcher (http://localhost:8025).
+      # Set EMAIL_PROVIDER=sendgrid + SENDGRID_API_KEY in .env to send for real.
       # Secrets stay in .env — never hardcoded here.
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-}
       SMTP_HOST: ${SMTP_HOST:-mailpit}
       SMTP_PORT: "${SMTP_PORT:-1025}"
       SMTP_USERNAME: ${SMTP_USERNAME:-}

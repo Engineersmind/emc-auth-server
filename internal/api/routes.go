@@ -53,7 +53,13 @@ type RoutesConfig struct {
 	// OAuthClientSecretEncryptionKeyPrevious is the old key accepted for
 	// decryption during rotation (empty when no rotation is in progress).
 	OAuthClientSecretEncryptionKeyPrevious string
-	// SMTP fields for mailer (used in production; dev logs to console).
+	// EmailProvider selects the global transport ("sendgrid"|"smtp"; empty = inferred).
+	EmailProvider string
+	// SendGridAPIKey is the global SendGrid API key (provider="sendgrid").
+	SendGridAPIKey string
+	// EmailFromName is the optional display name on the global From header.
+	EmailFromName string
+	// SMTP fields for the global SMTP provider (dev logs to console when nothing set).
 	SMTPHost     string
 	SMTPPort     int
 	SMTPFrom     string
@@ -223,27 +229,44 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	agentSvc := auth.NewAgentService(deps.Pool, deps.Logger)
 	agentHandler := handlers.NewAgentHandler(agentSvc, jwtSvc, deps.Logger)
 
-	// Mailer: dev (console log) or SMTP based on Env
+	// Mailer: global provider is SendGrid (Web API) when SENDGRID_API_KEY is set,
+	// else SMTP when SMTP_HOST is set, else a console log-only dev mailer.
 	m := mailer.NewMailer(mailer.MailerConfig{
-		Env:          deps.Config.Env,
-		SMTPHost:     deps.Config.SMTPHost,
-		SMTPPort:     deps.Config.SMTPPort,
-		SMTPFrom:     deps.Config.SMTPFrom,
-		SMTPUsername: deps.Config.SMTPUsername,
-		SMTPPassword: deps.Config.SMTPPassword,
-		SMTPTLS:      deps.Config.SMTPTLS,
-		Logger:       deps.Logger,
+		Env:            deps.Config.Env,
+		Provider:       deps.Config.EmailProvider,
+		SMTPHost:       deps.Config.SMTPHost,
+		SMTPPort:       deps.Config.SMTPPort,
+		SMTPUsername:   deps.Config.SMTPUsername,
+		SMTPPassword:   deps.Config.SMTPPassword,
+		SMTPTLS:        deps.Config.SMTPTLS,
+		SendGridAPIKey: deps.Config.SendGridAPIKey,
+		EmailFrom:      deps.Config.SMTPFrom,
+		FromName:       deps.Config.EmailFromName,
+		Logger:         deps.Logger,
 	})
 	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger)
 
-	// White-label email senders (issue #63 follow-on) — MFA code emails
-	// resolve their sender application → tenant → global (SMTP_FROM).
+	// White-label email senders (issue #63 follow-on) — transactional emails
+	// resolve their sender application → tenant → global. Providers: SMTP or SendGrid.
 	senderSvc := auth.NewEmailSenderService(deps.Pool, totpSvc.EncryptionKey(), deps.Logger)
+
+	// Per-scope email templates (Auth0-style) — application → tenant → built-in.
+	tmplSvc := auth.NewEmailTemplateService(deps.Pool, deps.Logger)
+
+	resetSvc.WithSenders(senderSvc).WithTemplates(tmplSvc) // reset uses tenant sender + template
+
+	// Email verification (register → verify link → welcome). Reuses the sender +
+	// template resolvers so verification/welcome mail is branded per scope too.
+	verifSvc := auth.NewVerificationService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
+		WithSenders(senderSvc).
+		WithTemplates(tmplSvc)
+	authSvc.WithVerification(verifSvc)
 
 	// Email MFA service (issue #63) — email one-time codes as a second factor,
 	// per-application opt-in via application_mfa_settings.allowed_methods.
 	emailMFASvc := auth.NewEmailMFAService(deps.Pool, deps.Redis, m, deps.Logger).
-		WithSenders(senderSvc)
+		WithSenders(senderSvc).
+		WithTemplates(tmplSvc)
 	authSvc.WithEmailMFA(emailMFASvc)
 
 	// Audit logger — shared by both auth and admin handlers. Prefer the
@@ -253,6 +276,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	if auditLog == nil {
 		auditLog = audit.New(deps.Pool, deps.Logger)
 	}
+
+	// Wire the audit logger into the send services so a template-disabled
+	// suppression is recorded (auth.email_suppressed), giving operators a trail
+	// when an email is intentionally not sent.
+	resetSvc.WithAudit(auditLog)
+	verifSvc.WithAudit(auditLog)
+	emailMFASvc.WithAudit(auditLog)
 
 	// Capture the real response status + (redacted) body and attach them to each
 	// request's audit events. Registered here (after auditLog exists) so it wraps
@@ -265,6 +295,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
 		WithTOTP(totpSvc).
 		WithEmailMFA(emailMFASvc).
+		WithVerification(verifSvc).
 		WithAPIKeys(apiKeySvc).
 		WithApplications(appSvc).
 		WithCookieConfig(cookieCfg).
@@ -287,6 +318,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithApplications(appSvc).
 		WithTOTP(totpSvc).
 		WithEmailSenders(senderSvc).
+		WithEmailTemplates(tmplSvc).
+		WithMailer(m).
 		WithCORS(corsSvc)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
@@ -343,8 +376,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, mw.OTPRateLimiter(rlCfg)) // forced enrollment: first code → tokens
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
-	authGroup.POST("/forgot-password", authHandler.ForgotPassword)
+	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
+
+	// Email verification — link is clicked (GET) from the email; resend is
+	// rate-limited and enumeration-safe (tenant via X-Tenant-Slug).
+	authGroup.GET("/verify-email", authHandler.VerifyEmail)
+	authGroup.POST("/resend-verification", authHandler.ResendVerification, mw.TokenRateLimiter(rlCfg))
 
 	// Management token — exchange an API key for a short-lived admin JWT.
 	// Equivalent to Auth0 client_credentials grant for the Management API.
@@ -516,9 +554,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/tenants/:tid/email-settings", adminHandler.GetEmailSender, tidAppsRead)
 	adminGroup.PUT("/tenants/:tid/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
+	adminGroup.POST("/tenants/:tid/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.GET("/tenants/:tid/applications/:appID/email-settings", adminHandler.GetEmailSender, tidAppsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+
+	// Per-scope email templates (Auth0-style) — same guards as senders.
+	adminGroup.GET("/tenants/:tid/email-templates", adminHandler.ListEmailTemplates, tidAppsRead)
+	adminGroup.GET("/tenants/:tid/email-templates/:type", adminHandler.GetEmailTemplate, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/email-templates/:type", adminHandler.UpsertEmailTemplate, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/email-templates/:type", adminHandler.DeleteEmailTemplate, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates", adminHandler.ListEmailTemplates, tidAppsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.GetEmailTemplate, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.UpsertEmailTemplate, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.DeleteEmailTemplate, tidAppsWrite)
 
 	// End-user application users under the canonical family — each
 	// application manages its own isolated user base.
@@ -641,9 +691,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/email-settings", adminHandler.GetEmailSender, appsRead)
 	adminGroup.PUT("/email-settings", adminHandler.UpsertEmailSender, appsWrite)
 	adminGroup.DELETE("/email-settings", adminHandler.DeleteEmailSender, appsWrite)
+	adminGroup.POST("/email-settings/test", adminHandler.SendTestEmail, appsWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.GET("/applications/:appID/email-settings", adminHandler.GetEmailSender, appsRead)
 	adminGroup.PUT("/applications/:appID/email-settings", adminHandler.UpsertEmailSender, appsWrite)
 	adminGroup.DELETE("/applications/:appID/email-settings", adminHandler.DeleteEmailSender, appsWrite)
+	adminGroup.POST("/applications/:appID/email-settings/test", adminHandler.SendTestEmail, appsWrite, mw.TokenRateLimiter(rlCfg))
+
+	// Flat email-template aliases (tenant from JWT).
+	adminGroup.GET("/email-templates", adminHandler.ListEmailTemplates, appsRead)
+	adminGroup.GET("/email-templates/:type", adminHandler.GetEmailTemplate, appsRead)
+	adminGroup.PUT("/email-templates/:type", adminHandler.UpsertEmailTemplate, appsWrite)
+	adminGroup.DELETE("/email-templates/:type", adminHandler.DeleteEmailTemplate, appsWrite)
+	adminGroup.GET("/applications/:appID/email-templates", adminHandler.ListEmailTemplates, appsRead)
+	adminGroup.GET("/applications/:appID/email-templates/:type", adminHandler.GetEmailTemplate, appsRead)
+	adminGroup.PUT("/applications/:appID/email-templates/:type", adminHandler.UpsertEmailTemplate, appsWrite)
+	adminGroup.DELETE("/applications/:appID/email-templates/:type", adminHandler.DeleteEmailTemplate, appsWrite)
 
 	// End-user application users — each application manages its own isolated
 	// user base (flat aliases of the canonical /tenants/:tid variants).
