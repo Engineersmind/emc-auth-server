@@ -192,6 +192,7 @@ func (t *sendGridTransport) send(ctx context.Context, m outMessage) error {
 	if client == nil {
 		client = &http.Client{Timeout: smtpSendTimeout}
 	}
+	//nolint:gosec // G704: endpoint is the fixed SendGrid API URL constant (only overridden in tests), never user input.
 	resp, err := client.Do(req)
 	if err != nil {
 		t.logger.Error().Err(err).Str("to", m.To).Msg("sendgrid send failed")
