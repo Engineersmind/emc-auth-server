@@ -32,7 +32,7 @@ func NewOAuthHandler(svc *auth.OAuthLoginService, idpSvc *auth.IdentityProviderS
 // @Summary      Start social login
 // @Description  Validates the application and redirect target, then redirects the browser to the provider's consent screen (Authorization Code + PKCE).
 // @Tags         oauth
-// @Param        provider   path   string  true   "Provider (google)"
+// @Param        provider   path   string  true   "Provider (google, github)"
 // @Param        client_id  query  string  true   "Application client_id"
 // @Param        redirect   query  string  false  "Post-login redirect target (must be in the application's allow-list; optional when the list has exactly one entry)"
 // @Success      302  "Redirect to provider"
@@ -68,7 +68,7 @@ func (h *OAuthHandler) Login(c echo.Context) error {
 // @Summary      Social login callback
 // @Description  Consumes the single-use state, exchanges the code (PKCE), verifies the provider ID token, resolves/links/provisions the user, and redirects back to the application with a one-time login_code.
 // @Tags         oauth
-// @Param        provider  path   string  true   "Provider (google)"
+// @Param        provider  path   string  true   "Provider (google, github)"
 // @Param        code      query  string  false  "Authorization code from the provider"
 // @Param        state     query  string  true   "Opaque state issued at login start"
 // @Param        error     query  string  false  "Provider error (e.g. access_denied)"
@@ -115,13 +115,15 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 		return c.Redirect(http.StatusFound, auth.AppendLoginError(st.Redirect, code))
 	}
 
-	metrics.SocialLogin.WithLabelValues("google", "success").Inc()
+	// st.Provider is validated server-stored state, safe to label audit
+	// actions with (auth.google_login, auth.github_login, ...).
+	metrics.SocialLogin.WithLabelValues(st.Provider, "success").Inc()
 	h.auditEvent(c, audit.Event{
 		TenantID:     &result.TenantID,
 		UserID:       &result.UserID,
 		ActorEmail:   result.Email,
-		Action:       audit.ActionAuthGoogleLogin,
-		AuthMethod:   audit.AuthMethodGoogle,
+		Action:       audit.SocialLoginAction(st.Provider),
+		AuthMethod:   audit.SocialAuthMethod(st.Provider),
 		ResourceType: "user",
 		ResourceID:   strconv.FormatInt(result.UserID, 10),
 		IPAddress:    c.RealIP(),
@@ -132,7 +134,7 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 			TenantID:     &result.TenantID,
 			UserID:       &result.UserID,
 			ActorEmail:   result.Email,
-			Action:       audit.ActionAuthGoogleLinked,
+			Action:       audit.SocialLinkedAction(st.Provider),
 			ResourceType: "user",
 			ResourceID:   strconv.FormatInt(result.UserID, 10),
 			IPAddress:    c.RealIP(),
@@ -146,9 +148,16 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 // auditLoginFailed writes the failure audit event. st may be nil when the
 // state itself was invalid (no tenant context is known in that case).
 func (h *OAuthHandler) auditLoginFailed(c echo.Context, st *auth.OAuthState, reason string) {
+	// The :provider path segment is raw request input — only a validated
+	// provider name may label the audit action; anything else gets the
+	// generic "oauth" label.
+	provider := c.Param("provider")
+	if !auth.IsSupportedProvider(provider) {
+		provider = "oauth"
+	}
 	e := audit.Event{
-		Action:       audit.ActionAuthGoogleLoginFailed,
-		AuthMethod:   audit.AuthMethodGoogle,
+		Action:       audit.SocialLoginFailedAction(provider),
+		AuthMethod:   audit.SocialAuthMethod(provider),
 		ResourceType: "user",
 		ResourceID:   reason,
 		IPAddress:    c.RealIP(),
@@ -158,7 +167,7 @@ func (h *OAuthHandler) auditLoginFailed(c echo.Context, st *auth.OAuthState, rea
 	if st != nil {
 		e.TenantID = &st.TenantID
 	}
-	metrics.SocialLogin.WithLabelValues("google", "failure").Inc()
+	metrics.SocialLogin.WithLabelValues(provider, "failure").Inc()
 	h.auditEvent(c, e)
 }
 
@@ -280,7 +289,7 @@ func (h *OAuthHandler) ListUserIdentities(c echo.Context) error {
 // @Tags         oauth
 // @Security     BearerAuth
 // @Param        id        path  string  true  "User ID"
-// @Param        provider  path  string  true  "Provider (google)"
+// @Param        provider  path  string  true  "Provider (google, github)"
 // @Success      204  "Unlinked"
 // @Failure      404  {object}  map[string]string
 // @Failure      409  {object}  map[string]string
@@ -324,7 +333,7 @@ func (h *OAuthHandler) UnlinkUserIdentity(c echo.Context) error {
 // @Produce      json
 // @Security     BearerAuth
 // @Param        appID     path      string                       true  "Application ID"
-// @Param        provider  path      string                       true  "Provider (google)"
+// @Param        provider  path      string                       true  "Provider (google, github)"
 // @Param        body      body      UpsertProviderConfigRequest  true  "Provider config"
 // @Success      200       {object}  auth.ProviderConfigDetail
 // @Failure      400       {object}  map[string]string
@@ -403,7 +412,7 @@ func (h *OAuthHandler) ListProviderConfigs(c echo.Context) error {
 // @Tags         oauth
 // @Security     BearerAuth
 // @Param        appID     path  string  true  "Application ID"
-// @Param        provider  path  string  true  "Provider (google)"
+// @Param        provider  path  string  true  "Provider (google, github)"
 // @Success      204  "Deleted"
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/applications/{appID}/identity-providers/{provider} [delete]

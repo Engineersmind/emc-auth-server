@@ -923,6 +923,9 @@ type LogoutRequest struct {
 //
 // @Summary      Refresh token rotation
 // @Description  Issues a new access + refresh token pair and immediately invalidates the old refresh token.
+// @Description  Body-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:
+// @Description  409 (`concurrent_refresh`) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.
+// @Description  503 means the session store (Redis) is temporarily unavailable — the client should retry.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
@@ -930,6 +933,8 @@ type LogoutRequest struct {
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "concurrent_refresh — sibling request already rotated the family; no token pair returned"
+// @Failure      503   {object}  map[string]string  "session store unavailable — retry"
 // @Router       /api/v1/auth/refresh [post]
 func (h *AuthHandler) Refresh(c echo.Context) error {
 	var req RefreshRequest
@@ -2112,10 +2117,13 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 //
 // @Summary      Cookie session refresh
 // @Description  Rotates the access and refresh tokens using the refresh cookie.
+// @Description  409 (`concurrent_refresh`) signals a sibling request already rotated the family within the grace window (the fresh cookies are on that sibling's response); 503 signals the session store (Redis) is temporarily unavailable — retry.
 // @Tags         auth-session
 // @Produce      json
 // @Success      200  {object}  map[string]string
 // @Failure      401  {object}  map[string]string
+// @Failure      409  {object}  map[string]string  "concurrent_refresh — sibling request already rotated the family"
+// @Failure      503  {object}  map[string]string  "session store unavailable — retry"
 // @Router       /api/v1/auth/session/refresh [post]
 func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 	cookie, err := c.Cookie(mw.RefreshTokenCookie)

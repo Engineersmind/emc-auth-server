@@ -236,21 +236,39 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 			VALUES ($1, $2, $3, $4, $5)
 		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL), *sessionFamilyID)
 	} else {
-		// New login: insert with session_family_id=0, then immediately set it to
-		// the row's own id using a single CTE.  Both operations execute in one
-		// round-trip and one implicit transaction — no window where family_id=0
-		// can leak or be caught by a concurrent revokeFamily(0) sweep.
-		_, err = s.pool.Exec(ctx, `
-			WITH ins AS (
-				INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, session_family_id)
-				VALUES ($1, $2, $3, $4, 0)
-				RETURNING id
-			)
-			UPDATE refresh_tokens
-			SET    session_family_id = ins.id
-			FROM   ins
-			WHERE  refresh_tokens.id = ins.id
-		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL))
+		// New login: insert with session_family_id=0, then set it to the row's
+		// own id inside a transaction.
+		//
+		// A single-statement CTE (INSERT ... RETURNING id, then UPDATE ... FROM
+		// that CTE) cannot do this: per Postgres's documented WITH semantics,
+		// the outer UPDATE scans refresh_tokens against the snapshot taken
+		// before the CTE's own write, so it never sees the row the CTE just
+		// inserted into that same table — the join matches zero rows and
+		// session_family_id is silently left at 0 forever (verified directly
+		// against Postgres; this previously affected every fresh login/
+		// registration, not just a transient window). The explicit transaction
+		// here gives the same "no visible family_id=0 window" guarantee the
+		// CTE was meant to provide, without relying on same-statement
+		// visibility that Postgres doesn't offer.
+		var newID int64
+		var tx pgx.Tx
+		tx, err = s.pool.Begin(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("begin refresh token tx: %w", err)
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck
+
+		err = tx.QueryRow(ctx, `
+			INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, session_family_id)
+			VALUES ($1, $2, $3, $4, 0)
+			RETURNING id
+		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL)).Scan(&newID)
+		if err == nil {
+			_, err = tx.Exec(ctx, `UPDATE refresh_tokens SET session_family_id = $1 WHERE id = $1`, newID)
+		}
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("persist refresh token: %w", err)

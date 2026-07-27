@@ -326,7 +326,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
 	samlHandler := handlers.NewSAMLHandler(samlService, jwtSvc, deps.Logger)
 
-	// Social login (issue #64) — Google OAuth for app-scoped end users.
+	// Social login (issue #64 Google, issue #66 GitHub) — OAuth for app-scoped end users.
 	// The secret box fails hard in production/staging when the key is unset;
 	// in development it falls back to an insecure zero key with a warning.
 	secretBox, sbErr := auth.NewSecretBox(deps.Config.OAuthClientSecretEncryptionKey, deps.Config.Env, "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", deps.Logger)

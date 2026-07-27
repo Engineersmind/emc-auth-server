@@ -132,10 +132,15 @@ const (
 	ActionAdminEmailTemplateUpdated = "admin.email_template_updated"
 	ActionAdminEmailTemplateDeleted = "admin.email_template_deleted"
 
-	// Auth — social login (issue #64)
+	// Auth — social login (issue #64 Google, issue #66 GitHub). These
+	// constants document the emitted action values; handlers derive them per
+	// provider via SocialLoginAction and friends.
 	ActionAuthGoogleLogin       = "auth.google_login"
 	ActionAuthGoogleLoginFailed = "auth.google_login_failed"
 	ActionAuthGoogleLinked      = "auth.google_account_linked"
+	ActionAuthGitHubLogin       = "auth.github_login"
+	ActionAuthGitHubLoginFailed = "auth.github_login_failed"
+	ActionAuthGitHubLinked      = "auth.github_account_linked"
 
 	// Admin — identity provider (social login) configuration
 	ActionAdminIdPConfigUpdated = "admin.identity_provider_updated"
@@ -161,6 +166,7 @@ const (
 const (
 	AuthMethodPassword          = "password"
 	AuthMethodGoogle            = "google-oauth2"
+	AuthMethodGitHub            = "github"
 	AuthMethodMagicLink         = "magic_link"
 	AuthMethodTOTP              = "totp"
 	AuthMethodEmailOTP          = "email_otp"
@@ -171,6 +177,37 @@ const (
 	AuthMethodAPIKey            = "api_key"
 	AuthMethodAgent             = "agent"
 )
+
+// SocialLoginAction returns the audit action for a successful social login
+// with the given provider (e.g. "auth.google_login", "auth.github_login").
+// Callers must pass a validated provider name — never raw request input.
+func SocialLoginAction(provider string) string {
+	return "auth." + provider + "_login"
+}
+
+// SocialLoginFailedAction returns the audit action for a failed social login.
+func SocialLoginFailedAction(provider string) string {
+	return "auth." + provider + "_login_failed"
+}
+
+// SocialLinkedAction returns the audit action for a social identity being
+// auto-linked to an existing local account.
+func SocialLinkedAction(provider string) string {
+	return "auth." + provider + "_account_linked"
+}
+
+// SocialAuthMethod maps a validated social provider name to its AuthMethod*
+// constant for the audit_logs.auth_method column.
+func SocialAuthMethod(provider string) string {
+	switch provider {
+	case "google":
+		return AuthMethodGoogle
+	case "github":
+		return AuthMethodGitHub
+	default:
+		return provider
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Event — input to Logger.Log()
@@ -247,7 +284,7 @@ type LogEntry struct {
 	Status          string          `json:"status"`
 	HTTPStatus      *int            `json:"http_status,omitempty"`
 	RequestID       string          `json:"request_id,omitempty"`
-	Metadata        json.RawMessage `json:"metadata,omitempty"`
+	Metadata        json.RawMessage `json:"metadata,omitempty" swaggertype:"object"`
 	CreatedAt       time.Time       `json:"created_at"`
 }
 
