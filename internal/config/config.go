@@ -84,6 +84,13 @@ type Config struct {
 	// Comma-separated via UNTRUSTED_IP_CIDRS; empty disables the check.
 	UntrustedIPCIDRs []string
 
+	// BreachDetectionEnabled turns on breached-password warnings, which check
+	// each accepted password against the Have I Been Pwned corpus via the
+	// k-anonymous range API (only a 5-character hash prefix leaves the server —
+	// see internal/security/breach). Off by default because it makes an outbound
+	// call to a third party; set BREACH_DETECTION_ENABLED=true to enable.
+	BreachDetectionEnabled bool
+
 	// AuditCaptureResponseBody controls whether the (redacted) HTTP response
 	// body is stored on audit rows. Values: "off" | "failures" | "all".
 	// Default "failures" — failure bodies are just error envelopes (no PII),
@@ -137,6 +144,7 @@ func Load() *Config {
 		GlobalCORSOrigins:                      getEnvList("GLOBAL_CORS_ORIGINS", ""),
 		GeoIPDatabasePath:                      getEnv("GEOIP_DATABASE_PATH", ""),
 		UntrustedIPCIDRs:                       getEnvList("UNTRUSTED_IP_CIDRS", ""),
+		BreachDetectionEnabled:                 getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
 		AuditCaptureResponseBody:               getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
 		AuditRetentionDays:                     mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
 		AuditSIEMWebhookURL:                    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),

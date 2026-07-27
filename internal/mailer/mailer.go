@@ -78,6 +78,9 @@ type ResetEmail struct {
 	To         string
 	ResetLink  string
 	TenantSlug string
+	// TTLMinutes is the link's validity window as stated in the body. Zero falls
+	// back to defaultResetTTLMinutes so an unset value never renders "0 minutes".
+	TTLMinutes int
 }
 
 // MFACodeEmail is a one-time MFA code email.
@@ -116,6 +119,44 @@ type PasswordChangedEmail struct {
 	To string
 }
 
+// InvitationEmail invites a user to claim an admin-created account.
+type InvitationEmail struct {
+	To          string
+	Link        string
+	AppName     string
+	InviterName string
+	Name        string
+	TTLMinutes  int
+}
+
+// ChangeEmailEmail confirms ownership of a new address during an email change.
+// It is always delivered to the NEW address — the pending one being proven.
+type ChangeEmailEmail struct {
+	To         string
+	Link       string
+	AppName    string
+	TTLMinutes int
+}
+
+// BlockedAccountEmail alerts a user that their account was blocked or that a
+// high-risk sign-in was seen. Link is either a single-use unblock link (an
+// automatic block the user may lift themselves) or a password-reset link (an
+// admin block / risk alert, which the user must not be able to undo).
+type BlockedAccountEmail struct {
+	To         string
+	Link       string
+	AppName    string
+	Reason     string
+	TTLMinutes int
+}
+
+// PasswordBreachEmail warns that the user's password appears in a known breach.
+type PasswordBreachEmail struct {
+	To      string
+	Link    string
+	AppName string
+}
+
 // Mailer sends transactional emails. Each method takes an optional per-scope
 // sender (nil = global) and an optional template override (nil = built-in).
 type Mailer interface {
@@ -125,6 +166,10 @@ type Mailer interface {
 	SendVerification(ctx context.Context, sender *SMTPConfig, tmpl *Template, email VerificationEmail) error
 	SendWelcome(ctx context.Context, sender *SMTPConfig, tmpl *Template, email WelcomeEmail) error
 	SendPasswordChanged(ctx context.Context, sender *SMTPConfig, tmpl *Template, email PasswordChangedEmail) error
+	SendInvitation(ctx context.Context, sender *SMTPConfig, tmpl *Template, email InvitationEmail) error
+	SendChangeEmail(ctx context.Context, sender *SMTPConfig, tmpl *Template, email ChangeEmailEmail) error
+	SendBlockedAccount(ctx context.Context, sender *SMTPConfig, tmpl *Template, email BlockedAccountEmail) error
+	SendPasswordBreach(ctx context.Context, sender *SMTPConfig, tmpl *Template, email PasswordBreachEmail) error
 	// SendTest renders the given template type with sample data and delivers it to
 	// `to`, so an admin can verify a sender/provider configuration end-to-end.
 	SendTest(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string) error
@@ -236,8 +281,18 @@ func (m *mailerImpl) dispatch(ctx context.Context, sender *SMTPConfig, tmpl *Tem
 	})
 }
 
+// defaultResetTTLMinutes states the reset-link validity window when a caller
+// leaves ResetEmail.TTLMinutes unset. It mirrors auth.ResetTokenTTL; callers
+// that know the real window should always pass it so the body cannot drift from
+// the token's actual expiry.
+const defaultResetTTLMinutes = 15
+
 func (m *mailerImpl) SendReset(ctx context.Context, sender *SMTPConfig, tmpl *Template, e ResetEmail) error {
-	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordReset, e.To, TemplateData{Link: e.ResetLink, TTLMinutes: 15})
+	ttl := e.TTLMinutes
+	if ttl <= 0 {
+		ttl = defaultResetTTLMinutes
+	}
+	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordReset, e.To, TemplateData{Link: e.ResetLink, TTLMinutes: ttl})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Msg("password reset email sent")
 	}
@@ -284,6 +339,44 @@ func (m *mailerImpl) SendPasswordChanged(ctx context.Context, sender *SMTPConfig
 	return err
 }
 
+func (m *mailerImpl) SendInvitation(ctx context.Context, sender *SMTPConfig, tmpl *Template, e InvitationEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateUserInvitation, e.To, TemplateData{
+		Link: e.Link, AppName: e.AppName, InviterName: e.InviterName, Name: e.Name, TTLMinutes: e.TTLMinutes,
+	})
+	if err == nil {
+		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("invitation email sent")
+	}
+	return err
+}
+
+func (m *mailerImpl) SendChangeEmail(ctx context.Context, sender *SMTPConfig, tmpl *Template, e ChangeEmailEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateChangeEmail, e.To, TemplateData{
+		Link: e.Link, AppName: e.AppName, TTLMinutes: e.TTLMinutes,
+	})
+	if err == nil {
+		m.logger.Info().Str("to", e.To).Msg("change-email confirmation sent")
+	}
+	return err
+}
+
+func (m *mailerImpl) SendBlockedAccount(ctx context.Context, sender *SMTPConfig, tmpl *Template, e BlockedAccountEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateBlockedAccount, e.To, TemplateData{
+		Link: e.Link, AppName: e.AppName, Reason: e.Reason, TTLMinutes: e.TTLMinutes,
+	})
+	if err == nil {
+		m.logger.Info().Str("to", e.To).Str("reason", e.Reason).Msg("blocked-account email sent")
+	}
+	return err
+}
+
+func (m *mailerImpl) SendPasswordBreach(ctx context.Context, sender *SMTPConfig, tmpl *Template, e PasswordBreachEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordBreach, e.To, TemplateData{Link: e.Link, AppName: e.AppName})
+	if err == nil {
+		m.logger.Info().Str("to", e.To).Msg("password-breach alert sent")
+	}
+	return err
+}
+
 // sampleTestData is the placeholder variable set used when rendering a test
 // email — every template field gets a representative value so the preview looks
 // realistic regardless of the chosen template type.
@@ -295,6 +388,7 @@ func sampleTestData() TemplateData {
 		TTLMinutes:  15,
 		Name:        "Alex Doe",
 		InviterName: "Jordan Smith",
+		Reason:      BlockReasonFailedAttempts,
 	}
 }
 

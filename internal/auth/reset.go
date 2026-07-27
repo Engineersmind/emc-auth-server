@@ -137,6 +137,9 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 	msg := mailer.ResetEmail{
 		To:        email,
 		ResetLink: resetLink,
+		// State the real window so the body can never contradict the token's
+		// actual expiry if ResetTokenTTL changes.
+		TTLMinutes: int(ResetTokenTTL.Minutes()),
 	}
 
 	// Resolve the sender for this application (application → tenant → global). A
@@ -188,13 +191,16 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 	tokenHash := HashToken(in.RawToken)
 
 	var tokenID, userID, tenantID int64
+	var email string
+	var appRowID *int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, user_id, tenant_id
-		FROM password_reset_tokens
-		WHERE token_hash = $1
-		  AND used_at IS NULL
-		  AND expires_at > NOW()
-	`, tokenHash).Scan(&tokenID, &userID, &tenantID)
+		SELECT t.id, t.user_id, t.tenant_id, u.email, u.application_id
+		FROM password_reset_tokens t
+		JOIN users u ON u.id = t.user_id
+		WHERE t.token_hash = $1
+		  AND t.used_at IS NULL
+		  AND t.expires_at > NOW()
+	`, tokenHash).Scan(&tokenID, &userID, &tenantID, &email, &appRowID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrInvalidResetToken
@@ -236,6 +242,13 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 		return fmt.Errorf("revoke refresh tokens on password reset: %w", err)
 	}
 
+	// The breach warning is per-password: clearing the marker means a user who
+	// resets to another breached password is warned again on their next sign-in.
+	_, err = tx.Exec(ctx, `UPDATE users SET breach_notified_at = NULL WHERE id = $1`, userID)
+	if err != nil {
+		return fmt.Errorf("clear breach marker on password reset: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit reset-password tx: %w", err)
 	}
@@ -245,5 +258,25 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 		Str("tenant_id", strconv.FormatInt(tenantID, 10)).
 		Msg("password reset completed; all sessions revoked")
 
+	// Confirm the change to the account owner. Best-effort: the password is
+	// already changed, so a mail failure must not fail the request — but it is a
+	// security notification, so it is logged at warn level when it does fail.
+	s.NotifyPasswordChanged(ctx, tenantID, appRowID, email)
+
 	return nil
+}
+
+// NotifyPasswordChanged sends the password-changed confirmation for an
+// out-of-band password change (reset completion, admin change, self-service
+// change). Best-effort and never returns an error: the change has already
+// happened by the time this runs.
+func (s *ResetService) NotifyPasswordChanged(ctx context.Context, tenantID int64, appRowID *int64, email string) {
+	n := emailNotifier{mailer: s.mailer, senderSvc: s.senderSvc, tmplSvc: s.tmplSvc, audit: s.audit, logger: s.logger}
+	_, err := n.send(ctx, tenantID, appRowID, mailer.TemplatePasswordChanged,
+		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
+			return s.mailer.SendPasswordChanged(ctx, sender, tmpl, mailer.PasswordChangedEmail{To: email})
+		})
+	if err != nil {
+		s.logger.Warn().Err(err).Str("email", email).Msg("password-changed confirmation could not be delivered")
+	}
 }

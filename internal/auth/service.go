@@ -27,6 +27,8 @@ type AuthService struct {
 	redisCli *redis.Client        // used for OTP session storage
 	appSvc   *ApplicationService  // nil when application context is not needed
 	verifSvc *VerificationService // nil when email verification is not configured
+	blockSvc *AccountBlockService // nil when brute-force lockout is not configured
+	brchSvc  *BreachService       // nil when breached-password detection is off
 	logger   zerolog.Logger
 }
 
@@ -62,6 +64,22 @@ func (s *AuthService) WithEmailMFA(emailSvc *EmailMFAService) *AuthService {
 // behaves as before (no verification email).
 func (s *AuthService) WithVerification(verifSvc *VerificationService) *AuthService {
 	s.verifSvc = verifSvc
+	return s
+}
+
+// WithAccountBlocking attaches an AccountBlockService so repeated failed
+// password attempts count toward a per-account lockout. Optional — without it,
+// only the per-IP/per-tenant rate limiters bound guessing.
+func (s *AuthService) WithAccountBlocking(blockSvc *AccountBlockService) *AuthService {
+	s.blockSvc = blockSvc
+	return s
+}
+
+// WithBreachDetection attaches a BreachService so a successful sign-in with a
+// password known to be breached warns the user. Optional and advisory: it never
+// blocks a login.
+func (s *AuthService) WithBreachDetection(brchSvc *BreachService) *AuthService {
+	s.brchSvc = brchSvc
 	return s
 }
 
@@ -386,6 +404,10 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		s.verifSvc.SendVerification(ctx, tenantID, appRowID, userID, in.Email, appName)
 	}
 
+	// Warn if the password chosen at sign-up is already in a breach corpus — the
+	// earliest useful moment to tell the user. Detached; never blocks registration.
+	s.brchSvc.Notify(ctx, tenantID, appRowID, userID, in.Email, in.Password)
+
 	perms, err := s.loadPermissions(ctx, userID, tenantID)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("register: failed to load permissions, continuing with empty set")
@@ -496,6 +518,14 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	}
 
 	if matchCount == 0 {
+		// Per-account brute-force counting. Every candidate account saw a failed
+		// attempt, so each one's counter advances: in the generic (non-app) mode a
+		// single wrong guess for an email held in several tenants counts against
+		// each of those accounts, which is the intended reading of "this account
+		// was attacked". The per-IP limiter remains the first line of defence.
+		for i := range candidates {
+			s.blockSvc.RecordFailedLogin(ctx, candidates[i].tenantID, candidates[i].userID)
+		}
 		return nil, fmt.Errorf("invalid credentials")
 	}
 	if matchCount > 1 {
@@ -509,6 +539,14 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	}
 
 	userID, tenantID, email, roleName := matched.userID, matched.tenantID, matched.email, matched.roleName
+
+	// The password is now proven correct, so the lockout counter is cleared here
+	// rather than after the MFA gate: a user who holds the right password should
+	// not accumulate lockout progress while completing a second factor.
+	s.blockSvc.ResetFailedLogins(ctx, tenantID, userID)
+
+	// Advisory breached-password check (detached; never delays or blocks login).
+	s.brchSvc.Notify(ctx, tenantID, appRowIDFromClaim(appID), userID, email, in.Password)
 
 	perms, err := s.loadPermissions(ctx, userID, tenantID)
 	if err != nil {

@@ -86,7 +86,24 @@ type TemplateData struct {
 	Name        string // recipient display name (may be empty)
 	Email       string // recipient address
 	InviterName string // who sent an invitation (user_invitation; may be empty)
+	// Reason explains why an account was blocked or flagged (blocked_account).
+	// One of the BlockReason* values; empty in every other template.
+	Reason string
 }
+
+// Block reasons carried in TemplateData.Reason. They select the wording of the
+// blocked_account email, which covers three distinct events.
+const (
+	// BlockReasonFailedAttempts is an automatic block after repeated failed
+	// sign-ins. The user may lift it themselves via the emailed link.
+	BlockReasonFailedAttempts = "failed_attempts"
+	// BlockReasonAdmin is an administrator disabling the account. The link is a
+	// password reset, not an unblock — only an admin can restore access.
+	BlockReasonAdmin = "admin"
+	// BlockReasonSuspiciousLogin is a high-risk sign-in that succeeded. Nothing
+	// is blocked; this is an alert telling the user to secure the account.
+	BlockReasonSuspiciousLogin = "suspicious_login"
+)
 
 // rendered is the output of applying a Template to TemplateData.
 type rendered struct {
@@ -286,20 +303,41 @@ This link is valid for {{.TTLMinutes}} minutes. If you did not request this chan
 
 - {{.ProductName}}`,
 	},
+	// One template, three events — selected by .Reason. "suspicious_login" is an
+	// alert (nothing is blocked), "admin" is an operator action the user cannot
+	// undo (link = password reset), and the default is an automatic lockout the
+	// user may lift via the emailed single-use link.
 	TemplateBlockedAccount: {
-		Subject: "Suspicious activity — your account was blocked",
-		HTML: shell(`<h2>Your account was blocked</h2>
-<p>We detected a suspicious sign-in attempt on your account and blocked access to keep it secure.</p>
-<p>If this was you, use the link below to unblock your account. This link is valid for {{.TTLMinutes}} minutes.</p>
+		Subject: `{{if eq .Reason "suspicious_login"}}Security alert — unusual sign-in to your account{{else}}Your account has been blocked{{end}}`,
+		HTML: shell(`{{if eq .Reason "suspicious_login"}}<h2>Unusual sign-in detected</h2>
+<p>Someone signed in to your account{{if .AppName}} for {{.AppName}}{{end}} from a device or location we have not seen before. Your account has not been blocked.</p>
+<p>If this was you, no action is needed. If it was not, secure your account now by changing your password.</p>
+` + fmt.Sprintf(button, "Change password") + `
+{{else if eq .Reason "admin"}}<h2>Your account has been blocked</h2>
+<p>An administrator has blocked access to your account{{if .AppName}} for {{.AppName}}{{end}}.</p>
+<p>Contact your administrator to restore access. If you believe your password was compromised, you can reset it using the link below.</p>
+` + fmt.Sprintf(button, "Reset password") + `
+{{else}}<h2>Your account was blocked</h2>
+<p>We blocked access to your account{{if .AppName}} for {{.AppName}}{{end}} after too many failed sign-in attempts, to keep it secure.</p>
+<p>If this was you, use the link below to unblock your account. This link is valid for {{.TTLMinutes}} minutes and can be used once.</p>
 ` + fmt.Sprintf(button, "Unblock account") + `
-<p>If this was not you, we recommend changing your password immediately.</p>`),
-		Text: `We detected a suspicious sign-in attempt on your account and blocked access to keep it secure.
+<p>If this was not you, someone may be trying to guess your password — we recommend changing it.</p>
+{{end}}`),
+		Text: `{{if eq .Reason "suspicious_login"}}Someone signed in to your account{{if .AppName}} for {{.AppName}}{{end}} from a device or location we have not seen before. Your account has not been blocked.
+
+If this was not you, secure your account by changing your password:
+{{.Link}}
+{{else if eq .Reason "admin"}}An administrator has blocked access to your account{{if .AppName}} for {{.AppName}}{{end}}.
+
+Contact your administrator to restore access. To reset your password:
+{{.Link}}
+{{else}}We blocked access to your account{{if .AppName}} for {{.AppName}}{{end}} after too many failed sign-in attempts.
 
 If this was you, unblock your account here:
 {{.Link}}
 
-This link is valid for {{.TTLMinutes}} minutes. If this was not you, change your password immediately.
-
+This link is valid for {{.TTLMinutes}} minutes and can be used once. If this was not you, change your password.
+{{end}}
 - {{.ProductName}}`,
 	},
 	TemplatePasswordBreach: {

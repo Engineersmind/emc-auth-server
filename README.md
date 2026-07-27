@@ -311,6 +311,10 @@ Password: password
 | GET | `/api/v1/auth/me` | Bearer JWT | Get current user profile |
 | POST | `/api/v1/auth/forgot-password` | — | Request password reset link |
 | POST | `/api/v1/auth/reset-password` | — | Set new password with reset token |
+| POST | `/api/v1/auth/accept-invitation` | Invitation token | Set the password for an invited account |
+| POST | `/api/v1/auth/change-email` | Bearer JWT | Request an email change (confirmation goes to the new address) |
+| GET | `/api/v1/auth/confirm-email-change` | Change token | Apply a pending email change |
+| GET | `/api/v1/auth/unblock-account` | Unblock token | Lift an automatic failed-attempt lockout |
 
 ### Admin — Tenant Management
 > Requires `tenant:manage` permission (super_admin only)
@@ -341,12 +345,13 @@ Password: password
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/v1/admin/users` | List users (`?search=&page=&limit=`) |
-| POST | `/api/v1/admin/users` | Create user with optional role |
+| POST | `/api/v1/admin/users` | Create user with optional role (`send_invitation: true` emails an invite instead of setting a password) |
 | GET | `/api/v1/admin/users/:id` | Get user details |
 | PUT | `/api/v1/admin/users/:id` | Update user profile |
 | PUT | `/api/v1/admin/users/:id/role` | Reassign role |
 | DELETE | `/api/v1/admin/users/:id` | Soft-delete user |
 | POST | `/api/v1/admin/users/:id/force-password-reset` | Send password reset email |
+| POST | `/api/v1/admin/users/:id/invite` | Resend the invitation link (supersedes any previous one) |
 
 ### Admin — Audit Logs
 
