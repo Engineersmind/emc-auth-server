@@ -221,17 +221,43 @@ type UpsertProviderConfigRequest struct {
 	RedirectAllow []string `json:"redirect_allow"`
 }
 
-// adminTenantAndApp extracts the caller's tenant from JWT claims and the
-// application row id from the :appID path param. The tenant in the JWT is
-// authoritative — the service layer re-checks the app belongs to it.
-func adminTenantAndApp(c echo.Context) (tenantID, appID int64, claims *auth.Claims, err error) {
+// oauthTargetTenant resolves the tenant these admin routes act on.
+//
+// Tenant-nested routes (/tenants/:tid/...) carry the target in the path and
+// are guarded by RequireTenantSelfOrAny, which has ALREADY proven the caller
+// may act on that :tid — either they hold tenant:manage (super_admin drilling
+// into another tenant) or :tid is their own. Trusting it here is therefore
+// safe, and it is what lets a super_admin manage another tenant's providers;
+// deriving the tenant from JWT claims on those routes would silently retarget
+// the call at the super_admin's own tenant.
+//
+// Flat legacy routes have no :tid and fall back to the claims tenant.
+func oauthTargetTenant(c echo.Context) (int64, *auth.Claims, error) {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
-		return 0, 0, nil, echo.NewHTTPError(http.StatusUnauthorized, "authorization required")
+		return 0, nil, echo.NewHTTPError(http.StatusUnauthorized, "authorization required")
 	}
-	tenantID, err = strconv.ParseInt(claims.TenantID, 10, 64)
+	if tid := c.Param("tid"); tid != "" {
+		parsed, err := strconv.ParseInt(tid, 10, 64)
+		if err != nil {
+			return 0, nil, echo.NewHTTPError(http.StatusBadRequest, "invalid tenant id")
+		}
+		return parsed, claims, nil
+	}
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 	if err != nil {
-		return 0, 0, nil, echo.NewHTTPError(http.StatusUnauthorized, "invalid tenant in token")
+		return 0, nil, echo.NewHTTPError(http.StatusUnauthorized, "invalid tenant in token")
+	}
+	return tenantID, claims, nil
+}
+
+// adminTenantAndApp resolves the target tenant and the application row id from
+// the :appID path param. The service layer re-checks the app belongs to the
+// tenant — this never trusts :appID on its own.
+func adminTenantAndApp(c echo.Context) (tenantID, appID int64, claims *auth.Claims, err error) {
+	tenantID, claims, err = oauthTargetTenant(c)
+	if err != nil {
+		return 0, 0, nil, err
 	}
 	appID, err = strconv.ParseInt(c.Param("appID"), 10, 64)
 	if err != nil {
@@ -240,22 +266,32 @@ func adminTenantAndApp(c echo.Context) (tenantID, appID int64, claims *auth.Clai
 	return tenantID, appID, claims, nil
 }
 
-// adminTenantAndUser mirrors adminTenantAndApp for the /users/:id/identities
-// routes (flat user routes use :id, not :uid).
+// adminTenantAndUser mirrors adminTenantAndApp for the identities routes. The
+// user id param differs by route family: tenant-nested application user routes
+// use :uid, the flat user routes use :id.
 func adminTenantAndUser(c echo.Context) (tenantID, userID int64, claims *auth.Claims, err error) {
-	claims, ok := c.Get("user").(*auth.Claims)
-	if !ok || claims == nil {
-		return 0, 0, nil, echo.NewHTTPError(http.StatusUnauthorized, "authorization required")
-	}
-	tenantID, err = strconv.ParseInt(claims.TenantID, 10, 64)
+	tenantID, claims, err = oauthTargetTenant(c)
 	if err != nil {
-		return 0, 0, nil, echo.NewHTTPError(http.StatusUnauthorized, "invalid tenant in token")
+		return 0, 0, nil, err
 	}
-	userID, err = strconv.ParseInt(c.Param("id"), 10, 64)
+	raw := c.Param("uid")
+	if raw == "" {
+		raw = c.Param("id")
+	}
+	userID, err = strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		return 0, 0, nil, echo.NewHTTPError(http.StatusBadRequest, "invalid user id")
 	}
 	return tenantID, userID, claims, nil
+}
+
+// userResourceID labels audit entries with the user id actually acted on,
+// independent of which route family supplied it.
+func userResourceID(c echo.Context) string {
+	if uid := c.Param("uid"); uid != "" {
+		return uid
+	}
+	return c.Param("id")
 }
 
 // ListUserIdentities handles GET /api/v1/users/:id/identities
@@ -317,7 +353,7 @@ func (h *OAuthHandler) UnlinkUserIdentity(c echo.Context) error {
 		ActorEmail:   claims.Email,
 		Action:       audit.ActionAdminUserIdentityUnlinked,
 		ResourceType: "user",
-		ResourceID:   c.Param("id") + ":" + provider,
+		ResourceID:   userResourceID(c) + ":" + provider,
 		IPAddress:    c.RealIP(),
 		UserAgent:    c.Request().UserAgent(),
 	})
@@ -403,6 +439,53 @@ func (h *OAuthHandler) ListProviderConfigs(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list provider configs")
 	}
 	return c.JSON(http.StatusOK, configs)
+}
+
+// TestProviderConfig handles POST /api/v1/tenants/:tid/applications/:appID/identity-providers/:provider/test
+//
+// @Summary      Test a social login provider configuration
+// @Description  Dry-runs the stored configuration and returns a per-check report: config present, secret decrypts, redirect allow-list usable, provider authorization URL builds (for Google this also proves OIDC discovery succeeded), provider enabled. Note that a passing result does NOT prove the client secret is correct — the secret is only exercised at the token endpoint, which needs a real user authorization code. Requires apps:write.
+// @Tags         oauth
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID     path      string  true  "Application ID"
+// @Param        provider  path      string  true  "Provider (google, github)"
+// @Success      200       {object}  auth.ProviderTestResult
+// @Failure      400       {object}  map[string]string
+// @Failure      404       {object}  map[string]string
+// @Router       /api/v1/tenants/{tid}/applications/{appID}/identity-providers/{provider}/test [post]
+func (h *OAuthHandler) TestProviderConfig(c echo.Context) error {
+	tenantID, appID, claims, err := adminTenantAndApp(c)
+	if err != nil {
+		return err
+	}
+	provider := c.Param("provider")
+
+	result, err := h.svc.TestConfig(c.Request().Context(), tenantID, appID, provider)
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrProviderNotSupported):
+			return echo.NewHTTPError(http.StatusBadRequest, "unknown identity provider")
+		case errors.Is(err, auth.ErrProviderNotConfigured):
+			return echo.NewHTTPError(http.StatusNotFound, "provider config not found")
+		default:
+			h.logger.Error().Err(err).Str("provider", provider).Msg("oauth: test provider config failed")
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to test provider config")
+		}
+	}
+
+	h.auditEvent(c, audit.Event{
+		TenantID:      &tenantID,
+		ApplicationID: &appID,
+		ActorEmail:    claims.Email,
+		Action:        audit.ActionAdminIdPConfigTested,
+		ResourceType:  "application",
+		ResourceID:    c.Param("appID") + ":" + provider,
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
+		Metadata:      map[string]any{"ok": result.OK, "enabled": result.Enabled},
+	})
+	return c.JSON(http.StatusOK, result)
 }
 
 // DeleteProviderConfig handles DELETE /api/v1/applications/:appID/identity-providers/:provider

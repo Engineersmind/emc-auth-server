@@ -54,23 +54,39 @@ const maxRedirectAllowEntries = 20
 // credentials (identity_provider_configs). Client secrets are AES-256-GCM
 // encrypted at rest via SecretBox and never returned by any read API.
 type IdentityProviderService struct {
-	pool   *pgxpool.Pool
-	box    *SecretBox
-	logger zerolog.Logger
+	pool    *pgxpool.Pool
+	box     *SecretBox
+	baseURL string
+	logger  zerolog.Logger
 }
 
-// NewIdentityProviderService constructs an IdentityProviderService.
-func NewIdentityProviderService(pool *pgxpool.Pool, box *SecretBox, logger zerolog.Logger) *IdentityProviderService {
-	return &IdentityProviderService{pool: pool, box: box, logger: logger}
+// NewIdentityProviderService constructs an IdentityProviderService. baseURL is
+// the server's public base URL (APP_BASE_URL) — it is what CallbackURL is
+// derived from, so admins can copy the exact redirect URI to register in the
+// provider console instead of hand-assembling it.
+func NewIdentityProviderService(pool *pgxpool.Pool, box *SecretBox, baseURL string, logger zerolog.Logger) *IdentityProviderService {
+	return &IdentityProviderService{pool: pool, box: box, baseURL: baseURL, logger: logger}
+}
+
+// CallbackURL is the redirect_uri this deployment registers with a provider.
+// Single source of truth shared by the login flow and the admin read APIs — a
+// drift between the two is exactly the misconfiguration this field exists to
+// prevent.
+func (s *IdentityProviderService) CallbackURL(provider string) string {
+	return s.baseURL + "/oauth/" + provider + "/callback"
 }
 
 // ProviderConfigDetail is the public representation of one provider config —
-// the client secret is never included.
+// the client secret is never included. HasSecret reports whether one is
+// stored, so the UI can offer "leave blank to keep the current secret"
+// without ever reading it back.
 type ProviderConfigDetail struct {
 	ID            string    `json:"id"`
 	Provider      string    `json:"provider"`
 	ClientID      string    `json:"client_id"`
 	Enabled       bool      `json:"enabled"`
+	HasSecret     bool      `json:"has_secret"`
+	CallbackURL   string    `json:"callback_url"`
 	RedirectAllow []string  `json:"redirect_allow"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -170,20 +186,21 @@ func (s *IdentityProviderService) UpsertConfig(ctx context.Context, tenantID, ap
 		    enabled           = EXCLUDED.enabled,
 		    redirect_allow    = EXCLUDED.redirect_allow,
 		    updated_at        = NOW()
-		RETURNING id, provider, client_id, enabled, redirect_allow, created_at, updated_at
+		RETURNING id, provider, client_id, enabled, client_secret_enc <> '', redirect_allow, created_at, updated_at
 	`, tenantID, appID, in.Provider, in.ClientID, secretEnc, in.Enabled, in.RedirectAllow).
-		Scan(&id, &d.Provider, &d.ClientID, &d.Enabled, &d.RedirectAllow, &d.CreatedAt, &d.UpdatedAt)
+		Scan(&id, &d.Provider, &d.ClientID, &d.Enabled, &d.HasSecret, &d.RedirectAllow, &d.CreatedAt, &d.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("upsert provider config: %w", err)
 	}
 	d.ID = strconv.FormatInt(id, 10)
+	d.CallbackURL = s.CallbackURL(d.Provider)
 	return &d, nil
 }
 
 // ListConfigs returns all provider configs for one application, secrets excluded.
 func (s *IdentityProviderService) ListConfigs(ctx context.Context, tenantID, appID int64) ([]ProviderConfigDetail, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, provider, client_id, enabled, redirect_allow, created_at, updated_at
+		SELECT id, provider, client_id, enabled, client_secret_enc <> '', redirect_allow, created_at, updated_at
 		FROM   identity_provider_configs
 		WHERE  application_id = $1 AND tenant_id = $2
 		ORDER  BY provider
@@ -197,10 +214,11 @@ func (s *IdentityProviderService) ListConfigs(ctx context.Context, tenantID, app
 	for rows.Next() {
 		var d ProviderConfigDetail
 		var id int64
-		if err := rows.Scan(&id, &d.Provider, &d.ClientID, &d.Enabled, &d.RedirectAllow, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		if err := rows.Scan(&id, &d.Provider, &d.ClientID, &d.Enabled, &d.HasSecret, &d.RedirectAllow, &d.CreatedAt, &d.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan provider config: %w", err)
 		}
 		d.ID = strconv.FormatInt(id, 10)
+		d.CallbackURL = s.CallbackURL(d.Provider)
 		configs = append(configs, d)
 	}
 	return configs, rows.Err()
@@ -256,6 +274,41 @@ func (s *IdentityProviderService) getFlowConfig(ctx context.Context, appID int64
 	}
 	return &cfg, nil
 }
+
+// getTestConfig loads and decrypts a provider config for the admin test
+// endpoint. Unlike getFlowConfig it does NOT require enabled = true — the
+// whole point of the test is to validate credentials BEFORE turning the
+// provider on — and it pins tenant_id, because the test path is reached with
+// an app id from the URL rather than from server-stored login state.
+func (s *IdentityProviderService) getTestConfig(ctx context.Context, tenantID, appID int64, provider string) (cfg *flowConfig, enabled bool, err error) {
+	var c flowConfig
+	var secretEnc string
+	err = s.pool.QueryRow(ctx, `
+		SELECT ipc.client_id, ipc.client_secret_enc, ipc.enabled, ipc.redirect_allow
+		FROM   identity_provider_configs ipc
+		JOIN   oauth_clients oc ON oc.id = ipc.application_id AND oc.deleted_at IS NULL
+		WHERE  ipc.application_id = $1 AND ipc.tenant_id = $2 AND ipc.provider = $3
+	`, appID, tenantID, provider).Scan(&c.ClientID, &secretEnc, &enabled, &c.RedirectAllow)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, ErrProviderNotConfigured
+		}
+		return nil, false, fmt.Errorf("load provider config: %w", err)
+	}
+	// A decrypt failure here is itself a finding (wrong SECRET_BOX_KEY after a
+	// key rotation), so it is reported as a failed check rather than swallowed
+	// — the caller distinguishes it via the empty ClientSecret.
+	c.ClientSecret, err = s.box.Decrypt(secretEnc)
+	if err != nil {
+		return &c, enabled, ErrProviderSecretUndecryptable
+	}
+	return &c, enabled, nil
+}
+
+// ErrProviderSecretUndecryptable is returned when a stored client secret
+// cannot be decrypted with the current key — a real, actionable
+// misconfiguration rather than a transient error.
+var ErrProviderSecretUndecryptable = errors.New("stored client secret cannot be decrypted with the current key")
 
 // ErrIdentityNotFound is returned when the user has no linked identity for
 // the given provider.

@@ -174,7 +174,7 @@ func newOAuthTestEnv(t *testing.T, sg *stubGoogle) *oauthTestEnv {
 	if err != nil {
 		t.Fatalf("secret box: %v", err)
 	}
-	idpSvc := NewIdentityProviderService(pool, box, logger)
+	idpSvc := NewIdentityProviderService(pool, box, "http://localhost:9090", logger)
 
 	redirect := "https://demo.example/cb"
 	_, err = idpSvc.UpsertConfig(ctx, tenantID, appRowID, UpsertProviderConfigInput{
@@ -369,7 +369,7 @@ func TestGoogleLoginFlowIntegration(t *testing.T) {
 	t.Run("unlink guard protects only login method", func(t *testing.T) {
 		logger := testhelper.TestLogger()
 		box, _ := NewSecretBox("", "development", "TEST_KEY", logger)
-		idpSvc := NewIdentityProviderService(env.pool, box, logger)
+		idpSvc := NewIdentityProviderService(env.pool, box, "http://localhost:9090", logger)
 
 		// The JIT user from the first subtest is Google-only → refuse unlink.
 		var jitID int64

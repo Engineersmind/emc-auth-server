@@ -547,6 +547,9 @@ definitions:
         type: string
       from_name:
         type: string
+      has_api_key:
+        description: 'sendgrid: an API key is stored'
+        type: boolean
       has_password:
         type: boolean
       is_active:
@@ -554,6 +557,9 @@ definitions:
       logo_url:
         type: string
       product_name:
+        type: string
+      provider:
+        description: '"smtp" | "sendgrid"'
         type: string
       reply_to:
         type: string
@@ -568,6 +574,29 @@ definitions:
       tenant_id:
         type: string
       tls_mode:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  auth.EmailTemplate:
+    properties:
+      application_id:
+        description: nil = tenant-level
+        type: string
+      html_body:
+        type: string
+      is_active:
+        type: boolean
+      is_default:
+        description: true when returned from the built-in fallback
+        type: boolean
+      subject:
+        type: string
+      template_type:
+        type: string
+      tenant_id:
+        type: string
+      text_body:
         type: string
       updated_at:
         type: string
@@ -631,11 +660,15 @@ definitions:
     type: object
   auth.ProviderConfigDetail:
     properties:
+      callback_url:
+        type: string
       client_id:
         type: string
       created_at:
         type: string
       enabled:
+        type: boolean
+      has_secret:
         type: boolean
       id:
         type: string
@@ -647,6 +680,32 @@ definitions:
         type: array
       updated_at:
         type: string
+    type: object
+  auth.ProviderTestCheck:
+    properties:
+      detail:
+        type: string
+      name:
+        type: string
+      passed:
+        type: boolean
+    type: object
+  auth.ProviderTestResult:
+    properties:
+      callback_url:
+        type: string
+      checks:
+        items:
+          $ref: '#/definitions/auth.ProviderTestCheck'
+        type: array
+      enabled:
+        type: boolean
+      ok:
+        type: boolean
+      provider:
+        type: string
+      secret_verified:
+        type: boolean
     type: object
   auth.TOTPStatus:
     properties:
@@ -900,11 +959,24 @@ definitions:
     - email
     - password
     type: object
+  handlers.ResendVerificationRequest:
+    properties:
+      email:
+        type: string
+    required:
+    - email
+    type: object
   handlers.ResetPasswordRequest:
     properties:
       new_password:
         type: string
       token:
+        type: string
+    type: object
+  handlers.SendTestEmailRequest:
+    properties:
+      template_type:
+        description: TemplateType selects which template to render (empty = email_verification).
         type: string
     type: object
   handlers.SessionLoginRequest:
@@ -1019,6 +1091,11 @@ definitions:
     type: object
   handlers.UpsertEmailSenderRequest:
     properties:
+      api_key:
+        description: |-
+          APIKey is the SendGrid API key (provider="sendgrid"); write-only. Empty on
+          update keeps the stored key. Response exposes only has_api_key.
+        type: string
       from_address:
         type: string
       from_name:
@@ -1029,6 +1106,9 @@ definitions:
       logo_url:
         type: string
       product_name:
+        type: string
+      provider:
+        description: 'Provider: "smtp" (default) or "sendgrid".'
         type: string
       reply_to:
         type: string
@@ -1045,6 +1125,17 @@ definitions:
       tls_mode:
         description: 'TLSMode: "ssl" | "starttls" | "opportunistic" | "none" (empty
           = derive from port).'
+        type: string
+    type: object
+  handlers.UpsertEmailTemplateRequest:
+    properties:
+      html_body:
+        type: string
+      is_active:
+        type: boolean
+      subject:
+        type: string
+      text_body:
         type: string
     type: object
   handlers.UpsertProviderConfigRequest:
@@ -2468,12 +2559,15 @@ paths:
     post:
       consumes:
       - application/json
-      description: Sends a reset link to the email address. ALWAYS returns 200 regardless
-        of whether the email is registered (prevents email enumeration).
+      description: 'Sends a reset link to the email address for the authenticated
+        application''s user. The application authenticates with Authorization: Basic
+        base64(client_id:client_secret) — this identifies both the tenant and application,
+        scoping the reset to that app''s account. ALWAYS returns 200 for a valid client
+        regardless of whether the email is registered (prevents email enumeration).'
       parameters:
-      - description: Tenant slug
+      - description: Basic base64(client_id:client_secret)
         in: header
-        name: X-Tenant-Slug
+        name: Authorization
         required: true
         type: string
       - description: Email address
@@ -2487,6 +2581,12 @@ paths:
       responses:
         "200":
           description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid client credentials
           schema:
             additionalProperties:
               type: string
@@ -3324,6 +3424,36 @@ paths:
       summary: Register a new user
       tags:
       - AUTH
+  /api/v1/auth/resend-verification:
+    post:
+      consumes:
+      - application/json
+      description: Re-sends the email-verification link for an unverified tenant-level
+        user. Always returns 200 to prevent account enumeration.
+      parameters:
+      - description: Tenant slug
+        in: header
+        name: X-Tenant-Slug
+        required: true
+        type: string
+      - description: Email to resend to
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ResendVerificationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Resend verification email
+      tags:
+      - AUTH
   /api/v1/auth/reset-password:
     post:
       consumes:
@@ -3486,6 +3616,34 @@ paths:
       summary: Client credentials token
       tags:
       - AUTH
+  /api/v1/auth/verify-email:
+    get:
+      description: Confirms ownership of an email address via the token from the verification
+        link. Single-use.
+      parameters:
+      - description: Verification token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Verify email address
+      tags:
+      - AUTH
   /api/v1/email-settings:
     delete:
       description: Removes the white-label sender at this scope; sends fall back to
@@ -3584,6 +3742,146 @@ paths:
       summary: Set email sender settings
       tags:
       - admin-email-senders
+  /api/v1/email-settings/test:
+    post:
+      consumes:
+      - application/json
+      description: Sends a sample email using the sender resolved for this scope (application
+        → tenant → global) and the chosen template type, so an admin can confirm the
+        SMTP/SendGrid configuration delivers mail. The recipient is always the requesting
+        admin's own email — an arbitrary recipient cannot be supplied.
+      parameters:
+      - description: Template type
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/handlers.SendTestEmailRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "502":
+          description: Delivery failed
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Send a test email
+      tags:
+      - admin-email-senders
+  /api/v1/email-templates:
+    get:
+      description: Returns every customizable email template at this scope. Rows with
+        is_default=true are the built-in defaults (no override stored).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.EmailTemplate'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List email templates
+      tags:
+      - admin-email-templates
+  /api/v1/email-templates/{type}:
+    delete:
+      description: Removes the template override at this scope; sends revert to the
+        next level (application → tenant → built-in default).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: No override configured at this scope
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete an email template
+      tags:
+      - admin-email-templates
+    get:
+      description: Returns the stored template for a type, or the built-in default
+        (is_default=true) when none is configured.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailTemplate'
+        "400":
+          description: Unknown template type
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get one email template
+      tags:
+      - admin-email-templates
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the template for a type at this scope. subject/html_body/text_body
+        are Go-template source with variables like {{.Link}}, {{.Code}}, {{.ProductName}},
+        {{.AppName}}, {{.TTLMinutes}}. Invalid template syntax is rejected.
+      parameters:
+      - description: Template content
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpsertEmailTemplateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailTemplate'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an email template
+      tags:
+      - admin-email-templates
   /api/v1/permissions:
     get:
       description: Returns all permissions for the caller's tenant. Requires admin:access.
@@ -4290,6 +4588,49 @@ paths:
       summary: List app rate limits
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/identity-providers/{provider}/test:
+    post:
+      description: 'Dry-runs the stored configuration and returns a per-check report:
+        config present, secret decrypts, redirect allow-list usable, provider authorization
+        URL builds (for Google this also proves OIDC discovery succeeded), provider
+        enabled. Note that a passing result does NOT prove the client secret is correct
+        — the secret is only exercised at the token endpoint, which needs a real user
+        authorization code. Requires apps:write.'
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Provider (google, github)
+        in: path
+        name: provider
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.ProviderTestResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Test a social login provider configuration
+      tags:
+      - oauth
   /api/v1/tenants/{tid}/applications/{appID}/rate-limit:
     delete:
       description: Removes the custom rate limit; the app falls back to the default.

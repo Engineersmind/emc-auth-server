@@ -176,7 +176,7 @@ func newGitHubTestEnv(t *testing.T, sg *stubGitHub) *githubTestEnv {
 	if err != nil {
 		t.Fatalf("secret box: %v", err)
 	}
-	idpSvc := NewIdentityProviderService(pool, box, logger)
+	idpSvc := NewIdentityProviderService(pool, box, "http://localhost:9090", logger)
 
 	redirect := "https://demo.example/cb"
 	_, err = idpSvc.UpsertConfig(ctx, tenantID, appRowID, UpsertProviderConfigInput{

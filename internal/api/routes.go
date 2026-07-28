@@ -336,7 +336,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	if err := secretBox.WithPreviousKey(deps.Config.OAuthClientSecretEncryptionKeyPrevious, "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS"); err != nil {
 		deps.Logger.Fatal().Err(err).Msg("social login init failed — check OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS")
 	}
-	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Logger)
+	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Config.AppBaseURL, deps.Logger)
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
 	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
 
@@ -765,6 +765,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// identities (users:read / users:write).
 	adminGroup.GET("/users/:id/identities", oauthHandler.ListUserIdentities, usersRead)
 	adminGroup.DELETE("/users/:id/identities/:provider", oauthHandler.UnlinkUserIdentity, usersWrite)
+
+	// Tenant-nested aliases for the identity provider + user identity APIs.
+	// The flat routes above resolve the tenant from the caller's JWT, so a
+	// super_admin drilling into another tenant would silently manage their
+	// OWN tenant's providers. These carry the target tenant in the path,
+	// guarded by RequireTenantSelfOrAny exactly like every other
+	// /tenants/:tid resource family (email settings, roles, users, ...).
+	adminGroup.GET("/tenants/:tid/applications/:appID/identity-providers", oauthHandler.ListProviderConfigs, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.UpsertProviderConfig, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.DeleteProviderConfig, tidAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/identity-providers/:provider/test", oauthHandler.TestProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/identities", oauthHandler.ListUserIdentities, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/identities/:provider", oauthHandler.UnlinkUserIdentity, tidUsersWrite)
 
 	// Agent management — apps:read / apps:write (agents are machine clients) (08-01, 08-04)
 	adminGroup.POST("/agents", agentHandler.RegisterAgent, appsWrite)
