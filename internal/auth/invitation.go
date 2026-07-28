@@ -38,6 +38,12 @@ var ErrInvalidInvitation = errors.New("invalid or expired invitation")
 // minimum length enforced everywhere a password is set.
 var ErrWeakPassword = errors.New("password must be at least 8 characters")
 
+// ErrInvitationBlocked is returned when the token is valid but the account has
+// since been blocked by an administrator. Distinct from ErrInvalidInvitation so
+// the handler can answer 403 rather than 400: nothing is wrong with the link,
+// the account state is what forbids acceptance.
+var ErrInvitationBlocked = errors.New("account is blocked by an administrator")
+
 // InvitationService issues and consumes user invitations.
 type InvitationService struct {
 	pool       *pgxpool.Pool
@@ -147,18 +153,27 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken, newPassword st
 
 	var invID int64
 	var t InvitationTarget
+	var blockReason *string
 	err := s.pool.QueryRow(ctx, `
-		SELECT i.id, i.user_id, i.tenant_id, u.email
+		SELECT i.id, i.user_id, i.tenant_id, u.email, u.block_reason
 		FROM user_invitations i
 		JOIN users u ON u.id = i.user_id
 		WHERE i.token_hash = $1 AND i.used_at IS NULL AND i.expires_at > NOW()
 		  AND u.deleted_at IS NULL
-	`, HashToken(rawToken)).Scan(&invID, &t.UserID, &t.TenantID, &t.Email)
+	`, HashToken(rawToken)).Scan(&invID, &t.UserID, &t.TenantID, &t.Email, &blockReason)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidInvitation
 		}
 		return nil, fmt.Errorf("lookup invitation: %w", err)
+	}
+	// An admin who blocks an account after inviting it must not be overridden by
+	// the still-live invitation link: accepting it would set a password and
+	// re-activate the row, silently undoing the operator's decision. Only an
+	// automatic failed-attempt lockout may be cleared this way — the same rule the
+	// self-service unblock endpoint applies.
+	if blockReason != nil && *blockReason != mailer.BlockReasonFailedAttempts {
+		return nil, ErrInvitationBlocked
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), BcryptCost)
@@ -185,11 +200,25 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken, newPassword st
 	`, t.UserID, t.TenantID, string(hash)); err != nil {
 		return nil, fmt.Errorf("set invitation password: %w", err)
 	}
+	// is_active reflects actual state rather than being forced true: an account
+	// carrying a lockout stays inactive until that lockout is lifted through its
+	// own path. Only an account with no block at all is activated here.
 	if _, err := tx.Exec(ctx, `
-		UPDATE users SET email_verified = true, is_active = true, updated_at = NOW()
+		UPDATE users
+		SET email_verified = true, is_active = (blocked_at IS NULL),
+		    token_version = token_version + 1, updated_at = NOW()
 		WHERE id = $1 AND tenant_id = $2
 	`, t.UserID, t.TenantID); err != nil {
 		return nil, fmt.Errorf("mark invited user verified: %w", err)
+	}
+	// Setting a password through an invitation is a credential change, so it ends
+	// any session that existed beforehand — the case that matters is a user who
+	// already had a password and was re-invited.
+	if _, err := tx.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW()
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, t.UserID, t.TenantID); err != nil {
+		return nil, fmt.Errorf("revoke sessions on invitation accept: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit accept-invitation: %w", err)

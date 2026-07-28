@@ -129,13 +129,22 @@ type InvitationEmail struct {
 	TTLMinutes  int
 }
 
-// ChangeEmailEmail confirms ownership of a new address during an email change.
-// It is always delivered to the NEW address — the pending one being proven.
+// ChangeEmailEmail carries either half of the email-change flow, selected by
+// Reason:
+//
+//	"" (default)     — the confirmation link, delivered to the NEW address, which
+//	                   is the pending one being proven.
+//	"email_changed"  — the after-the-fact security notice, delivered to the OLD
+//	                   address once the change has applied. No action link; it
+//	                   points at password reset so a user who did not ask for the
+//	                   change can react. NewEmail names the address now on file.
 type ChangeEmailEmail struct {
 	To         string
 	Link       string
 	AppName    string
 	TTLMinutes int
+	Reason     string
+	NewEmail   string
 }
 
 // BlockedAccountEmail alerts a user that their account was blocked or that a
@@ -352,9 +361,10 @@ func (m *mailerImpl) SendInvitation(ctx context.Context, sender *SMTPConfig, tmp
 func (m *mailerImpl) SendChangeEmail(ctx context.Context, sender *SMTPConfig, tmpl *Template, e ChangeEmailEmail) error {
 	err := m.dispatch(ctx, sender, tmpl, TemplateChangeEmail, e.To, TemplateData{
 		Link: e.Link, AppName: e.AppName, TTLMinutes: e.TTLMinutes,
+		Reason: e.Reason, NewEmail: e.NewEmail,
 	})
 	if err == nil {
-		m.logger.Info().Str("to", e.To).Msg("change-email confirmation sent")
+		m.logger.Info().Str("to", e.To).Str("reason", e.Reason).Msg("change-email message sent")
 	}
 	return err
 }

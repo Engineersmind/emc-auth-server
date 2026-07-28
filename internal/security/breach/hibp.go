@@ -20,6 +20,7 @@ import (
 	"crypto/sha1" //nolint:gosec // G505: see the #nosec justification above
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -35,6 +36,11 @@ const rangeEndpoint = "https://api.pwnedpasswords.com/range/"
 // checkTimeout bounds one lookup. The check is advisory — a slow or unreachable
 // API must never delay a sign-in — so this is deliberately short.
 const checkTimeout = 3 * time.Second
+
+// maxRangeResponseBytes caps how much of a range response is read. Real padded
+// responses are ~40–65 KB, so this is generous while keeping a hostile or
+// hijacked endpoint from streaming an unbounded body into memory.
+const maxRangeResponseBytes = 512 * 1024
 
 // Checker queries the Pwned Passwords range API.
 type Checker struct {
@@ -112,7 +118,12 @@ func (c *Checker) Count(ctx context.Context, password string) int {
 
 	// Each line is "SUFFIX:COUNT". Padding entries carry a count of 0 and are
 	// therefore indistinguishable from a genuine miss, which is the point.
-	scanner := bufio.NewScanner(resp.Body)
+	//
+	// The read is byte-bounded as well as time-bounded: checkTimeout caps how long
+	// a response may take, but not how much it may send, so a hijacked or
+	// misbehaving endpoint could otherwise drip an unbounded body into memory
+	// while staying inside the deadline. A padded range response is ~40–65 KB.
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, maxRangeResponseBytes))
 	for scanner.Scan() {
 		line := scanner.Text()
 		sep := strings.IndexByte(line, ':')

@@ -244,7 +244,7 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 
 	// The breach warning is per-password: clearing the marker means a user who
 	// resets to another breached password is warned again on their next sign-in.
-	_, err = tx.Exec(ctx, `UPDATE users SET breach_notified_at = NULL WHERE id = $1`, userID)
+	_, err = tx.Exec(ctx, `UPDATE users SET breach_notified_at = NULL WHERE id = $1 AND tenant_id = $2`, userID, tenantID)
 	if err != nil {
 		return fmt.Errorf("clear breach marker on password reset: %w", err)
 	}

@@ -63,6 +63,7 @@ type AcceptInvitationRequest struct {
 // @Param        body  body      AcceptInvitationRequest  true  "Invitation token and chosen password"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string
 // @Router       /api/v1/auth/accept-invitation [post]
 func (h *AuthHandler) AcceptInvitation(c echo.Context) error {
 	if h.invSvc == nil {
@@ -85,6 +86,10 @@ func (h *AuthHandler) AcceptInvitation(c echo.Context) error {
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidInvitation) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired invitation link"})
+		}
+		if errors.Is(err, auth.ErrInvitationBlocked) {
+			// The link is valid; the account state is what forbids acceptance.
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "this account has been blocked — contact your administrator"})
 		}
 		if errors.Is(err, auth.ErrWeakPassword) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -186,7 +191,7 @@ func (h *AuthHandler) ConfirmEmailChange(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "token is required"})
 	}
 
-	newEmail, err := h.chgSvc.Confirm(c.Request().Context(), token)
+	res, err := h.chgSvc.Confirm(c.Request().Context(), token)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrInvalidEmailChange):
@@ -199,13 +204,16 @@ func (h *AuthHandler) ConfirmEmailChange(c echo.Context) error {
 	}
 
 	h.auditEvent(c, audit.Event{
-		ActorEmail:   newEmail,
+		TenantID:     &res.TenantID,
+		UserID:       &res.UserID,
+		ActorEmail:   res.NewEmail,
 		Action:       audit.ActionAuthEmailChanged,
 		ResourceType: "user",
 		IPAddress:    c.RealIP(),
 		UserAgent:    c.Request().UserAgent(),
+		Metadata:     map[string]any{"previous_email": res.OldEmail},
 	})
-	return c.JSON(http.StatusOK, map[string]string{"message": "email address updated", "email": newEmail})
+	return c.JSON(http.StatusOK, map[string]string{"message": "email address updated", "email": res.NewEmail})
 }
 
 // UnblockAccount handles GET /api/v1/auth/unblock-account?token=... — the link

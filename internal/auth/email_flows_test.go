@@ -153,6 +153,47 @@ func TestInvitation_ResendSupersedesPrevious(t *testing.T) {
 	}
 }
 
+// TestInvitation_AdminBlockCannotBeBypassed proves a still-live invitation link
+// cannot undo an operator's block: an admin who invites a user and then blocks
+// the account stays in control, and the account is not silently re-activated.
+func TestInvitation_AdminBlockCannotBeBypassed(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, "http://localhost:9090", testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	email := uniqueEmail("invite-blocked")
+	userID := e.seedUser(t, email, "")
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	raw := tokenFromLink(t, e.mail.invitations[0].Link)
+
+	if _, err := e.pool.Exec(e.ctx, `
+		UPDATE users SET is_active = false, blocked_at = NOW(), block_reason = $2 WHERE id = $1
+	`, userID, mailer.BlockReasonAdmin); err != nil {
+		t.Fatalf("admin-block user: %v", err)
+	}
+
+	if _, err := invSvc.Accept(e.ctx, raw, "Password123!"); !errors.Is(err, auth.ErrInvitationBlocked) {
+		t.Fatalf("Accept on an admin-blocked account = %v, want ErrInvitationBlocked", err)
+	}
+	var active bool
+	var used *string
+	if err := e.pool.QueryRow(e.ctx, `
+		SELECT u.is_active, i.used_at::text
+		FROM users u JOIN user_invitations i ON i.user_id = u.id
+		WHERE u.id = $1
+	`, userID).Scan(&active, &used); err != nil {
+		t.Fatalf("read state after rejected accept: %v", err)
+	}
+	if active {
+		t.Error("is_active = true after a rejected accept, want the admin block to stand")
+	}
+	if used != nil {
+		t.Error("invitation was consumed by a rejected accept, want it untouched")
+	}
+}
+
 // TestInvitation_SuppressedTemplateRetiresToken proves a disabled template sends
 // nothing and leaves no usable link behind.
 func TestInvitation_SuppressedTemplateRetiresToken(t *testing.T) {
@@ -221,8 +262,29 @@ func TestEmailChange_FullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
-	if got != newEmail {
-		t.Errorf("Confirm returned %s, want %s", got, newEmail)
+	if got.NewEmail != newEmail || got.OldEmail != oldEmail || got.UserID != userID || got.TenantID != e.tenantID {
+		t.Errorf("Confirm returned %+v, want new=%s old=%s user=%d tenant=%d", got, newEmail, oldEmail, userID, e.tenantID)
+	}
+
+	// The previous address is told after the fact, so a takeover is never silent.
+	if len(e.mail.emailChanges) != 2 || e.mail.emailChanges[1].To != oldEmail ||
+		e.mail.emailChanges[1].Reason != mailer.EmailChangeApplied ||
+		e.mail.emailChanges[1].NewEmail != newEmail {
+		t.Errorf("second change-email send = %+v, want the %q notice to %s", e.mail.emailChanges, mailer.EmailChangeApplied, oldEmail)
+	}
+
+	// An email change is a credential change: prior sessions must not survive it.
+	var tokenVersion int
+	var liveTokens int
+	if err := e.pool.QueryRow(e.ctx, `
+		SELECT u.token_version,
+		       (SELECT COUNT(*) FROM refresh_tokens WHERE user_id = u.id AND revoked_at IS NULL)
+		FROM users u WHERE u.id = $1
+	`, userID).Scan(&tokenVersion, &liveTokens); err != nil {
+		t.Fatalf("read token state: %v", err)
+	}
+	if tokenVersion == 0 || liveTokens != 0 {
+		t.Errorf("after confirm token_version=%d live refresh tokens=%d, want a bump and 0", tokenVersion, liveTokens)
 	}
 
 	var verified bool
@@ -472,7 +534,7 @@ func TestBreach_WarnsOnceForBreachedPassword(t *testing.T) {
 	}
 
 	// After a password change the marker is cleared and a new hit warns again.
-	brchSvc.ClearNotified(e.ctx, userID)
+	brchSvc.ClearNotified(e.ctx, e.tenantID, userID)
 	if err := brchSvc.CheckNow(e.ctx, e.tenantID, nil, userID, email, password); err != nil {
 		t.Fatalf("CheckNow after clear: %v", err)
 	}

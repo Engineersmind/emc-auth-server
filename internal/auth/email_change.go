@@ -22,9 +22,11 @@ import (
 // row is the whole point: a typo'd or attacker-supplied address can never take
 // over the account, because the change never lands until the NEW inbox confirms.
 //
-// The confirmation goes to the new address only. Notifying the old address is a
-// separate concern handled by the password-changed-style alerts, and sending the
-// link there would defeat the proof-of-control check.
+// The confirmation link goes to the new address only — sending it to the old one
+// would defeat the proof-of-control check. The old address is told after the fact
+// instead: once the change applies it receives a security notice naming the new
+// address, so a silent takeover is impossible even for someone holding a valid
+// session.
 // ---------------------------------------------------------------------------
 
 // EmailChangeTTL is how long a pending email-change confirmation stays valid.
@@ -161,47 +163,94 @@ func (s *EmailChangeService) Request(ctx context.Context, tenantID, userID int64
 	return nil
 }
 
+// EmailChangeResult describes an applied email change. It carries the identity
+// the caller needs for a complete audit record — the handler has no session to
+// read it from, because the confirmation link is followed unauthenticated.
+type EmailChangeResult struct {
+	UserID   int64
+	TenantID int64
+	OldEmail string
+	NewEmail string
+}
+
 // Confirm consumes an email-change token and moves users.email to the confirmed
-// address, marking it verified. Returns the new address on success.
-func (s *EmailChangeService) Confirm(ctx context.Context, rawToken string) (string, error) {
-	var reqID, userID, tenantID int64
-	var newEmail string
+// address, marking it verified. The identity on the account has changed, so this
+// is treated like any other credential change: token_version is bumped and every
+// refresh token revoked, so sessions carrying the old email claim cannot outlive
+// it. The previous address is then told what happened.
+func (s *EmailChangeService) Confirm(ctx context.Context, rawToken string) (*EmailChangeResult, error) {
+	var res EmailChangeResult
+	var reqID int64
+	var appRowID *int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, user_id, tenant_id, new_email
-		FROM email_change_requests
-		WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()
-	`, HashToken(rawToken)).Scan(&reqID, &userID, &tenantID, &newEmail)
+		SELECT r.id, r.user_id, r.tenant_id, r.new_email, u.email, u.application_id
+		FROM email_change_requests r
+		JOIN users u ON u.id = r.user_id
+		WHERE r.token_hash = $1 AND r.used_at IS NULL AND r.expires_at > NOW()
+		  AND u.deleted_at IS NULL
+	`, HashToken(rawToken)).Scan(&reqID, &res.UserID, &res.TenantID, &res.NewEmail, &res.OldEmail, &appRowID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrInvalidEmailChange
+			return nil, ErrInvalidEmailChange
 		}
-		return "", fmt.Errorf("lookup email change request: %w", err)
+		return nil, fmt.Errorf("lookup email change request: %w", err)
 	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("begin confirm-email-change tx: %w", err)
+		return nil, fmt.Errorf("begin confirm-email-change tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	if _, err := tx.Exec(ctx, `UPDATE email_change_requests SET used_at = NOW() WHERE id = $1`, reqID); err != nil {
-		return "", fmt.Errorf("mark email change used: %w", err)
+		return nil, fmt.Errorf("mark email change used: %w", err)
 	}
 	// The address may have been claimed between request and confirmation, so the
 	// unique constraint is the authority here, not the earlier availability check.
 	if _, err := tx.Exec(ctx, `
-		UPDATE users SET email = $1, email_verified = true, updated_at = NOW()
+		UPDATE users SET email = $1, email_verified = true,
+		    token_version = token_version + 1, updated_at = NOW()
 		WHERE id = $2 AND tenant_id = $3
-	`, newEmail, userID, tenantID); err != nil {
+	`, res.NewEmail, res.UserID, res.TenantID); err != nil {
 		if isUniqueViolation(err) {
-			return "", ErrEmailTaken
+			return nil, ErrEmailTaken
 		}
-		return "", fmt.Errorf("apply email change: %w", err)
+		return nil, fmt.Errorf("apply email change: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW()
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, res.UserID, res.TenantID); err != nil {
+		return nil, fmt.Errorf("revoke sessions on email change: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return "", fmt.Errorf("commit confirm-email-change: %w", err)
+		return nil, fmt.Errorf("commit confirm-email-change: %w", err)
 	}
 
-	s.logger.Info().Int64("user_id", userID).Msg("email change confirmed")
-	return newEmail, nil
+	s.logger.Info().Int64("user_id", res.UserID).Msg("email change confirmed")
+	s.notifyOldAddress(ctx, res.TenantID, appRowID, res.OldEmail, res.NewEmail)
+	return &res, nil
+}
+
+// notifyOldAddress tells the previous address that the account moved. Without it
+// an attacker holding a captured access token could reroute an account silently,
+// and the original owner would have no signal at all. Best-effort and after
+// commit: the change stands whether or not this mail is delivered.
+func (s *EmailChangeService) notifyOldAddress(ctx context.Context, tenantID int64, appRowID *int64, oldEmail, newEmail string) {
+	if oldEmail == "" {
+		return
+	}
+	msg := mailer.ChangeEmailEmail{
+		To:       oldEmail,
+		Link:     fmt.Sprintf("%s/forgot-password", s.appBaseURL),
+		AppName:  appNameByRowID(ctx, s.pool, appRowID),
+		Reason:   mailer.EmailChangeApplied,
+		NewEmail: newEmail,
+	}
+	if _, err := s.notify.send(ctx, tenantID, appRowID, mailer.TemplateChangeEmail,
+		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
+			return s.notify.mailer.SendChangeEmail(ctx, sender, tmpl, msg)
+		}); err != nil {
+		s.logger.Warn().Err(err).Msg("email change: could not alert the previous address")
+	}
 }

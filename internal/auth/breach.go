@@ -153,7 +153,7 @@ func (s *BreachService) CheckNow(ctx context.Context, tenantID int64, appRowID *
 		}); err != nil {
 		// Release the slot so the next sign-in retries rather than swallowing the
 		// only warning the user was ever going to get.
-		if _, rbErr := s.pool.Exec(ctx, `UPDATE users SET breach_notified_at = NULL WHERE id = $1`, userID); rbErr != nil {
+		if _, rbErr := s.pool.Exec(ctx, `UPDATE users SET breach_notified_at = NULL WHERE id = $1 AND tenant_id = $2`, userID, tenantID); rbErr != nil {
 			s.logger.Warn().Err(rbErr).Int64("user_id", userID).Msg("breach: could not release notification slot")
 		}
 		return fmt.Errorf("send breach warning: %w", err)
@@ -164,11 +164,11 @@ func (s *BreachService) CheckNow(ctx context.Context, tenantID int64, appRowID *
 // ClearNotified resets the one-warning-per-password marker. Callers invoke it
 // whenever a password changes, so a user who ignores the warning and later
 // changes to another breached password is warned again. Best-effort.
-func (s *BreachService) ClearNotified(ctx context.Context, userID int64) {
+func (s *BreachService) ClearNotified(ctx context.Context, tenantID, userID int64) {
 	if s == nil {
 		return
 	}
-	if _, err := s.pool.Exec(ctx, `UPDATE users SET breach_notified_at = NULL WHERE id = $1`, userID); err != nil {
+	if _, err := s.pool.Exec(ctx, `UPDATE users SET breach_notified_at = NULL WHERE id = $1 AND tenant_id = $2`, userID, tenantID); err != nil {
 		s.logger.Warn().Err(err).Int64("user_id", userID).Msg("breach: could not clear notification marker")
 	}
 }

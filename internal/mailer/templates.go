@@ -86,10 +86,19 @@ type TemplateData struct {
 	Name        string // recipient display name (may be empty)
 	Email       string // recipient address
 	InviterName string // who sent an invitation (user_invitation; may be empty)
-	// Reason explains why an account was blocked or flagged (blocked_account).
-	// One of the BlockReason* values; empty in every other template.
+	// Reason selects a variant within a template that covers several events: one
+	// of the BlockReason* values for blocked_account, or EmailChangeApplied for
+	// change_email. Empty in every other template.
 	Reason string
+	// NewEmail is the address an account was moved to (change_email's
+	// EmailChangeApplied variant, sent to the previous address). Empty elsewhere.
+	NewEmail string
 }
+
+// EmailChangeApplied is the TemplateData.Reason value that turns the
+// change_email template into the security notice sent to the PREVIOUS address
+// after a change has applied, instead of the confirmation sent to the new one.
+const EmailChangeApplied = "email_changed"
 
 // Block reasons carried in TemplateData.Reason. They select the wording of the
 // blocked_account email, which covers three distinct events.
@@ -288,19 +297,31 @@ This link is valid for {{.TTLMinutes}} minutes. If you were not expecting this, 
 
 - {{.ProductName}}`,
 	},
+	// One template, two events — selected by .Reason. The default is the
+	// confirmation sent to the NEW address; "email_changed" is the notice sent to
+	// the PREVIOUS address once the change has applied, so the original owner
+	// always learns about it and can act if it was not their doing.
 	TemplateChangeEmail: {
-		Subject: "Confirm your new email address",
-		HTML: shell(`<h2>Confirm your new email</h2>
+		Subject: `{{if eq .Reason "email_changed"}}Security alert — the email address on your account was changed{{else}}Confirm your new email address{{end}}`,
+		HTML: shell(`{{if eq .Reason "email_changed"}}<h2>Your account email was changed</h2>
+<p>The email address on your account{{if .AppName}} for {{.AppName}}{{end}} was changed to <strong>{{.NewEmail}}</strong>. This message is the last one we will send to this address.</p>
+<p>If you made this change, no action is needed. If you did not, your account may be compromised — reset your password immediately and contact support.</p>
+` + fmt.Sprintf(button, "Reset password") + `
+{{else}}<h2>Confirm your new email</h2>
 <p>We received a request to change the email address on your account to this one. Please confirm it belongs to you.</p>
 <p>This link is valid for {{.TTLMinutes}} minutes.</p>
 ` + fmt.Sprintf(button, "Confirm email") + `
-<p>If you did not request this change, you can safely ignore this email — your address will not be updated.</p>`),
-		Text: `Confirm your new email address for your account.
+<p>If you did not request this change, you can safely ignore this email — your address will not be updated.</p>{{end}}`),
+		Text: `{{if eq .Reason "email_changed"}}The email address on your account{{if .AppName}} for {{.AppName}}{{end}} was changed to {{.NewEmail}}.
+
+If you did not make this change, reset your password immediately and contact support:
+{{.Link}}
+{{else}}Confirm your new email address for your account.
 
 {{.Link}}
 
 This link is valid for {{.TTLMinutes}} minutes. If you did not request this change, ignore this email.
-
+{{end}}
 - {{.ProductName}}`,
 	},
 	// One template, three events — selected by .Reason. "suspicious_login" is an

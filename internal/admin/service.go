@@ -1566,7 +1566,7 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 	// block stands whether or not the mail is delivered.
 	if !active {
 		var appRowID *int64
-		if err := s.pool.QueryRow(ctx, `SELECT application_id FROM users WHERE id = $1`, userID).Scan(&appRowID); err != nil {
+		if err := s.pool.QueryRow(ctx, `SELECT application_id FROM users WHERE id = $1 AND tenant_id = $2`, userID, tenantID).Scan(&appRowID); err != nil {
 			s.logger.Warn().Err(err).Int64("user_id", userID).Msg("admin: could not resolve app scope for block notification")
 		} else {
 			s.blockSvc.NotifyAdminBlock(ctx, tenantID, appRowID, userID, result.Email)
