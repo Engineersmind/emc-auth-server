@@ -668,7 +668,7 @@ Items tracked for v2 (post-Phase 7):
 | Enhancement | Description | Priority |
 |-------------|-------------|----------|
 | OAuth2 / OIDC server | Expose authorization_code + client_credentials flows so third-party apps can use EMC-Auth as a full OAuth2 provider | High |
-| Social login | Google, GitHub, Microsoft OAuth2 login with account linking | Medium |
+| Social login | Google (#64 ✅) and GitHub (#66 ✅) shipped with account linking; Microsoft pending | Medium |
 | Passwordless / magic link | Email-based one-click login for low-friction onboarding | Medium |
 | RS256 JWT | Asymmetric signing — public key endpoint so external services can verify tokens without calling EMC-Auth | Medium |
 | Webhooks | POST to a configured URL on user lifecycle events: `user.created`, `user.deleted`, `auth.login_failed` | Medium |
@@ -962,7 +962,7 @@ Items tracked for v2 (post-Phase 8):
 | Enhancement | Description | Priority |
 |-------------|-------------|----------|
 | OAuth2 / OIDC server | Expose authorization_code + client_credentials flows so third-party apps can use EMC-Auth as a full OAuth2 provider | High |
-| Social login | Google, GitHub, Microsoft OAuth2 login with account linking | Medium |
+| Social login | Google (#64 ✅) and GitHub (#66 ✅) shipped with account linking; Microsoft pending | Medium |
 | Passwordless / magic link | Email-based one-click login for low-friction onboarding | Medium |
 | RS256 JWT | Asymmetric signing — public key endpoint so external services can verify tokens without calling EMC-Auth | Medium |
 | Webhooks | POST to a configured URL on user lifecycle events: `user.created`, `user.deleted`, `auth.login_failed` | Medium |

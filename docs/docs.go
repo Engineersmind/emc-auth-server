@@ -601,7 +601,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -664,7 +664,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -3229,7 +3229,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/refresh": {
             "post": {
-                "description": "Issues a new access + refresh token pair and immediately invalidates the old refresh token.",
+                "description": "Issues a new access + refresh token pair and immediately invalidates the old refresh token.\nBody-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:\n409 (` + "`" + `concurrent_refresh` + "`" + `) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.\n503 means the session store (Redis) is temporarily unavailable — the client should retry.",
                 "consumes": [
                     "application/json"
                 ],
@@ -3269,6 +3269,24 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "concurrent_refresh — sibling request already rotated the family; no token pair returned",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "session store unavailable — retry",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3517,7 +3535,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/session/refresh": {
             "post": {
-                "description": "Rotates the access and refresh tokens using the refresh cookie.",
+                "description": "Rotates the access and refresh tokens using the refresh cookie.\n409 (` + "`" + `concurrent_refresh` + "`" + `) signals a sibling request already rotated the family within the grace window (the fresh cookies are on that sibling's response); 503 signals the session store (Redis) is temporarily unavailable — retry.",
                 "produces": [
                     "application/json"
                 ],
@@ -3537,6 +3555,24 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "concurrent_refresh — sibling request already rotated the family",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "session store unavailable — retry",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5998,7 +6034,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -6430,7 +6466,7 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
@@ -6481,7 +6517,7 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Provider (google)",
+                        "description": "Provider (google, github)",
                         "name": "provider",
                         "in": "path",
                         "required": true
