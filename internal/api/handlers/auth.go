@@ -29,7 +29,10 @@ type AuthHandler struct {
 	totpSvc   *auth.TOTPService         // nil when TOTP not configured
 	emailSvc  *auth.EmailMFAService     // nil when email MFA not configured
 	apiKeySvc *auth.APIKeyService
-	appSvc    *auth.ApplicationService // nil until WithApplications is called
+	appSvc    *auth.ApplicationService  // nil until WithApplications is called
+	invSvc    *auth.InvitationService   // nil when invitations are not configured
+	chgSvc    *auth.EmailChangeService  // nil when email change is not configured
+	blockSvc  *auth.AccountBlockService // nil when account lockout is not configured
 	jwtSvc    *auth.JWTService
 	audit     *audit.Logger
 	logger    zerolog.Logger
@@ -358,6 +361,8 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		UserAgent:     c.Request().UserAgent(),
 	})
 
+	h.notifyRiskySignIn(c, tid, uid, appID, req.Email)
+
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
 	return c.JSON(http.StatusOK, result.Token)
 }
@@ -543,6 +548,8 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		IPAddress:     c.RealIP(),
 		UserAgent:     c.Request().UserAgent(),
 	})
+
+	h.notifyRiskySignIn(c, tid, uid, appID, req.Email)
 
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
 	return c.JSON(http.StatusOK, result.Token)

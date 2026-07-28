@@ -1061,6 +1061,10 @@ type CreateUserAdminRequest struct {
 	FirstName string  `json:"first_name"`
 	LastName  string  `json:"last_name"`
 	RoleID    *string `json:"role_id"`
+	// SendInvitation emails the user a link to set their own password instead of
+	// the admin choosing one. When true, Password must be omitted — supplying
+	// both is contradictory and is rejected rather than silently resolved.
+	SendInvitation bool `json:"send_invitation"`
 }
 
 // UpdateUserAdminRequest is the body for PUT /api/v1/admin/users/:id.
@@ -1139,7 +1143,10 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 	if req.Email == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email is required"})
 	}
-	if len(req.Password) < 8 {
+	switch {
+	case req.SendInvitation && req.Password != "":
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "send_invitation and password are mutually exclusive"})
+	case !req.SendInvitation && len(req.Password) < 8:
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
 	}
 
@@ -1152,7 +1159,13 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 		roleID = &rid
 	}
 
-	result, err := h.svc.CreateUser(c.Request().Context(), tenantID, appScope, req.Email, req.Password, req.FirstName, req.LastName, roleID)
+	ctx := c.Request().Context()
+	var result *admin.UserResult
+	if req.SendInvitation {
+		result, err = h.svc.InviteUser(ctx, tenantID, appScope, req.Email, req.FirstName, req.LastName, roleID, actorUserID(claims), actorName(claims))
+	} else {
+		result, err = h.svc.CreateUser(ctx, tenantID, appScope, req.Email, req.Password, req.FirstName, req.LastName, roleID)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, admin.ErrAlreadyExists):
@@ -1161,12 +1174,90 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case errors.Is(err, admin.ErrNotFound):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "role not found"})
+		case errors.Is(err, admin.ErrInvitationsUnavailable):
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": err.Error()})
+		}
+		// A non-nil result with an error means the account was created but the
+		// invitation could not be sent: report 201 with a warning rather than a
+		// 500 that hides an account the admin now owns.
+		if result != nil {
+			h.logger.Error().Err(err).Msg("admin: invitation dispatch failed after user creation")
+			h.auditAdmin(c, claims, audit.ActionAdminUserCreated, "user", result.ID)
+			return c.JSON(http.StatusCreated, map[string]any{
+				"user":    result,
+				"warning": "user created but the invitation email could not be sent — use the resend endpoint",
+			})
 		}
 		h.logger.Error().Err(err).Msg("admin: create user failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create user"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminUserCreated, "user", result.ID)
+	action := audit.ActionAdminUserCreated
+	if req.SendInvitation {
+		action = audit.ActionAdminUserInvited
+	}
+	h.auditAdmin(c, claims, action, "user", result.ID)
 	return c.JSON(http.StatusCreated, result)
+}
+
+// ResendInvitation handles POST .../users/:uid/invite — issues a fresh
+// invitation link, superseding any outstanding one.
+//
+// @Summary      Resend a user invitation
+// @Description  Emails a fresh invitation link to the user, invalidating any previous one. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/invite [post]
+func (h *AdminHandler) ResendInvitation(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	if err := h.svc.ResendInvitation(c.Request().Context(), tenantID, appScope, userID, actorUserID(claims), actorName(claims)); err != nil {
+		switch {
+		case errors.Is(err, admin.ErrNotFound):
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		case errors.Is(err, admin.ErrInvitationsUnavailable):
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: resend invitation failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to send invitation"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserInvited, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "invitation sent"})
+}
+
+// actorUserID extracts the acting admin's users.id from their claims, or nil for
+// a service token (whose UserID claim is a client_id, not a users.id).
+func actorUserID(claims *auth.Claims) *int64 {
+	if claims == nil {
+		return nil
+	}
+	id, err := strconv.ParseInt(claims.UserID, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+
+// actorName is the display name shown as the inviter in invitation emails.
+func actorName(claims *auth.Claims) string {
+	if claims == nil {
+		return ""
+	}
+	return claims.Email
 }
 
 // GetAdminUser handles GET /api/v1/admin/users/:id.

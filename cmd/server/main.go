@@ -194,6 +194,8 @@ func main() {
 			CookieDomain:                           cfg.CookieDomain,
 			GlobalCORSOrigins:                      cfg.GlobalCORSOrigins,
 			AuditCaptureResponseBody:               cfg.AuditCaptureResponseBody,
+			BreachDetectionEnabled:                 cfg.BreachDetectionEnabled,
+			UntrustedIPCIDRs:                       cfg.UntrustedIPCIDRs,
 		},
 	})
 

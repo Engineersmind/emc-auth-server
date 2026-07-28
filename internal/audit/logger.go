@@ -115,6 +115,15 @@ const (
 	// Auth — passwordless magic-link sign-in (issue #63 follow-on)
 	ActionAuthMagicLinkRequested = "auth.magic_link_requested"
 
+	// Auth — invitations, email change, lockout, breached passwords
+	ActionAdminUserInvited        = "admin.user_invited"
+	ActionAuthInvitationAccepted  = "auth.invitation_accepted"
+	ActionAuthEmailChangeReq      = "auth.email_change_requested"
+	ActionAuthEmailChanged        = "auth.email_changed"
+	ActionAuthAccountBlocked      = "auth.account_blocked"
+	ActionAuthAccountUnblocked    = "auth.account_unblocked"
+	ActionAuthPasswordBreachFound = "auth.password_breach_detected"
+
 	// Admin — per-application MFA policy management (issue #63)
 	ActionAdminMFAPolicyUpdated = "admin.mfa_policy_updated"
 	ActionAdminUserMFAReset     = "admin.user_mfa_reset"

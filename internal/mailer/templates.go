@@ -86,7 +86,33 @@ type TemplateData struct {
 	Name        string // recipient display name (may be empty)
 	Email       string // recipient address
 	InviterName string // who sent an invitation (user_invitation; may be empty)
+	// Reason selects a variant within a template that covers several events: one
+	// of the BlockReason* values for blocked_account, or EmailChangeApplied for
+	// change_email. Empty in every other template.
+	Reason string
+	// NewEmail is the address an account was moved to (change_email's
+	// EmailChangeApplied variant, sent to the previous address). Empty elsewhere.
+	NewEmail string
 }
+
+// EmailChangeApplied is the TemplateData.Reason value that turns the
+// change_email template into the security notice sent to the PREVIOUS address
+// after a change has applied, instead of the confirmation sent to the new one.
+const EmailChangeApplied = "email_changed"
+
+// Block reasons carried in TemplateData.Reason. They select the wording of the
+// blocked_account email, which covers three distinct events.
+const (
+	// BlockReasonFailedAttempts is an automatic block after repeated failed
+	// sign-ins. The user may lift it themselves via the emailed link.
+	BlockReasonFailedAttempts = "failed_attempts"
+	// BlockReasonAdmin is an administrator disabling the account. The link is a
+	// password reset, not an unblock — only an admin can restore access.
+	BlockReasonAdmin = "admin"
+	// BlockReasonSuspiciousLogin is a high-risk sign-in that succeeded. Nothing
+	// is blocked; this is an alert telling the user to secure the account.
+	BlockReasonSuspiciousLogin = "suspicious_login"
+)
 
 // rendered is the output of applying a Template to TemplateData.
 type rendered struct {
@@ -271,35 +297,68 @@ This link is valid for {{.TTLMinutes}} minutes. If you were not expecting this, 
 
 - {{.ProductName}}`,
 	},
+	// One template, two events — selected by .Reason. The default is the
+	// confirmation sent to the NEW address; "email_changed" is the notice sent to
+	// the PREVIOUS address once the change has applied, so the original owner
+	// always learns about it and can act if it was not their doing.
 	TemplateChangeEmail: {
-		Subject: "Confirm your new email address",
-		HTML: shell(`<h2>Confirm your new email</h2>
+		Subject: `{{if eq .Reason "email_changed"}}Security alert — the email address on your account was changed{{else}}Confirm your new email address{{end}}`,
+		HTML: shell(`{{if eq .Reason "email_changed"}}<h2>Your account email was changed</h2>
+<p>The email address on your account{{if .AppName}} for {{.AppName}}{{end}} was changed to <strong>{{.NewEmail}}</strong>. This message is the last one we will send to this address.</p>
+<p>If you made this change, no action is needed. If you did not, your account may be compromised — reset your password immediately and contact support.</p>
+` + fmt.Sprintf(button, "Reset password") + `
+{{else}}<h2>Confirm your new email</h2>
 <p>We received a request to change the email address on your account to this one. Please confirm it belongs to you.</p>
 <p>This link is valid for {{.TTLMinutes}} minutes.</p>
 ` + fmt.Sprintf(button, "Confirm email") + `
-<p>If you did not request this change, you can safely ignore this email — your address will not be updated.</p>`),
-		Text: `Confirm your new email address for your account.
+<p>If you did not request this change, you can safely ignore this email — your address will not be updated.</p>{{end}}`),
+		Text: `{{if eq .Reason "email_changed"}}The email address on your account{{if .AppName}} for {{.AppName}}{{end}} was changed to {{.NewEmail}}.
+
+If you did not make this change, reset your password immediately and contact support:
+{{.Link}}
+{{else}}Confirm your new email address for your account.
 
 {{.Link}}
 
 This link is valid for {{.TTLMinutes}} minutes. If you did not request this change, ignore this email.
-
+{{end}}
 - {{.ProductName}}`,
 	},
+	// One template, three events — selected by .Reason. "suspicious_login" is an
+	// alert (nothing is blocked), "admin" is an operator action the user cannot
+	// undo (link = password reset), and the default is an automatic lockout the
+	// user may lift via the emailed single-use link.
 	TemplateBlockedAccount: {
-		Subject: "Suspicious activity — your account was blocked",
-		HTML: shell(`<h2>Your account was blocked</h2>
-<p>We detected a suspicious sign-in attempt on your account and blocked access to keep it secure.</p>
-<p>If this was you, use the link below to unblock your account. This link is valid for {{.TTLMinutes}} minutes.</p>
+		Subject: `{{if eq .Reason "suspicious_login"}}Security alert — unusual sign-in to your account{{else}}Your account has been blocked{{end}}`,
+		HTML: shell(`{{if eq .Reason "suspicious_login"}}<h2>Unusual sign-in detected</h2>
+<p>Someone signed in to your account{{if .AppName}} for {{.AppName}}{{end}} from a device or location we have not seen before. Your account has not been blocked.</p>
+<p>If this was you, no action is needed. If it was not, secure your account now by changing your password.</p>
+` + fmt.Sprintf(button, "Change password") + `
+{{else if eq .Reason "admin"}}<h2>Your account has been blocked</h2>
+<p>An administrator has blocked access to your account{{if .AppName}} for {{.AppName}}{{end}}.</p>
+<p>Contact your administrator to restore access. If you believe your password was compromised, you can reset it using the link below.</p>
+` + fmt.Sprintf(button, "Reset password") + `
+{{else}}<h2>Your account was blocked</h2>
+<p>We blocked access to your account{{if .AppName}} for {{.AppName}}{{end}} after too many failed sign-in attempts, to keep it secure.</p>
+<p>If this was you, use the link below to unblock your account. This link is valid for {{.TTLMinutes}} minutes and can be used once.</p>
 ` + fmt.Sprintf(button, "Unblock account") + `
-<p>If this was not you, we recommend changing your password immediately.</p>`),
-		Text: `We detected a suspicious sign-in attempt on your account and blocked access to keep it secure.
+<p>If this was not you, someone may be trying to guess your password — we recommend changing it.</p>
+{{end}}`),
+		Text: `{{if eq .Reason "suspicious_login"}}Someone signed in to your account{{if .AppName}} for {{.AppName}}{{end}} from a device or location we have not seen before. Your account has not been blocked.
+
+If this was not you, secure your account by changing your password:
+{{.Link}}
+{{else if eq .Reason "admin"}}An administrator has blocked access to your account{{if .AppName}} for {{.AppName}}{{end}}.
+
+Contact your administrator to restore access. To reset your password:
+{{.Link}}
+{{else}}We blocked access to your account{{if .AppName}} for {{.AppName}}{{end}} after too many failed sign-in attempts.
 
 If this was you, unblock your account here:
 {{.Link}}
 
-This link is valid for {{.TTLMinutes}} minutes. If this was not you, change your password immediately.
-
+This link is valid for {{.TTLMinutes}} minutes and can be used once. If this was not you, change your password.
+{{end}}
 - {{.ProductName}}`,
 	},
 	TemplatePasswordBreach: {

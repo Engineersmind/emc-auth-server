@@ -22,6 +22,8 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 	samlsvc "github.com/engineersmind/emc-auth-server/internal/saml"
+	"github.com/engineersmind/emc-auth-server/internal/security/breach"
+	"github.com/engineersmind/emc-auth-server/internal/security/risk"
 )
 
 // Deps holds shared dependencies injected into route handlers.
@@ -74,6 +76,10 @@ type RoutesConfig struct {
 	GlobalCORSOrigins []string
 	// AuditCaptureResponseBody gates response-body capture: "off" | "failures" | "all".
 	AuditCaptureResponseBody string
+	// BreachDetectionEnabled turns on breached-password warnings (HIBP range API).
+	BreachDetectionEnabled bool
+	// UntrustedIPCIDRs feeds the risk assessor behind suspicious-sign-in alerts.
+	UntrustedIPCIDRs []string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -269,6 +275,28 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithTemplates(tmplSvc)
 	authSvc.WithEmailMFA(emailMFASvc)
 
+	// Invitations, self-service email change, account lockout, and breached-
+	// password warnings — the remaining transactional email flows. Each reuses
+	// the same sender + template resolvers, so their mail is branded per scope
+	// and can be customized or disabled per application like every other type.
+	invSvc := auth.NewInvitationService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
+		WithSenders(senderSvc).
+		WithTemplates(tmplSvc)
+	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
+		WithSenders(senderSvc).
+		WithTemplates(tmplSvc)
+	blockSvc := auth.NewAccountBlockService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
+		WithSenders(senderSvc).
+		WithTemplates(tmplSvc).
+		WithRiskAssessor(risk.New(deps.Pool, deps.Config.UntrustedIPCIDRs, deps.Logger))
+	// A disabled checker yields a service whose Notify is a no-op.
+	breachSvc := auth.NewBreachService(deps.Pool,
+		breach.New(deps.Config.BreachDetectionEnabled, deps.Logger),
+		m, deps.Config.AppBaseURL, deps.Logger).
+		WithSenders(senderSvc).
+		WithTemplates(tmplSvc)
+	authSvc.WithAccountBlocking(blockSvc).WithBreachDetection(breachSvc)
+
 	// Audit logger — shared by both auth and admin handlers. Prefer the
 	// caller-owned instance (main.go closes it on shutdown to drain the
 	// async buffer); fall back to a local one for tests.
@@ -283,6 +311,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	resetSvc.WithAudit(auditLog)
 	verifSvc.WithAudit(auditLog)
 	emailMFASvc.WithAudit(auditLog)
+	invSvc.WithAudit(auditLog)
+	emailChangeSvc.WithAudit(auditLog)
+	blockSvc.WithAudit(auditLog)
+	breachSvc.WithAudit(auditLog)
 
 	// Capture the real response status + (redacted) body and attach them to each
 	// request's audit events. Registered here (after auditLog exists) so it wraps
@@ -300,10 +332,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithApplications(appSvc).
 		WithCookieConfig(cookieCfg).
 		WithJWT(jwtSvc).
-		WithRedis(deps.Redis)
+		WithRedis(deps.Redis).
+		WithInvitations(invSvc).
+		WithEmailChange(emailChangeSvc).
+		WithAccountBlocking(blockSvc)
 
 	// Admin service (Phase 5)
-	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
+	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger).
+		WithInvitations(invSvc).
+		WithAccountBlocking(blockSvc)
 
 	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
 	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
@@ -384,6 +421,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.GET("/verify-email", authHandler.VerifyEmail)
 	authGroup.POST("/resend-verification", authHandler.ResendVerification, mw.TokenRateLimiter(rlCfg))
 
+	// Landing points for the invitation, email-change, and unblock emails. All
+	// three are token-authenticated (the token IS the credential), so they are
+	// public but rate-limited: a bearer-token guard would be impossible to
+	// satisfy from a link in an email.
+	authGroup.POST("/accept-invitation", authHandler.AcceptInvitation, mw.TokenRateLimiter(rlCfg))
+	authGroup.GET("/confirm-email-change", authHandler.ConfirmEmailChange, mw.TokenRateLimiter(rlCfg))
+	authGroup.GET("/unblock-account", authHandler.UnblockAccount, mw.TokenRateLimiter(rlCfg))
+
 	// Management token — exchange an API key for a short-lived admin JWT.
 	// Equivalent to Auth0 client_credentials grant for the Management API.
 	// Usage: POST /api/v1/auth/management-token with X-API-Key: emck_<key>
@@ -427,6 +472,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Auth routes — protected with transparent renewal (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, jwtRenew, appRateLimit)
 	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
+
+	// Self-service email change — authenticated: the user must prove who they are
+	// to start it, and prove control of the new inbox to finish it (the GET
+	// confirm route above). Rate-limited so the confirmation mail cannot be used
+	// to spam an arbitrary address.
+	authGroup.POST("/change-email", authHandler.ChangeEmail, jwtRenew, appRateLimit, mw.TokenRateLimiter(rlCfg))
 
 	// TOTP management — protected (03-01)
 	otpGroup := authGroup.Group("/otp", jwtRenew, appRateLimit)
@@ -507,6 +558,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/users/:uid", adminHandler.UpdateAdminUser, tidUsersWrite)
 	adminGroup.PUT("/tenants/:tid/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
+	adminGroup.POST("/tenants/:tid/users/:uid/invite", adminHandler.ResendInvitation, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
 	adminGroup.GET("/tenants/:tid/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
 	adminGroup.PUT("/tenants/:tid/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
@@ -578,6 +630,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, tidUsersWrite)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/invite", adminHandler.ResendInvitation, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
 	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
