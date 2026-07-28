@@ -74,6 +74,16 @@ type RoutesConfig struct {
 	GlobalCORSOrigins []string
 	// AuditCaptureResponseBody gates response-body capture: "off" | "failures" | "all".
 	AuditCaptureResponseBody string
+	// Per-account brute-force lockout thresholds (issue #72). See the matching
+	// config.Config fields for semantics; zero SoftLockThreshold disables it.
+	LoginSoftLockThreshold    int
+	LoginHardLockThreshold    int
+	LoginFailureWindowMinutes int
+	LoginHardLockMinutes      int
+	// Login rate-limit budgets per minute (AUTH-07 defaults 5 per IP, 10 per
+	// account). Zero falls back to the default rather than blocking all logins.
+	LoginRateLimitPerIP      int
+	LoginRateLimitPerAccount int
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -283,6 +293,18 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	resetSvc.WithAudit(auditLog)
 	verifSvc.WithAudit(auditLog)
 	emailMFASvc.WithAudit(auditLog)
+	authSvc.WithAudit(auditLog)
+
+	// Per-account brute-force lockout (issue #72). Layered UNDER the per-IP /
+	// per-email LoginRateLimiter, not instead of it: the limiter throttles
+	// request volume from one source, this refuses attempts against one account
+	// no matter how widely distributed the source is.
+	authSvc.WithLockout(deps.Redis, auth.NewLockoutConfig(
+		deps.Config.LoginSoftLockThreshold,
+		deps.Config.LoginHardLockThreshold,
+		deps.Config.LoginFailureWindowMinutes,
+		deps.Config.LoginHardLockMinutes,
+	))
 
 	// Capture the real response status + (redacted) body and attach them to each
 	// request's audit events. Registered here (after auditLog exists) so it wraps
@@ -302,8 +324,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithJWT(jwtSvc).
 		WithRedis(deps.Redis)
 
-	// Admin service (Phase 5)
-	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger)
+	// Admin service (Phase 5). WithLockoutReset lets the unlock endpoint clear
+	// the brute-force failure counter, not just the persisted lock (issue #72).
+	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger).
+		WithLockoutReset(authSvc)
 
 	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
 	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
@@ -355,6 +379,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
+	// Env overrides (0 = keep the AUTH-07 default). Raising these is how the
+	// lockout tiers become testable end-to-end: with the per-IP budget at the
+	// default 5, a single-source attacker is 429'd before the soft lock engages.
+	if deps.Config.LoginRateLimitPerIP > 0 {
+		rlCfg.PerIPRate = deps.Config.LoginRateLimitPerIP
+	}
+	if deps.Config.LoginRateLimitPerAccount > 0 {
+		rlCfg.PerTenantRate = deps.Config.LoginRateLimitPerAccount
+	}
 
 	// /api/v1 route group
 	apiV1 := e.Group("/api/v1")
@@ -627,6 +660,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
 	adminGroup.GET("/users/:id/detail", adminHandler.GetAdminUserDetail, usersRead)
 	adminGroup.PUT("/users/:id/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.POST("/users/:id/unlock", adminHandler.UnlockUser, usersWrite)
 	adminGroup.GET("/users/:id/sessions", adminHandler.ListUserSessions, usersRead)
 	adminGroup.DELETE("/users/:id/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
 	adminGroup.DELETE("/users/:id/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)

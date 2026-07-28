@@ -102,6 +102,22 @@ const (
 	ActionAuthMFALockedOut     = "auth.mfa_locked_out"
 	ActionAuthMFAEmailCodeSent = "auth.mfa_email_code_sent"
 
+	// Auth — per-account password brute-force lockout (issue #72).
+	// SoftLocked: the in-window failure counter crossed the soft threshold;
+	// further attempts are refused for the rest of the window, nothing is
+	// written to the users row. HardLocked: the counter crossed the hard
+	// threshold and users.locked_until was set. LoginBlocked: an attempt was
+	// refused because a lock was already in force (one row per blocked attempt,
+	// so the audit trail shows how long an attack kept running).
+	ActionAuthAccountSoftLocked = "auth.account_soft_locked"
+	ActionAuthAccountHardLocked = "auth.account_hard_locked"
+	ActionAuthLoginBlocked      = "auth.login_blocked_account_locked"
+
+	// Admin — clearing a brute-force lockout (issue #72). Distinct from
+	// ActionAdminUserUnblocked, which reverses an administrative is_active
+	// block; these are two different states and must stay separable in the trail.
+	ActionAdminAccountUnlocked = "admin.account_unlocked"
+
 	// Auth — MFA/TOTP lifecycle (issue #63)
 	ActionAuthMFAEnrolled         = "auth.mfa_enrolled"
 	ActionAuthMFAActivated        = "auth.mfa_activated"
@@ -230,25 +246,27 @@ type Event struct {
 
 // LogEntry is a single audit log row returned by the query endpoints.
 type LogEntry struct {
-	ID              string          `json:"id"`
-	TenantID        *string         `json:"tenant_id"`
-	TenantSlug      *string         `json:"tenant_slug"`
-	UserID          *string         `json:"user_id"`
-	AgentID         *string         `json:"agent_id,omitempty"`
-	ApplicationID   *string         `json:"application_id,omitempty"`
-	ApplicationName *string         `json:"application_name,omitempty"`
-	ActorEmail      string          `json:"actor_email"`
-	Action          string          `json:"action"`
-	AuthMethod      string          `json:"auth_method,omitempty"`
-	ResourceType    string          `json:"resource_type"`
-	ResourceID      string          `json:"resource_id"`
-	IPAddress       string          `json:"ip_address"`
-	UserAgent       string          `json:"user_agent,omitempty"`
-	Status          string          `json:"status"`
-	HTTPStatus      *int            `json:"http_status,omitempty"`
-	RequestID       string          `json:"request_id,omitempty"`
-	Metadata        json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt       time.Time       `json:"created_at"`
+	ID              string  `json:"id"`
+	TenantID        *string `json:"tenant_id"`
+	TenantSlug      *string `json:"tenant_slug"`
+	UserID          *string `json:"user_id"`
+	AgentID         *string `json:"agent_id,omitempty"`
+	ApplicationID   *string `json:"application_id,omitempty"`
+	ApplicationName *string `json:"application_name,omitempty"`
+	ActorEmail      string  `json:"actor_email"`
+	Action          string  `json:"action"`
+	AuthMethod      string  `json:"auth_method,omitempty"`
+	ResourceType    string  `json:"resource_type"`
+	ResourceID      string  `json:"resource_id"`
+	IPAddress       string  `json:"ip_address"`
+	UserAgent       string  `json:"user_agent,omitempty"`
+	Status          string  `json:"status"`
+	HTTPStatus      *int    `json:"http_status,omitempty"`
+	RequestID       string  `json:"request_id,omitempty"`
+	// swaggertype tells swag to document this as a free-form object; without it
+	// swag cannot resolve json.RawMessage and aborts the whole generation run.
+	Metadata  json.RawMessage `json:"metadata,omitempty" swaggertype:"object"`
+	CreatedAt time.Time       `json:"created_at"`
 }
 
 // LogsPage wraps a paginated audit log result.

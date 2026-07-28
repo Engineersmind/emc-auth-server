@@ -13,10 +13,19 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 )
 
 // BcryptCost is the work factor for password hashing (AUTH-02).
 const BcryptCost = 12
+
+// ErrInvalidCredentials is the single failure returned by Login for every
+// unsuccessful outcome — unknown email, wrong password, a password valid for
+// more than one of the email's tenant accounts, and a brute-force lockout in
+// force. They share one error value (and one message) so that no caller can
+// accidentally surface a distinction the client is not meant to observe.
+var ErrInvalidCredentials = errors.New("invalid credentials")
 
 // AuthService implements the business logic for registration, login, and profile lookup.
 type AuthService struct {
@@ -28,6 +37,14 @@ type AuthService struct {
 	appSvc   *ApplicationService  // nil when application context is not needed
 	verifSvc *VerificationService // nil when email verification is not configured
 	logger   zerolog.Logger
+
+	// lockoutRedis and lockout drive per-account brute-force lockout (issue #72).
+	// Held separately from redisCli so lockout works on servers with TOTP
+	// disabled; a nil client or a zero SoftThreshold disables the feature.
+	lockoutRedis *redis.Client
+	lockout      LockoutConfig
+	// audit records lockout events. Nil = lockouts still enforced, just unaudited.
+	audit *audit.Logger
 }
 
 // NewAuthService creates an AuthService.
@@ -54,6 +71,23 @@ func (s *AuthService) WithApplications(appSvc *ApplicationService) *AuthService 
 // verify emailed one-time codes for users enrolled in the email method.
 func (s *AuthService) WithEmailMFA(emailSvc *EmailMFAService) *AuthService {
 	s.emailSvc = emailSvc
+	return s
+}
+
+// WithLockout enables per-account brute-force lockout on login (issue #72).
+// Takes its own Redis client rather than reusing the one WithTOTP installs so
+// the protection does not silently depend on TOTP being configured. Without
+// this call — or with a zero SoftThreshold — Login behaves exactly as before.
+func (s *AuthService) WithLockout(redisCli *redis.Client, cfg LockoutConfig) *AuthService {
+	s.lockoutRedis = redisCli
+	s.lockout = cfg
+	return s
+}
+
+// WithAudit attaches an audit logger so lockout events reach the audit trail.
+// Optional: lockouts are still enforced without it, just not recorded.
+func (s *AuthService) WithAudit(a *audit.Logger) *AuthService {
+	s.audit = a
 	return s
 }
 
@@ -409,6 +443,15 @@ var dummyPasswordHash = []byte("$2a$12$CwTycUXWue0Thq9StjUM0uJ8fVWy9j9G2sQm.a5S0
 // response timing can reveal an email's tenant-account count for the common case.
 const loginCompareFloor = 5
 
+// padCompares runs dummy bcrypt comparisons so that `done` real comparisons
+// plus the padding always total loginCompareFloor, keeping every failure path
+// (unknown email, wrong password, locked account) on the same timing profile.
+func padCompares(done int, password string) {
+	for i := done; i < loginCompareFloor; i++ {
+		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(password))
+	}
+}
+
 // loginCandidate is one (tenant, user) row whose email matches a login attempt.
 type loginCandidate struct {
 	userID       int64
@@ -416,6 +459,9 @@ type loginCandidate struct {
 	email        string
 	passwordHash string
 	roleName     string
+	// lockedUntil is the brute-force lockout expiry, nil when never locked.
+	// A past value means the lock has already elapsed (issue #72).
+	lockedUntil *time.Time
 }
 
 // Login authenticates a user by email and password. Without application
@@ -439,11 +485,17 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		appID = strconv.FormatInt(aid, 10)
 	}
 
+	// Per-account brute-force gate (issue #72). Read first, acted on after the
+	// candidate lookup: refusing here still needs the candidate rows so that a
+	// sustained attack can escalate from the soft tier to a persistent lock.
+	fails, failsKnown := s.loginFailureCount(ctx, in.Email)
+	softLocked := failsKnown && s.lockout.SoftThreshold > 0 && fails >= s.lockout.SoftThreshold
+
 	// User-base isolation: app-authenticated logins only see that application's
 	// own users; generic logins only see tenant-level users (application_id IS
 	// NULL) — an app-scoped account can never authenticate outside its app.
 	candidateQuery := `
-		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, '')
+		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, ''), u.locked_until
 		FROM users u
 		JOIN user_credentials uc ON uc.user_id = u.id
 		JOIN tenants t ON t.id = u.tenant_id
@@ -465,7 +517,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	var candidates []loginCandidate
 	for rows.Next() {
 		var c loginCandidate
-		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName); err != nil {
+		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName, &c.lockedUntil); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan login candidate: %w", err)
 		}
@@ -476,11 +528,21 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		return nil, fmt.Errorf("iterate login candidates: %w", err)
 	}
 
+	// Soft-locked: refuse without comparing the password at all — the expensive
+	// part is skipped, but the dummy floor is still paid so the refusal is
+	// indistinguishable from a wrong password by response time as well as body.
+	// The counter keeps advancing so continued hammering reaches the hard tier.
+	if softLocked {
+		padCompares(0, in.Password)
+		s.auditLoginBlocked(ctx, "soft", in.Email, candidates)
+		s.recordLoginFailure(ctx, in.Email, candidates)
+		return nil, ErrInvalidCredentials
+	}
+
 	if len(candidates) == 0 {
-		for i := 0; i < loginCompareFloor; i++ {
-			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(in.Password))
-		}
-		return nil, fmt.Errorf("invalid credentials")
+		padCompares(0, in.Password)
+		s.recordLoginFailure(ctx, in.Email, nil)
+		return nil, ErrInvalidCredentials
 	}
 
 	var matched *loginCandidate
@@ -491,12 +553,11 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 			matched = &candidates[i]
 		}
 	}
-	for i := len(candidates); i < loginCompareFloor; i++ {
-		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(in.Password))
-	}
+	padCompares(len(candidates), in.Password)
 
 	if matchCount == 0 {
-		return nil, fmt.Errorf("invalid credentials")
+		s.recordLoginFailure(ctx, in.Email, candidates)
+		return nil, ErrInvalidCredentials
 	}
 	if matchCount > 1 {
 		// Same password happens to be valid for more than one of this email's
@@ -505,8 +566,28 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		// valid for 2+ accounts", a stronger signal than plain match/no-match.
 		// The fix (differing passwords per tenant) is documented on CreateTenant,
 		// not surfaced here, to avoid using a login failure as the guidance channel.
-		return nil, fmt.Errorf("invalid credentials")
+		//
+		// Deliberately NOT counted as a brute-force failure: the submitted
+		// password was correct, so this is a tenant misconfiguration rather than
+		// a guessing attempt, and counting it would let a legitimate user lock
+		// themselves out by retrying.
+		return nil, ErrInvalidCredentials
 	}
+
+	// A hard lock (users.locked_until) outlives the Redis counter window, so it
+	// is enforced here rather than in the gate above. Checked AFTER the password
+	// comparison on purpose: returning early would make a locked account
+	// measurably faster to probe than a wrong password. A correct password does
+	// not clear the counter while a lock stands — the lock has to elapse (or an
+	// admin has to lift it) first.
+	if matched.lockedUntil != nil && matched.lockedUntil.After(time.Now()) {
+		s.auditLoginBlocked(ctx, "hard", in.Email, []loginCandidate{*matched})
+		return nil, ErrInvalidCredentials
+	}
+
+	// Correct password and no lock in force: the password brute-force window is
+	// over. See clearLoginFailures for why this happens before the MFA gate.
+	s.clearLoginFailures(ctx, in.Email)
 
 	userID, tenantID, email, roleName := matched.userID, matched.tenantID, matched.email, matched.roleName
 

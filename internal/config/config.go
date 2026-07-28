@@ -108,6 +108,51 @@ type Config struct {
 	// authenticate the stream. Empty leaves payloads unsigned. Set via
 	// AUDIT_SIEM_WEBHOOK_SECRET.
 	AuditSIEMWebhookSecret string
+
+	// ---------------------------------------------------------------------
+	// Per-account brute-force lockout (issue #72). Two tiers over the same
+	// per-email failure counter; see internal/auth/lockout.go for semantics.
+	// ---------------------------------------------------------------------
+
+	// LoginSoftLockThreshold is the number of consecutive failed login attempts
+	// (per email, within LoginFailureWindowMinutes) after which further attempts
+	// are refused for the rest of the window — even a correct password. Nothing
+	// is written to the database at this tier. 0 disables lockout entirely.
+	// Set via AUTH_LOGIN_SOFT_LOCK_THRESHOLD.
+	LoginSoftLockThreshold int
+
+	// LoginHardLockThreshold is the failure count at which every account owning
+	// the email is persistently locked (users.locked_until) for
+	// LoginHardLockMinutes. Values below the soft threshold are raised to it;
+	// 0 disables the hard tier, leaving soft locks only.
+	// Set via AUTH_LOGIN_HARD_LOCK_THRESHOLD.
+	LoginHardLockThreshold int
+
+	// LoginFailureWindowMinutes is both the TTL of the failure counter and the
+	// duration of a soft lock. The TTL is refreshed on each failure up to the
+	// soft threshold, so the window is "N failures within N minutes of each
+	// other"; past that it stops sliding, so a sustained attack cannot extend a
+	// soft lock indefinitely. Set via AUTH_LOGIN_FAILURE_WINDOW_MINUTES.
+	LoginFailureWindowMinutes int
+
+	// LoginRateLimitPerIP is the per-minute login attempt budget for one client
+	// IP, and LoginRateLimitPerAccount the budget for one submitted email
+	// (AUTH-07 defaults 5 and 10). Exposed as configuration because the two
+	// interact with the lockout thresholds above: an IP budget at or below
+	// LoginSoftLockThreshold means a single-source attacker is throttled with a
+	// 429 before the account lockout can engage, which is fine in production
+	// (both defenses fire) but makes the lockout tiers untestable end-to-end
+	// without raising these. Set via AUTH_LOGIN_RATE_LIMIT_PER_IP and
+	// AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT.
+	LoginRateLimitPerIP      int
+	LoginRateLimitPerAccount int
+
+	// LoginHardLockMinutes is how long a hard lock holds before expiring on its
+	// own. Self-healing by design: an attacker who knows a victim's email must
+	// not be able to disable that account permanently. An admin can still clear
+	// it early via POST /api/v1/users/{id}/unlock.
+	// Set via AUTH_LOGIN_HARD_LOCK_MINUTES.
+	LoginHardLockMinutes int
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -141,6 +186,12 @@ func Load() *Config {
 		AuditRetentionDays:                     mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
 		AuditSIEMWebhookURL:                    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
 		AuditSIEMWebhookSecret:                 getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		LoginSoftLockThreshold:                 atoiOr(getEnv("AUTH_LOGIN_SOFT_LOCK_THRESHOLD", ""), 5),
+		LoginHardLockThreshold:                 atoiOr(getEnv("AUTH_LOGIN_HARD_LOCK_THRESHOLD", ""), 10),
+		LoginFailureWindowMinutes:              atoiOr(getEnv("AUTH_LOGIN_FAILURE_WINDOW_MINUTES", ""), 15),
+		LoginHardLockMinutes:                   atoiOr(getEnv("AUTH_LOGIN_HARD_LOCK_MINUTES", ""), 60),
+		LoginRateLimitPerIP:                    atoiOr(getEnv("AUTH_LOGIN_RATE_LIMIT_PER_IP", ""), 5),
+		LoginRateLimitPerAccount:               atoiOr(getEnv("AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT", ""), 10),
 	}
 }
 
@@ -150,6 +201,18 @@ func mustAtoi(s string) int {
 	n, err := strconv.Atoi(s)
 	if err != nil {
 		return 0
+	}
+	return n
+}
+
+// atoiOr parses an integer env value, falling back to def on any parse error
+// (including an unset value). Unlike mustAtoi it must never collapse to 0:
+// for the lockout thresholds 0 means "disabled" and a threshold of 0 would
+// otherwise turn a typo'd env var into "reject every login attempt".
+func atoiOr(s string, def int) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
 	}
 	return n
 }

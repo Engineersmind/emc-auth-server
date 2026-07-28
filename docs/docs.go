@@ -1588,6 +1588,69 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/audit-logs/erase-user": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Erase a user's PII from the audit trail (GDPR)",
+                "parameters": [
+                    {
+                        "description": "Target user id",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.EraseUserAuditRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/export": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "text/csv"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Export audit logs (CSV)",
+                "responses": {
+                    "200": {
+                        "description": "CSV",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/audit-logs/system": {
             "get": {
                 "security": [
@@ -1646,6 +1709,125 @@ const docTemplate = `{
                         "description": "OK",
                         "schema": {
                             "$ref": "#/definitions/audit.LogsPage"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/system/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the full detail of a single audit event across ALL tenants. Requires tenant:manage.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "System-wide audit log detail",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Audit log ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.LogEntry"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/verify": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Recomputes the tamper-evidence hash chain over recent rows and reports whether any row was altered, deleted, or reordered. Requires tenant:manage.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Verify audit trail integrity",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Max recent rows to verify (default 10000)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.VerifyResult"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audit-logs/{id}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the full detail of a single audit event (all metadata expanded), scoped to the caller's tenant. Requires admin:access.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audit"
+                ],
+                "summary": "Tenant audit log detail",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Audit log ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/audit.LogEntry"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
                         }
                     }
                 }
@@ -1910,7 +2092,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/forgot-password": {
             "post": {
-                "description": "Sends a reset link to the email address. ALWAYS returns 200 regardless of whether the email is registered (prevents email enumeration).",
+                "description": "Sends a reset link to the email address for the authenticated application's user. The application authenticates with Authorization: Basic base64(client_id:client_secret) — this identifies both the tenant and application, scoping the reset to that app's account. ALWAYS returns 200 for a valid client regardless of whether the email is registered (prevents email enumeration).",
                 "consumes": [
                     "application/json"
                 ],
@@ -1924,8 +2106,8 @@ const docTemplate = `{
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Tenant slug",
-                        "name": "X-Tenant-Slug",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
                         "in": "header",
                         "required": true
                     },
@@ -1942,6 +2124,15 @@ const docTemplate = `{
                 "responses": {
                     "200": {
                         "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid client credentials",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3156,6 +3347,50 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/resend-verification": {
+            "post": {
+                "description": "Re-sends the email-verification link for an unverified tenant-level user. Always returns 200 to prevent account enumeration.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Resend verification email",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug",
+                        "name": "X-Tenant-Slug",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Email to resend to",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ResendVerificationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/reset-password": {
             "post": {
                 "description": "Validates the reset token, updates the user's password, and revokes all active refresh tokens.",
@@ -3372,6 +3607,47 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/verify-email": {
+            "get": {
+                "description": "Confirms ownership of an email address via the token from the verification link. Single-use.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Verify email address",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Verification token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/email-settings": {
             "get": {
                 "security": [
@@ -3504,6 +3780,217 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "No sender configured at this scope",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/email-settings/test": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sends a sample email using the sender resolved for this scope (application → tenant → global) and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The recipient is always the requesting admin's own email — an arbitrary recipient cannot be supplied.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-senders"
+                ],
+                "summary": "Send a test email",
+                "parameters": [
+                    {
+                        "description": "Template type",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SendTestEmailRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "502": {
+                        "description": "Delivery failed",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/email-templates": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns every customizable email template at this scope. Rows with is_default=true are the built-in defaults (no override stored).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "List email templates",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.EmailTemplate"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/email-templates/{type}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the stored template for a type, or the built-in default (is_default=true) when none is configured.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "Get one email template",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EmailTemplate"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown template type",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Creates or updates the template for a type at this scope. subject/html_body/text_body are Go-template source with variables like {{.Link}}, {{.Code}}, {{.ProductName}}, {{.AppName}}, {{.TTLMinutes}}. Invalid template syntax is rejected.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "Set an email template",
+                "parameters": [
+                    {
+                        "description": "Template content",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpsertEmailTemplateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EmailTemplate"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the template override at this scope; sends revert to the next level (application → tenant → built-in default).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "Delete an email template",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "No override configured at this scope",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5862,6 +6349,58 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/users/{id}/unlock": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Clears an automatic account lockout (users.locked_until) and resets the failed-login counter so the user can sign in immediately. Does not change is_active — use the status endpoint to reverse an administrative block. Idempotent. Requires users:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Clear a brute-force lockout on a user",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.UserResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/health": {
             "get": {
                 "produces": [
@@ -6336,6 +6875,10 @@ const docTemplate = `{
                 "last_name": {
                     "type": "string"
                 },
+                "locked_until": {
+                    "description": "LockedUntil is when an automatic brute-force lockout expires (issue #72).\nNon-nil means the account is locked RIGHT NOW — an elapsed lock is\nreported as nil — so the admin UI can render its badge without doing\nclock arithmetic. Independent of IsActive, which is an admin block.",
+                    "type": "string"
+                },
                 "logins_count": {
                     "description": "LoginsCount is the number of successful logins on record (audit-derived,\nAuth0's stats.loginsCount equivalent).",
                     "type": "integer"
@@ -6420,6 +6963,10 @@ const docTemplate = `{
                 "last_name": {
                     "type": "string"
                 },
+                "locked_until": {
+                    "description": "LockedUntil is when an automatic brute-force lockout expires (issue #72).\nNon-nil means the account is locked RIGHT NOW — an elapsed lock is\nreported as nil — so the admin UI can render its badge without doing\nclock arithmetic. Independent of IsActive, which is an admin block.",
+                    "type": "string"
+                },
                 "logins_count": {
                     "description": "LoginsCount is the number of successful logins on record (audit-derived,\nAuth0's stats.loginsCount equivalent).",
                     "type": "integer"
@@ -6490,13 +7037,32 @@ const docTemplate = `{
                 "agent_id": {
                     "type": "string"
                 },
+                "application_id": {
+                    "type": "string"
+                },
+                "application_name": {
+                    "type": "string"
+                },
+                "auth_method": {
+                    "type": "string"
+                },
                 "created_at": {
                     "type": "string"
+                },
+                "http_status": {
+                    "type": "integer"
                 },
                 "id": {
                     "type": "string"
                 },
                 "ip_address": {
+                    "type": "string"
+                },
+                "metadata": {
+                    "description": "swaggertype tells swag to document this as a free-form object; without it\nswag cannot resolve json.RawMessage and aborts the whole generation run.",
+                    "type": "object"
+                },
+                "request_id": {
                     "type": "string"
                 },
                 "resource_id": {
@@ -6505,10 +7071,16 @@ const docTemplate = `{
                 "resource_type": {
                     "type": "string"
                 },
+                "status": {
+                    "type": "string"
+                },
                 "tenant_id": {
                     "type": "string"
                 },
                 "tenant_slug": {
+                    "type": "string"
+                },
+                "user_agent": {
                     "type": "string"
                 },
                 "user_id": {
@@ -6559,6 +7131,27 @@ const docTemplate = `{
                 },
                 "total_audit_events": {
                     "type": "integer"
+                }
+            }
+        },
+        "audit.VerifyResult": {
+            "type": "object",
+            "properties": {
+                "broken_at_id": {
+                    "description": "BrokenAtID is the id of the first row whose hash/linkage failed, when any.",
+                    "type": "string"
+                },
+                "checked": {
+                    "description": "Checked is the number of rows verified.",
+                    "type": "integer"
+                },
+                "detail": {
+                    "description": "Detail is a human-readable description of the break (or \"ok\").",
+                    "type": "string"
+                },
+                "intact": {
+                    "description": "Intact is true when every checked row's hash and linkage verified.",
+                    "type": "boolean"
                 }
             }
         },
@@ -6861,6 +7454,10 @@ const docTemplate = `{
                 "from_name": {
                     "type": "string"
                 },
+                "has_api_key": {
+                    "description": "sendgrid: an API key is stored",
+                    "type": "boolean"
+                },
                 "has_password": {
                     "type": "boolean"
                 },
@@ -6871,6 +7468,10 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "product_name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "description": "\"smtp\" | \"sendgrid\"",
                     "type": "string"
                 },
                 "reply_to": {
@@ -6892,6 +7493,40 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "tls_mode": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.EmailTemplate": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "description": "nil = tenant-level",
+                    "type": "string"
+                },
+                "html_body": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "is_default": {
+                    "description": "true when returned from the built-in fallback",
+                    "type": "boolean"
+                },
+                "subject": {
+                    "type": "string"
+                },
+                "template_type": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                },
+                "text_body": {
                     "type": "string"
                 },
                 "updated_at": {
@@ -7225,6 +7860,14 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.EraseUserAuditRequest": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.ForgotPasswordRequest": {
             "type": "object",
             "properties": {
@@ -7387,6 +8030,17 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.ResendVerificationRequest": {
+            "type": "object",
+            "required": [
+                "email"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.ResetPasswordRequest": {
             "type": "object",
             "properties": {
@@ -7394,6 +8048,15 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SendTestEmailRequest": {
+            "type": "object",
+            "properties": {
+                "template_type": {
+                    "description": "TemplateType selects which template to render (empty = email_verification).",
                     "type": "string"
                 }
             }
@@ -7572,6 +8235,10 @@ const docTemplate = `{
         "handlers.UpsertEmailSenderRequest": {
             "type": "object",
             "properties": {
+                "api_key": {
+                    "description": "APIKey is the SendGrid API key (provider=\"sendgrid\"); write-only. Empty on\nupdate keeps the stored key. Response exposes only has_api_key.",
+                    "type": "string"
+                },
                 "from_address": {
                     "type": "string"
                 },
@@ -7586,6 +8253,10 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "product_name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "description": "Provider: \"smtp\" (default) or \"sendgrid\".",
                     "type": "string"
                 },
                 "reply_to": {
@@ -7608,6 +8279,23 @@ const docTemplate = `{
                 },
                 "tls_mode": {
                     "description": "TLSMode: \"ssl\" | \"starttls\" | \"opportunistic\" | \"none\" (empty = derive from port).",
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpsertEmailTemplateRequest": {
+            "type": "object",
+            "properties": {
+                "html_body": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "subject": {
+                    "type": "string"
+                },
+                "text_body": {
                     "type": "string"
                 }
             }

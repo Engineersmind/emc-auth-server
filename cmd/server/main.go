@@ -194,6 +194,12 @@ func main() {
 			CookieDomain:                           cfg.CookieDomain,
 			GlobalCORSOrigins:                      cfg.GlobalCORSOrigins,
 			AuditCaptureResponseBody:               cfg.AuditCaptureResponseBody,
+			LoginSoftLockThreshold:                 cfg.LoginSoftLockThreshold,
+			LoginHardLockThreshold:                 cfg.LoginHardLockThreshold,
+			LoginFailureWindowMinutes:              cfg.LoginFailureWindowMinutes,
+			LoginHardLockMinutes:                   cfg.LoginHardLockMinutes,
+			LoginRateLimitPerIP:                    cfg.LoginRateLimitPerIP,
+			LoginRateLimitPerAccount:               cfg.LoginRateLimitPerAccount,
 		},
 	})
 

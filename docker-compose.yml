@@ -84,6 +84,21 @@ services:
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
       SMTP_FROM: ${SMTP_FROM:-no-reply@emc.local}
       SMTP_TLS: ${SMTP_TLS:-none}
+      # ── Account lockout (issue #72) ────────────────────────────────────────
+      # Defaults here are the PRODUCTION values; override in .env only to test.
+      # The soft tier refuses further attempts for the window (Redis only); the
+      # hard tier stamps users.locked_until so the lock survives a Redis restart.
+      AUTH_LOGIN_SOFT_LOCK_THRESHOLD: "${AUTH_LOGIN_SOFT_LOCK_THRESHOLD:-5}"
+      AUTH_LOGIN_HARD_LOCK_THRESHOLD: "${AUTH_LOGIN_HARD_LOCK_THRESHOLD:-10}"
+      AUTH_LOGIN_FAILURE_WINDOW_MINUTES: "${AUTH_LOGIN_FAILURE_WINDOW_MINUTES:-15}"
+      AUTH_LOGIN_HARD_LOCK_MINUTES: "${AUTH_LOGIN_HARD_LOCK_MINUTES:-60}"
+      # AUTH-07 login rate limits. NOTE the interaction with the thresholds
+      # above: at the default 5/min per IP a single-source attacker is 429'd
+      # before the soft lock engages (correct in production — both defenses
+      # hold), which also means the lockout tiers cannot be exercised
+      # end-to-end from one machine without raising PER_IP in .env.
+      AUTH_LOGIN_RATE_LIMIT_PER_IP: "${AUTH_LOGIN_RATE_LIMIT_PER_IP:-5}"
+      AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT: "${AUTH_LOGIN_RATE_LIMIT_PER_ACCOUNT:-10}"
     depends_on:
       postgres:
         condition: service_healthy

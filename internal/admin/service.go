@@ -201,6 +201,11 @@ type UserResult struct {
 	// credentials row exists, plus every linked federated provider (Auth0's
 	// "Connection" column).
 	Connections []string `json:"connections"`
+	// LockedUntil is when an automatic brute-force lockout expires (issue #72).
+	// Non-nil means the account is locked RIGHT NOW — an elapsed lock is
+	// reported as nil — so the admin UI can render its badge without doing
+	// clock arithmetic. Independent of IsActive, which is an admin block.
+	LockedUntil *time.Time `json:"locked_until"`
 }
 
 // UsersPage wraps a paginated user list.
@@ -259,11 +264,30 @@ type Service struct {
 	pool     *pgxpool.Pool
 	resetSvc *auth.ResetService
 	logger   zerolog.Logger
+	// lockoutReset clears the brute-force failure counter on admin unlock.
+	// Nil is safe: the database lock is still lifted, only the in-window
+	// counter is left to expire on its own.
+	lockoutReset LoginFailureResetter
+}
+
+// LoginFailureResetter clears the per-account login failure counter that backs
+// brute-force lockout (issue #72). Implemented by *auth.AuthService. Declared
+// as an interface here so the admin service depends on the one operation it
+// needs rather than on the whole auth service or on Redis key formats.
+type LoginFailureResetter interface {
+	ResetLoginFailures(ctx context.Context, email string) error
 }
 
 // New creates a Service.
 func New(pool *pgxpool.Pool, resetSvc *auth.ResetService, logger zerolog.Logger) *Service {
 	return &Service{pool: pool, resetSvc: resetSvc, logger: logger}
+}
+
+// WithLockoutReset lets UnlockUser clear the brute-force failure counter in
+// addition to the persisted lock. Optional — see the field comment.
+func (s *Service) WithLockoutReset(r LoginFailureResetter) *Service {
+	s.lockoutReset = r
+	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,7 +1157,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		var providers []string
 		if err := rows.Scan(&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 			&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
-			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers); err != nil {
+			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers, &u.LockedUntil); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		u.ID = strconv.FormatInt(id, 10)
@@ -1446,6 +1470,51 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 	return s.getUserByID(ctx, tenantID, applicationID, userID)
 }
 
+// UnlockUser clears an automatic brute-force lockout (issue #72): it drops
+// users.locked_until and resets the failure counter so the very next attempt
+// starts from zero. Idempotent — unlocking an account that is not locked
+// succeeds and returns the unchanged row.
+//
+// Deliberately does NOT touch is_active. An account can be simultaneously
+// locked by the brute-force guard and blocked by an administrator; lifting the
+// lock must not silently reinstate someone an admin disabled. SetUserActive
+// remains the way to reverse an administrative block.
+//
+// Note that the failure counter is keyed on the email alone (it has to be — see
+// internal/auth/lockout.go), so for an email that owns accounts in more than one
+// tenant this also clears the shared counter. The persisted lock on the OTHER
+// tenants' rows is untouched, which is the safe half of that trade: those
+// accounts stay locked until their own admin unlocks them or the lock elapses.
+func (s *Service) UnlockUser(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserResult, error) {
+	var email string
+	err := s.pool.QueryRow(ctx, `
+		UPDATE users
+		SET locked_until = NULL, locked_reason = NULL, updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+		RETURNING email
+	`, userID, tenantID, applicationID).Scan(&email)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("unlock user: %w", err)
+	}
+
+	// A soft lock consists ONLY of the Redis counter, so clearing the column
+	// without resetting it would leave the user refused for the rest of the
+	// window and make the unlock button look broken. Best-effort: a Redis
+	// failure must not fail an otherwise-successful unlock.
+	if s.lockoutReset != nil {
+		if err := s.lockoutReset.ResetLoginFailures(ctx, email); err != nil {
+			s.logger.Warn().Err(err).Int64("user_id", userID).
+				Msg("unlock: failure counter not reset; soft lock will expire on its own")
+		}
+	}
+
+	return s.getUserByID(ctx, tenantID, applicationID, userID)
+}
+
 // ListUserSessions returns the user's active (non-revoked, unexpired) sessions,
 // one row per session family, most-recently-active first.
 func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64) ([]UserSession, error) {
@@ -1677,7 +1746,11 @@ const userEnrichmentColumns = `
 	       EXISTS (SELECT 1 FROM user_credentials uc
 	               WHERE uc.user_id = u.id AND uc.tenant_id = u.tenant_id AND uc.deleted_at IS NULL) AS has_password,
 	       (SELECT COALESCE(array_agg(ui.provider ORDER BY ui.provider), '{}')
-	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers`
+	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers,
+	       -- Brute-force lockout state (issue #72). NULLed out once the lock has
+	       -- elapsed so callers never have to compare against the clock: a
+	       -- non-null locked_until in the API response always means "locked now".
+	       CASE WHEN u.locked_until > NOW() THEN u.locked_until END AS locked_until`
 
 // buildConnections merges the password credential and federated providers
 // into the public Connections list ("password", "google", ...).
@@ -1706,7 +1779,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 	`, userID, tenantID, applicationID).Scan(
 		&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
-		&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
+		&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers, &u.LockedUntil,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

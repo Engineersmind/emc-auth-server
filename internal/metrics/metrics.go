@@ -149,6 +149,32 @@ var (
 		},
 	)
 
+	// AccountLockouts counts per-account password brute-force lockouts as they
+	// trip (issue #72), once per tier crossing rather than once per attempt.
+	// tier: soft (in-window refusal, no database write) | hard (users.locked_until set).
+	AccountLockouts = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "account_lockouts_total",
+			Help:      "Per-account login lockouts triggered, by tier (soft|hard).",
+		},
+		[]string{"tier"},
+	)
+
+	// LoginsBlockedByLockout counts login attempts refused because a lockout was
+	// already in force. Rising while account_lockouts_total is flat means an
+	// attack is still hammering an already-locked account — the signal worth
+	// alerting on, since the refusal itself is invisible to the client (the
+	// response is byte-identical to a wrong password, by design).
+	LoginsBlockedByLockout = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "logins_blocked_by_lockout_total",
+			Help:      "Login attempts refused because the account was already locked, by tier (soft|hard).",
+		},
+		[]string{"tier"},
+	)
+
 	// TokensIssued counts access tokens issued by grant type.
 	// grant_type: password | refresh_token | client_credentials | magic_link |
 	//             google-oauth2 | management.

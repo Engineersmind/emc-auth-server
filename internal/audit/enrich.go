@@ -149,6 +149,9 @@ var riskActions = map[string]bool{
 	ActionAuthReplayDetected:     true,
 	ActionAuthMFALockedOut:       true,
 	ActionAuthTokenRefreshFailed: true,
+	ActionAuthAccountSoftLocked:  true,
+	ActionAuthAccountHardLocked:  true,
+	ActionAuthLoginBlocked:       true,
 }
 
 // assessRisk merges security signals into the metadata for login-type events

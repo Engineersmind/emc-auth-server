@@ -1484,6 +1484,46 @@ func (h *AdminHandler) SetUserStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, result)
 }
 
+// UnlockUser handles POST .../users/:id/unlock.
+//
+// @Summary      Clear a brute-force lockout on a user
+// @Description  Clears an automatic account lockout (users.locked_until) and resets the failed-login counter so the user can sign in immediately. Does not change is_active — use the status endpoint to reverse an administrative block. Idempotent. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  admin.UserResult
+// @Failure      400  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/unlock [post]
+func (h *AdminHandler) UnlockUser(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	// No self-lockout guard here (unlike SetUserStatus): unlocking only ever
+	// restores access, so an admin acting on their own account is harmless.
+	result, err := h.svc.UnlockUser(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: unlock user failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to unlock user"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminAccountUnlocked, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, result)
+}
+
 // ListUserSessions handles GET .../users/:id/sessions.
 //
 // @Summary      List a user's active sessions
