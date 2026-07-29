@@ -14,6 +14,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
+	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 	"github.com/engineersmind/emc-auth-server/internal/store"
@@ -126,7 +127,21 @@ func newTestSendEnv(t *testing.T) *testSendEnv {
 	senderSvc := auth.NewEmailSenderService(pool, totpSvc.EncryptionKey(), logger)
 	rec := &recordingMailer{}
 
-	h := NewAdminHandler(admin.New(pool, nil, logger), nil, logger).
+	// A real audit logger is required: the success path audits, and a nil
+	// *audit.Logger nil-pointer dereferences inside Log(). Drained on cleanup so
+	// events are flushed before the tables are truncated.
+	auditLog := audit.New(pool, logger, audit.WithFlushInterval(20*time.Millisecond))
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		_ = auditLog.Close(cctx)
+	})
+
+	// WithApplications is required, not optional: the app-scoped routes go
+	// through emailSenderScope → applicationOwnedByTenant → appSvc, which nil
+	// pointer dereferences when unset.
+	h := NewAdminHandler(admin.New(pool, nil, logger), auditLog, logger).
+		WithApplications(auth.NewApplicationService(pool, logger)).
 		WithEmailSenders(senderSvc).
 		WithMailer(rec)
 
