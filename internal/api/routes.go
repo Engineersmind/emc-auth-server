@@ -504,7 +504,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// app_id is empty. So mounting it here cannot rate-limit an operator out of
 	// the rate-limit CRUD routes below — the limiter only ever engages for
 	// application-scoped traffic, never for the admin console's own calls.
-	adminGroup := apiV1.Group("", mw.JWTRequired(jwtSvc), appRateLimit)
+	//
+	// Accepted token types (issue #84): admin/management routes have three
+	// legitimate kinds of caller, so all three audiences are allowed here and
+	// authorization stays with the RequirePermission guards below —
+	//   - AudienceAPI:        a human operator in the admin SPA
+	//   - AudienceManagement: an API-key integration (POST /auth/management-token)
+	//   - AudienceM2M:        a client_credentials machine client, whose grants
+	//                         come from oauth_clients.scopes
+	// Agent tokens are deliberately absent — nothing verifies them yet.
+	adminGroup := apiV1.Group("", mw.JWTRequired(
+		jwtSvc,
+		auth.AudienceAPI,
+		auth.AudienceManagement,
+		auth.AudienceM2M,
+	), appRateLimit)
 
 	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {

@@ -236,7 +236,7 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 		Permissions: perms,
 	}
 
-	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
+	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, claims)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -1386,6 +1386,11 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 // oauth_clients.id remains available in the app_id claim. Scopes are loaded
 // from the oauth_clients.scopes column so downstream permission checks receive
 // the correct grants.
+//
+// The token carries AudienceM2M so it is distinguishable from a user session
+// token (issue #84): it is accepted on admin/management routes, where a machine
+// client is a legitimate caller subject to its scopes, but refused on user
+// self-service routes, which assume a real user behind the token.
 func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int64) (string, int, error) {
 	var clientID string
 	var scopes []string
@@ -1406,7 +1411,7 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 		Role:        "service",
 		Permissions: scopes,
 	}
-	token, err := s.jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
+	token, err := s.jwtSvc.Sign(ctx, tenantID, AudienceM2M, claims)
 	if err != nil {
 		return "", 0, fmt.Errorf("sign service token: %w", err)
 	}

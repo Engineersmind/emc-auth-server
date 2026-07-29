@@ -144,7 +144,9 @@ func (h *SAMLHandler) handleACSImpl(c echo.Context) error {
 		Permissions: []string{},
 	}
 
-	accessToken, err := h.jwtSvc.Sign(c.Request().Context(), tenantIDInt, "emc-auth-server", claims)
+	// SAML JIT login produces a real user session — same audience as password,
+	// social, and magic-link login (issue #84).
+	accessToken, err := h.jwtSvc.Sign(c.Request().Context(), tenantIDInt, auth.AudienceAPI, claims)
 	if err != nil {
 		h.logger.Error().Err(err).Str("user_id", user.ID).Msg("saml: JWT sign failed")
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to issue token")

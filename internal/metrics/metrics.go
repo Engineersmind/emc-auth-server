@@ -14,6 +14,7 @@
 //   - emc_auth_mfa_lockouts_total            — MFA attempt-budget lockouts
 //   - emc_auth_tokens_issued_total           — tokens issued (grant_type)
 //   - emc_auth_tokens_revoked_total          — tokens/sessions revoked (reason)
+//   - emc_auth_token_audience_rejections_total — tokens refused on a route by aud
 //   - emc_auth_apikey_auth_total             — API-key auth attempts (outcome)
 //   - emc_auth_social_login_total            — social login (provider, outcome)
 //   - emc_auth_risk_signals_total            — risk signals raised (signal)
@@ -170,6 +171,25 @@ var (
 			Help:      "Tokens/sessions revoked by reason.",
 		},
 		[]string{"reason"},
+	)
+
+	// TokenAudienceRejections counts requests refused because the token was
+	// minted for a different audience (token type) than the route accepts —
+	// e.g. an M2M service token presented on a user self-service route.
+	//
+	// A correctly-behaving client never triggers this: it means a token is being
+	// used outside its intended flow, which is the signature of a leaked or
+	// replayed token. Alert on any sustained non-zero rate.
+	//
+	// Labels: audience (the presented aud, normalized to a known value or
+	// "other"), route (Echo route template).
+	TokenAudienceRejections = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "token_audience_rejections_total",
+			Help:      "Requests rejected because the token's audience is not accepted on that route.",
+		},
+		[]string{"audience", "route"},
 	)
 
 	// APIKeyAuth counts API-key → management-token exchanges by outcome.

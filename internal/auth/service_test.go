@@ -372,9 +372,11 @@ func TestIssueServiceToken_SubIsClientID(t *testing.T) {
 		t.Errorf("IssueServiceToken() expiresIn = %d, want 900", expiresIn)
 	}
 
-	claims, err := jwtSvc.Verify(ctx, token)
+	// VerifyM2M, not Verify: a service token carries AudienceM2M and is refused
+	// on the user/session path by design (issue #84).
+	claims, err := jwtSvc.VerifyM2M(ctx, token)
 	if err != nil {
-		t.Fatalf("Verify() error = %v", err)
+		t.Fatalf("VerifyM2M() error = %v", err)
 	}
 	if claims.UserID != created.ClientID {
 		t.Errorf("service token UserID/sub = %q, want client_id %q", claims.UserID, created.ClientID)
@@ -428,12 +430,63 @@ func TestIssueServiceToken_ScopesBecomePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("IssueServiceToken() error = %v", err)
 	}
-	claims, err := jwtSvc.Verify(ctx, token)
+	claims, err := jwtSvc.VerifyM2M(ctx, token)
 	if err != nil {
-		t.Fatalf("Verify() error = %v", err)
+		t.Fatalf("VerifyM2M() error = %v", err)
 	}
 	if len(claims.Permissions) != 2 || claims.Permissions[0] != "orders:read" || claims.Permissions[1] != "orders:write" {
 		t.Errorf("service token Permissions = %v, want [orders:read orders:write]", claims.Permissions)
+	}
+}
+
+// TestIssueServiceToken_AudienceIsM2M pins the audience of a client_credentials
+// token: it must be distinguishable from a user session token, so a leaked
+// service token cannot be replayed on user self-service routes (issue #84).
+func TestIssueServiceToken_AudienceIsM2M(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	appSvc := auth.NewApplicationService(pool, logger)
+	created, err := appSvc.CreateApplication(ctx, tenantID, "m2m-audience", "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication() error = %v", err)
+	}
+
+	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	svc := auth.NewAuthService(pool, jwtSvc, logger)
+
+	_, appID, err := appSvc.AuthenticateClient(ctx, created.ClientID, created.ClientSecret)
+	if err != nil {
+		t.Fatalf("AuthenticateClient() error = %v", err)
+	}
+
+	token, _, err := svc.IssueServiceToken(ctx, tenantID, appID)
+	if err != nil {
+		t.Fatalf("IssueServiceToken() error = %v", err)
+	}
+
+	claims, err := jwtSvc.VerifyM2M(ctx, token)
+	if err != nil {
+		t.Fatalf("VerifyM2M() error = %v", err)
+	}
+	if len(claims.Audience) != 1 || claims.Audience[0] != auth.AudienceM2M {
+		t.Errorf("service token aud = %v, want [%s]", []string(claims.Audience), auth.AudienceM2M)
+	}
+
+	// The same token must not authenticate as a user session.
+	if _, err := jwtSvc.Verify(ctx, token); !errors.Is(err, auth.ErrUnexpectedAudience) {
+		t.Errorf("Verify(service token) error = %v, want ErrUnexpectedAudience", err)
 	}
 }
 

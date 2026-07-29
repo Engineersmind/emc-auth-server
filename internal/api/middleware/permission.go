@@ -22,7 +22,12 @@ import (
 //
 // Usage in routes:
 //
-//	adminGroup.POST("/tenants", handler, mw.JWTRequired(jwtSvc), mw.RequirePermission("tenant:write"))
+//	adminGroup.POST("/tenants", handler,
+//	    mw.JWTRequired(jwtSvc, auth.AudienceAPI, auth.AudienceManagement, auth.AudienceM2M),
+//	    mw.RequirePermission("tenant:write"))
+//
+// Permissions are the authorization layer; the audiences passed to JWTRequired
+// are a prior gate deciding which kinds of token may reach the route at all.
 func RequirePermission(permission string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
