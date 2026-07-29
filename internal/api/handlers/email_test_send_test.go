@@ -410,3 +410,41 @@ func TestSendTestDoesNotEchoRawProviderErrors(t *testing.T) {
 		t.Errorf("error = %q, want the generic message", msg)
 	}
 }
+
+// A service token carries no email, so ownEmail is "" and ANY supplied
+// recipient must count as external. Documented explicitly (PR #91 FLAG-1)
+// because the alternative reading — empty ownEmail matching an empty-ish
+// recipient, or a refactor treating "" as "self" — would silently reopen the
+// arbitrary-content path for exactly the least attributable caller.
+func TestSendTestTreatsAnyRecipientAsExternalForATokenWithNoEmail(t *testing.T) {
+	e := newTestSendEnv(t)
+	e.claims.Email = "" // service token: client_id in UserID, no email claim
+
+	rec, body := e.post(t, `{"to":"someone@elsewhere.example","template_type":"welcome"}`, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", rec.Code, body)
+	}
+	call := e.mail.calls[0]
+	if call.Type != mailer.TemplateProviderTest {
+		t.Errorf("template = %q, want %q — an email-less caller must never be able to send a real template outward", call.Type, mailer.TemplateProviderTest)
+	}
+	if call.Tmpl != nil {
+		t.Error("a per-scope override was resolved for an email-less caller")
+	}
+}
+
+// The mirror case: with no email claim there is no self-send, so omitting the
+// recipient has nothing to fall back to and must 400 rather than attempt a
+// send to "".
+func TestSendTestRejectsOmittedRecipientWhenCallerHasNoEmail(t *testing.T) {
+	e := newTestSendEnv(t)
+	e.claims.Email = ""
+
+	rec, _ := e.post(t, `{}`, false)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if len(e.mail.calls) != 0 {
+		t.Error("attempted a send with no resolvable recipient")
+	}
+}

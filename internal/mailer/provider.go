@@ -138,9 +138,15 @@ func (t *smtpTransport) send(ctx context.Context, m outMessage) error {
 // rejection rather than a connection or content problem.
 // The numeric codes are anchored with a trailing space and paired with the
 // enhanced status code, because a bare "535" also matches byte counts, port
-// numbers and message IDs that happen to contain it. That direction is a false
-// positive — telling an admin to check credentials for what was really a
-// connection failure — which is the one outcome loose matching must not produce.
+// numbers and message IDs that happen to contain it.
+//
+// The residual risk is a false positive, and it is bounded to UX rather than
+// security: the phrase matches are generic English ("authentication failed"
+// could plausibly appear in a future go-mail wrapping of a content rejection),
+// so a miss sends the admin to check credentials that were actually fine. It
+// never changes what is sent, to whom, or with which sender — misclassification
+// only ever swaps one 502 message for another. That is why matching loosely is
+// the right trade here; if it were reachable from a send decision it would not be.
 func isSMTPAuthFailure(err error) bool {
 	s := strings.ToLower(err.Error())
 	return strings.Contains(s, "535 ") || // "535 authentication credentials invalid"
