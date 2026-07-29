@@ -128,6 +128,15 @@ definitions:
         type: integer
       application_id:
         type: string
+      block_reason:
+        type: string
+      blocked_at:
+        description: |-
+          Lockout state. BlockReason distinguishes an automatic failed-attempt
+          lockout (which the user can lift via an emailed link) from an operator
+          block (which they cannot) — without it an admin cannot tell why an account
+          is inactive. Both are nil for an account that was never blocked.
+        type: string
       connections:
         description: |-
           Connections lists how this user can sign in: "password" when a
@@ -142,6 +151,11 @@ definitions:
         type: string
       email_verified:
         type: boolean
+      failed_login_attempts:
+        description: |-
+          FailedLoginAttempts is the current consecutive-failure count, so an admin
+          can see an account approaching the lockout threshold.
+        type: integer
       first_name:
         type: string
       id:
@@ -165,6 +179,11 @@ definitions:
         type: integer
       mfa:
         $ref: '#/definitions/admin.UserMFAStatus'
+      pending_invitation:
+        description: |-
+          PendingInvitation is true when an unused, unexpired invitation exists —
+          the account has been created but never claimed.
+        type: boolean
       role:
         type: string
       role_id:
@@ -547,6 +566,9 @@ definitions:
         type: string
       from_name:
         type: string
+      has_api_key:
+        description: 'sendgrid: an API key is stored'
+        type: boolean
       has_password:
         type: boolean
       is_active:
@@ -554,6 +576,9 @@ definitions:
       logo_url:
         type: string
       product_name:
+        type: string
+      provider:
+        description: '"smtp" | "sendgrid"'
         type: string
       reply_to:
         type: string
@@ -568,6 +593,29 @@ definitions:
       tenant_id:
         type: string
       tls_mode:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  auth.EmailTemplate:
+    properties:
+      application_id:
+        description: nil = tenant-level
+        type: string
+      html_body:
+        type: string
+      is_active:
+        type: boolean
+      is_default:
+        description: true when returned from the built-in fallback
+        type: boolean
+      subject:
+        type: string
+      template_type:
+        type: string
+      tenant_id:
+        type: string
+      text_body:
         type: string
       updated_at:
         type: string
@@ -670,6 +718,17 @@ definitions:
       provider_email:
         type: string
     type: object
+  handlers.AcceptInvitationRequest:
+    properties:
+      password:
+        minLength: 8
+        type: string
+      token:
+        type: string
+    required:
+    - password
+    - token
+    type: object
   handlers.AppLimitRequest:
     properties:
       burst:
@@ -715,6 +774,13 @@ definitions:
         type: string
       tenant_id:
         type: string
+    type: object
+  handlers.ChangeEmailRequest:
+    properties:
+      new_email:
+        type: string
+    required:
+    - new_email
     type: object
   handlers.CreateAPIKeyRequest:
     properties:
@@ -785,6 +851,12 @@ definitions:
         type: string
       role_id:
         type: string
+      send_invitation:
+        description: |-
+          SendInvitation emails the user a link to set their own password instead of
+          the admin choosing one. When true, Password must be omitted — supplying
+          both is contradictory and is rejected rather than silently resolved.
+        type: boolean
     type: object
   handlers.EmailMFACodeRequest:
     properties:
@@ -900,11 +972,69 @@ definitions:
     - email
     - password
     type: object
+  handlers.ResendVerificationRequest:
+    properties:
+      email:
+        type: string
+    required:
+    - email
+    type: object
   handlers.ResetPasswordRequest:
     properties:
       new_password:
         type: string
       token:
+        type: string
+    type: object
+  handlers.SendTestEmailRequest:
+    properties:
+      allow_inherited:
+        description: |-
+          AllowInherited permits the send to proceed when the scope being tested
+          has no sender of its own and would fall through to a broader one.
+
+          Default false, i.e. a test at a scope only exercises THAT scope's
+          configuration. Falling through by default made a green result meaningless:
+          an application with no provider would report success on the strength of
+          the tenant's or the platform's credentials, telling the admin the
+          application was configured when it was not.
+
+          Set true deliberately to verify the inherited path — which is the real
+          production path for an application that intentionally has no sender.
+        type: boolean
+      template_type:
+        description: TemplateType selects which template to render (empty = email_verification).
+        type: string
+      to:
+        description: |-
+          To is the recipient. Empty = the requesting admin's own address.
+
+          Any syntactically valid address is accepted: verifying deliverability to
+          a real external inbox (a QA alias, a personal account, a customer's
+          domain) is the main thing this endpoint is for, and restricting it to
+          tenant members made it useless for that.
+
+          The trade-off is deliberate and bounded: reaching this endpoint requires
+          apps:write on the tenant, it is rate-limited, it only ever sends the
+          sample-data render of a template, and every send is audited WITH the
+          recipient. A caller who could abuse it can already edit the templates and
+          add users, so the marginal capability is small — but it is real, which is
+          why the recipient is on the audit record rather than just the scope.
+        type: string
+    type: object
+  handlers.SendTestEmailResponse:
+    properties:
+      message:
+        type: string
+      provider:
+        description: smtp | sendgrid | dev
+        type: string
+      scope:
+        description: application | tenant | global
+        type: string
+      template:
+        type: string
+      to:
         type: string
     type: object
   handlers.SessionLoginRequest:
@@ -1019,6 +1149,11 @@ definitions:
     type: object
   handlers.UpsertEmailSenderRequest:
     properties:
+      api_key:
+        description: |-
+          APIKey is the SendGrid API key (provider="sendgrid"); write-only. Empty on
+          update keeps the stored key. Response exposes only has_api_key.
+        type: string
       from_address:
         type: string
       from_name:
@@ -1029,6 +1164,9 @@ definitions:
       logo_url:
         type: string
       product_name:
+        type: string
+      provider:
+        description: 'Provider: "smtp" (default) or "sendgrid".'
         type: string
       reply_to:
         type: string
@@ -1045,6 +1183,17 @@ definitions:
       tls_mode:
         description: 'TLSMode: "ssl" | "starttls" | "opportunistic" | "none" (empty
           = derive from port).'
+        type: string
+    type: object
+  handlers.UpsertEmailTemplateRequest:
+    properties:
+      html_body:
+        type: string
+      is_active:
+        type: boolean
+      subject:
+        type: string
+      text_body:
         type: string
     type: object
   handlers.UpsertProviderConfigRequest:
@@ -2283,6 +2432,43 @@ paths:
       summary: Verify audit trail integrity
       tags:
       - admin-audit
+  /api/v1/auth/accept-invitation:
+    post:
+      consumes:
+      - application/json
+      description: Sets the password for an invited account using the token from the
+        invitation email, and marks the address verified. Single-use.
+      parameters:
+      - description: Invitation token and chosen password
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AcceptInvitationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Accept an invitation
+      tags:
+      - AUTH
   /api/v1/auth/apps/login:
     post:
       consumes:
@@ -2464,16 +2650,92 @@ paths:
       summary: Register an end user via application credentials
       tags:
       - AUTH
+  /api/v1/auth/change-email:
+    post:
+      consumes:
+      - application/json
+      description: Sends a confirmation link to the new address. The account email
+        changes only after the link is followed. Requires a valid access token.
+      parameters:
+      - description: New email address
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ChangeEmailRequest'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Request an email change
+      tags:
+      - AUTH
+  /api/v1/auth/confirm-email-change:
+    get:
+      description: Applies a pending email change using the token sent to the new
+        address, and marks it verified. Single-use.
+      parameters:
+      - description: Email change token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Confirm an email change
+      tags:
+      - AUTH
   /api/v1/auth/forgot-password:
     post:
       consumes:
       - application/json
-      description: Sends a reset link to the email address. ALWAYS returns 200 regardless
-        of whether the email is registered (prevents email enumeration).
+      description: 'Sends a reset link to the email address for the authenticated
+        application''s user. The application authenticates with Authorization: Basic
+        base64(client_id:client_secret) — this identifies both the tenant and application,
+        scoping the reset to that app''s account. ALWAYS returns 200 for a valid client
+        regardless of whether the email is registered (prevents email enumeration).'
       parameters:
-      - description: Tenant slug
+      - description: Basic base64(client_id:client_secret)
         in: header
-        name: X-Tenant-Slug
+        name: Authorization
         required: true
         type: string
       - description: Email address
@@ -2487,6 +2749,12 @@ paths:
       responses:
         "200":
           description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid client credentials
           schema:
             additionalProperties:
               type: string
@@ -3324,6 +3592,36 @@ paths:
       summary: Register a new user
       tags:
       - AUTH
+  /api/v1/auth/resend-verification:
+    post:
+      consumes:
+      - application/json
+      description: Re-sends the email-verification link for an unverified tenant-level
+        user. Always returns 200 to prevent account enumeration.
+      parameters:
+      - description: Tenant slug
+        in: header
+        name: X-Tenant-Slug
+        required: true
+        type: string
+      - description: Email to resend to
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ResendVerificationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Resend verification email
+      tags:
+      - AUTH
   /api/v1/auth/reset-password:
     post:
       consumes:
@@ -3486,6 +3784,63 @@ paths:
       summary: Client credentials token
       tags:
       - AUTH
+  /api/v1/auth/unblock-account:
+    get:
+      description: Lifts an automatic failed-attempt lockout using the token from
+        the blocked-account email. Single-use. Admin blocks cannot be lifted this
+        way.
+      parameters:
+      - description: Unblock token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Unblock an account
+      tags:
+      - AUTH
+  /api/v1/auth/verify-email:
+    get:
+      description: Confirms ownership of an email address via the token from the verification
+        link. Single-use.
+      parameters:
+      - description: Verification token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Verify email address
+      tags:
+      - AUTH
   /api/v1/email-settings:
     delete:
       description: Removes the white-label sender at this scope; sends fall back to
@@ -3584,6 +3939,153 @@ paths:
       summary: Set email sender settings
       tags:
       - admin-email-senders
+  /api/v1/email-settings/test:
+    post:
+      consumes:
+      - application/json
+      description: Sends a sample email using the sender configured at this scope
+        and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration
+        delivers mail. The response reports which scope and provider handled the send.
+        Recipient defaults to the requesting admin's own address; any valid address
+        may be supplied (rate-limited, and audited with the recipient). Returns 409
+        when this scope has no sender of its own — pass allow_inherited=true to deliberately
+        test the inherited (tenant or platform) sender instead.
+      parameters:
+      - description: Recipient, template type, allow_inherited
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/handlers.SendTestEmailRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.SendTestEmailResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: This scope has no sender of its own
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "502":
+          description: Delivery failed
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Send a test email
+      tags:
+      - admin-email-senders
+  /api/v1/email-templates:
+    get:
+      description: Returns every customizable email template at this scope. Rows with
+        is_default=true are the built-in defaults (no override stored).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.EmailTemplate'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List email templates
+      tags:
+      - admin-email-templates
+  /api/v1/email-templates/{type}:
+    delete:
+      description: Removes the template override at this scope; sends revert to the
+        next level (application → tenant → built-in default).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: No override configured at this scope
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete an email template
+      tags:
+      - admin-email-templates
+    get:
+      description: Returns the stored template for a type, or the built-in default
+        (is_default=true) when none is configured.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailTemplate'
+        "400":
+          description: Unknown template type
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get one email template
+      tags:
+      - admin-email-templates
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the template for a type at this scope. subject/html_body/text_body
+        are Go-template source with variables like {{.Link}}, {{.Code}}, {{.ProductName}},
+        {{.AppName}}, {{.TTLMinutes}}. Invalid template syntax is rejected.
+      parameters:
+      - description: Template content
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpsertEmailTemplateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailTemplate'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an email template
+      tags:
+      - admin-email-templates
   /api/v1/permissions:
     get:
       description: Returns all permissions for the caller's tenant. Requires admin:access.
@@ -4911,6 +5413,36 @@ paths:
       summary: Unlink a social identity from a user
       tags:
       - oauth
+  /api/v1/users/{id}/invite:
+    post:
+      description: Emails a fresh invitation link to the user, invalidating any previous
+        one. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Resend a user invitation
+      tags:
+      - admin-users
   /api/v1/users/{id}/mfa:
     get:
       description: Returns the user's enrolled MFA methods and remaining backup codes.

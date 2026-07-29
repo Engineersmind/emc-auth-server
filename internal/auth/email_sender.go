@@ -138,7 +138,10 @@ func (in *UpsertSenderInput) validate(hasStoredSecret bool) error {
 		}
 	case SenderProviderSendGrid:
 		// SendGrid needs an API key: either supplied now or already stored.
-		if in.APIKey == "" && !hasStoredSecret {
+		// Trimmed to match Upsert, which treats a whitespace-only value as
+		// "not supplied" — without this a config could pass validation and then
+		// be stored with no key at all.
+		if strings.TrimSpace(in.APIKey) == "" && !hasStoredSecret {
 			return ErrInvalidSender
 		}
 		if in.SMTPPort <= 0 || in.SMTPPort > 65535 {
@@ -166,17 +169,24 @@ func (s *EmailSenderService) Upsert(ctx context.Context, tenantID int64, appRowI
 		return nil, err
 	}
 
+	// Trim before encrypting: a secret pasted from a provider console routinely
+	// carries a trailing newline, and once encrypted the whitespace is invisible
+	// — it surfaces only as an unexplained 401 at send time. Whitespace is never
+	// meaningful in an API key or SMTP password, so this cannot corrupt a valid
+	// credential. Note this also means a value of only whitespace is treated as
+	// "not supplied", i.e. it preserves the stored secret rather than storing
+	// blanks.
 	passwordEnc := ""
-	if in.SMTPPassword != "" {
-		enc, err := encryptAESGCM(s.encKey, in.SMTPPassword)
+	if pw := strings.TrimSpace(in.SMTPPassword); pw != "" {
+		enc, err := encryptAESGCM(s.encKey, pw)
 		if err != nil {
 			return nil, fmt.Errorf("encrypt smtp password: %w", err)
 		}
 		passwordEnc = enc
 	}
 	apiKeyEnc := ""
-	if in.APIKey != "" {
-		enc, err := encryptAESGCM(s.encKey, in.APIKey)
+	if key := strings.TrimSpace(in.APIKey); key != "" {
+		enc, err := encryptAESGCM(s.encKey, key)
 		if err != nil {
 			return nil, fmt.Errorf("encrypt api key: %w", err)
 		}
@@ -278,6 +288,38 @@ func (s *EmailSenderService) Delete(ctx context.Context, tenantID int64, appRowI
 		return ErrSenderNotFound
 	}
 	return nil
+}
+
+// Sender scopes reported by ResolveScope, in priority order.
+const (
+	SenderScopeApplication = "application"
+	SenderScopeTenant      = "tenant"
+	SenderScopeGlobal      = "global"
+)
+
+// ResolveScope reports WHICH scope Resolve would pick for the same arguments.
+//
+// Resolve deliberately collapses the application → tenant → global chain into
+// one row, which is right for sending but useless for a test endpoint: an admin
+// pressing "send test" on an application needs to know whether they just
+// exercised that application's provider or silently fell through to the
+// tenant's (or the server's). Reporting "sent OK" without saying which
+// configuration was used is how a broken per-app setup hides behind a working
+// global one.
+func (s *EmailSenderService) ResolveScope(ctx context.Context, tenantID int64, appRowID *int64) (string, error) {
+	if appRowID != nil {
+		if _, err := s.Get(ctx, tenantID, appRowID); err == nil {
+			return SenderScopeApplication, nil
+		} else if !errors.Is(err, ErrSenderNotFound) {
+			return "", err
+		}
+	}
+	if _, err := s.Get(ctx, tenantID, nil); err == nil {
+		return SenderScopeTenant, nil
+	} else if !errors.Is(err, ErrSenderNotFound) {
+		return "", err
+	}
+	return SenderScopeGlobal, nil
 }
 
 // Resolve returns the effective sender for a send: the application's own row

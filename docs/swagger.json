@@ -1827,6 +1827,61 @@
                 }
             }
         },
+        "/api/v1/auth/accept-invitation": {
+            "post": {
+                "description": "Sets the password for an invited account using the token from the invitation email, and marks the address verified. Single-use.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Accept an invitation",
+                "parameters": [
+                    {
+                        "description": "Invitation token and chosen password",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AcceptInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/apps/login": {
             "post": {
                 "description": "Authenticates a user that belongs to the authenticated application's own user base — invisible to POST /auth/login and to every other application. Application credentials via Authorization: Basic header only.",
@@ -2084,9 +2139,119 @@
                 }
             }
         },
+        "/api/v1/auth/change-email": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sends a confirmation link to the new address. The account email changes only after the link is followed. Requires a valid access token.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Request an email change",
+                "parameters": [
+                    {
+                        "description": "New email address",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ChangeEmailRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Accepted",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/confirm-email-change": {
+            "get": {
+                "description": "Applies a pending email change using the token sent to the new address, and marks it verified. Single-use.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Confirm an email change",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Email change token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/forgot-password": {
             "post": {
-                "description": "Sends a reset link to the email address. ALWAYS returns 200 regardless of whether the email is registered (prevents email enumeration).",
+                "description": "Sends a reset link to the email address for the authenticated application's user. The application authenticates with Authorization: Basic base64(client_id:client_secret) — this identifies both the tenant and application, scoping the reset to that app's account. ALWAYS returns 200 for a valid client regardless of whether the email is registered (prevents email enumeration).",
                 "consumes": [
                     "application/json"
                 ],
@@ -2100,8 +2265,8 @@
                 "parameters": [
                     {
                         "type": "string",
-                        "description": "Tenant slug",
-                        "name": "X-Tenant-Slug",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
                         "in": "header",
                         "required": true
                     },
@@ -2118,6 +2283,15 @@
                 "responses": {
                     "200": {
                         "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid client credentials",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3350,6 +3524,50 @@
                 }
             }
         },
+        "/api/v1/auth/resend-verification": {
+            "post": {
+                "description": "Re-sends the email-verification link for an unverified tenant-level user. Always returns 200 to prevent account enumeration.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Resend verification email",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug",
+                        "name": "X-Tenant-Slug",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Email to resend to",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ResendVerificationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/reset-password": {
             "post": {
                 "description": "Validates the reset token, updates the user's password, and revokes all active refresh tokens.",
@@ -3584,6 +3802,88 @@
                 }
             }
         },
+        "/api/v1/auth/unblock-account": {
+            "get": {
+                "description": "Lifts an automatic failed-attempt lockout using the token from the blocked-account email. Single-use. Admin blocks cannot be lifted this way.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Unblock an account",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unblock token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/verify-email": {
+            "get": {
+                "description": "Confirms ownership of an email address via the token from the verification link. Single-use.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Verify email address",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Verification token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/email-settings": {
             "get": {
                 "security": [
@@ -3716,6 +4016,223 @@
                     },
                     "404": {
                         "description": "No sender configured at this scope",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/email-settings/test": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sends a sample email using the sender configured at this scope and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The response reports which scope and provider handled the send. Recipient defaults to the requesting admin's own address; any valid address may be supplied (rate-limited, and audited with the recipient). Returns 409 when this scope has no sender of its own — pass allow_inherited=true to deliberately test the inherited (tenant or platform) sender instead.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-senders"
+                ],
+                "summary": "Send a test email",
+                "parameters": [
+                    {
+                        "description": "Recipient, template type, allow_inherited",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SendTestEmailRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SendTestEmailResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "This scope has no sender of its own",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "502": {
+                        "description": "Delivery failed",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/email-templates": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns every customizable email template at this scope. Rows with is_default=true are the built-in defaults (no override stored).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "List email templates",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.EmailTemplate"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/email-templates/{type}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the stored template for a type, or the built-in default (is_default=true) when none is configured.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "Get one email template",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EmailTemplate"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown template type",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Creates or updates the template for a type at this scope. subject/html_body/text_body are Go-template source with variables like {{.Link}}, {{.Code}}, {{.ProductName}}, {{.AppName}}, {{.TTLMinutes}}. Invalid template syntax is rejected.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "Set an email template",
+                "parameters": [
+                    {
+                        "description": "Template content",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpsertEmailTemplateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.EmailTemplate"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the template override at this scope; sends revert to the next level (application → tenant → built-in default).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-email-templates"
+                ],
+                "summary": "Delete an email template",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "No override configured at this scope",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5754,6 +6271,52 @@
                 }
             }
         },
+        "/api/v1/users/{id}/invite": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Emails a fresh invitation link to the user, invalidating any previous one. Requires users:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Resend a user invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/users/{id}/mfa": {
             "get": {
                 "security": [
@@ -6510,6 +7073,13 @@
                 "application_id": {
                     "type": "string"
                 },
+                "block_reason": {
+                    "type": "string"
+                },
+                "blocked_at": {
+                    "description": "Lockout state. BlockReason distinguishes an automatic failed-attempt\nlockout (which the user can lift via an emailed link) from an operator\nblock (which they cannot) — without it an admin cannot tell why an account\nis inactive. Both are nil for an account that was never blocked.",
+                    "type": "string"
+                },
                 "connections": {
                     "description": "Connections lists how this user can sign in: \"password\" when a\ncredentials row exists, plus every linked federated provider (Auth0's\n\"Connection\" column).",
                     "type": "array",
@@ -6525,6 +7095,10 @@
                 },
                 "email_verified": {
                     "type": "boolean"
+                },
+                "failed_login_attempts": {
+                    "description": "FailedLoginAttempts is the current consecutive-failure count, so an admin\ncan see an account approaching the lockout threshold.",
+                    "type": "integer"
                 },
                 "first_name": {
                     "type": "string"
@@ -6554,6 +7128,10 @@
                 },
                 "mfa": {
                     "$ref": "#/definitions/admin.UserMFAStatus"
+                },
+                "pending_invitation": {
+                    "description": "PendingInvitation is true when an unused, unexpired invitation exists —\nthe account has been created but never claimed.",
+                    "type": "boolean"
                 },
                 "role": {
                     "type": "string"
@@ -7118,6 +7696,10 @@
                 "from_name": {
                     "type": "string"
                 },
+                "has_api_key": {
+                    "description": "sendgrid: an API key is stored",
+                    "type": "boolean"
+                },
                 "has_password": {
                     "type": "boolean"
                 },
@@ -7128,6 +7710,10 @@
                     "type": "string"
                 },
                 "product_name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "description": "\"smtp\" | \"sendgrid\"",
                     "type": "string"
                 },
                 "reply_to": {
@@ -7149,6 +7735,40 @@
                     "type": "string"
                 },
                 "tls_mode": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.EmailTemplate": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "description": "nil = tenant-level",
+                    "type": "string"
+                },
+                "html_body": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "is_default": {
+                    "description": "true when returned from the built-in fallback",
+                    "type": "boolean"
+                },
+                "subject": {
+                    "type": "string"
+                },
+                "template_type": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                },
+                "text_body": {
                     "type": "string"
                 },
                 "updated_at": {
@@ -7297,6 +7917,22 @@
                 }
             }
         },
+        "handlers.AcceptInvitationRequest": {
+            "type": "object",
+            "required": [
+                "password",
+                "token"
+            ],
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "minLength": 8
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.AppLimitRequest": {
             "type": "object",
             "properties": {
@@ -7363,6 +7999,17 @@
                     "type": "string"
                 },
                 "tenant_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.ChangeEmailRequest": {
+            "type": "object",
+            "required": [
+                "new_email"
+            ],
+            "properties": {
+                "new_email": {
                     "type": "string"
                 }
             }
@@ -7471,6 +8118,10 @@
                 },
                 "role_id": {
                     "type": "string"
+                },
+                "send_invitation": {
+                    "description": "SendInvitation emails the user a link to set their own password instead of\nthe admin choosing one. When true, Password must be omitted — supplying\nboth is contradictory and is rejected rather than silently resolved.",
+                    "type": "boolean"
                 }
             }
         },
@@ -7652,6 +8303,17 @@
                 }
             }
         },
+        "handlers.ResendVerificationRequest": {
+            "type": "object",
+            "required": [
+                "email"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.ResetPasswordRequest": {
             "type": "object",
             "properties": {
@@ -7659,6 +8321,45 @@
                     "type": "string"
                 },
                 "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SendTestEmailRequest": {
+            "type": "object",
+            "properties": {
+                "allow_inherited": {
+                    "description": "AllowInherited permits the send to proceed when the scope being tested\nhas no sender of its own and would fall through to a broader one.\n\nDefault false, i.e. a test at a scope only exercises THAT scope's\nconfiguration. Falling through by default made a green result meaningless:\nan application with no provider would report success on the strength of\nthe tenant's or the platform's credentials, telling the admin the\napplication was configured when it was not.\n\nSet true deliberately to verify the inherited path — which is the real\nproduction path for an application that intentionally has no sender.",
+                    "type": "boolean"
+                },
+                "template_type": {
+                    "description": "TemplateType selects which template to render (empty = email_verification).",
+                    "type": "string"
+                },
+                "to": {
+                    "description": "To is the recipient. Empty = the requesting admin's own address.\n\nAny syntactically valid address is accepted: verifying deliverability to\na real external inbox (a QA alias, a personal account, a customer's\ndomain) is the main thing this endpoint is for, and restricting it to\ntenant members made it useless for that.\n\nThe trade-off is deliberate and bounded: reaching this endpoint requires\napps:write on the tenant, it is rate-limited, it only ever sends the\nsample-data render of a template, and every send is audited WITH the\nrecipient. A caller who could abuse it can already edit the templates and\nadd users, so the marginal capability is small — but it is real, which is\nwhy the recipient is on the audit record rather than just the scope.",
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SendTestEmailResponse": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string"
+                },
+                "provider": {
+                    "description": "smtp | sendgrid | dev",
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "application | tenant | global",
+                    "type": "string"
+                },
+                "template": {
+                    "type": "string"
+                },
+                "to": {
                     "type": "string"
                 }
             }
@@ -7837,6 +8538,10 @@
         "handlers.UpsertEmailSenderRequest": {
             "type": "object",
             "properties": {
+                "api_key": {
+                    "description": "APIKey is the SendGrid API key (provider=\"sendgrid\"); write-only. Empty on\nupdate keeps the stored key. Response exposes only has_api_key.",
+                    "type": "string"
+                },
                 "from_address": {
                     "type": "string"
                 },
@@ -7851,6 +8556,10 @@
                     "type": "string"
                 },
                 "product_name": {
+                    "type": "string"
+                },
+                "provider": {
+                    "description": "Provider: \"smtp\" (default) or \"sendgrid\".",
                     "type": "string"
                 },
                 "reply_to": {
@@ -7873,6 +8582,23 @@
                 },
                 "tls_mode": {
                     "description": "TLSMode: \"ssl\" | \"starttls\" | \"opportunistic\" | \"none\" (empty = derive from port).",
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpsertEmailTemplateRequest": {
+            "type": "object",
+            "properties": {
+                "html_body": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "subject": {
+                    "type": "string"
+                },
+                "text_body": {
                     "type": "string"
                 }
             }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,16 +42,23 @@ type transport interface {
 // pickTransport chooses the transport for a resolved sender. A nil sender means
 // "use the global default transport" (already wired into the mailer). This is
 // only called with a non-nil per-scope override.
+//
+// Credentials are trimmed at every transport boundary. A key or password
+// pasted into a form or a .env line very often carries a trailing newline or
+// space; sent verbatim it produces an indistinguishable 401, which reads as
+// "wrong key" and sends people hunting in the provider console for a problem
+// that is in their clipboard. Whitespace is never significant in any of these
+// values, so trimming cannot break a valid credential.
 func pickTransport(sender *SMTPConfig, logger zerolog.Logger) transport {
-	switch strings.ToLower(sender.Provider) {
+	switch strings.ToLower(strings.TrimSpace(sender.Provider)) {
 	case ProviderSendGrid:
-		return &sendGridTransport{apiKey: sender.APIKey, logger: logger}
+		return &sendGridTransport{apiKey: strings.TrimSpace(sender.APIKey), logger: logger}
 	default:
 		return &smtpTransport{
-			host:     sender.Host,
+			host:     strings.TrimSpace(sender.Host),
 			port:     sender.Port,
-			username: sender.Username,
-			password: sender.Password,
+			username: strings.TrimSpace(sender.Username),
+			password: strings.TrimSpace(sender.Password),
 			tlsMode:  sender.TLSMode,
 			logger:   logger,
 		}
@@ -114,10 +122,41 @@ func (t *smtpTransport) send(ctx context.Context, m outMessage) error {
 	}
 	if err := client.DialAndSendWithContext(ctx, msg); err != nil {
 		t.logger.Error().Err(err).Str("to", m.To).Str("from", m.From).Msg("smtp send failed")
+		// SMTP has no structured error code here, so classification is by the
+		// 535/534 auth codes and the standard "authentication failed" wording
+		// relays use. A miss only costs a less specific message, never a wrong
+		// send, so matching loosely is the right trade.
+		if isSMTPAuthFailure(err) {
+			return fmt.Errorf("%w: the SMTP relay rejected the username/password", ErrProviderAuth)
+		}
 		return fmt.Errorf("smtp send: %w", err)
 	}
 	return nil
 }
+
+// isSMTPAuthFailure reports whether a go-mail send error looks like credential
+// rejection rather than a connection or content problem.
+func isSMTPAuthFailure(err error) bool {
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "535") || // "authentication credentials invalid"
+		strings.Contains(s, "534") || // "authentication mechanism too weak"
+		strings.Contains(s, "authentication failed") ||
+		strings.Contains(s, "auth failed") ||
+		strings.Contains(s, "invalid credentials") ||
+		strings.Contains(s, "username and password not accepted")
+}
+
+// ErrProviderAuth reports that the provider rejected our CREDENTIALS, as
+// opposed to rejecting the message or being unreachable. It is the difference
+// between "your API key is wrong" and "something went wrong" — an admin can act
+// on the first immediately, so the distinction is worth carrying up to the API
+// rather than collapsing every failure into one opaque message.
+var ErrProviderAuth = errors.New("the email provider rejected the configured credentials")
+
+// ErrProviderSender reports that the provider accepted our credentials but
+// refused the From address — almost always an unverified sender identity or
+// unauthenticated domain, which is a completely different fix from a bad key.
+var ErrProviderSender = errors.New("the email provider rejected the From address")
 
 // ---------------------------------------------------------------------------
 // SendGrid Web API v3 transport.
@@ -206,7 +245,23 @@ func (t *sendGridTransport) send(ctx context.Context, m outMessage) error {
 	snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 	t.logger.Error().Int("status", resp.StatusCode).Str("to", m.To).
 		Str("response", string(snippet)).Msg("sendgrid rejected message")
-	return fmt.Errorf("sendgrid: status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
+
+	// Classify the two failures an admin can actually fix, so the API can say
+	// which one it is instead of echoing a raw upstream body.
+	//
+	// 401 is an invalid/revoked key. 403 is ambiguous at SendGrid: it covers
+	// both an under-scoped key (no Mail Send permission) and an unverified
+	// sender identity, and the only way to tell them apart is the body text.
+	respBody := strings.TrimSpace(string(snippet))
+	switch {
+	case resp.StatusCode == http.StatusUnauthorized:
+		return fmt.Errorf("%w: sendgrid rejected the API key (status 401)", ErrProviderAuth)
+	case resp.StatusCode == http.StatusForbidden && strings.Contains(strings.ToLower(respBody), "verified sender"):
+		return fmt.Errorf("%w: sendgrid does not recognise %q as a verified sender", ErrProviderSender, m.From)
+	case resp.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("%w: sendgrid returned 403 — the API key may lack Mail Send permission", ErrProviderAuth)
+	}
+	return fmt.Errorf("sendgrid: status %d: %s", resp.StatusCode, respBody)
 }
 
 // ---------------------------------------------------------------------------

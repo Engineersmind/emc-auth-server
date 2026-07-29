@@ -3084,23 +3084,89 @@ func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
 type SendTestEmailRequest struct {
 	// TemplateType selects which template to render (empty = email_verification).
 	TemplateType string `json:"template_type"`
+	// To is the recipient. Empty = the requesting admin's own address.
+	//
+	// Any syntactically valid address is accepted: verifying deliverability to
+	// a real external inbox (a QA alias, a personal account, a customer's
+	// domain) is the main thing this endpoint is for, and restricting it to
+	// tenant members made it useless for that.
+	//
+	// The trade-off is deliberate and bounded: reaching this endpoint requires
+	// apps:write on the tenant, it is rate-limited, it only ever sends the
+	// sample-data render of a template, and every send is audited WITH the
+	// recipient. A caller who could abuse it can already edit the templates and
+	// add users, so the marginal capability is small — but it is real, which is
+	// why the recipient is on the audit record rather than just the scope.
+	To string `json:"to"`
+	// AllowInherited permits the send to proceed when the scope being tested
+	// has no sender of its own and would fall through to a broader one.
+	//
+	// Default false, i.e. a test at a scope only exercises THAT scope's
+	// configuration. Falling through by default made a green result meaningless:
+	// an application with no provider would report success on the strength of
+	// the tenant's or the platform's credentials, telling the admin the
+	// application was configured when it was not.
+	//
+	// Set true deliberately to verify the inherited path — which is the real
+	// production path for an application that intentionally has no sender.
+	AllowInherited bool `json:"allow_inherited"`
+}
+
+// requestedScope names the scope a test-send call is addressed to, derived from
+// the route shape rather than from what happens to be configured.
+func requestedScope(appRowID *int64) string {
+	if appRowID != nil {
+		return auth.SenderScopeApplication
+	}
+	return auth.SenderScopeTenant
+}
+
+// inheritedScopeMessage explains the refusal in terms of the fix, naming where
+// the send WOULD have gone so the admin can decide whether that is what they
+// actually wanted to test.
+func inheritedScopeMessage(want, actual string) string {
+	switch {
+	case want == auth.SenderScopeApplication && actual == auth.SenderScopeTenant:
+		return "this application has no email provider of its own — save one first, or test the tenant provider from tenant settings"
+	case want == auth.SenderScopeApplication:
+		return "this application has no email provider of its own — save one first, or test the platform default from tenant settings"
+	default:
+		return "this tenant has no email provider of its own — save one first; the platform default sender is configured by the server operator"
+	}
+}
+
+// SendTestEmailResponse tells the admin exactly what was exercised. "Sent OK"
+// alone is misleading when an application with no sender of its own silently
+// falls through to the tenant or global configuration — the admin would believe
+// they had verified a per-app provider they never touched.
+type SendTestEmailResponse struct {
+	Message  string `json:"message"`
+	To       string `json:"to"`
+	Scope    string `json:"scope"`    // application | tenant | global
+	Provider string `json:"provider"` // smtp | sendgrid | dev
+	Template string `json:"template"`
 }
 
 // SendTestEmail handles POST .../email-settings/test and flat aliases: it sends
-// a sample email through the sender resolved for this scope (application →
-// tenant → global), so an admin can verify the provider configuration works.
-// The email is always delivered to the requesting admin's own address.
+// a sample email through the sender configured AT THIS SCOPE, so an admin can
+// verify a provider configuration actually delivers.
+//
+// The scope is taken from the route, not from what happens to be configured: a
+// call addressed to an application whose sender is unset is refused with 409
+// rather than quietly succeeding on the tenant's or the platform's credentials.
+// Pass allow_inherited=true to test the inherited sender on purpose.
 //
 // @Summary      Send a test email
-// @Description  Sends a sample email using the sender resolved for this scope (application → tenant → global) and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The recipient is always the requesting admin's own email — an arbitrary recipient cannot be supplied.
+// @Description  Sends a sample email using the sender configured at this scope and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The response reports which scope and provider handled the send. Recipient defaults to the requesting admin's own address; any valid address may be supplied (rate-limited, and audited with the recipient). Returns 409 when this scope has no sender of its own — pass allow_inherited=true to deliberately test the inherited (tenant or platform) sender instead.
 // @Tags         admin-email-senders
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      SendTestEmailRequest  false  "Template type"
-// @Success      200   {object}  map[string]string
+// @Param        body  body      SendTestEmailRequest  false  "Recipient, template type, allow_inherited"
+// @Success      200   {object}  SendTestEmailResponse
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "This scope has no sender of its own"
 // @Failure      502   {object}  map[string]string  "Delivery failed"
 // @Router       /api/v1/email-settings/test [post]
 func (h *AdminHandler) SendTestEmail(c echo.Context) error {
@@ -3114,19 +3180,37 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	// Recipient is always the authenticated admin — never client-supplied — so
-	// this endpoint cannot be used to relay mail to arbitrary addresses.
-	to := ""
+	// Recipient: the admin's own address by default, or any valid address they
+	// supply. See SendTestEmailRequest.To for the reasoning and the controls
+	// that bound it.
+	ownEmail := ""
 	if claims != nil {
-		to = strings.TrimSpace(claims.Email)
+		ownEmail = strings.TrimSpace(claims.Email)
+	}
+	to := strings.TrimSpace(req.To)
+	if to == "" {
+		to = ownEmail
 	}
 	if _, err := mail.ParseAddress(to); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "your account has no valid email address to send the test to"})
+		if req.To == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "your account has no valid email address to send the test to — enter a recipient"})
+		}
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "recipient is not a valid email address"})
+	}
+	// Header injection guard. mail.ParseAddress already rejects embedded CR/LF,
+	// but the recipient reaches an SMTP envelope and a JSON payload, so this is
+	// asserted rather than assumed.
+	if strings.ContainsAny(to, "\r\n") {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "recipient is not a valid email address"})
 	}
 
+	// No template_type means "just check the provider", which sends the
+	// diagnostic test email. It used to default to email_verification, so the
+	// recipient got a real-looking "Verify your email address" message with a
+	// dead sample link — indistinguishable from a genuine verification bug.
 	tt := mailer.TemplateType(req.TemplateType)
 	if req.TemplateType == "" {
-		tt = mailer.TemplateEmailVerification
+		tt = mailer.TemplateProviderTest
 	} else if !mailer.ValidTemplateType(tt) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown template type"})
 	}
@@ -3138,16 +3222,92 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: resolve sender for test email failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to resolve email sender"})
 	}
-	tmpl := h.tmplSvc.ResolveTemplate(c.Request().Context(), tenantID, appRowID, tt)
-
-	if err := h.mailer.SendTest(c.Request().Context(), sender, tmpl, tt, to); err != nil {
-		h.logger.Error().Err(err).Str("to", to).Msg("admin: test email send failed")
-		return c.JSON(http.StatusBadGateway, map[string]string{"error": "failed to send test email: " + err.Error()})
+	// The diagnostic template is not customizable, so no override lookup is
+	// performed for it: passing nil guarantees the built-in is what goes out,
+	// even if a row with this type were inserted into email_templates directly.
+	var tmpl *mailer.Template
+	if tt != mailer.TemplateProviderTest {
+		tmpl = h.tmplSvc.ResolveTemplate(c.Request().Context(), tenantID, appRowID, tt)
 	}
 
+	// Which configuration is actually being exercised — reported on success AND
+	// on failure, because "the app has no sender and fell back to global" is
+	// often the whole explanation for an unexpected result.
+	scope, err := h.senderSvc.ResolveScope(c.Request().Context(), tenantID, appRowID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: resolve sender scope for test email failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to resolve email sender"})
+	}
+	provider := h.mailer.GlobalProvider()
+	if sender != nil && sender.Provider != "" {
+		provider = sender.Provider
+	}
+
+	// A test proves the scope it was invoked on, nothing broader. Without this,
+	// pressing "send test" on an application with no provider of its own would
+	// succeed using the tenant's or the platform's credentials and report that
+	// the application was fine.
+	if want := requestedScope(appRowID); scope != want && !req.AllowInherited {
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error":       inheritedScopeMessage(want, scope),
+			"scope":       scope,
+			"want_scope":  want,
+			"provider":    provider,
+			"can_proceed": "set allow_inherited=true to test the inherited sender instead",
+		})
+	}
+
+	if err := h.mailer.SendTest(c.Request().Context(), sender, tmpl, tt, to); err != nil {
+		h.logger.Error().Err(err).Str("to", to).Str("scope", scope).Msg("admin: test email send failed")
+		// Credential and sender-identity rejections are the two an admin can fix
+		// directly, so they get their own message instead of a raw upstream body.
+		msg := "failed to send test email: " + err.Error()
+		switch {
+		case errors.Is(err, mailer.ErrProviderAuth):
+			msg = fmt.Sprintf("the %s credentials for the %s sender were rejected — check the API key or SMTP password", provider, scope)
+		case errors.Is(err, mailer.ErrProviderSender):
+			msg = fmt.Sprintf("the %s provider rejected the From address — verify it as a sender identity or authenticate its domain", provider)
+		}
+		return c.JSON(http.StatusBadGateway, map[string]string{"error": msg, "scope": scope, "provider": provider})
+	}
+
+	// Audited with the recipient, not just the scope: this endpoint can send to
+	// an arbitrary address, so the address is the part that has to be
+	// attributable after the fact.
 	rt, rid := senderResource(tenantID, appRowID)
-	h.auditAdminApp(c, claims, audit.ActionAdminEmailTestSent, rt, rid, appRowID)
-	return c.JSON(http.StatusOK, map[string]string{"message": "test email sent to " + to})
+	if claims != nil {
+		var uidPtr *int64
+		if uid, parseErr := strconv.ParseInt(claims.UserID, 10, 64); parseErr == nil {
+			uidPtr = &uid
+		}
+		h.auditEvent(c, audit.Event{
+			TenantID:      &tenantID,
+			UserID:        uidPtr,
+			ApplicationID: appRowID,
+			ActorEmail:    claims.Email,
+			Action:        audit.ActionAdminEmailTestSent,
+			ResourceType:  rt,
+			ResourceID:    rid,
+			IPAddress:     c.RealIP(),
+			UserAgent:     c.Request().UserAgent(),
+			Metadata: map[string]any{
+				"recipient": to,
+				"template":  string(tt),
+				"scope":     scope,
+				"provider":  provider,
+				// Distinguishes "sent somewhere else" from the routine
+				// self-test when reviewing the log.
+				"external": !strings.EqualFold(to, ownEmail),
+			},
+		})
+	}
+	return c.JSON(http.StatusOK, SendTestEmailResponse{
+		Message:  "test email sent to " + to,
+		To:       to,
+		Scope:    scope,
+		Provider: provider,
+		Template: string(tt),
+	})
 }
 
 // ---------------------------------------------------------------------------
