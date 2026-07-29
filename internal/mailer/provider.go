@@ -136,10 +136,16 @@ func (t *smtpTransport) send(ctx context.Context, m outMessage) error {
 
 // isSMTPAuthFailure reports whether a go-mail send error looks like credential
 // rejection rather than a connection or content problem.
+// The numeric codes are anchored with a trailing space and paired with the
+// enhanced status code, because a bare "535" also matches byte counts, port
+// numbers and message IDs that happen to contain it. That direction is a false
+// positive — telling an admin to check credentials for what was really a
+// connection failure — which is the one outcome loose matching must not produce.
 func isSMTPAuthFailure(err error) bool {
 	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "535") || // "authentication credentials invalid"
-		strings.Contains(s, "534") || // "authentication mechanism too weak"
+	return strings.Contains(s, "535 ") || // "535 authentication credentials invalid"
+		strings.Contains(s, "534 ") || // "534 authentication mechanism too weak"
+		strings.Contains(s, "5.7.8") || // enhanced status code for bad credentials
 		strings.Contains(s, "authentication failed") ||
 		strings.Contains(s, "auth failed") ||
 		strings.Contains(s, "invalid credentials") ||

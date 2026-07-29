@@ -290,51 +290,45 @@ func (s *EmailSenderService) Delete(ctx context.Context, tenantID int64, appRowI
 	return nil
 }
 
-// Sender scopes reported by ResolveScope, in priority order.
+// Sender scopes, in priority order.
 const (
 	SenderScopeApplication = "application"
 	SenderScopeTenant      = "tenant"
 	SenderScopeGlobal      = "global"
 )
 
-// ResolveScope reports WHICH scope Resolve would pick for the same arguments.
-//
-// Resolve deliberately collapses the application → tenant → global chain into
-// one row, which is right for sending but useless for a test endpoint: an admin
-// pressing "send test" on an application needs to know whether they just
-// exercised that application's provider or silently fell through to the
-// tenant's (or the server's). Reporting "sent OK" without saying which
-// configuration was used is how a broken per-app setup hides behind a working
-// global one.
-func (s *EmailSenderService) ResolveScope(ctx context.Context, tenantID int64, appRowID *int64) (string, error) {
-	if appRowID != nil {
-		if _, err := s.Get(ctx, tenantID, appRowID); err == nil {
-			return SenderScopeApplication, nil
-		} else if !errors.Is(err, ErrSenderNotFound) {
-			return "", err
-		}
-	}
-	if _, err := s.Get(ctx, tenantID, nil); err == nil {
-		return SenderScopeTenant, nil
-	} else if !errors.Is(err, ErrSenderNotFound) {
-		return "", err
-	}
-	return SenderScopeGlobal, nil
-}
-
 // Resolve returns the effective sender for a send: the application's own row
 // if one exists (and is active), else the tenant-level row, else nil — nil
-// means "use the global server sender". One query resolves the whole chain:
-// rows matching the app sort before the tenant-level row.
+// means "use the global server sender".
 func (s *EmailSenderService) Resolve(ctx context.Context, tenantID int64, appRowID *int64) (*mailer.SMTPConfig, error) {
+	cfg, _, err := s.ResolveWithScope(ctx, tenantID, appRowID)
+	return cfg, err
+}
+
+// ResolveWithScope is Resolve plus the scope the returned config came from.
+//
+// The scope is derived from the SAME row the credentials come from, in the same
+// query. An earlier version answered this with separate Get() calls, which was
+// a correctness bug: Get has no is_active filter, so a DEACTIVATED
+// application-level row made the scope report "application" while the
+// credentials actually came from the tenant. The test endpoint then asserted a
+// scope it had never exercised — worse than the silent fall-through it was
+// meant to replace. Two queries that can disagree also left a TOCTOU window
+// where a concurrent sender update made the reported scope a lie.
+//
+// One row, one answer: application_id non-NULL means the application's own
+// sender won; a row with application_id NULL is the tenant's; no row at all is
+// the global server sender.
+func (s *EmailSenderService) ResolveWithScope(ctx context.Context, tenantID int64, appRowID *int64) (*mailer.SMTPConfig, string, error) {
 	var (
 		provider, from, host, username, passwordEnc, apiKeyEnc   string
 		tlsMode, fromName, replyTo, productName, logoURL, prefix string
 		port                                                     int
+		rowAppID                                                 *int64
 	)
 	err := s.pool.QueryRow(ctx, `
 		SELECT provider, from_address, COALESCE(smtp_host, ''), smtp_port, smtp_username, smtp_password_enc, api_key_enc,
-		       tls_mode, from_name, reply_to, product_name, logo_url, subject_prefix
+		       tls_mode, from_name, reply_to, product_name, logo_url, subject_prefix, application_id
 		FROM email_sender_settings
 		WHERE tenant_id = $1
 		  AND is_active = true
@@ -342,26 +336,33 @@ func (s *EmailSenderService) Resolve(ctx context.Context, tenantID int64, appRow
 		ORDER BY application_id ASC NULLS LAST
 		LIMIT 1
 	`, tenantID, appRowID).Scan(&provider, &from, &host, &port, &username, &passwordEnc, &apiKeyEnc,
-		&tlsMode, &fromName, &replyTo, &productName, &logoURL, &prefix)
+		&tlsMode, &fromName, &replyTo, &productName, &logoURL, &prefix, &rowAppID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil // global sender
+			return nil, SenderScopeGlobal, nil // global sender
 		}
-		return nil, fmt.Errorf("resolve email sender: %w", err)
+		return nil, "", fmt.Errorf("resolve email sender: %w", err)
+	}
+
+	// Scope comes from the row that actually won, so it can never disagree with
+	// the credentials returned alongside it.
+	scope := SenderScopeTenant
+	if rowAppID != nil {
+		scope = SenderScopeApplication
 	}
 
 	password := ""
 	if passwordEnc != "" {
 		password, err = decryptAESGCM(s.encKey, passwordEnc)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt smtp password: %w", err)
+			return nil, "", fmt.Errorf("decrypt smtp password: %w", err)
 		}
 	}
 	apiKey := ""
 	if apiKeyEnc != "" {
 		apiKey, err = decryptAESGCM(s.encKey, apiKeyEnc)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt api key: %w", err)
+			return nil, "", fmt.Errorf("decrypt api key: %w", err)
 		}
 	}
 	return &mailer.SMTPConfig{
@@ -378,5 +379,5 @@ func (s *EmailSenderService) Resolve(ctx context.Context, tenantID int64, appRow
 		ProductName:   productName,
 		LogoURL:       logoURL,
 		SubjectPrefix: prefix,
-	}, nil
+	}, scope, nil
 }

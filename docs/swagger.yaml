@@ -990,17 +990,9 @@ definitions:
     properties:
       allow_inherited:
         description: |-
-          AllowInherited permits the send to proceed when the scope being tested
-          has no sender of its own and would fall through to a broader one.
-
-          Default false, i.e. a test at a scope only exercises THAT scope's
-          configuration. Falling through by default made a green result meaningless:
-          an application with no provider would report success on the strength of
-          the tenant's or the platform's credentials, telling the admin the
-          application was configured when it was not.
-
-          Set true deliberately to verify the inherited path — which is the real
-          production path for an application that intentionally has no sender.
+          AllowInherited permits an application-addressed test to proceed when the
+          application has no sender of its own and would fall through to the
+          tenant's or the platform's. Default false; see PR #91 for the reasoning.
         type: boolean
       template_type:
         description: TemplateType selects which template to render (empty = email_verification).
@@ -1009,17 +1001,12 @@ definitions:
         description: |-
           To is the recipient. Empty = the requesting admin's own address.
 
-          Any syntactically valid address is accepted: verifying deliverability to
-          a real external inbox (a QA alias, a personal account, a customer's
-          domain) is the main thing this endpoint is for, and restricting it to
-          tenant members made it useless for that.
-
-          The trade-off is deliberate and bounded: reaching this endpoint requires
-          apps:write on the tenant, it is rate-limited, it only ever sends the
-          sample-data render of a template, and every send is audited WITH the
-          recipient. A caller who could abuse it can already edit the templates and
-          add users, so the marginal capability is small — but it is real, which is
-          why the recipient is on the audit record rather than just the scope.
+          INVARIANT: a recipient other than the caller's own address always gets the
+          built-in diagnostic template, never a per-scope override — see the
+          enforcement in SendTestEmail. Template bodies are editable at this same
+          permission level, so allowing both an arbitrary recipient and arbitrary
+          content would make this a phishing relay from a verified sender identity.
+          See PR #91 for the full threat model.
         type: string
     type: object
   handlers.SendTestEmailResponse:

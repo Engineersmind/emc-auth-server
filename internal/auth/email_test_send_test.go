@@ -52,7 +52,7 @@ func newSenderTestEnv(t *testing.T) (*auth.EmailSenderService, int64, int64, con
 func TestResolveScopeReportsGlobalWhenNothingConfigured(t *testing.T) {
 	svc, tenantID, appRowID, ctx := newSenderTestEnv(t)
 
-	scope, err := svc.ResolveScope(ctx, tenantID, &appRowID)
+	_, scope, err := svc.ResolveWithScope(ctx, tenantID, &appRowID)
 	if err != nil {
 		t.Fatalf("ResolveScope: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestResolveScopeReportsTenantFallthrough(t *testing.T) {
 
 	// The application has no sender of its own, so a test "for the app" is
 	// really exercising the tenant's configuration — and must say so.
-	scope, err := svc.ResolveScope(ctx, tenantID, &appRowID)
+	_, scope, err := svc.ResolveWithScope(ctx, tenantID, &appRowID)
 	if err != nil {
 		t.Fatalf("ResolveScope: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestResolveScopeReportsApplicationWhenItHasItsOwn(t *testing.T) {
 		t.Fatalf("Upsert(app): %v", err)
 	}
 
-	scope, err := svc.ResolveScope(ctx, tenantID, &appRowID)
+	_, scope, err := svc.ResolveWithScope(ctx, tenantID, &appRowID)
 	if err != nil {
 		t.Fatalf("ResolveScope: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestResolveScopeDistinguishesOwnFromInherited(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("Upsert(tenant): %v", err)
 	}
-	scope, err := svc.ResolveScope(ctx, tenantID, &appRowID)
+	_, scope, err := svc.ResolveWithScope(ctx, tenantID, &appRowID)
 	if err != nil {
 		t.Fatalf("ResolveScope: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestResolveScopeDistinguishesOwnFromInherited(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("Upsert(app): %v", err)
 	}
-	scope, err = svc.ResolveScope(ctx, tenantID, &appRowID)
+	_, scope, err = svc.ResolveWithScope(ctx, tenantID, &appRowID)
 	if err != nil {
 		t.Fatalf("ResolveScope: %v", err)
 	}
@@ -194,11 +194,102 @@ func TestResolveScopeDistinguishesOwnFromInherited(t *testing.T) {
 
 	// A tenant-addressed test still reports tenant scope — the application's
 	// row must not leak upward into the tenant's answer.
-	tenantScope, err := svc.ResolveScope(ctx, tenantID, nil)
+	_, tenantScope, err := svc.ResolveWithScope(ctx, tenantID, nil)
 	if err != nil {
 		t.Fatalf("ResolveScope(tenant): %v", err)
 	}
 	if tenantScope != auth.SenderScopeTenant {
 		t.Errorf("tenant scope = %q, want %q", tenantScope, auth.SenderScopeTenant)
+	}
+}
+
+// TestResolveScopeIgnoresInactiveSender is the regression test for the bug that
+// shipped in the first cut of this work (PR #91 review): scope was answered by
+// Get(), which has no is_active filter, while the credentials came from
+// Resolve(), which does. A DEACTIVATED application row therefore reported
+// "application" scope while sending on the tenant's key — the response actively
+// asserted a scope it had never exercised, and the 409 guard waved it through.
+func TestResolveScopeIgnoresInactiveSender(t *testing.T) {
+	svc, tenantID, appRowID, ctx := newSenderTestEnv(t)
+
+	// Tenant sender active; the application has its own row but deactivated.
+	if _, err := svc.Upsert(ctx, tenantID, nil, auth.UpsertSenderInput{
+		Provider: auth.SenderProviderSendGrid, FromAddress: "tenant@acme.com", APIKey: "SG.tenant-key",
+	}, nil); err != nil {
+		t.Fatalf("Upsert(tenant): %v", err)
+	}
+	inactive := false
+	if _, err := svc.Upsert(ctx, tenantID, &appRowID, auth.UpsertSenderInput{
+		Provider: auth.SenderProviderSendGrid, FromAddress: "app@acme.com", APIKey: "SG.app-key",
+		IsActive: &inactive,
+	}, nil); err != nil {
+		t.Fatalf("Upsert(app, inactive): %v", err)
+	}
+
+	cfg, scope, err := svc.ResolveWithScope(ctx, tenantID, &appRowID)
+	if err != nil {
+		t.Fatalf("ResolveWithScope: %v", err)
+	}
+	if scope == auth.SenderScopeApplication {
+		t.Error("an inactive application sender reported application scope — the 409 guard would pass and the response would vouch for a provider that was never exercised")
+	}
+	if scope != auth.SenderScopeTenant {
+		t.Errorf("scope = %q, want %q", scope, auth.SenderScopeTenant)
+	}
+	// The whole point: scope and credentials must come from the same row.
+	if cfg == nil || cfg.APIKey != "SG.tenant-key" {
+		t.Errorf("credentials = %+v but scope reported %q — the two disagree", cfg, scope)
+	}
+}
+
+// Scope and credentials are returned from one query, so they cannot diverge.
+// This asserts the pairing directly for every configuration shape.
+func TestResolveWithScopePairsScopeToCredentials(t *testing.T) {
+	svc, tenantID, appRowID, ctx := newSenderTestEnv(t)
+
+	// Nothing configured → global, and no credentials at all.
+	cfg, scope, err := svc.ResolveWithScope(ctx, tenantID, &appRowID)
+	if err != nil {
+		t.Fatalf("ResolveWithScope: %v", err)
+	}
+	if scope != auth.SenderScopeGlobal || cfg != nil {
+		t.Errorf("nothing configured: scope=%q cfg=%+v, want global/nil", scope, cfg)
+	}
+
+	// Tenant only.
+	if _, err := svc.Upsert(ctx, tenantID, nil, auth.UpsertSenderInput{
+		Provider: auth.SenderProviderSendGrid, FromAddress: "tenant@acme.com", APIKey: "SG.tenant-key",
+	}, nil); err != nil {
+		t.Fatalf("Upsert(tenant): %v", err)
+	}
+	cfg, scope, err = svc.ResolveWithScope(ctx, tenantID, &appRowID)
+	if err != nil {
+		t.Fatalf("ResolveWithScope: %v", err)
+	}
+	if scope != auth.SenderScopeTenant || cfg == nil || cfg.APIKey != "SG.tenant-key" {
+		t.Errorf("tenant only: scope=%q key=%v", scope, cfg)
+	}
+
+	// Application row wins once it exists and is active.
+	if _, err := svc.Upsert(ctx, tenantID, &appRowID, auth.UpsertSenderInput{
+		Provider: auth.SenderProviderSendGrid, FromAddress: "app@acme.com", APIKey: "SG.app-key",
+	}, nil); err != nil {
+		t.Fatalf("Upsert(app): %v", err)
+	}
+	cfg, scope, err = svc.ResolveWithScope(ctx, tenantID, &appRowID)
+	if err != nil {
+		t.Fatalf("ResolveWithScope: %v", err)
+	}
+	if scope != auth.SenderScopeApplication || cfg == nil || cfg.APIKey != "SG.app-key" {
+		t.Errorf("app configured: scope=%q key=%v", scope, cfg)
+	}
+
+	// A tenant-addressed call still gets the tenant's row, not the app's.
+	cfg, scope, err = svc.ResolveWithScope(ctx, tenantID, nil)
+	if err != nil {
+		t.Fatalf("ResolveWithScope(tenant): %v", err)
+	}
+	if scope != auth.SenderScopeTenant || cfg == nil || cfg.APIKey != "SG.tenant-key" {
+		t.Errorf("tenant-addressed: scope=%q key=%v — the app row leaked upward", scope, cfg)
 	}
 }

@@ -8335,7 +8335,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "allow_inherited": {
-                    "description": "AllowInherited permits the send to proceed when the scope being tested\nhas no sender of its own and would fall through to a broader one.\n\nDefault false, i.e. a test at a scope only exercises THAT scope's\nconfiguration. Falling through by default made a green result meaningless:\nan application with no provider would report success on the strength of\nthe tenant's or the platform's credentials, telling the admin the\napplication was configured when it was not.\n\nSet true deliberately to verify the inherited path — which is the real\nproduction path for an application that intentionally has no sender.",
+                    "description": "AllowInherited permits an application-addressed test to proceed when the\napplication has no sender of its own and would fall through to the\ntenant's or the platform's. Default false; see PR #91 for the reasoning.",
                     "type": "boolean"
                 },
                 "template_type": {
@@ -8343,7 +8343,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "to": {
-                    "description": "To is the recipient. Empty = the requesting admin's own address.\n\nAny syntactically valid address is accepted: verifying deliverability to\na real external inbox (a QA alias, a personal account, a customer's\ndomain) is the main thing this endpoint is for, and restricting it to\ntenant members made it useless for that.\n\nThe trade-off is deliberate and bounded: reaching this endpoint requires\napps:write on the tenant, it is rate-limited, it only ever sends the\nsample-data render of a template, and every send is audited WITH the\nrecipient. A caller who could abuse it can already edit the templates and\nadd users, so the marginal capability is small — but it is real, which is\nwhy the recipient is on the audit record rather than just the scope.",
+                    "description": "To is the recipient. Empty = the requesting admin's own address.\n\nINVARIANT: a recipient other than the caller's own address always gets the\nbuilt-in diagnostic template, never a per-scope override — see the\nenforcement in SendTestEmail. Template bodies are editable at this same\npermission level, so allowing both an arbitrary recipient and arbitrary\ncontent would make this a phishing relay from a verified sender identity.\nSee PR #91 for the full threat model.",
                     "type": "string"
                 }
             }
