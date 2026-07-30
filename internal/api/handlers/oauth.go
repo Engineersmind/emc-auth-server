@@ -471,12 +471,33 @@ func (h *OAuthHandler) TestProviderConfig(c echo.Context) error {
 	}
 	provider := c.Param("provider")
 
+	// Audited on the not-found path too: the request establishes whether an
+	// (application, provider) pair is configured, so a slow-roll probe across
+	// pairs must leave the same trail a successful test does.
+	auditTested := func(status string, httpStatus int, meta map[string]any) {
+		h.auditEvent(c, audit.Event{
+			TenantID:      &tenantID,
+			ApplicationID: &appID,
+			ActorEmail:    claims.Email,
+			Action:        audit.ActionAdminIdPConfigTested,
+			ResourceType:  "application",
+			ResourceID:    c.Param("appID") + ":" + provider,
+			IPAddress:     c.RealIP(),
+			UserAgent:     c.Request().UserAgent(),
+			Status:        status,
+			HTTPStatus:    httpStatus,
+			Metadata:      meta,
+		})
+	}
+
 	result, err := h.svc.TestConfig(c.Request().Context(), tenantID, appID, provider)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrProviderNotSupported):
 			return echo.NewHTTPError(http.StatusBadRequest, "unknown identity provider")
 		case errors.Is(err, auth.ErrProviderNotConfigured):
+			auditTested(audit.StatusFailure, http.StatusNotFound,
+				map[string]any{"ok": false, "reason": "not_configured"})
 			return echo.NewHTTPError(http.StatusNotFound, "provider config not found")
 		default:
 			h.logger.Error().Err(err).Str("provider", provider).Msg("oauth: test provider config failed")
@@ -484,17 +505,8 @@ func (h *OAuthHandler) TestProviderConfig(c echo.Context) error {
 		}
 	}
 
-	h.auditEvent(c, audit.Event{
-		TenantID:      &tenantID,
-		ApplicationID: &appID,
-		ActorEmail:    claims.Email,
-		Action:        audit.ActionAdminIdPConfigTested,
-		ResourceType:  "application",
-		ResourceID:    c.Param("appID") + ":" + provider,
-		IPAddress:     c.RealIP(),
-		UserAgent:     c.Request().UserAgent(),
-		Metadata:      map[string]any{"ok": result.OK, "enabled": result.Enabled},
-	})
+	auditTested(audit.StatusSuccess, http.StatusOK,
+		map[string]any{"ok": result.OK, "enabled": result.Enabled})
 	return c.JSON(http.StatusOK, result)
 }
 

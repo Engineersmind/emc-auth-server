@@ -195,7 +195,7 @@ func (s *IdentityProviderService) UpsertConfig(ctx context.Context, tenantID, ap
 		    enabled           = EXCLUDED.enabled,
 		    redirect_allow    = EXCLUDED.redirect_allow,
 		    updated_at        = NOW()
-		RETURNING id, provider, client_id, enabled, client_secret_enc <> '', redirect_allow, created_at, updated_at
+		RETURNING id, provider, client_id, enabled, COALESCE(client_secret_enc, '') <> '', redirect_allow, created_at, updated_at
 	`, tenantID, appID, in.Provider, in.ClientID, secretEnc, in.Enabled, in.RedirectAllow).
 		Scan(&id, &d.Provider, &d.ClientID, &d.Enabled, &d.HasSecret, &d.RedirectAllow, &d.CreatedAt, &d.UpdatedAt)
 	if err != nil {
@@ -209,7 +209,7 @@ func (s *IdentityProviderService) UpsertConfig(ctx context.Context, tenantID, ap
 // ListConfigs returns all provider configs for one application, secrets excluded.
 func (s *IdentityProviderService) ListConfigs(ctx context.Context, tenantID, appID int64) ([]ProviderConfigDetail, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, provider, client_id, enabled, client_secret_enc <> '', redirect_allow, created_at, updated_at
+		SELECT id, provider, client_id, enabled, COALESCE(client_secret_enc, '') <> '', redirect_allow, created_at, updated_at
 		FROM   identity_provider_configs
 		WHERE  application_id = $1 AND tenant_id = $2
 		ORDER  BY provider
@@ -305,11 +305,12 @@ func (s *IdentityProviderService) getTestConfig(ctx context.Context, tenantID, a
 		return nil, false, fmt.Errorf("load provider config: %w", err)
 	}
 	// A decrypt failure here is itself a finding (wrong SECRET_BOX_KEY after a
-	// key rotation), so it is reported as a failed check rather than swallowed
-	// — the caller distinguishes it via the empty ClientSecret.
+	// key rotation), so it is reported as a failed check rather than swallowed.
+	// The config is returned as nil on that path: a half-initialized flowConfig
+	// with no usable secret must not look like something a caller may act on.
 	c.ClientSecret, err = s.box.Decrypt(secretEnc)
 	if err != nil {
-		return &c, enabled, ErrProviderSecretUndecryptable
+		return nil, enabled, ErrProviderSecretUndecryptable
 	}
 	return &c, enabled, nil
 }

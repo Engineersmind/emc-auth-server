@@ -773,8 +773,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// guarded by RequireTenantSelfOrAny exactly like every other
 	// /tenants/:tid resource family (email settings, roles, users, ...).
 	adminGroup.GET("/tenants/:tid/applications/:appID/identity-providers", oauthHandler.ListProviderConfigs, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.UpsertProviderConfig, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.DeleteProviderConfig, tidAppsWrite)
+	// The two mutating routes carry the same token rate limiter as /test: each
+	// performs AES-256-GCM work, a DB upsert/delete and an audit write, so
+	// leaving the heavier endpoints unguarded while the lighter one is limited
+	// would be the wrong asymmetry.
+	adminGroup.PUT("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.UpsertProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.DeleteProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.POST("/tenants/:tid/applications/:appID/identity-providers/:provider/test", oauthHandler.TestProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/identities", oauthHandler.ListUserIdentities, tidUsersRead)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/identities/:provider", oauthHandler.UnlinkUserIdentity, tidUsersWrite)

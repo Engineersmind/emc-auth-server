@@ -482,3 +482,50 @@ func TestIdentityRoutesAreScopedToTheApplicationInThePath(t *testing.T) {
 		t.Fatalf("app one user has %d identities, want the 1 the foreign-app unlink must not have removed", len(right))
 	}
 }
+
+// TestTestConfigShapeIsStableWhenSecretUndecryptable pins that the result of a
+// test is always the same six named checks, whichever path produced it. A UI
+// reads checks by name, so an entry that is merely absent — rather than present
+// and failed — silently disappears from the report.
+func TestTestConfigShapeIsStableWhenSecretUndecryptable(t *testing.T) {
+	sg := newStubGoogle(t)
+	env := newOAuthTestEnv(t, sg)
+	ctx := context.Background()
+
+	healthy, err := env.svc.TestConfig(ctx, env.tenantID, env.appRowID, ProviderGoogle)
+	if err != nil {
+		t.Fatalf("TestConfig on healthy config: %v", err)
+	}
+
+	// Corrupt the stored ciphertext so decryption with the current key fails —
+	// the wrong-key-after-rotation case.
+	if _, err := env.pool.Exec(ctx, `
+		UPDATE identity_provider_configs SET client_secret_enc = 'not-valid-ciphertext'
+		WHERE application_id = $1 AND provider = $2
+	`, env.appRowID, ProviderGoogle); err != nil {
+		t.Fatalf("corrupt stored secret: %v", err)
+	}
+
+	broken, err := env.svc.TestConfig(ctx, env.tenantID, env.appRowID, ProviderGoogle)
+	if err != nil {
+		t.Fatalf("TestConfig with undecryptable secret returned an error, want a failed check: %v", err)
+	}
+	if broken.OK {
+		t.Error("OK = true with an undecryptable client secret")
+	}
+	if checkByName(t, broken, "client_secret").Passed {
+		t.Error("client_secret check passed for an undecryptable secret")
+	}
+
+	// Same names, same order, as the healthy result.
+	if len(broken.Checks) != len(healthy.Checks) {
+		t.Fatalf("undecryptable path returned %d checks, want the %d of a normal result",
+			len(broken.Checks), len(healthy.Checks))
+	}
+	for i, c := range healthy.Checks {
+		if broken.Checks[i].Name != c.Name {
+			t.Errorf("check %d = %q, want %q — the result shape must not vary by path",
+				i, broken.Checks[i].Name, c.Name)
+		}
+	}
+}

@@ -179,9 +179,22 @@ func (s *OAuthLoginService) TestConfig(ctx context.Context, tenantID, appID int6
 	case errors.Is(err, ErrProviderNotConfigured):
 		return nil, err
 	case errors.Is(err, ErrProviderSecretUndecryptable):
+		// Every check name is still emitted, so the result shape is identical on
+		// every returned path and a UI iterating checks by name never finds an
+		// entry simply missing. The ones that genuinely cannot run without a
+		// decrypted secret are reported as skipped rather than as passing.
 		res.Enabled = enabled
 		add("config_stored", true, "provider configuration found")
+		add("client_id", true, "client_id is set")
 		add("client_secret", false, "stored client secret cannot be decrypted with the current key")
+		add("redirect_allow", false, checkSkipped)
+		add("authorization_url", false, checkSkipped)
+		if enabled {
+			add("enabled", true, "provider is enabled")
+		} else {
+			add("enabled", false, "provider is configured but disabled — logins are rejected until it is enabled")
+		}
+		res.OK = allPassed(res.Checks)
 		return res, nil
 	case err != nil:
 		return nil, err
@@ -219,14 +232,25 @@ func (s *OAuthLoginService) TestConfig(ctx context.Context, tenantID, appID int6
 		add("enabled", true, "provider is enabled")
 	}
 
-	res.OK = true
-	for _, c := range res.Checks {
+	res.OK = allPassed(res.Checks)
+	return res, nil
+}
+
+// checkSkipped is the detail for a check that could not be attempted because an
+// earlier one failed. It is reported as not passed — "not proven" is the honest
+// reading, and it keeps res.OK false without a separate flag.
+const checkSkipped = "skipped — the stored client secret is unavailable"
+
+// allPassed is the ONLY place res.OK is derived. Every return path in
+// TestConfig goes through it, so a result can never carry an OK that was set
+// before the checks it is supposed to summarise.
+func allPassed(checks []ProviderTestCheck) bool {
+	for _, c := range checks {
 		if !c.Passed {
-			res.OK = false
-			break
+			return false
 		}
 	}
-	return res, nil
+	return len(checks) > 0
 }
 
 // providerProbeTimeout bounds the driver probe in TestConfig — an unreachable
