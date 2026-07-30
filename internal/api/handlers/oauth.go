@@ -269,10 +269,14 @@ func adminTenantAndApp(c echo.Context) (tenantID, appID int64, claims *auth.Clai
 // adminTenantAndUser mirrors adminTenantAndApp for the identities routes. The
 // user id param differs by route family: tenant-nested application user routes
 // use :uid, the flat user routes use :id.
-func adminTenantAndUser(c echo.Context) (tenantID, userID int64, claims *auth.Claims, err error) {
+//
+// appID is the application the URL scopes the user to, or 0 on the flat routes
+// which carry no application segment. The service enforces it, so the nested
+// URL shape cannot claim an app dimension it does not check.
+func adminTenantAndUser(c echo.Context) (tenantID, userID, appID int64, claims *auth.Claims, err error) {
 	tenantID, claims, err = oauthTargetTenant(c)
 	if err != nil {
-		return 0, 0, nil, err
+		return 0, 0, 0, nil, err
 	}
 	raw := c.Param("uid")
 	if raw == "" {
@@ -280,9 +284,15 @@ func adminTenantAndUser(c echo.Context) (tenantID, userID int64, claims *auth.Cl
 	}
 	userID, err = strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		return 0, 0, nil, echo.NewHTTPError(http.StatusBadRequest, "invalid user id")
+		return 0, 0, 0, nil, echo.NewHTTPError(http.StatusBadRequest, "invalid user id")
 	}
-	return tenantID, userID, claims, nil
+	if rawApp := c.Param("appID"); rawApp != "" {
+		appID, err = strconv.ParseInt(rawApp, 10, 64)
+		if err != nil {
+			return 0, 0, 0, nil, echo.NewHTTPError(http.StatusBadRequest, "invalid application id")
+		}
+	}
+	return tenantID, userID, appID, claims, nil
 }
 
 // userResourceID labels audit entries with the user id actually acted on,
@@ -306,11 +316,11 @@ func userResourceID(c echo.Context) string {
 // @Failure      400 {object}  map[string]string
 // @Router       /api/v1/users/{id}/identities [get]
 func (h *OAuthHandler) ListUserIdentities(c echo.Context) error {
-	tenantID, userID, _, err := adminTenantAndUser(c)
+	tenantID, userID, appID, _, err := adminTenantAndUser(c)
 	if err != nil {
 		return err
 	}
-	identities, err := h.idpSvc.ListUserIdentities(c.Request().Context(), tenantID, userID)
+	identities, err := h.idpSvc.ListUserIdentities(c.Request().Context(), tenantID, userID, appID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("oauth: list user identities failed")
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list identities")
@@ -331,12 +341,12 @@ func (h *OAuthHandler) ListUserIdentities(c echo.Context) error {
 // @Failure      409  {object}  map[string]string
 // @Router       /api/v1/users/{id}/identities/{provider} [delete]
 func (h *OAuthHandler) UnlinkUserIdentity(c echo.Context) error {
-	tenantID, userID, claims, err := adminTenantAndUser(c)
+	tenantID, userID, appID, claims, err := adminTenantAndUser(c)
 	if err != nil {
 		return err
 	}
 	provider := c.Param("provider")
-	if err := h.idpSvc.UnlinkUserIdentity(c.Request().Context(), tenantID, userID, provider); err != nil {
+	if err := h.idpSvc.UnlinkUserIdentity(c.Request().Context(), tenantID, userID, appID, provider); err != nil {
 		switch {
 		case errors.Is(err, auth.ErrProviderNotSupported), errors.Is(err, auth.ErrIdentityNotFound):
 			return echo.NewHTTPError(http.StatusNotFound, "identity not found")

@@ -73,7 +73,16 @@ func NewIdentityProviderService(pool *pgxpool.Pool, box *SecretBox, baseURL stri
 // drift between the two is exactly the misconfiguration this field exists to
 // prevent.
 func (s *IdentityProviderService) CallbackURL(provider string) string {
-	return s.baseURL + "/oauth/" + provider + "/callback"
+	return callbackURLFor(s.baseURL, provider)
+}
+
+// callbackURLFor is the ONE implementation of the callback URL shape. Both the
+// login flow (OAuthLoginService.callbackURL) and the admin read APIs
+// (IdentityProviderService.CallbackURL) go through it, so the URL an admin
+// copies into the provider console cannot drift from the redirect_uri the
+// flow actually sends.
+func callbackURLFor(baseURL, provider string) string {
+	return baseURL + "/oauth/" + provider + "/callback"
 }
 
 // ProviderConfigDetail is the public representation of one provider config —
@@ -328,15 +337,20 @@ type UserIdentityDetail struct {
 }
 
 // ListUserIdentities returns the external identities linked to one user,
-// scoped to the caller's tenant.
-func (s *IdentityProviderService) ListUserIdentities(ctx context.Context, tenantID, userID int64) ([]UserIdentityDetail, error) {
+// scoped to the caller's tenant. appID additionally pins the user to one
+// application — pass the :appID of the tenant-nested route so the URL's app
+// dimension is enforced rather than merely implied; pass 0 on the flat route,
+// which has no app in its path. A mismatch yields an empty list, the same
+// answer an unknown user gets.
+func (s *IdentityProviderService) ListUserIdentities(ctx context.Context, tenantID, userID, appID int64) ([]UserIdentityDetail, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT ui.id, ui.provider, ui.provider_email, ui.created_at
 		FROM   user_identities ui
 		JOIN   users u ON u.id = ui.user_id
 		WHERE  ui.user_id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+		  AND  ($3 = 0 OR u.application_id = $3)
 		ORDER  BY ui.provider
-	`, userID, tenantID)
+	`, userID, tenantID, appID)
 	if err != nil {
 		return nil, fmt.Errorf("list user identities: %w", err)
 	}
@@ -363,7 +377,10 @@ func (s *IdentityProviderService) ListUserIdentities(ctx context.Context, tenant
 // FOR UPDATE: concurrent unlinks on the same user serialize on that lock, so
 // two requests can never both pass the guard and jointly strip the account of
 // every login method (including unlinks of two DIFFERENT providers).
-func (s *IdentityProviderService) UnlinkUserIdentity(ctx context.Context, tenantID, userID int64, provider string) error {
+//
+// appID pins the user to one application (0 = unconstrained); see
+// ListUserIdentities.
+func (s *IdentityProviderService) UnlinkUserIdentity(ctx context.Context, tenantID, userID, appID int64, provider string) error {
 	if !supportedProviders[provider] {
 		return ErrProviderNotSupported
 	}
@@ -374,20 +391,29 @@ func (s *IdentityProviderService) UnlinkUserIdentity(ctx context.Context, tenant
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var hasPassword bool
+	var hasPassword, hasThisProvider bool
 	var identityCount int
 	err = tx.QueryRow(ctx, `
 		SELECT EXISTS (SELECT 1 FROM user_credentials WHERE user_id = u.id),
-		       (SELECT COUNT(*) FROM user_identities WHERE user_id = u.id)
+		       (SELECT COUNT(*) FROM user_identities WHERE user_id = u.id),
+		       EXISTS (SELECT 1 FROM user_identities
+		               WHERE user_id = u.id AND tenant_id = $2 AND provider = $4)
 		FROM   users u
 		WHERE  u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+		  AND  ($3 = 0 OR u.application_id = $3)
 		FOR UPDATE OF u
-	`, userID, tenantID).Scan(&hasPassword, &identityCount)
+	`, userID, tenantID, appID, provider).Scan(&hasPassword, &identityCount, &hasThisProvider)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrIdentityNotFound
 		}
 		return fmt.Errorf("check login methods: %w", err)
+	}
+	// Existence of THIS provider's identity is checked before the last-method
+	// guard: unlinking a provider the user never linked is a 404, not a 409
+	// about a login method the request was not touching.
+	if !hasThisProvider {
+		return ErrIdentityNotFound
 	}
 	if !hasPassword && identityCount <= 1 {
 		return ErrLastLoginMethod

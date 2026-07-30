@@ -390,11 +390,11 @@ func TestSameProviderAccountIsSeparatePerApplication(t *testing.T) {
 	}
 
 	// Unlink in application one only.
-	if err := env.svc.idpSvc.UnlinkUserIdentity(ctx, env.tenantID, userOne, ProviderGoogle); err != nil {
+	if err := env.svc.idpSvc.UnlinkUserIdentity(ctx, env.tenantID, userOne, env.appRowID, ProviderGoogle); err != nil {
 		t.Fatalf("unlink app one identity: %v", err)
 	}
 
-	oneIdentities, err := env.svc.idpSvc.ListUserIdentities(ctx, env.tenantID, userOne)
+	oneIdentities, err := env.svc.idpSvc.ListUserIdentities(ctx, env.tenantID, userOne, env.appRowID)
 	if err != nil {
 		t.Fatalf("list app one identities: %v", err)
 	}
@@ -402,7 +402,7 @@ func TestSameProviderAccountIsSeparatePerApplication(t *testing.T) {
 		t.Errorf("app one user still has %d identities after unlink", len(oneIdentities))
 	}
 
-	twoIdentities, err := env.svc.idpSvc.ListUserIdentities(ctx, env.tenantID, userTwo)
+	twoIdentities, err := env.svc.idpSvc.ListUserIdentities(ctx, env.tenantID, userTwo, appTwo)
 	if err != nil {
 		t.Fatalf("list app two identities: %v", err)
 	}
@@ -411,5 +411,74 @@ func TestSameProviderAccountIsSeparatePerApplication(t *testing.T) {
 	}
 	if twoIdentities[0].Provider != ProviderGoogle {
 		t.Errorf("app two identity provider = %q, want google", twoIdentities[0].Provider)
+	}
+}
+
+// TestUnlinkUnlinkedProviderIsNotFound pins the ordering of the two failure
+// modes: a user with no password and a single GitHub identity asked to unlink
+// GOOGLE must get "identity not found", not the last-login-method conflict
+// about the GitHub link the request never touched.
+func TestUnlinkUnlinkedProviderIsNotFound(t *testing.T) {
+	sg := newStubGoogle(t)
+	env := newOAuthTestEnv(t, sg)
+	ctx := context.Background()
+
+	var userID int64
+	err := env.pool.QueryRow(ctx, `
+		INSERT INTO users (tenant_id, application_id, email, is_active, email_verified)
+		VALUES ($1, $2, 'github.only@example.com', true, true)
+		RETURNING id
+	`, env.tenantID, env.appRowID).Scan(&userID)
+	if err != nil {
+		t.Fatalf("seed passwordless user: %v", err)
+	}
+	if _, err := env.pool.Exec(ctx, `
+		INSERT INTO user_identities
+		    (user_id, tenant_id, application_id, provider, provider_sub, provider_email)
+		VALUES ($1, $2, $3, $4, 'gh-sub-1', 'github.only@example.com')
+	`, userID, env.tenantID, env.appRowID, ProviderGitHub); err != nil {
+		t.Fatalf("seed github identity: %v", err)
+	}
+
+	// Google was never linked → 404, even though GitHub is the only method.
+	if err := env.svc.idpSvc.UnlinkUserIdentity(ctx, env.tenantID, userID, env.appRowID, ProviderGoogle); !errors.Is(err, ErrIdentityNotFound) {
+		t.Fatalf("unlink unlinked google: err = %v, want ErrIdentityNotFound", err)
+	}
+	// The provider that IS linked still trips the last-method guard.
+	if err := env.svc.idpSvc.UnlinkUserIdentity(ctx, env.tenantID, userID, env.appRowID, ProviderGitHub); !errors.Is(err, ErrLastLoginMethod) {
+		t.Fatalf("unlink only github: err = %v, want ErrLastLoginMethod", err)
+	}
+}
+
+// TestIdentityRoutesAreScopedToTheApplicationInThePath pins that the appID the
+// tenant-nested URL carries is enforced, not merely decorative: a user of
+// application one is invisible to, and unmodifiable through, application two.
+func TestIdentityRoutesAreScopedToTheApplicationInThePath(t *testing.T) {
+	sg := newStubGoogle(t)
+	env := newOAuthTestEnv(t, sg)
+	ctx := context.Background()
+	appTwo := secondApp(t, env)
+
+	userOne := seedUserWithIdentity(t, env, env.appRowID, "scoped.one@example.com", "scoped-sub-1")
+
+	// Listed through the WRONG application → empty, as for an unknown user.
+	wrong, err := env.svc.idpSvc.ListUserIdentities(ctx, env.tenantID, userOne, appTwo)
+	if err != nil {
+		t.Fatalf("list under wrong app: %v", err)
+	}
+	if len(wrong) != 0 {
+		t.Errorf("app two listed %d identities of an app one user", len(wrong))
+	}
+
+	// Unlinked through the WRONG application → not found, and nothing removed.
+	if err := env.svc.idpSvc.UnlinkUserIdentity(ctx, env.tenantID, userOne, appTwo, ProviderGoogle); !errors.Is(err, ErrIdentityNotFound) {
+		t.Fatalf("unlink under wrong app: err = %v, want ErrIdentityNotFound", err)
+	}
+	right, err := env.svc.idpSvc.ListUserIdentities(ctx, env.tenantID, userOne, env.appRowID)
+	if err != nil {
+		t.Fatalf("list under correct app: %v", err)
+	}
+	if len(right) != 1 {
+		t.Fatalf("app one user has %d identities, want the 1 the foreign-app unlink must not have removed", len(right))
 	}
 }

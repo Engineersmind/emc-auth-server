@@ -378,7 +378,7 @@ func TestGoogleLoginFlowIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("find JIT user: %v", err)
 		}
-		if err := idpSvc.UnlinkUserIdentity(ctx, env.tenantID, jitID, ProviderGoogle); !errors.Is(err, ErrLastLoginMethod) {
+		if err := idpSvc.UnlinkUserIdentity(ctx, env.tenantID, jitID, 0, ProviderGoogle); !errors.Is(err, ErrLastLoginMethod) {
 			t.Fatalf("err = %v, want ErrLastLoginMethod", err)
 		}
 
@@ -389,7 +389,7 @@ func TestGoogleLoginFlowIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("find linked user: %v", err)
 		}
-		if err := idpSvc.UnlinkUserIdentity(ctx, env.tenantID, linkedID, ProviderGoogle); err != nil {
+		if err := idpSvc.UnlinkUserIdentity(ctx, env.tenantID, linkedID, 0, ProviderGoogle); err != nil {
 			t.Fatalf("unlink with password fallback: %v", err)
 		}
 	})

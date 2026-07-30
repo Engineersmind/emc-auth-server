@@ -116,9 +116,10 @@ func (s *OAuthLoginService) driver(providerName string) (flowDriver, error) {
 }
 
 // callbackURL is the redirect_uri registered with every provider for this
-// deployment: baseURL + "/oauth/<provider>/callback".
+// deployment. Delegates to callbackURLFor, the shared implementation the admin
+// read APIs also use, so the two can never disagree.
 func (s *OAuthLoginService) callbackURL(providerName string) string {
-	return s.baseURL + "/oauth/" + providerName + "/callback"
+	return callbackURLFor(s.baseURL, providerName)
 }
 
 // ProviderTestCheck is one named assertion in a provider config test.
