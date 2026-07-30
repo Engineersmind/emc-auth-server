@@ -27,6 +27,11 @@ type captureMailer struct {
 	resets        []mailer.ResetEmail
 	verifications []mailer.VerificationEmail
 	welcomes      []mailer.WelcomeEmail
+	changed       []mailer.PasswordChangedEmail
+	invitations   []mailer.InvitationEmail
+	emailChanges  []mailer.ChangeEmailEmail
+	blocks        []mailer.BlockedAccountEmail
+	breaches      []mailer.PasswordBreachEmail
 	senders       []*mailer.SMTPConfig // parallel to sends; nil = global sender
 }
 
@@ -73,6 +78,39 @@ func (m *captureMailer) SendWelcome(ctx context.Context, sender *mailer.SMTPConf
 func (m *captureMailer) SendPasswordChanged(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.PasswordChangedEmail) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.changed = append(m.changed, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendInvitation(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.InvitationEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.invitations = append(m.invitations, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendChangeEmail(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.ChangeEmailEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.emailChanges = append(m.emailChanges, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendBlockedAccount(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.BlockedAccountEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blocks = append(m.blocks, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendPasswordBreach(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.PasswordBreachEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.breaches = append(m.breaches, e)
 	m.senders = append(m.senders, sender)
 	return nil
 }
@@ -83,6 +121,10 @@ func (m *captureMailer) SendTest(ctx context.Context, sender *mailer.SMTPConfig,
 	m.senders = append(m.senders, sender)
 	return nil
 }
+
+// GlobalProvider satisfies mailer.Mailer. The fake never transmits, so it
+// reports the same label the real mailer uses for its log-only transport.
+func (m *captureMailer) GlobalProvider() string { return "dev" }
 
 // lastLink returns the most recently "sent" magic link email.
 func (m *captureMailer) lastLink(t *testing.T) mailer.MagicLinkEmail {

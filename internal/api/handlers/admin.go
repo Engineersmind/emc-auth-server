@@ -1061,6 +1061,10 @@ type CreateUserAdminRequest struct {
 	FirstName string  `json:"first_name"`
 	LastName  string  `json:"last_name"`
 	RoleID    *string `json:"role_id"`
+	// SendInvitation emails the user a link to set their own password instead of
+	// the admin choosing one. When true, Password must be omitted — supplying
+	// both is contradictory and is rejected rather than silently resolved.
+	SendInvitation bool `json:"send_invitation"`
 }
 
 // UpdateUserAdminRequest is the body for PUT /api/v1/admin/users/:id.
@@ -1139,7 +1143,10 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 	if req.Email == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email is required"})
 	}
-	if len(req.Password) < 8 {
+	switch {
+	case req.SendInvitation && req.Password != "":
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "send_invitation and password are mutually exclusive"})
+	case !req.SendInvitation && len(req.Password) < 8:
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
 	}
 
@@ -1152,7 +1159,13 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 		roleID = &rid
 	}
 
-	result, err := h.svc.CreateUser(c.Request().Context(), tenantID, appScope, req.Email, req.Password, req.FirstName, req.LastName, roleID)
+	ctx := c.Request().Context()
+	var result *admin.UserResult
+	if req.SendInvitation {
+		result, err = h.svc.InviteUser(ctx, tenantID, appScope, req.Email, req.FirstName, req.LastName, roleID, actorUserID(claims), actorName(claims))
+	} else {
+		result, err = h.svc.CreateUser(ctx, tenantID, appScope, req.Email, req.Password, req.FirstName, req.LastName, roleID)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, admin.ErrAlreadyExists):
@@ -1161,12 +1174,90 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case errors.Is(err, admin.ErrNotFound):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "role not found"})
+		case errors.Is(err, admin.ErrInvitationsUnavailable):
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": err.Error()})
+		}
+		// A non-nil result with an error means the account was created but the
+		// invitation could not be sent: report 201 with a warning rather than a
+		// 500 that hides an account the admin now owns.
+		if result != nil {
+			h.logger.Error().Err(err).Msg("admin: invitation dispatch failed after user creation")
+			h.auditAdmin(c, claims, audit.ActionAdminUserCreated, "user", result.ID)
+			return c.JSON(http.StatusCreated, map[string]any{
+				"user":    result,
+				"warning": "user created but the invitation email could not be sent — use the resend endpoint",
+			})
 		}
 		h.logger.Error().Err(err).Msg("admin: create user failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create user"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminUserCreated, "user", result.ID)
+	action := audit.ActionAdminUserCreated
+	if req.SendInvitation {
+		action = audit.ActionAdminUserInvited
+	}
+	h.auditAdmin(c, claims, action, "user", result.ID)
 	return c.JSON(http.StatusCreated, result)
+}
+
+// ResendInvitation handles POST .../users/:uid/invite — issues a fresh
+// invitation link, superseding any outstanding one.
+//
+// @Summary      Resend a user invitation
+// @Description  Emails a fresh invitation link to the user, invalidating any previous one. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/invite [post]
+func (h *AdminHandler) ResendInvitation(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	if err := h.svc.ResendInvitation(c.Request().Context(), tenantID, appScope, userID, actorUserID(claims), actorName(claims)); err != nil {
+		switch {
+		case errors.Is(err, admin.ErrNotFound):
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		case errors.Is(err, admin.ErrInvitationsUnavailable):
+			return c.JSON(http.StatusNotImplemented, map[string]string{"error": err.Error()})
+		}
+		h.logger.Error().Err(err).Msg("admin: resend invitation failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to send invitation"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserInvited, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "invitation sent"})
+}
+
+// actorUserID extracts the acting admin's users.id from their claims, or nil for
+// a service token (whose UserID claim is a client_id, not a users.id).
+func actorUserID(claims *auth.Claims) *int64 {
+	if claims == nil {
+		return nil
+	}
+	id, err := strconv.ParseInt(claims.UserID, 10, 64)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+
+// actorName is the display name shown as the inviter in invitation emails.
+func actorName(claims *auth.Claims) string {
+	if claims == nil {
+		return ""
+	}
+	return claims.Email
 }
 
 // GetAdminUser handles GET /api/v1/admin/users/:id.
@@ -1917,23 +2008,42 @@ func (h *AdminHandler) auditAdminApp(c echo.Context, claims *auth.Claims, action
 	if claims == nil {
 		return
 	}
-	tid, _ := strconv.ParseInt(claims.TenantID, 10, 64)
-	// Service tokens carry the public client_id in the UserID claim, which is
-	// not a users.id — record no user rather than a garbage zero.
-	var uidPtr *int64
-	if uid, err := strconv.ParseInt(claims.UserID, 10, 64); err == nil {
-		uidPtr = &uid
+	h.auditAdminAppMeta(c, claims, action, resourceType, resourceID, appID, nil)
+}
+
+// auditAdminAppMeta is auditAdminApp with extra structured metadata, sharing the
+// same actor/tenant enrichment so the two cannot drift.
+//
+// Unlike auditAdminApp it does NOT bail out on nil claims: for actions whose
+// whole point is attribution (sending mail to an arbitrary address, say), an
+// event with empty actor fields is far better than no event at all.
+func (h *AdminHandler) auditAdminAppMeta(c echo.Context, claims *auth.Claims, action, resourceType, resourceID string, appID *int64, meta map[string]any) {
+	var (
+		tidPtr, uidPtr *int64
+		actorEmail     string
+	)
+	if claims != nil {
+		if tid, err := strconv.ParseInt(claims.TenantID, 10, 64); err == nil {
+			tidPtr = &tid
+		}
+		// Service tokens carry the public client_id in the UserID claim, which is
+		// not a users.id — record no user rather than a garbage zero.
+		if uid, err := strconv.ParseInt(claims.UserID, 10, 64); err == nil {
+			uidPtr = &uid
+		}
+		actorEmail = claims.Email
 	}
 	h.auditEvent(c, audit.Event{
-		TenantID:      &tid,
+		TenantID:      tidPtr,
 		UserID:        uidPtr,
 		ApplicationID: appID,
-		ActorEmail:    claims.Email,
+		ActorEmail:    actorEmail,
 		Action:        action,
 		ResourceType:  resourceType,
 		ResourceID:    resourceID,
 		IPAddress:     c.RealIP(),
 		UserAgent:     c.Request().UserAgent(),
+		Metadata:      meta,
 	})
 }
 
@@ -2993,23 +3103,73 @@ func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
 type SendTestEmailRequest struct {
 	// TemplateType selects which template to render (empty = email_verification).
 	TemplateType string `json:"template_type"`
+	// To is the recipient. Empty = the requesting admin's own address.
+	//
+	// INVARIANT: a recipient other than the caller's own address always gets the
+	// built-in diagnostic template, never a per-scope override — see the
+	// enforcement in SendTestEmail. Template bodies are editable at this same
+	// permission level, so allowing both an arbitrary recipient and arbitrary
+	// content would make this a phishing relay from a verified sender identity.
+	// See PR #91 for the full threat model.
+	To string `json:"to"`
+	// AllowInherited permits an application-addressed test to proceed when the
+	// application has no sender of its own and would fall through to the
+	// tenant's or the platform's. Default false; see PR #91 for the reasoning.
+	AllowInherited bool `json:"allow_inherited"`
+}
+
+// requestedScope names the scope a test-send call is addressed to, derived from
+// the route shape rather than from what happens to be configured.
+func requestedScope(appRowID *int64) string {
+	if appRowID != nil {
+		return auth.SenderScopeApplication
+	}
+	return auth.SenderScopeTenant
+}
+
+// inheritedScopeMessage explains the refusal in terms of the fix, naming where
+// the send WOULD have gone so the admin can decide whether that is what they
+// actually wanted to test. Only reachable for application-addressed tests —
+// tenant → global is a legitimate default, not a fall-through.
+func inheritedScopeMessage(actual string) string {
+	if actual == auth.SenderScopeTenant {
+		return "this application has no email provider of its own — save one first, or test the tenant provider from tenant settings"
+	}
+	return "this application has no email provider of its own — save one first, or test the platform default from tenant settings"
+}
+
+// SendTestEmailResponse tells the admin exactly what was exercised. "Sent OK"
+// alone is misleading when an application with no sender of its own silently
+// falls through to the tenant or global configuration — the admin would believe
+// they had verified a per-app provider they never touched.
+type SendTestEmailResponse struct {
+	Message  string `json:"message"`
+	To       string `json:"to"`
+	Scope    string `json:"scope"`    // application | tenant | global
+	Provider string `json:"provider"` // smtp | sendgrid | dev
+	Template string `json:"template"`
 }
 
 // SendTestEmail handles POST .../email-settings/test and flat aliases: it sends
-// a sample email through the sender resolved for this scope (application →
-// tenant → global), so an admin can verify the provider configuration works.
-// The email is always delivered to the requesting admin's own address.
+// a sample email through the sender configured AT THIS SCOPE, so an admin can
+// verify a provider configuration actually delivers.
+//
+// The scope is taken from the route, not from what happens to be configured: a
+// call addressed to an application whose sender is unset is refused with 409
+// rather than quietly succeeding on the tenant's or the platform's credentials.
+// Pass allow_inherited=true to test the inherited sender on purpose.
 //
 // @Summary      Send a test email
-// @Description  Sends a sample email using the sender resolved for this scope (application → tenant → global) and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The recipient is always the requesting admin's own email — an arbitrary recipient cannot be supplied.
+// @Description  Sends a sample email using the sender configured at this scope and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The response reports which scope and provider handled the send. Recipient defaults to the requesting admin's own address; any valid address may be supplied (rate-limited, and audited with the recipient). Returns 409 when this scope has no sender of its own — pass allow_inherited=true to deliberately test the inherited (tenant or platform) sender instead.
 // @Tags         admin-email-senders
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
-// @Param        body  body      SendTestEmailRequest  false  "Template type"
-// @Success      200   {object}  map[string]string
+// @Param        body  body      SendTestEmailRequest  false  "Recipient, template type, allow_inherited"
+// @Success      200   {object}  SendTestEmailResponse
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "This scope has no sender of its own"
 // @Failure      502   {object}  map[string]string  "Delivery failed"
 // @Router       /api/v1/email-settings/test [post]
 func (h *AdminHandler) SendTestEmail(c echo.Context) error {
@@ -3023,40 +3183,143 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	// Recipient is always the authenticated admin — never client-supplied — so
-	// this endpoint cannot be used to relay mail to arbitrary addresses.
-	to := ""
+	// Recipient: the admin's own address by default, or any valid address they
+	// supply. See SendTestEmailRequest.To for the reasoning and the controls
+	// that bound it.
+	ownEmail := ""
 	if claims != nil {
-		to = strings.TrimSpace(claims.Email)
+		ownEmail = strings.TrimSpace(claims.Email)
 	}
-	if _, err := mail.ParseAddress(to); err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "your account has no valid email address to send the test to"})
+	to := strings.TrimSpace(req.To)
+	if to == "" {
+		to = ownEmail
 	}
+	addr, err := mail.ParseAddress(to)
+	if err != nil {
+		if req.To == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "your account has no valid email address to send the test to — enter a recipient"})
+		}
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "recipient is not a valid email address"})
+	}
+	// Use the PARSED address, not the raw input: ParseAddress accepts a display
+	// name (`"Verify Your Account" <a@b.com>`), and carrying that form onward
+	// would put attacker-chosen text in the SMTP envelope, SendGrid's to.email
+	// (which wants a bare address), the JSON response, and the audit record.
+	to = addr.Address
+	// Header injection guard, asserted on the normalized value.
+	if strings.ContainsAny(to, "\r\n") {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "recipient is not a valid email address"})
+	}
+	// Whether this send leaves the caller's own mailbox. Drives both the audit
+	// flag and the content restriction below.
+	external := !strings.EqualFold(to, ownEmail)
 
+	// No template_type means "just check the provider", which sends the
+	// diagnostic test email. It used to default to email_verification, so the
+	// recipient got a real-looking "Verify your email address" message with a
+	// dead sample link — indistinguishable from a genuine verification bug.
 	tt := mailer.TemplateType(req.TemplateType)
 	if req.TemplateType == "" {
-		tt = mailer.TemplateEmailVerification
+		tt = mailer.TemplateProviderTest
 	} else if !mailer.ValidTemplateType(tt) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown template type"})
 	}
 
-	// Resolve the effective sender + template override for this scope. A nil
-	// sender means the global server sender applies.
-	sender, err := h.senderSvc.Resolve(c.Request().Context(), tenantID, appRowID)
+	// SECURITY: an external recipient always gets the built-in diagnostic
+	// template, never a per-scope override.
+	//
+	// Template bodies are editable at the SAME permission level as this endpoint
+	// (PUT /email-templates/:type is apps:write), so allowing both an arbitrary
+	// recipient and an arbitrary template would let one apps:write token deliver
+	// attacker-authored HTML, with product branding, from a verified sender
+	// identity — to any address on the internet. With an inherited global
+	// sender that is the operator's shared domain, so the blast radius crosses
+	// the tenant boundary.
+	//
+	// Restricting content rather than recipients keeps the actual use case
+	// (proving deliverability to a QA alias or a customer domain) fully intact.
+	// Template previews still work — they just go to your own mailbox.
+	if external {
+		tt = mailer.TemplateProviderTest
+	}
+
+	// Sender AND the scope it came from, in one query — see ResolveWithScope for
+	// why these must not be two separate lookups.
+	sender, scope, err := h.senderSvc.ResolveWithScope(c.Request().Context(), tenantID, appRowID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: resolve sender for test email failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to resolve email sender"})
 	}
-	tmpl := h.tmplSvc.ResolveTemplate(c.Request().Context(), tenantID, appRowID, tt)
-
-	if err := h.mailer.SendTest(c.Request().Context(), sender, tmpl, tt, to); err != nil {
-		h.logger.Error().Err(err).Str("to", to).Msg("admin: test email send failed")
-		return c.JSON(http.StatusBadGateway, map[string]string{"error": "failed to send test email: " + err.Error()})
+	// The diagnostic template is not customizable, so no override lookup is
+	// performed for it: passing nil guarantees the built-in is what goes out,
+	// even if a row with this type were inserted into email_templates directly.
+	var tmpl *mailer.Template
+	if tt != mailer.TemplateProviderTest {
+		tmpl = h.tmplSvc.ResolveTemplate(c.Request().Context(), tenantID, appRowID, tt)
 	}
 
+	provider := h.mailer.GlobalProvider()
+	if sender != nil && sender.Provider != "" {
+		provider = sender.Provider
+	}
+
+	// A test addressed to an APPLICATION must exercise that application's own
+	// provider, otherwise a green result vouches for a configuration that was
+	// never touched.
+	//
+	// Deliberately not applied to tenant-addressed tests: for a single-tenant
+	// install with the provider configured via env vars and no
+	// email_sender_settings row, tenant → global is not a fall-through at all,
+	// it is the documented default. Refusing there would break the primary
+	// "does my email work?" button in the most common deployment.
+	if want := requestedScope(appRowID); want == auth.SenderScopeApplication && scope != want && !req.AllowInherited {
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error":       inheritedScopeMessage(scope),
+			"scope":       scope,
+			"want_scope":  want,
+			"provider":    provider,
+			"can_proceed": "set allow_inherited=true to test the inherited sender instead",
+		})
+	}
+
+	if err := h.mailer.SendTest(c.Request().Context(), sender, tmpl, tt, to); err != nil {
+		h.logger.Error().Err(err).Str("to", to).Str("scope", scope).Msg("admin: test email send failed")
+		// Credential and sender-identity rejections are the two an admin can fix
+		// directly, so they get their own message. Everything else gets a generic
+		// one: raw upstream text can carry the SMTP host, port and username, and
+		// "stop echoing provider bodies at the client" is the point of this
+		// mapping. The detail is in the structured log line above.
+		msg := fmt.Sprintf("the %s provider rejected the message — see server logs for details", provider)
+		switch {
+		case errors.Is(err, mailer.ErrProviderAuth):
+			msg = fmt.Sprintf("the %s credentials for the %s sender were rejected — check the API key or SMTP password", provider, scope)
+		case errors.Is(err, mailer.ErrProviderSender):
+			msg = fmt.Sprintf("the %s provider rejected the From address — verify it as a sender identity or authenticate its domain", provider)
+		}
+		return c.JSON(http.StatusBadGateway, map[string]string{"error": msg, "scope": scope, "provider": provider})
+	}
+
+	// Audited with the recipient, not just the scope: this endpoint can send to
+	// an arbitrary address, so the address is the part that has to be
+	// attributable afterwards. Recorded unconditionally — for a send-mail
+	// endpoint, an event with a missing actor beats no event at all.
 	rt, rid := senderResource(tenantID, appRowID)
-	h.auditAdminApp(c, claims, audit.ActionAdminEmailTestSent, rt, rid, appRowID)
-	return c.JSON(http.StatusOK, map[string]string{"message": "test email sent to " + to})
+	h.auditAdminAppMeta(c, claims, audit.ActionAdminEmailTestSent, rt, rid, appRowID, map[string]any{
+		"recipient": to,
+		"template":  string(tt),
+		"scope":     scope,
+		"provider":  provider,
+		// Separates routine self-tests from sends to third parties when
+		// reviewing the log.
+		"external": external,
+	})
+	return c.JSON(http.StatusOK, SendTestEmailResponse{
+		Message:  "test email sent to " + to,
+		To:       to,
+		Scope:    scope,
+		Provider: provider,
+		Template: string(tt),
+	})
 }
 
 // ---------------------------------------------------------------------------

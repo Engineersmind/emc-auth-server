@@ -1833,6 +1833,61 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/accept-invitation": {
+            "post": {
+                "description": "Sets the password for an invited account using the token from the invitation email, and marks the address verified. Single-use.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Accept an invitation",
+                "parameters": [
+                    {
+                        "description": "Invitation token and chosen password",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AcceptInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/apps/login": {
             "post": {
                 "description": "Authenticates a user that belongs to the authenticated application's own user base — invisible to POST /auth/login and to every other application. Application credentials via Authorization: Basic header only.",
@@ -2080,6 +2135,116 @@ const docTemplate = `{
                     },
                     "409": {
                         "description": "Email already registered in this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/change-email": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sends a confirmation link to the new address. The account email changes only after the link is followed. Requires a valid access token.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Request an email change",
+                "parameters": [
+                    {
+                        "description": "New email address",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ChangeEmailRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Accepted",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/confirm-email-change": {
+            "get": {
+                "description": "Applies a pending email change using the token sent to the new address, and marks it verified. Single-use.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Confirm an email change",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Email change token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3643,6 +3808,47 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/unblock-account": {
+            "get": {
+                "description": "Lifts an automatic failed-attempt lockout using the token from the blocked-account email. Single-use. Admin blocks cannot be lifted this way.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Unblock an account",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Unblock token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/verify-email": {
             "get": {
                 "description": "Confirms ownership of an email address via the token from the verification link. Single-use.",
@@ -3833,7 +4039,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sends a sample email using the sender resolved for this scope (application → tenant → global) and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The recipient is always the requesting admin's own email — an arbitrary recipient cannot be supplied.",
+                "description": "Sends a sample email using the sender configured at this scope and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration delivers mail. The response reports which scope and provider handled the send. Recipient defaults to the requesting admin's own address; any valid address may be supplied (rate-limited, and audited with the recipient). Returns 409 when this scope has no sender of its own — pass allow_inherited=true to deliberately test the inherited (tenant or platform) sender instead.",
                 "consumes": [
                     "application/json"
                 ],
@@ -3846,7 +4052,7 @@ const docTemplate = `{
                 "summary": "Send a test email",
                 "parameters": [
                     {
-                        "description": "Template type",
+                        "description": "Recipient, template type, allow_inherited",
                         "name": "body",
                         "in": "body",
                         "schema": {
@@ -3858,10 +4064,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
+                            "$ref": "#/definitions/handlers.SendTestEmailResponse"
                         }
                     },
                     "400": {
@@ -3875,6 +4078,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "This scope has no sender of its own",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -6124,6 +6336,52 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/users/{id}/invite": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Emails a fresh invitation link to the user, invalidating any previous one. Requires users:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Resend a user invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/users/{id}/mfa": {
             "get": {
                 "security": [
@@ -6880,6 +7138,13 @@ const docTemplate = `{
                 "application_id": {
                     "type": "string"
                 },
+                "block_reason": {
+                    "type": "string"
+                },
+                "blocked_at": {
+                    "description": "Lockout state. BlockReason distinguishes an automatic failed-attempt\nlockout (which the user can lift via an emailed link) from an operator\nblock (which they cannot) — without it an admin cannot tell why an account\nis inactive. Both are nil for an account that was never blocked.",
+                    "type": "string"
+                },
                 "connections": {
                     "description": "Connections lists how this user can sign in: \"password\" when a\ncredentials row exists, plus every linked federated provider (Auth0's\n\"Connection\" column).",
                     "type": "array",
@@ -6895,6 +7160,10 @@ const docTemplate = `{
                 },
                 "email_verified": {
                     "type": "boolean"
+                },
+                "failed_login_attempts": {
+                    "description": "FailedLoginAttempts is the current consecutive-failure count, so an admin\ncan see an account approaching the lockout threshold.",
+                    "type": "integer"
                 },
                 "first_name": {
                     "type": "string"
@@ -6924,6 +7193,10 @@ const docTemplate = `{
                 },
                 "mfa": {
                     "$ref": "#/definitions/admin.UserMFAStatus"
+                },
+                "pending_invitation": {
+                    "description": "PendingInvitation is true when an unused, unexpired invitation exists —\nthe account has been created but never claimed.",
+                    "type": "boolean"
                 },
                 "role": {
                     "type": "string"
@@ -7755,6 +8028,22 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.AcceptInvitationRequest": {
+            "type": "object",
+            "required": [
+                "password",
+                "token"
+            ],
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "minLength": 8
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.AppLimitRequest": {
             "type": "object",
             "properties": {
@@ -7821,6 +8110,17 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "tenant_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.ChangeEmailRequest": {
+            "type": "object",
+            "required": [
+                "new_email"
+            ],
+            "properties": {
+                "new_email": {
                     "type": "string"
                 }
             }
@@ -7929,6 +8229,10 @@ const docTemplate = `{
                 },
                 "role_id": {
                     "type": "string"
+                },
+                "send_invitation": {
+                    "description": "SendInvitation emails the user a link to set their own password instead of\nthe admin choosing one. When true, Password must be omitted — supplying\nboth is contradictory and is rejected rather than silently resolved.",
+                    "type": "boolean"
                 }
             }
         },
@@ -8135,8 +8439,38 @@ const docTemplate = `{
         "handlers.SendTestEmailRequest": {
             "type": "object",
             "properties": {
+                "allow_inherited": {
+                    "description": "AllowInherited permits an application-addressed test to proceed when the\napplication has no sender of its own and would fall through to the\ntenant's or the platform's. Default false; see PR #91 for the reasoning.",
+                    "type": "boolean"
+                },
                 "template_type": {
                     "description": "TemplateType selects which template to render (empty = email_verification).",
+                    "type": "string"
+                },
+                "to": {
+                    "description": "To is the recipient. Empty = the requesting admin's own address.\n\nINVARIANT: a recipient other than the caller's own address always gets the\nbuilt-in diagnostic template, never a per-scope override — see the\nenforcement in SendTestEmail. Template bodies are editable at this same\npermission level, so allowing both an arbitrary recipient and arbitrary\ncontent would make this a phishing relay from a verified sender identity.\nSee PR #91 for the full threat model.",
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SendTestEmailResponse": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string"
+                },
+                "provider": {
+                    "description": "smtp | sendgrid | dev",
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "application | tenant | global",
+                    "type": "string"
+                },
+                "template": {
+                    "type": "string"
+                },
+                "to": {
                     "type": "string"
                 }
             }

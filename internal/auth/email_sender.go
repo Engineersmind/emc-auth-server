@@ -138,7 +138,10 @@ func (in *UpsertSenderInput) validate(hasStoredSecret bool) error {
 		}
 	case SenderProviderSendGrid:
 		// SendGrid needs an API key: either supplied now or already stored.
-		if in.APIKey == "" && !hasStoredSecret {
+		// Trimmed to match Upsert, which treats a whitespace-only value as
+		// "not supplied" — without this a config could pass validation and then
+		// be stored with no key at all.
+		if strings.TrimSpace(in.APIKey) == "" && !hasStoredSecret {
 			return ErrInvalidSender
 		}
 		if in.SMTPPort <= 0 || in.SMTPPort > 65535 {
@@ -166,17 +169,24 @@ func (s *EmailSenderService) Upsert(ctx context.Context, tenantID int64, appRowI
 		return nil, err
 	}
 
+	// Trim before encrypting: a secret pasted from a provider console routinely
+	// carries a trailing newline, and once encrypted the whitespace is invisible
+	// — it surfaces only as an unexplained 401 at send time. Whitespace is never
+	// meaningful in an API key or SMTP password, so this cannot corrupt a valid
+	// credential. Note this also means a value of only whitespace is treated as
+	// "not supplied", i.e. it preserves the stored secret rather than storing
+	// blanks.
 	passwordEnc := ""
-	if in.SMTPPassword != "" {
-		enc, err := encryptAESGCM(s.encKey, in.SMTPPassword)
+	if pw := strings.TrimSpace(in.SMTPPassword); pw != "" {
+		enc, err := encryptAESGCM(s.encKey, pw)
 		if err != nil {
 			return nil, fmt.Errorf("encrypt smtp password: %w", err)
 		}
 		passwordEnc = enc
 	}
 	apiKeyEnc := ""
-	if in.APIKey != "" {
-		enc, err := encryptAESGCM(s.encKey, in.APIKey)
+	if key := strings.TrimSpace(in.APIKey); key != "" {
+		enc, err := encryptAESGCM(s.encKey, key)
 		if err != nil {
 			return nil, fmt.Errorf("encrypt api key: %w", err)
 		}
@@ -280,19 +290,45 @@ func (s *EmailSenderService) Delete(ctx context.Context, tenantID int64, appRowI
 	return nil
 }
 
+// Sender scopes, in priority order.
+const (
+	SenderScopeApplication = "application"
+	SenderScopeTenant      = "tenant"
+	SenderScopeGlobal      = "global"
+)
+
 // Resolve returns the effective sender for a send: the application's own row
 // if one exists (and is active), else the tenant-level row, else nil — nil
-// means "use the global server sender". One query resolves the whole chain:
-// rows matching the app sort before the tenant-level row.
+// means "use the global server sender".
 func (s *EmailSenderService) Resolve(ctx context.Context, tenantID int64, appRowID *int64) (*mailer.SMTPConfig, error) {
+	cfg, _, err := s.ResolveWithScope(ctx, tenantID, appRowID)
+	return cfg, err
+}
+
+// ResolveWithScope is Resolve plus the scope the returned config came from.
+//
+// The scope is derived from the SAME row the credentials come from, in the same
+// query. An earlier version answered this with separate Get() calls, which was
+// a correctness bug: Get has no is_active filter, so a DEACTIVATED
+// application-level row made the scope report "application" while the
+// credentials actually came from the tenant. The test endpoint then asserted a
+// scope it had never exercised — worse than the silent fall-through it was
+// meant to replace. Two queries that can disagree also left a TOCTOU window
+// where a concurrent sender update made the reported scope a lie.
+//
+// One row, one answer: application_id non-NULL means the application's own
+// sender won; a row with application_id NULL is the tenant's; no row at all is
+// the global server sender.
+func (s *EmailSenderService) ResolveWithScope(ctx context.Context, tenantID int64, appRowID *int64) (*mailer.SMTPConfig, string, error) {
 	var (
 		provider, from, host, username, passwordEnc, apiKeyEnc   string
 		tlsMode, fromName, replyTo, productName, logoURL, prefix string
 		port                                                     int
+		rowAppID                                                 *int64
 	)
 	err := s.pool.QueryRow(ctx, `
 		SELECT provider, from_address, COALESCE(smtp_host, ''), smtp_port, smtp_username, smtp_password_enc, api_key_enc,
-		       tls_mode, from_name, reply_to, product_name, logo_url, subject_prefix
+		       tls_mode, from_name, reply_to, product_name, logo_url, subject_prefix, application_id
 		FROM email_sender_settings
 		WHERE tenant_id = $1
 		  AND is_active = true
@@ -300,26 +336,33 @@ func (s *EmailSenderService) Resolve(ctx context.Context, tenantID int64, appRow
 		ORDER BY application_id ASC NULLS LAST
 		LIMIT 1
 	`, tenantID, appRowID).Scan(&provider, &from, &host, &port, &username, &passwordEnc, &apiKeyEnc,
-		&tlsMode, &fromName, &replyTo, &productName, &logoURL, &prefix)
+		&tlsMode, &fromName, &replyTo, &productName, &logoURL, &prefix, &rowAppID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil // global sender
+			return nil, SenderScopeGlobal, nil // global sender
 		}
-		return nil, fmt.Errorf("resolve email sender: %w", err)
+		return nil, "", fmt.Errorf("resolve email sender: %w", err)
+	}
+
+	// Scope comes from the row that actually won, so it can never disagree with
+	// the credentials returned alongside it.
+	scope := SenderScopeTenant
+	if rowAppID != nil {
+		scope = SenderScopeApplication
 	}
 
 	password := ""
 	if passwordEnc != "" {
 		password, err = decryptAESGCM(s.encKey, passwordEnc)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt smtp password: %w", err)
+			return nil, "", fmt.Errorf("decrypt smtp password: %w", err)
 		}
 	}
 	apiKey := ""
 	if apiKeyEnc != "" {
 		apiKey, err = decryptAESGCM(s.encKey, apiKeyEnc)
 		if err != nil {
-			return nil, fmt.Errorf("decrypt api key: %w", err)
+			return nil, "", fmt.Errorf("decrypt api key: %w", err)
 		}
 	}
 	return &mailer.SMTPConfig{
@@ -336,5 +379,5 @@ func (s *EmailSenderService) Resolve(ctx context.Context, tenantID int64, appRow
 		ProductName:   productName,
 		LogoURL:       logoURL,
 		SubjectPrefix: prefix,
-	}, nil
+	}, scope, nil
 }

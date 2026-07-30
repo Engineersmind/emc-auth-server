@@ -238,6 +238,18 @@ type UserDetail struct {
 	ActiveSessions int            `json:"active_sessions"`
 	MFA            UserMFAStatus  `json:"mfa"`
 	Identities     []UserIdentity `json:"identities"`
+	// Lockout state. BlockReason distinguishes an automatic failed-attempt
+	// lockout (which the user can lift via an emailed link) from an operator
+	// block (which they cannot) — without it an admin cannot tell why an account
+	// is inactive. Both are nil for an account that was never blocked.
+	BlockedAt   *time.Time `json:"blocked_at,omitempty"`
+	BlockReason *string    `json:"block_reason,omitempty"`
+	// FailedLoginAttempts is the current consecutive-failure count, so an admin
+	// can see an account approaching the lockout threshold.
+	FailedLoginAttempts int `json:"failed_login_attempts"`
+	// PendingInvitation is true when an unused, unexpired invitation exists —
+	// the account has been created but never claimed.
+	PendingInvitation bool `json:"pending_invitation"`
 }
 
 // UserSession is one active refresh-token session family for a user.
@@ -258,12 +270,28 @@ type UserSession struct {
 type Service struct {
 	pool     *pgxpool.Pool
 	resetSvc *auth.ResetService
+	invSvc   *auth.InvitationService   // nil when invitations are not configured
+	blockSvc *auth.AccountBlockService // nil when block notifications are not configured
 	logger   zerolog.Logger
 }
 
 // New creates a Service.
 func New(pool *pgxpool.Pool, resetSvc *auth.ResetService, logger zerolog.Logger) *Service {
 	return &Service{pool: pool, resetSvc: resetSvc, logger: logger}
+}
+
+// WithInvitations wires the invitation service so admin-created accounts can be
+// invited instead of handed a password out-of-band.
+func (s *Service) WithInvitations(invSvc *auth.InvitationService) *Service {
+	s.invSvc = invSvc
+	return s
+}
+
+// WithAccountBlocking wires the block service so an admin block notifies the
+// affected user and an admin unblock clears their lockout counters.
+func (s *Service) WithAccountBlocking(blockSvc *auth.AccountBlockService) *Service {
+	s.blockSvc = blockSvc
+	return s
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1254,65 @@ func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID 
 	return s.getUserByID(ctx, tenantID, applicationID, userID)
 }
 
+// ErrInvitationsUnavailable is returned when an invitation is requested on a
+// server that has no invitation service wired.
+var ErrInvitationsUnavailable = errors.New("invitations are not configured on this server")
+
+// InviteUser creates a user and emails them an invitation to set their own
+// password, instead of the admin choosing one and passing it out of band.
+//
+// The account is created with a random unusable password: the invitation link is
+// the only way to set a real one, so the throwaway value is never known to
+// anybody, including the admin who triggered it.
+func (s *Service) InviteUser(ctx context.Context, tenantID int64, applicationID *int64, email, firstName, lastName string, roleID *int64, inviterID *int64, inviterName string) (*UserResult, error) {
+	if s.invSvc == nil {
+		return nil, ErrInvitationsUnavailable
+	}
+
+	placeholder, err := generateTempPassword()
+	if err != nil {
+		return nil, fmt.Errorf("invite user: generate placeholder password: %w", err)
+	}
+	result, err := s.CreateUser(ctx, tenantID, applicationID, email, placeholder, firstName, lastName, roleID)
+	if err != nil {
+		return nil, err
+	}
+
+	userID, err := strconv.ParseInt(result.ID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invite user: parse created id: %w", err)
+	}
+	if err := s.invSvc.Invite(ctx, tenantID, applicationID, userID, email, inviterName, inviterID); err != nil {
+		// The account exists but the invitation did not go out. Report it so the
+		// admin can resend rather than silently returning a claimable-by-nobody
+		// account.
+		return result, fmt.Errorf("user created but invitation could not be sent: %w", err)
+	}
+	return result, nil
+}
+
+// ResendInvitation issues a fresh invitation for an existing user, superseding
+// any outstanding one.
+func (s *Service) ResendInvitation(ctx context.Context, tenantID int64, applicationID *int64, userID int64, inviterID *int64, inviterName string) error {
+	if s.invSvc == nil {
+		return ErrInvitationsUnavailable
+	}
+	var email string
+	var appRowID *int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT email, application_id FROM users
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+	`, userID, tenantID, applicationID).Scan(&email, &appRowID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("lookup user for invitation: %w", err)
+	}
+	return s.invSvc.Invite(ctx, tenantID, appRowID, userID, email, inviterName, inviterID)
+}
+
 // GetUser fetches a single user by ID. applicationID nil applies no scope
 // filter (tenant-admin routes may reach any of the tenant's users); non-nil
 // requires the user to belong to that application.
@@ -1352,10 +1439,24 @@ func (s *Service) GetUserDetail(ctx context.Context, tenantID int64, application
 
 	// Profile extras straight off the users row.
 	if err := s.pool.QueryRow(ctx, `
-		SELECT email_verified, token_version, updated_at
+		SELECT email_verified, token_version, updated_at,
+		       blocked_at, block_reason, failed_login_attempts
 		FROM users WHERE id = $1 AND tenant_id = $2
-	`, userID, tenantID).Scan(&d.EmailVerified, &d.TokenVersion, &d.UpdatedAt); err != nil {
+	`, userID, tenantID).Scan(
+		&d.EmailVerified, &d.TokenVersion, &d.UpdatedAt,
+		&d.BlockedAt, &d.BlockReason, &d.FailedLoginAttempts,
+	); err != nil {
 		return nil, fmt.Errorf("user detail: profile: %w", err)
+	}
+
+	// A live invitation means the account exists but has never been claimed.
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM user_invitations
+			WHERE user_id = $1 AND used_at IS NULL AND expires_at > NOW()
+		)
+	`, userID).Scan(&d.PendingInvitation); err != nil {
+		return nil, fmt.Errorf("user detail: invitation: %w", err)
 	}
 
 	// MFA status. Both tables are keyed by user_id; absence = not enrolled.
@@ -1438,12 +1539,40 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 		`, userID, tenantID); err != nil {
 			return nil, fmt.Errorf("revoke tokens on block: %w", err)
 		}
+	} else {
+		// An admin unblock also clears automatic-lockout state: leaving a stale
+		// counter at the threshold would re-block the account on the next typo,
+		// and leaving blocked_at set would keep an old unblock link usable.
+		if _, err := tx.Exec(ctx, `
+			UPDATE users
+			SET failed_login_attempts = 0, last_failed_login_at = NULL,
+			    blocked_at = NULL, block_reason = NULL
+			WHERE id = $1 AND tenant_id = $2
+		`, userID, tenantID); err != nil {
+			return nil, fmt.Errorf("clear lockout state on unblock: %w", err)
+		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit set-active: %w", err)
 	}
-	return s.getUserByID(ctx, tenantID, applicationID, userID)
+
+	result, err := s.getUserByID(ctx, tenantID, applicationID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Tell the user an operator blocked them. Best-effort and after commit: the
+	// block stands whether or not the mail is delivered.
+	if !active {
+		var appRowID *int64
+		if err := s.pool.QueryRow(ctx, `SELECT application_id FROM users WHERE id = $1 AND tenant_id = $2`, userID, tenantID).Scan(&appRowID); err != nil {
+			s.logger.Warn().Err(err).Int64("user_id", userID).Msg("admin: could not resolve app scope for block notification")
+		} else {
+			s.blockSvc.NotifyAdminBlock(ctx, tenantID, appRowID, userID, result.Email)
+		}
+	}
+	return result, nil
 }
 
 // ListUserSessions returns the user's active (non-revoked, unexpired) sessions,
