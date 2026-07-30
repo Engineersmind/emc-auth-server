@@ -5398,6 +5398,65 @@
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/identity-providers/{provider}/test": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Dry-runs the stored configuration and returns a per-check report: config present, secret decrypts, redirect allow-list usable, provider authorization URL builds (for Google this also proves OIDC discovery succeeded), provider enabled. Note that a passing result does NOT prove the client secret is correct — the secret is only exercised at the token endpoint, which needs a real user authorization code. Requires apps:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "Test a social login provider configuration",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Provider (google, github)",
+                        "name": "provider",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ProviderTestResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/rate-limit": {
             "get": {
                 "security": [
@@ -7857,6 +7916,9 @@
         "auth.ProviderConfigDetail": {
             "type": "object",
             "properties": {
+                "callback_url": {
+                    "type": "string"
+                },
                 "client_id": {
                     "type": "string"
                 },
@@ -7864,6 +7926,9 @@
                     "type": "string"
                 },
                 "enabled": {
+                    "type": "boolean"
+                },
+                "has_secret": {
                     "type": "boolean"
                 },
                 "id": {
@@ -7880,6 +7945,46 @@
                 },
                 "updated_at": {
                     "type": "string"
+                }
+            }
+        },
+        "auth.ProviderTestCheck": {
+            "type": "object",
+            "properties": {
+                "detail": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "passed": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "auth.ProviderTestResult": {
+            "type": "object",
+            "properties": {
+                "callback_url": {
+                    "type": "string"
+                },
+                "checks": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.ProviderTestCheck"
+                    }
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "ok": {
+                    "type": "boolean"
+                },
+                "provider": {
+                    "type": "string"
+                },
+                "secret_verified": {
+                    "type": "boolean"
                 }
             }
         },

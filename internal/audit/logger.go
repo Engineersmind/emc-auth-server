@@ -154,6 +154,7 @@ const (
 	// Admin — identity provider (social login) configuration
 	ActionAdminIdPConfigUpdated = "admin.identity_provider_updated"
 	ActionAdminIdPConfigDeleted = "admin.identity_provider_deleted"
+	ActionAdminIdPConfigTested  = "admin.identity_provider_tested"
 
 	// Admin — user identity management
 	ActionAdminUserIdentityUnlinked = "admin.user_identity_unlinked"
