@@ -182,6 +182,11 @@ type Mailer interface {
 	// SendTest renders the given template type with sample data and delivers it to
 	// `to`, so an admin can verify a sender/provider configuration end-to-end.
 	SendTest(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string) error
+	// GlobalProvider names the transport the global sender uses ("smtp",
+	// "sendgrid", or "dev" when nothing is configured). Reported by the test
+	// endpoint so an admin can see that a send fell through to the server
+	// default — or, in dev, that it was only logged and never transmitted.
+	GlobalProvider() string
 }
 
 // ---------------------------------------------------------------------------
@@ -402,9 +407,25 @@ func sampleTestData() TemplateData {
 	}
 }
 
+// GlobalProvider names the global transport. The empty Provider set by
+// NewMailer's default branch means the log-only dev transport, which is
+// reported as "dev" rather than blank — an admin seeing a successful test that
+// never arrives needs to be told nothing was actually transmitted.
+func (m *mailerImpl) GlobalProvider() string {
+	if m.global.Provider == "" {
+		return "dev"
+	}
+	return m.global.Provider
+}
+
 func (m *mailerImpl) SendTest(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string) error {
-	if !ValidTemplateType(tt) {
-		tt = TemplateEmailVerification
+	// TemplateProviderTest is intentionally absent from AllTemplateTypes (it is
+	// not customizable), so ValidTemplateType rejects it — accept it explicitly
+	// rather than silently coercing a provider test into a verification email.
+	// Anything else unrecognised falls back to the diagnostic template too: a
+	// test send should never impersonate a real account email.
+	if tt != TemplateProviderTest && !ValidTemplateType(tt) {
+		tt = TemplateProviderTest
 	}
 	err := m.dispatch(ctx, sender, tmpl, tt, to, sampleTestData())
 	if err == nil {
@@ -468,18 +489,20 @@ func NewMailer(cfg MailerConfig) Mailer {
 		logger: cfg.Logger,
 		global: SMTPConfig{From: cfg.EmailFrom, FromName: cfg.FromName},
 	}
+	// Same trimming rationale as pickTransport: a trailing newline on an env
+	// var is invisible in a 401 and costs hours to find.
 	switch cfg.resolveProvider() {
 	case ProviderSendGrid:
 		m.global.Provider = ProviderSendGrid
-		m.global.APIKey = cfg.SendGridAPIKey
-		m.globalTr = &sendGridTransport{apiKey: cfg.SendGridAPIKey, logger: cfg.Logger}
+		m.global.APIKey = strings.TrimSpace(cfg.SendGridAPIKey)
+		m.globalTr = &sendGridTransport{apiKey: strings.TrimSpace(cfg.SendGridAPIKey), logger: cfg.Logger}
 	case ProviderSMTP:
 		m.global.Provider = ProviderSMTP
 		m.globalTr = &smtpTransport{
-			host:     cfg.SMTPHost,
+			host:     strings.TrimSpace(cfg.SMTPHost),
 			port:     cfg.SMTPPort,
-			username: cfg.SMTPUsername,
-			password: cfg.SMTPPassword,
+			username: strings.TrimSpace(cfg.SMTPUsername),
+			password: strings.TrimSpace(cfg.SMTPPassword),
 			tlsMode:  cfg.SMTPTLS,
 			logger:   cfg.Logger,
 		}

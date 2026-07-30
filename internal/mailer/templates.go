@@ -38,6 +38,19 @@ const (
 	// TemplatePasswordBreach warns a user that their password was found in a known
 	// data breach and should be changed.
 	TemplatePasswordBreach TemplateType = "password_breach"
+
+	// TemplateProviderTest is the diagnostic email sent by the admin "send test"
+	// action. It is deliberately NOT in AllTemplateTypes: it is not a
+	// customizable, user-facing email, so it must not appear in the template
+	// editor or be overridable per scope.
+	//
+	// It exists because the test used to render email_verification, which meant
+	// the recipient received a genuine-looking "Verify your email address"
+	// message containing a dead sample link. That is actively harmful: it trains
+	// people to click verification links that go nowhere, and an admin checking
+	// their inbox cannot tell a configuration test from a real verification bug.
+	// A test email should announce itself as a test.
+	TemplateProviderTest TemplateType = "provider_test"
 )
 
 // AllTemplateTypes lists every customizable template, for admin listing and
@@ -202,6 +215,21 @@ func shell(inner string) string { return htmlShellHead + inner + htmlShellFoot }
 
 // builtinTemplates holds the default Template for every TemplateType.
 var builtinTemplates = map[TemplateType]Template{
+	// Diagnostic only — see TemplateProviderTest. Contains no links and no
+	// call to action, so it cannot be mistaken for a real account email.
+	TemplateProviderTest: {
+		Subject: "Test email",
+		HTML: shell(`<h2>Your email configuration works</h2>
+<p>This is a test message sent from the {{.ProductName}} admin console to confirm that email delivery is working.</p>
+<p>Nothing else is required — no action is needed and no account was changed. If you were not expecting this, you can ignore it.</p>`),
+		Text: `Your email configuration works.
+
+This is a test message sent from the {{.ProductName}} admin console to confirm that email delivery is working.
+
+No action is needed and no account was changed. If you were not expecting this, you can ignore it.
+
+- {{.ProductName}}`,
+	},
 	TemplateEmailVerification: {
 		Subject: "Verify your email address",
 		HTML: shell(`<h2>Confirm your email</h2>

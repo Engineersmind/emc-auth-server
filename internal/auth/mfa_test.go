@@ -122,6 +122,10 @@ func (m *captureMailer) SendTest(ctx context.Context, sender *mailer.SMTPConfig,
 	return nil
 }
 
+// GlobalProvider satisfies mailer.Mailer. The fake never transmits, so it
+// reports the same label the real mailer uses for its log-only transport.
+func (m *captureMailer) GlobalProvider() string { return "dev" }
+
 // lastLink returns the most recently "sent" magic link email.
 func (m *captureMailer) lastLink(t *testing.T) mailer.MagicLinkEmail {
 	t.Helper()
