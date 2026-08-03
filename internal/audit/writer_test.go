@@ -241,6 +241,69 @@ func TestApplicationIDRoundTrip(t *testing.T) {
 	if all.Total != 2 {
 		t.Fatalf("tenant total = %d, want 2", all.Total)
 	}
+
+	// OnlyApplicationIDs is the CALLER'S reach rather than a chosen filter
+	// (issue #97): a co-owner monitoring the tenant sees only the applications
+	// they administer, and never the tenant-level events that belong to no
+	// application.
+	scoped, err := l.Query(ctx, audit.QueryParams{
+		TenantID:           &tenantID,
+		OnlyApplicationIDs: []int64{appID},
+	})
+	if err != nil {
+		t.Fatalf("Query scoped: %v", err)
+	}
+	if scoped.Total != 1 {
+		t.Fatalf("scoped total = %d, want 1 — the tenant-level event must be excluded", scoped.Total)
+	}
+
+	// Empty and nil must not be conflated: empty means no reach, nil means all.
+	none, err := l.Query(ctx, audit.QueryParams{
+		TenantID:           &tenantID,
+		OnlyApplicationIDs: []int64{},
+	})
+	if err != nil {
+		t.Fatalf("Query empty scope: %v", err)
+	}
+	if none.Total != 0 {
+		t.Fatalf("empty-scope total = %d, want 0", none.Total)
+	}
+
+	// A requested filter cannot widen the caller's reach: asking for an
+	// application outside the grant set yields nothing, not someone else's rows.
+	other, err := l.Query(ctx, audit.QueryParams{
+		TenantID:           &tenantID,
+		ApplicationID:      fmt.Sprintf("%d", appID),
+		OnlyApplicationIDs: []int64{appID + 100000},
+	})
+	if err != nil {
+		t.Fatalf("Query outside scope: %v", err)
+	}
+	if other.Total != 0 {
+		t.Fatalf("outside-scope total = %d, want 0", other.Total)
+	}
+
+	// Stats carries the same restriction, counts AND recent events. Without it a
+	// scoped admin would read zeroed totals above their neighbours' events.
+	stats, err := l.StatsScoped(ctx, &tenantID, []int64{appID})
+	if err != nil {
+		t.Fatalf("StatsScoped: %v", err)
+	}
+	if stats.TotalAuditEvents != 1 {
+		t.Errorf("scoped TotalAuditEvents = %d, want 1", stats.TotalAuditEvents)
+	}
+	for _, e := range stats.RecentEvents {
+		if e.ApplicationID == nil || *e.ApplicationID != fmt.Sprintf("%d", appID) {
+			t.Errorf("recent event %s is outside the caller's applications", e.ID)
+		}
+	}
+	unscoped, err := l.StatsScoped(ctx, &tenantID, nil)
+	if err != nil {
+		t.Fatalf("StatsScoped(nil): %v", err)
+	}
+	if unscoped.TotalAuditEvents != 2 {
+		t.Errorf("unscoped TotalAuditEvents = %d, want 2 — nil must not restrict", unscoped.TotalAuditEvents)
+	}
 }
 
 // TestInvalidIPBecomesNull verifies one malformed IP cannot sink a batch:

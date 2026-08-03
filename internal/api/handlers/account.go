@@ -44,9 +44,45 @@ func (h *AuthHandler) notifyRiskySignIn(c echo.Context, tenantID, userID, appID 
 }
 
 // AcceptInvitationRequest is the body for POST /api/v1/auth/accept-invitation.
+//
+// For an account with no password yet, Password is required and CurrentPassword
+// is meaningless. For an account that already has one — see PreviewInvitation —
+// the recipient chooses: supply CurrentPassword to keep it, or Password to
+// replace it. Supplying neither is refused, so activating an administrative
+// grant always takes more than possession of the emailed link.
 type AcceptInvitationRequest struct {
-	Token    string `json:"token" validate:"required"`
-	Password string `json:"password" validate:"required,min=8"`
+	Token           string `json:"token" validate:"required"`
+	Password        string `json:"password"`
+	CurrentPassword string `json:"current_password"`
+}
+
+// PreviewInvitation handles GET /api/v1/auth/invitation.
+//
+// @Summary      Inspect an invitation link
+// @Description  Returns what a live invitation token is for, WITHOUT consuming it, so the landing page can ask for a password only when there is one to set. requires_password is false for an account that already has credentials — an existing user being made an administrator, or an administrator being re-instated — and for those the link only confirms the grant. grants_admin reports that accepting will activate a pending administrative grant.
+// @Tags         AUTH
+// @Produce      json
+// @Param        token  query     string  true  "Invitation token from the email"
+// @Success      200    {object}  auth.InvitationPreview
+// @Failure      400    {object}  map[string]string
+// @Router       /api/v1/auth/invitation [get]
+func (h *AuthHandler) PreviewInvitation(c echo.Context) error {
+	if h.invSvc == nil {
+		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "invitations are not configured"})
+	}
+	token := c.QueryParam("token")
+	if token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "token is required"})
+	}
+	preview, err := h.invSvc.Preview(c.Request().Context(), token)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidInvitation) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired invitation link"})
+		}
+		h.logger.Error().Err(err).Msg("auth: preview invitation failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not read that invitation"})
+	}
+	return c.JSON(http.StatusOK, preview)
 }
 
 // AcceptInvitation handles POST /api/v1/auth/accept-invitation — the user sets
@@ -78,11 +114,17 @@ func (h *AuthHandler) AcceptInvitation(c echo.Context) error {
 	if req.Token == "" {
 		req.Token = c.QueryParam("token")
 	}
-	if req.Token == "" || req.Password == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "token and password are required"})
+	// Password is deliberately not required here: the service decides, since only
+	// it knows whether the account already has credentials. An empty password for
+	// an account that has none comes back as ErrWeakPassword below.
+	if req.Token == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "token is required"})
 	}
 
-	target, err := h.invSvc.Accept(c.Request().Context(), req.Token, req.Password)
+	target, err := h.invSvc.Accept(c.Request().Context(), req.Token, auth.AcceptOptions{
+		NewPassword:     req.Password,
+		CurrentPassword: req.CurrentPassword,
+	})
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidInvitation) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired invitation link"})
@@ -90,6 +132,15 @@ func (h *AuthHandler) AcceptInvitation(c echo.Context) error {
 		if errors.Is(err, auth.ErrInvitationBlocked) {
 			// The link is valid; the account state is what forbids acceptance.
 			return c.JSON(http.StatusForbidden, map[string]string{"error": "this account has been blocked — contact your administrator"})
+		}
+		if errors.Is(err, auth.ErrCurrentPasswordMismatch) {
+			// 401, not 400: the link is fine, the credential is not. A 400 here
+			// would read as "expired link" and send the recipient looking for a
+			// new email that nobody needs to send.
+			return c.JSON(http.StatusUnauthorized, map[string]string{
+				"error": "that is not your current password",
+				"code":  "current_password_mismatch",
+			})
 		}
 		if errors.Is(err, auth.ErrWeakPassword) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})

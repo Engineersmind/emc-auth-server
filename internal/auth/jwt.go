@@ -26,8 +26,40 @@ type Claims struct {
 	Email       string   `json:"email"`
 	Role        string   `json:"role"`
 	Permissions []string `json:"permissions"`
+	// AdminScope and AdminApps describe how far the caller's tenant-administration
+	// rights reach across the tenant's applications (issue #97). Permissions say
+	// WHAT an administrator may do; these say WHICH applications they may do it
+	// to. Both are empty for ordinary end users, who hold no admin permissions
+	// and never reach the guarded routes anyway.
+	//
+	// AdminScope is AdminScopeTenant for a tenant owner (and for API-key
+	// management tokens), or AdminScopeApps for a co-owner, in which case
+	// AdminApps lists the application row ids they administer.
+	AdminScope string   `json:"admin_scope,omitempty"`
+	AdminApps  []string `json:"admin_apps,omitempty"`
 	jwt.RegisteredClaims
 }
+
+// Admin scope values for Claims.AdminScope.
+//
+// The empty string is NOT a third tier meaning "unrestricted" — RequireAppScope
+// denies it. Treating the zero value as tenant-wide would make any future bug
+// that forgets to populate the claim fail open, which is the wrong direction
+// for the claim that bounds administrative reach.
+//
+// The cost is that access tokens minted before this claim existed are refused
+// on per-application admin routes. Access tokens live 15 minutes and both
+// refresh rotation and the renewal middleware re-mint them with the claim
+// populated, so the window is short and self-healing.
+const (
+	// AdminScopeTenant grants administration of every application in the
+	// caller's own tenant, including applications created after the token was
+	// issued. Held by tenant owners and API-key management tokens.
+	AdminScopeTenant = "tenant"
+	// AdminScopeApps restricts administration to the applications listed in
+	// Claims.AdminApps. Held by co-owners.
+	AdminScopeApps = "apps"
+)
 
 // AgentClaims is the JWT payload for machine-to-machine agent tokens (08-01).
 type AgentClaims struct {
@@ -118,10 +150,15 @@ func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentit
 
 	now := time.Now().UTC()
 	claims := &Claims{
-		UserID:      "key:" + strconv.FormatInt(identity.KeyID, 10),
-		TenantID:    strconv.FormatInt(identity.TenantID, 10),
-		Email:       identity.Name + "@apikey",
-		Role:        "api_key",
+		UserID:   "key:" + strconv.FormatInt(identity.KeyID, 10),
+		TenantID: strconv.FormatInt(identity.TenantID, 10),
+		Email:    identity.Name + "@apikey",
+		Role:     "api_key",
+		// An API key belongs to the tenant, not to any one application, and its
+		// permissions were already scoped when the key was issued. Without this
+		// the key would lose access to every per-application admin route the
+		// moment RequireAppScope starts guarding them.
+		AdminScope:  AdminScopeTenant,
 		Permissions: identity.Permissions,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        uuid.New().String(),

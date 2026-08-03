@@ -350,9 +350,15 @@ func TestUsers_ApplicationScoped(t *testing.T) {
 	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, appUserID, parseID(t, appRole.ID)); err != nil {
 		t.Fatalf("AssignUserRole(app user, app role) error = %v", err)
 	}
-	// Tenant-level role (super_admin) on an app user must be rejected.
-	systemRoleID := seedSystemRoleID(t, f)
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, appUserID, systemRoleID); !errors.Is(err, admin.ErrRoleScope) {
+	// A tenant-level role on an app user must be rejected. Uses a NON-system
+	// tenant-level role deliberately: a system one is now refused by the
+	// is_system check before the scope check runs, which would make this assert
+	// the wrong guard.
+	tenantRole, err := f.svc.CreateRole(ctx, f.tenantID, nil, "tenant-analyst", nil)
+	if err != nil {
+		t.Fatalf("CreateRole(tenant-level) error = %v", err)
+	}
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, appUserID, parseID(t, tenantRole.ID)); !errors.Is(err, admin.ErrRoleScope) {
 		t.Errorf("AssignUserRole(app user, tenant-level role) error = %v, want ErrRoleScope", err)
 	}
 	// App role on a tenant-level user must be rejected too.
@@ -361,10 +367,61 @@ func TestUsers_ApplicationScoped(t *testing.T) {
 	}
 
 	// CreateUser with a role from another scope must be rejected.
-	if _, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID, "appuser2@iso.test", "Password123!", "", "", &systemRoleID); !errors.Is(err, admin.ErrRoleScope) {
-		t.Errorf("CreateUser(app user, owner role) error = %v, want ErrRoleScope", err)
+	if _, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID, "appuser2@iso.test", "Password123!", "", "", ptrInt64(parseID(t, tenantRole.ID))); !errors.Is(err, admin.ErrRoleScope) {
+		t.Errorf("CreateUser(app user, tenant-level role) error = %v, want ErrRoleScope", err)
 	}
 }
+
+// TestSystemRolesAreNotAssignable is the guard on the one path that could hand
+// out administrative authority without going through an invitation.
+//
+// Administrative roles are attached by auth.activatePendingAdminGrant when the
+// recipient accepts, alongside the tenant_admins row that records the grant.
+// Assigning one directly produces an account that holds every admin permission
+// but has NO tenant_admins row, so:
+//
+//   - loadAdminScope returns "", and an absent admin_scope claim is read as
+//     tenant-wide by RequireTenantSelfOrAny;
+//   - the activation gate added in migration 00064 never runs;
+//   - the account appears in neither the tenant's administrator list nor the
+//     platform directory, both of which read tenant_admins.
+//
+// In the platform's own seeded tenant the reachable system role is super_admin,
+// which carries tenant:manage — authority over every tenant, not just this one.
+func TestSystemRolesAreNotAssignable(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	systemRoleID := seedSystemRoleID(t, f)
+
+	victim, err := f.svc.CreateUser(ctx, f.tenantID, nil, "escalate@iso.test", "Password123!", "", "", nil)
+	if err != nil {
+		t.Fatalf("CreateUser(tenant-level) error = %v", err)
+	}
+
+	// Re-roling an existing tenant-level user.
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, parseID(t, victim.ID), systemRoleID); !errors.Is(err, admin.ErrSystemRole) {
+		t.Errorf("AssignUserRole(tenant user, system role) error = %v, want ErrSystemRole", err)
+	}
+
+	// And the same thing in one step at creation, which is the same bypass
+	// minus a call.
+	if _, err := f.svc.CreateUser(ctx, f.tenantID, nil, "escalate2@iso.test", "Password123!", "", "", &systemRoleID); !errors.Is(err, admin.ErrSystemRole) {
+		t.Errorf("CreateUser(tenant user, system role) error = %v, want ErrSystemRole", err)
+	}
+
+	// The refusal must leave nothing behind: no role attached to the account
+	// that already existed.
+	var roleID *int64
+	if err := f.pool.QueryRow(ctx, `SELECT role_id FROM users WHERE id = $1`, parseID(t, victim.ID)).Scan(&roleID); err != nil {
+		t.Fatalf("read back victim role: %v", err)
+	}
+	if roleID != nil {
+		t.Errorf("role_id = %d after a refused assignment, want NULL", *roleID)
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }
 
 // TestRolesOneDefaultPerApp_UniqueIndex verifies the DB-level guard: two
 // default roles cannot coexist for the same (tenant, application) even if

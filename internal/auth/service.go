@@ -173,6 +173,13 @@ type MeResult struct {
 	Email       string   `json:"email"`
 	Role        string   `json:"role"`
 	Permissions []string `json:"permissions"`
+	// AdminScope and AdminApps mirror the token's administrative reach (issue
+	// #97) so a client can render the same boundary the server enforces —
+	// showing a co-owner only the applications they administer, rather than
+	// offering every tenant-level control and letting each one 403 on submit.
+	// Empty for callers who are not tenant administrators.
+	AdminScope string   `json:"admin_scope,omitempty"`
+	AdminApps  []string `json:"admin_apps,omitempty"`
 }
 
 // resolveTenant fetches the tenant row by slug. Returns pgx.ErrNoRows if not found.
@@ -235,6 +242,17 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 		Role:        role,
 		Permissions: perms,
 	}
+
+	// Administrative reach is resolved here rather than at each caller because
+	// every path that mints a user token — Login, Register, Refresh, MFA
+	// completion, magic link, OAuth callbacks — funnels through this function.
+	// Resolving it once means a co-owner's grants cannot survive their own
+	// revocation by riding a refresh rotation that forgot to reload them.
+	adminScope, adminApps, err := loadAdminScope(ctx, s.pool, userID, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	claims.AdminScope, claims.AdminApps = adminScope, adminApps
 
 	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
 	if err != nil {
@@ -1074,6 +1092,8 @@ func (s *AuthService) Me(claims *Claims) *MeResult {
 		Email:       claims.Email,
 		Role:        claims.Role,
 		Permissions: claims.Permissions,
+		AdminScope:  claims.AdminScope,
+		AdminApps:   claims.AdminApps,
 	}
 }
 

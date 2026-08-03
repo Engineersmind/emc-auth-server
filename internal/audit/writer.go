@@ -195,10 +195,15 @@ func (l *Logger) flush(batch []Event) {
 	}
 	metrics.AuditEventsWritten.Add(float64(len(batch)))
 
-	// Stream the durably-written batch to the external sink (SIEM), if any.
-	// Emit is non-blocking and best-effort — it must never slow the worker.
-	if l.sink != nil {
-		l.sink.Emit(batch)
+	// Stream the durably-written batch to every registered sink (SIEM,
+	// notification emails). Only successful batches are streamed, so a sink can
+	// never report an event that was not persisted.
+	//
+	// Each Emit is non-blocking and best-effort — it must never slow the worker,
+	// and with several sinks the cost is additive, so one that breaks its
+	// contract delays the rest and ultimately backs up the audit queue.
+	for _, sink := range l.sinks {
+		sink.Emit(batch)
 	}
 }
 

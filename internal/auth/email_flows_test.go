@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
@@ -74,11 +75,177 @@ func (e flowEnv) seedUser(t *testing.T, email, passwordHash string) int64 {
 // Invitations
 // ---------------------------------------------------------------------------
 
+// testDashboardURL stands in for DASHBOARD_BASE_URL — the admin console origin,
+// deliberately NOT the API origin. An invitation link must open a page that can
+// collect a password; POST /api/v1/auth/accept-invitation answers a browser GET
+// with "authorization required".
+const testDashboardURL = "http://localhost:5173"
+
+// TestInvitation_LinkTargetsTheConsolePage guards the shape of the emailed link.
+// Pointing it at the API produced an invitation nobody could accept, which for a
+// freshly seeded tenant owner meant a tenant nobody could enter at all.
+func TestInvitation_LinkTargetsTheConsolePage(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	email := uniqueEmail("invite-link")
+	userID := e.seedUser(t, email, "")
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+
+	link := e.mail.invitations[0].Link
+	if !strings.HasPrefix(link, testDashboardURL+"/accept-invitation?token=") {
+		t.Errorf("invitation link = %q, want the console page on %s", link, testDashboardURL)
+	}
+	if strings.Contains(link, "/api/") {
+		t.Errorf("invitation link = %q, must not point at an API endpoint", link)
+	}
+}
+
+// TestInvitation_ConfirmsAdminGrantWithoutTouchingPassword covers the
+// confirmation half of an administrative grant: the recipient already has a
+// working account, so following the link must activate the grant and attach its
+// role WITHOUT resetting their password or ending their sessions.
+//
+// Promoting someone already working in the tenant is the ordinary case; making
+// it cost them a credential reset would be a real tax for no security gain,
+// since the link only proves they control the inbox, which they had already
+// proven.
+func TestInvitation_ConfirmsAdminGrantWithoutTouchingPassword(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	// An existing, working account. MinCost keeps the test fast; the comparison
+	// path is identical.
+	const knownPassword = "ExistingPassw0rd!"
+	hashed, err := bcrypt.GenerateFromPassword([]byte(knownPassword), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash existing password: %v", err)
+	}
+	knownHash := string(hashed)
+	email := uniqueEmail("confirm-grant")
+	userID := e.seedUser(t, email, knownHash)
+
+	// A co_owner role plus a pending grant, as InviteTenantAdmin would leave it:
+	// role unassigned, activated_at NULL.
+	var roleID int64
+	if err := e.pool.QueryRow(e.ctx, `
+		INSERT INTO roles (tenant_id, name, is_system, created_at)
+		VALUES ($1, 'co_owner', true, NOW()) RETURNING id
+	`, e.tenantID).Scan(&roleID); err != nil {
+		t.Fatalf("seed co_owner role: %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role) VALUES ($1, $2, 'co_owner')
+	`, e.tenantID, userID); err != nil {
+		t.Fatalf("seed pending grant: %v", err)
+	}
+
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	raw := tokenFromLink(t, e.mail.invitations[0].Link)
+
+	// The page learns from Preview that no password is needed here.
+	preview, err := invSvc.Preview(e.ctx, raw)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if preview.RequiresPassword {
+		t.Error("RequiresPassword = true for an account that already has a password")
+	}
+	if !preview.GrantsAdmin {
+		t.Error("GrantsAdmin = false, want true so the page can say what is being confirmed")
+	}
+	if preview.Email != email {
+		t.Errorf("Preview email = %q, want %q", preview.Email, email)
+	}
+
+	// The link alone is not enough: activating an administrative grant takes
+	// proof that the recipient can operate the account, not only read the inbox.
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{}); !errors.Is(err, auth.ErrCurrentPasswordMismatch) {
+		t.Errorf("Accept with nothing supplied = %v, want ErrCurrentPasswordMismatch", err)
+	}
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{CurrentPassword: "wrong-password"}); !errors.Is(err, auth.ErrCurrentPasswordMismatch) {
+		t.Errorf("Accept with the wrong password = %v, want ErrCurrentPasswordMismatch", err)
+	}
+	// A rejected attempt must not burn the token — otherwise one typo costs the
+	// recipient their invitation and an operator has to reissue it.
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{CurrentPassword: knownPassword}); err != nil {
+		t.Fatalf("Accept keeping the current password: %v", err)
+	}
+
+	var hash string
+	var activated *string
+	var assignedRole *int64
+	if err := e.pool.QueryRow(e.ctx, `
+		SELECT c.password_hash, ta.activated_at::text, u.role_id
+		FROM users u
+		JOIN user_credentials c ON c.user_id = u.id
+		JOIN tenant_admins ta ON ta.user_id = u.id
+		WHERE u.id = $1
+	`, userID).Scan(&hash, &activated, &assignedRole); err != nil {
+		t.Fatalf("read state after confirm: %v", err)
+	}
+	if hash != knownHash {
+		t.Error("password hash changed; confirming a grant must not reset a working password")
+	}
+	if activated == nil {
+		t.Error("activated_at is still NULL, want the grant confirmed")
+	}
+	if assignedRole == nil || *assignedRole != roleID {
+		t.Errorf("role_id = %v, want the co_owner role %d attached on confirmation", assignedRole, roleID)
+	}
+
+	// Preview must refuse a spent token rather than reporting it live.
+	if _, err := invSvc.Preview(e.ctx, raw); !errors.Is(err, auth.ErrInvalidInvitation) {
+		t.Errorf("Preview after accept = %v, want ErrInvalidInvitation", err)
+	}
+}
+
+// TestInvitation_OnboardingStillRequiresAPassword proves the other half: an
+// account with no credentials cannot be activated by an empty password.
+func TestInvitation_OnboardingStillRequiresAPassword(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	email := uniqueEmail("onboard-pw")
+	userID := e.seedUser(t, email, "")
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	raw := tokenFromLink(t, e.mail.invitations[0].Link)
+
+	preview, err := invSvc.Preview(e.ctx, raw)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if !preview.RequiresPassword {
+		t.Error("RequiresPassword = false for an account with no credentials")
+	}
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{}); !errors.Is(err, auth.ErrWeakPassword) {
+		t.Errorf("Accept with no password = %v, want ErrWeakPassword", err)
+	}
+	// CurrentPassword is meaningless for an account that has none, and must not
+	// be accepted as a substitute for choosing one.
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{CurrentPassword: "anything"}); !errors.Is(err, auth.ErrWeakPassword) {
+		t.Errorf("Accept with only a current password = %v, want ErrWeakPassword", err)
+	}
+	// The token survives a rejected attempt, so the recipient can try again.
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{NewPassword: "ChosenPassword123!"}); err != nil {
+		t.Errorf("Accept after the rejected attempt: %v", err)
+	}
+}
+
 // TestInvitation_FullFlow proves invite → emailed link → password set → verified,
 // and that the token is single-use.
 func TestInvitation_FullFlow(t *testing.T) {
 	e := newFlowEnv(t)
-	invSvc := auth.NewInvitationService(e.pool, e.mail, "http://localhost:9090", testhelper.TestLogger()).
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
 		WithTemplates(e.tmplSvc)
 
 	email := uniqueEmail("invite-full")
@@ -95,7 +262,7 @@ func TestInvitation_FullFlow(t *testing.T) {
 	}
 
 	raw := tokenFromLink(t, e.mail.invitations[0].Link)
-	target, err := invSvc.Accept(e.ctx, raw, "ChosenPassword123!")
+	target, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{NewPassword: "ChosenPassword123!"})
 	if err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
@@ -120,7 +287,7 @@ func TestInvitation_FullFlow(t *testing.T) {
 	}
 
 	// Single use.
-	if _, err := invSvc.Accept(e.ctx, raw, "AnotherPassword123!"); !errors.Is(err, auth.ErrInvalidInvitation) {
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{NewPassword: "AnotherPassword123!"}); !errors.Is(err, auth.ErrInvalidInvitation) {
 		t.Errorf("second Accept = %v, want ErrInvalidInvitation", err)
 	}
 }
@@ -129,7 +296,7 @@ func TestInvitation_FullFlow(t *testing.T) {
 // so a leaked earlier email cannot still claim the account.
 func TestInvitation_ResendSupersedesPrevious(t *testing.T) {
 	e := newFlowEnv(t)
-	invSvc := auth.NewInvitationService(e.pool, e.mail, "http://localhost:9090", testhelper.TestLogger()).
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
 		WithTemplates(e.tmplSvc)
 
 	email := uniqueEmail("invite-resend")
@@ -145,10 +312,10 @@ func TestInvitation_ResendSupersedesPrevious(t *testing.T) {
 
 	first := tokenFromLink(t, e.mail.invitations[0].Link)
 	second := tokenFromLink(t, e.mail.invitations[1].Link)
-	if _, err := invSvc.Accept(e.ctx, first, "Password123!"); !errors.Is(err, auth.ErrInvalidInvitation) {
+	if _, err := invSvc.Accept(e.ctx, first, auth.AcceptOptions{NewPassword: "Password123!"}); !errors.Is(err, auth.ErrInvalidInvitation) {
 		t.Errorf("superseded invitation = %v, want ErrInvalidInvitation", err)
 	}
-	if _, err := invSvc.Accept(e.ctx, second, "Password123!"); err != nil {
+	if _, err := invSvc.Accept(e.ctx, second, auth.AcceptOptions{NewPassword: "Password123!"}); err != nil {
 		t.Errorf("latest invitation Accept = %v, want success", err)
 	}
 }
@@ -158,7 +325,7 @@ func TestInvitation_ResendSupersedesPrevious(t *testing.T) {
 // the account stays in control, and the account is not silently re-activated.
 func TestInvitation_AdminBlockCannotBeBypassed(t *testing.T) {
 	e := newFlowEnv(t)
-	invSvc := auth.NewInvitationService(e.pool, e.mail, "http://localhost:9090", testhelper.TestLogger()).
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
 		WithTemplates(e.tmplSvc)
 
 	email := uniqueEmail("invite-blocked")
@@ -174,7 +341,7 @@ func TestInvitation_AdminBlockCannotBeBypassed(t *testing.T) {
 		t.Fatalf("admin-block user: %v", err)
 	}
 
-	if _, err := invSvc.Accept(e.ctx, raw, "Password123!"); !errors.Is(err, auth.ErrInvitationBlocked) {
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{NewPassword: "Password123!"}); !errors.Is(err, auth.ErrInvitationBlocked) {
 		t.Fatalf("Accept on an admin-blocked account = %v, want ErrInvitationBlocked", err)
 	}
 	var active bool
@@ -204,7 +371,7 @@ func TestInvitation_SuppressedTemplateRetiresToken(t *testing.T) {
 	}, nil); err != nil {
 		t.Fatalf("disable template: %v", err)
 	}
-	invSvc := auth.NewInvitationService(e.pool, e.mail, "http://localhost:9090", testhelper.TestLogger()).
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
 		WithTemplates(e.tmplSvc)
 
 	email := uniqueEmail("invite-suppressed")

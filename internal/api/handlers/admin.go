@@ -148,7 +148,7 @@ type SlugCheckResponse struct {
 // CreateTenant handles POST /api/v1/tenants.
 //
 // @Summary      Create tenant
-// @Description  Creates a new isolated tenant and auto-seeds an owner role with 8 default permissions and an owner user using the provided owner_email. The owner.temp_password in the response is shown once and never stored — hand it to the tenant owner. Requires tenant:manage permission (super_admin only).
+// @Description  Creates a new isolated tenant and auto-seeds the granular permission catalog, an owner role holding all of it, an owner user for the provided owner_email, and the matching tenant_admins record. The owner account is created WITHOUT a password: an invitation link is emailed, and accepting it sets the password and marks the address verified. The response carries owner.status = "pending_invitation" and owner.invite_sent; when invite_sent is false the tenant still exists and the invitation can be resent. Requires tenant:manage permission (super_admin only).
 // @Tags         admin-tenants
 // @Accept       json
 // @Produce      json
@@ -1172,6 +1172,10 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "email already registered in this scope"})
 		case errors.Is(err, admin.ErrRoleScope):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		case errors.Is(err, admin.ErrSystemRole):
+			return c.JSON(http.StatusForbidden, map[string]string{
+				"error": "administrative roles are granted by invitation, not by assignment",
+			})
 		case errors.Is(err, admin.ErrNotFound):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": "role not found"})
 		case errors.Is(err, admin.ErrInvitationsUnavailable):
@@ -1393,6 +1397,21 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 		}
 		if errors.Is(err, admin.ErrRoleScope) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		// 403, not 400: the request is well-formed and the role exists. What is
+		// refused is the privilege transfer.
+		//
+		// Recorded as access_denied rather than a failed role assignment so it
+		// reaches the notifier: access_denied is catalogued as notify-on-failure,
+		// whereas cataloguing role_assigned would mail somebody every time an
+		// ordinary end user's role changed. An attempt to hand out an
+		// administrative role is exactly the signal that channel exists for.
+		if errors.Is(err, admin.ErrSystemRole) {
+			h.auditPrivilegeRefused(c, claims, "user", strconv.FormatInt(userID, 10),
+				"assignment of system role "+strconv.FormatInt(roleID, 10))
+			return c.JSON(http.StatusForbidden, map[string]string{
+				"error": "administrative roles are granted by invitation, not by assignment",
+			})
 		}
 		h.logger.Error().Err(err).Msg("admin: assign role failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to assign role"})
@@ -1748,7 +1767,7 @@ func (h *AdminHandler) GetStats(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
-	result, err := h.audit.Stats(c.Request().Context(), &tenantID)
+	result, err := h.audit.StatsScoped(c.Request().Context(), &tenantID, monitoringScope(claims))
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: stats query failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query stats"})
@@ -1806,6 +1825,7 @@ func (h *AdminHandler) GetTenantAuditLogs(c echo.Context) error {
 
 	p := auditQueryParams(c)
 	p.TenantID = &tenantID
+	p.OnlyApplicationIDs = monitoringScope(claims)
 
 	result, err := h.audit.Query(c.Request().Context(), p)
 	if err != nil {
@@ -1863,7 +1883,7 @@ func (h *AdminHandler) GetTenantAuditLogByID(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
-	return h.getAuditLogByID(c, &tenantID)
+	return h.getAuditLogByID(c, &tenantID, monitoringScope(claims))
 }
 
 // GetSystemAuditLogByID handles GET /api/v1/admin/audit-logs/system/:id —
@@ -1879,11 +1899,13 @@ func (h *AdminHandler) GetTenantAuditLogByID(c echo.Context) error {
 // @Failure      404  {object}  map[string]string
 // @Router       /api/v1/audit-logs/system/{id} [get]
 func (h *AdminHandler) GetSystemAuditLogByID(c echo.Context) error {
-	return h.getAuditLogByID(c, nil)
+	// tenant:manage only, and cross-tenant by definition — no restriction.
+	return h.getAuditLogByID(c, nil, nil)
 }
 
-// getAuditLogByID is the shared detail lookup. tenantScope nil = system-wide.
-func (h *AdminHandler) getAuditLogByID(c echo.Context, tenantScope *int64) error {
+// getAuditLogByID is the shared detail lookup. tenantScope nil = system-wide;
+// onlyApps nil = every application in that scope.
+func (h *AdminHandler) getAuditLogByID(c echo.Context, tenantScope *int64, onlyApps []int64) error {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid audit log id"})
@@ -1896,7 +1918,32 @@ func (h *AdminHandler) getAuditLogByID(c echo.Context, tenantScope *int64) error
 		h.logger.Error().Err(err).Msg("admin: audit log detail lookup failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load audit log"})
 	}
+	// Row ids are sequential and guessable, so a scoped administrator must not
+	// be able to walk the tenant's trail one id at a time. Answered as 404
+	// rather than 403: whether a given id exists is itself part of what they are
+	// not entitled to know.
+	if !auditEntryInScope(entry, onlyApps) {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "audit log not found"})
+	}
 	return c.JSON(http.StatusOK, entry)
+}
+
+// auditEntryInScope reports whether one event falls inside a caller's
+// application restriction. nil onlyApps admits everything; an event with no
+// application (a tenant-level event) is admitted only to an unrestricted caller.
+func auditEntryInScope(entry *audit.LogEntry, onlyApps []int64) bool {
+	if onlyApps == nil {
+		return true
+	}
+	if entry == nil || entry.ApplicationID == nil {
+		return false
+	}
+	for _, id := range onlyApps {
+		if strconv.FormatInt(id, 10) == *entry.ApplicationID {
+			return true
+		}
+	}
+	return false
 }
 
 // VerifyAuditChain handles GET /api/v1/audit-logs/verify — recomputes the
@@ -1941,6 +1988,10 @@ func (h *AdminHandler) ExportAuditLogs(c echo.Context) error {
 	}
 	p := auditQueryParams(c)
 	p.TenantID = &tenantID
+	// The export is the same data in another format, so it carries the same
+	// restriction. Leaving it off would make a CSV download the way around
+	// per-application monitoring.
+	p.OnlyApplicationIDs = monitoringScope(claims)
 
 	c.Response().Header().Set(echo.HeaderContentType, "text/csv")
 	c.Response().Header().Set(echo.HeaderContentDisposition, `attachment; filename="audit-logs.csv"`)
@@ -2044,6 +2095,36 @@ func (h *AdminHandler) auditAdminAppMeta(c echo.Context, claims *auth.Claims, ac
 		IPAddress:     c.RealIP(),
 		UserAgent:     c.Request().UserAgent(),
 		Metadata:      meta,
+	})
+}
+
+// auditPrivilegeRefused records a privileged request the HANDLER refused.
+//
+// The middleware equivalent is denyAudited, which cannot cover this: the caller
+// legitimately holds the permission the route requires, and the refusal turns on
+// what they asked to do with it. Same action and same failure status, so it
+// lands in the same place in the monitoring view and reaches the notifier by the
+// same catalogued route.
+func (h *AdminHandler) auditPrivilegeRefused(c echo.Context, claims *auth.Claims, resourceType, resourceID, attempted string) {
+	if claims == nil {
+		return
+	}
+	tid, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	var uidPtr *int64
+	if uid, err := strconv.ParseInt(claims.UserID, 10, 64); err == nil {
+		uidPtr = &uid
+	}
+	h.auditEvent(c, audit.Event{
+		TenantID:     &tid,
+		UserID:       uidPtr,
+		ActorEmail:   claims.Email,
+		Action:       audit.ActionAdminAccessDenied,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Status:       audit.StatusFailure,
+		IPAddress:    c.RealIP(),
+		UserAgent:    c.Request().UserAgent(),
+		Metadata:     map[string]any{"attempted": attempted},
 	})
 }
 
@@ -2506,6 +2587,38 @@ func (h *AdminHandler) tenantFromClaimsOrPath(c echo.Context) (int64, *auth.Clai
 	return tenantID, claims, nil
 }
 
+// monitoringScope returns the application restriction to apply to an audit or
+// stats query for this caller (issue #97).
+//
+// nil means unrestricted — a tenant owner, a platform admin, or a token that
+// predates the admin_scope claim. A non-nil slice restricts to exactly those
+// applications, and an empty one restricts to nothing.
+//
+// The three tiers land as: super_admin sees everything the endpoint offers, an
+// owner sees their whole tenant, and a co-owner sees only the applications they
+// administer.
+func monitoringScope(claims *auth.Claims) []int64 {
+	if claims == nil || claims.AdminScope != auth.AdminScopeApps {
+		return nil
+	}
+	return parseAppIDs(claims.AdminApps)
+}
+
+// parseAppIDs converts the admin_apps claim to row ids for AppFilter.OnlyIDs.
+//
+// Always returns a non-nil slice, so a caller with no grants (or a malformed
+// claim) restricts to nothing rather than to everything. nil would mean
+// "unrestricted", which is the opposite of what an empty grant set means.
+func parseAppIDs(raw []string) []int64 {
+	ids := make([]int64, 0, len(raw))
+	for _, s := range raw {
+		if id, err := strconv.ParseInt(s, 10, 64); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // appFilterFromQuery parses list query params shared by both list routes.
 func appFilterFromQuery(c echo.Context) auth.AppFilter {
 	page, _ := strconv.Atoi(c.QueryParam("page"))
@@ -2581,12 +2694,22 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 // @Failure      403     {object}  map[string]string
 // @Router       /api/v1/applications [get]
 func (h *AdminHandler) ListApplications(c echo.Context) error {
-	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
 		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 	}
 
-	page, err := h.appSvc.ListApplicationsPaginated(c.Request().Context(), tenantID, appFilterFromQuery(c))
+	// RequireTenantSelfScoped lets an application-scoped administrator reach this
+	// route — they have to be able to find their own applications — on the
+	// condition that the response is narrowed here. This is that narrowing, and
+	// it is the security boundary: the client filters too, but only for tidiness,
+	// and rows it filters out would still have crossed the wire.
+	filter := appFilterFromQuery(c)
+	if claims != nil && claims.AdminScope == auth.AdminScopeApps {
+		filter.OnlyIDs = parseAppIDs(claims.AdminApps)
+	}
+
+	page, err := h.appSvc.ListApplicationsPaginated(c.Request().Context(), tenantID, filter)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidAppType) || containsMsg(err, "invalid status") {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -3484,7 +3607,8 @@ func (h *AdminHandler) TenantGetStats(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
-	result, err := h.audit.Stats(c.Request().Context(), &tid)
+	claims, _ := claimsFromCtx(c)
+	result, err := h.audit.StatsScoped(c.Request().Context(), &tid, monitoringScope(claims))
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: tenant stats query failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query stats"})
@@ -3514,8 +3638,10 @@ func (h *AdminHandler) TenantGetActivity(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
+	claims, _ := claimsFromCtx(c)
 	p := auditQueryParams(c)
 	p.TenantID = &tid
+	p.OnlyApplicationIDs = monitoringScope(claims)
 
 	result, err := h.audit.Query(c.Request().Context(), p)
 	if err != nil {

@@ -230,6 +230,64 @@ func TestApplicationService_GetAndUpdate(t *testing.T) {
 	}
 }
 
+// TestApplicationService_ListPaginated_OnlyIDs covers the server-side half of
+// application-scoped administration (issue #97): a co-owner may list the
+// tenant's applications but must see only the ones granted to them.
+//
+// The distinction that matters is nil versus empty. nil means unrestricted;
+// an empty slice means nothing. Collapsing them would show a co-owner whose
+// last grant was revoked every application in the tenant.
+func TestApplicationService_ListPaginated_OnlyIDs(t *testing.T) {
+	svc, ctx, tenantA, _ := newApplicationService(t)
+
+	mk := func(name string) int64 {
+		t.Helper()
+		r, err := svc.CreateApplication(ctx, tenantA, name, "web", nil)
+		if err != nil {
+			t.Fatalf("CreateApplication(%s): %v", name, err)
+		}
+		id, _ := strconv.ParseInt(r.ID, 10, 64)
+		return id
+	}
+	// Measured rather than assumed: the fixture tenant is not guaranteed empty.
+	baseline, err := svc.ListApplicationsPaginated(ctx, tenantA, auth.AppFilter{})
+	if err != nil {
+		t.Fatalf("baseline list: %v", err)
+	}
+
+	granted := mk("scoped-granted")
+	mk("scoped-other")
+
+	page, err := svc.ListApplicationsPaginated(ctx, tenantA, auth.AppFilter{OnlyIDs: []int64{granted}})
+	if err != nil {
+		t.Fatalf("ListApplicationsPaginated(OnlyIDs): %v", err)
+	}
+	// Total is filtered too, so the count reflects what the caller can see
+	// rather than the size of the tenant.
+	if page.Total != 1 || len(page.Data) != 1 {
+		t.Fatalf("Total=%d rows=%d, want exactly the one granted application", page.Total, len(page.Data))
+	}
+	if page.Data[0].Name != "scoped-granted" {
+		t.Errorf("returned %q, want the granted application", page.Data[0].Name)
+	}
+
+	empty, err := svc.ListApplicationsPaginated(ctx, tenantA, auth.AppFilter{OnlyIDs: []int64{}})
+	if err != nil {
+		t.Fatalf("ListApplicationsPaginated(empty OnlyIDs): %v", err)
+	}
+	if empty.Total != 0 || len(empty.Data) != 0 {
+		t.Errorf("Total=%d rows=%d for an empty grant set, want nothing", empty.Total, len(empty.Data))
+	}
+
+	unrestricted, err := svc.ListApplicationsPaginated(ctx, tenantA, auth.AppFilter{})
+	if err != nil {
+		t.Fatalf("ListApplicationsPaginated(nil OnlyIDs): %v", err)
+	}
+	if unrestricted.Total != baseline.Total+2 {
+		t.Errorf("Total = %d for nil OnlyIDs, want %d — nil must not restrict", unrestricted.Total, baseline.Total+2)
+	}
+}
+
 // TestApplicationService_ListPaginated verifies filters, pagination, and that
 // deactivated apps appear only under status=inactive.
 func TestApplicationService_ListPaginated(t *testing.T) {

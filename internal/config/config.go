@@ -44,6 +44,30 @@ type Config struct {
 	// Example: "https://auth.emc.local"
 	AppBaseURL string
 
+	// DashboardBaseURL is the origin of the admin console SPA. It is prepended
+	// to emailed links whose destination is a PAGE rather than an API endpoint.
+	//
+	// The distinction matters: verify-email, confirm-email-change and
+	// unblock-account are GET endpoints that act on the token directly, so their
+	// links point at AppBaseURL. An invitation cannot — the recipient has to
+	// choose a password first, so accept-invitation is POST-only and a link to
+	// it produces "authorization required" in a browser. That link must land on
+	// the console page that collects the password and then calls the API.
+	//
+	// Set via DASHBOARD_BASE_URL. The default is the Vite dev server; any
+	// deployment where the console is not on localhost must set it explicitly.
+	DashboardBaseURL string
+
+	// PlatformNotifyEmails receive the admin-activity notifications raised when a
+	// tenant OWNER takes a privileged action — the platform tier's oversight
+	// mail. Comma-separated; set via PLATFORM_NOTIFY_EMAIL.
+	//
+	// When empty the notifier falls back to every active super_admin user, so
+	// the feature works unconfigured. Naming an address is preferable in a real
+	// deployment: it survives super_admin churn and routes to a shared mailbox
+	// or a ticket queue rather than fanning out to individuals.
+	PlatformNotifyEmails []string
+
 	// TOTPEncryptionKey is a 32-byte hex-encoded key used to AES-256-GCM encrypt
 	// TOTP secrets at rest. Generate with: openssl rand -hex 32
 	// Required when TOTP is used. Must be exactly 64 hex characters.
@@ -137,6 +161,8 @@ func Load() *Config {
 		SMTPPassword:                           getEnv("SMTP_PASSWORD", ""),
 		SMTPTLS:                                getEnv("SMTP_TLS", ""),
 		AppBaseURL:                             getEnv("APP_BASE_URL", "http://localhost:9090"),
+		DashboardBaseURL:                       getEnv("DASHBOARD_BASE_URL", "http://localhost:5173"),
+		PlatformNotifyEmails:                   getEnvList("PLATFORM_NOTIFY_EMAIL", ""),
 		TOTPEncryptionKey:                      getEnv("TOTP_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKey:         getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKeyPrevious: getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS", ""),

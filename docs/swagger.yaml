@@ -7,15 +7,36 @@ definitions:
       tenant:
         $ref: '#/definitions/admin.TenantResult'
     type: object
+  admin.InviteTenantAdminResult:
+    properties:
+      action:
+        description: "Action is one of:\n\n\tinvited            a new account was
+          created and an invitation sent\n\tgrants_added       the address was already
+          a tenant-level user; it was\n\t                   made an administrator
+          (or its grants widened) without\n\t                   creating a second
+          identity\n\tinvitation_resent  an invitation was already outstanding and
+          has been\n\t                   superseded by a fresh one"
+        type: string
+      admin:
+        $ref: '#/definitions/admin.TenantAdminResult'
+      invite_error:
+        type: string
+      invite_sent:
+        type: boolean
+    type: object
   admin.OwnerResult:
     properties:
       email:
         type: string
       id:
         type: string
+      invite_error:
+        type: string
+      invite_sent:
+        type: boolean
       role:
         type: string
-      temp_password:
+      status:
         type: string
     type: object
   admin.PermissionResult:
@@ -32,6 +53,86 @@ definitions:
         type: string
       tenant_id:
         type: string
+    type: object
+  admin.PlatformAdminResult:
+    properties:
+      applications:
+        description: |-
+          Applications names the applications a co-owner administers. Empty for an
+          owner, who administers every application in their tenant — the two empties
+          mean opposite things, so read this with Role.
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      email:
+        type: string
+      email_verified:
+        type: boolean
+      id:
+        description: |-
+          ID is the tenant_admins row, which is what the per-tenant management
+          endpoints take. UserID is the account behind it, for the user-detail and
+          session endpoints.
+        type: string
+      is_primary:
+        type: boolean
+      last_login_at:
+        type: string
+      logins_count:
+        type: integer
+      mfa_enabled:
+        type: boolean
+      name:
+        type: string
+      role:
+        description: Role is "owner" or "co_owner".
+        type: string
+      status:
+        description: |-
+          Status is "active", "pending_invitation" (granted but never accepted), or
+          "blocked". Distinguishing the last matters: a blocked administrator still
+          holds their grant and regains it the moment the block is lifted.
+        type: string
+      tenant_id:
+        type: string
+      tenant_name:
+        type: string
+      tenant_slug:
+        type: string
+      user_id:
+        type: string
+    type: object
+  admin.PlatformAdminStats:
+    properties:
+      co_owners:
+        type: integer
+      no_mfa:
+        type: integer
+      owners:
+        type: integer
+      pending_invitations:
+        type: integer
+      tenants_without_owner:
+        type: integer
+      total_admins:
+        type: integer
+    type: object
+  admin.PlatformAdminsPage:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/admin.PlatformAdminResult'
+        type: array
+      page:
+        type: integer
+      per_page:
+        type: integer
+      total:
+        type: integer
+      total_pages:
+        type: integer
     type: object
   admin.RoleResult:
     properties:
@@ -52,6 +153,35 @@ definitions:
           $ref: '#/definitions/admin.PermissionResult'
         type: array
       tenant_id:
+        type: string
+    type: object
+  admin.TenantAdminResult:
+    properties:
+      applications:
+        description: |-
+          Applications is empty for an owner — not because they administer none,
+          but because they administer all of them. Read it together with Role.
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      email:
+        type: string
+      id:
+        type: string
+      is_primary:
+        type: boolean
+      name:
+        type: string
+      role:
+        description: Role is "owner" or "co_owner".
+        type: string
+      status:
+        description: |-
+          Status is "active" once the invitation has been accepted and the address
+          verified, "pending_invitation" until then. An administrator who is
+          pending does not count toward the last-usable-owner guard.
         type: string
     type: object
   admin.TenantDashboardDelta:
@@ -629,6 +759,18 @@ definitions:
       otp_uri:
         type: string
     type: object
+  auth.InvitationPreview:
+    properties:
+      email:
+        type: string
+      grants_admin:
+        description: |-
+          GrantsAdmin reports that accepting will also activate a pending
+          administrative grant, so the page can say what is being confirmed.
+        type: boolean
+      requires_password:
+        type: boolean
+    type: object
   auth.MFAPolicy:
     properties:
       allowed_methods:
@@ -664,6 +806,18 @@ definitions:
     type: object
   auth.MeResult:
     properties:
+      admin_apps:
+        items:
+          type: string
+        type: array
+      admin_scope:
+        description: |-
+          AdminScope and AdminApps mirror the token's administrative reach (issue
+          #97) so a client can render the same boundary the server enforces —
+          showing a co-owner only the applications they administer, rather than
+          offering every tenant-level control and letting each one 403 on submit.
+          Empty for callers who are not tenant administrators.
+        type: string
       email:
         type: string
       permissions:
@@ -750,13 +904,13 @@ definitions:
     type: object
   handlers.AcceptInvitationRequest:
     properties:
+      current_password:
+        type: string
       password:
-        minLength: 8
         type: string
       token:
         type: string
     required:
-    - password
     - token
     type: object
   handlers.AppLimitRequest:
@@ -908,6 +1062,21 @@ definitions:
       service:
         type: string
       status:
+        type: string
+    type: object
+  handlers.InviteTenantAdminRequest:
+    properties:
+      application_ids:
+        description: |-
+          ApplicationIDs is required for a co-owner and must be absent for an
+          owner, whose reach is every application in the tenant.
+        items:
+          type: string
+        type: array
+      email:
+        type: string
+      role:
+        description: Role is "owner" or "co_owner".
         type: string
     type: object
   handlers.LoginOTPRequest:
@@ -1063,6 +1232,13 @@ definitions:
     required:
     - email
     - password
+    type: object
+  handlers.SetTenantAdminGrantsRequest:
+    properties:
+      application_ids:
+        items:
+          type: string
+        type: array
     type: object
   handlers.SetUserStatusRequest:
     properties:
@@ -1255,6 +1431,84 @@ info:
   title: EMC Auth Server
   version: 1.5.0
 paths:
+  /api/v1/administrators:
+    get:
+      description: Lists owners and co-owners in EVERY tenant, for platform oversight
+        — the per-tenant equivalent is /tenants/{tid}/admins. Rows carry the tenant,
+        sign-in history and second-factor state because the reader has no other context.
+        An owner's applications array is empty because they administer every application
+        in their tenant; a co-owner's lists exactly theirs, so read it together with
+        role. Requires tenant:manage (super_admin only).
+      parameters:
+      - description: Match on email, name, tenant name or slug
+        in: query
+        name: search
+        type: string
+      - description: owner | co_owner
+        in: query
+        name: role
+        type: string
+      - description: active | pending_invitation | blocked
+        in: query
+        name: status
+        type: string
+      - description: 1-based page number
+        in: query
+        name: page
+        type: integer
+      - description: Rows per page (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.PlatformAdminsPage'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Directory of every administrator across all tenants
+      tags:
+      - admin-platform
+  /api/v1/administrators/stats:
+    get:
+      description: 'Counts across every tenant: total administrators, owners, co-owners,
+        unaccepted invitations, administrators without a second factor, and tenants
+        with no owner who can sign in. The last two are the numbers worth acting on
+        — privileged accounts protected by a password alone, and tenants nobody has
+        taken ownership of. Requires tenant:manage.'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.PlatformAdminStats'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Administrator directory summary
+      tags:
+      - admin-platform
   /api/v1/agents:
     get:
       description: Returns all active agent registrations for the requesting tenant.
@@ -2777,6 +3031,36 @@ paths:
               type: string
             type: object
       summary: Request password reset
+      tags:
+      - AUTH
+  /api/v1/auth/invitation:
+    get:
+      description: Returns what a live invitation token is for, WITHOUT consuming
+        it, so the landing page can ask for a password only when there is one to set.
+        requires_password is false for an account that already has credentials — an
+        existing user being made an administrator, or an administrator being re-instated
+        — and for those the link only confirms the grant. grants_admin reports that
+        accepting will activate a pending administrative grant.
+      parameters:
+      - description: Invitation token from the email
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.InvitationPreview'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Inspect an invitation link
       tags:
       - AUTH
   /api/v1/auth/login:
@@ -4505,10 +4789,14 @@ paths:
     post:
       consumes:
       - application/json
-      description: Creates a new isolated tenant and auto-seeds an owner role with
-        8 default permissions and an owner user using the provided owner_email. The
-        owner.temp_password in the response is shown once and never stored — hand
-        it to the tenant owner. Requires tenant:manage permission (super_admin only).
+      description: 'Creates a new isolated tenant and auto-seeds the granular permission
+        catalog, an owner role holding all of it, an owner user for the provided owner_email,
+        and the matching tenant_admins record. The owner account is created WITHOUT
+        a password: an invitation link is emailed, and accepting it sets the password
+        and marks the address verified. The response carries owner.status = "pending_invitation"
+        and owner.invite_sent; when invite_sent is false the tenant still exists and
+        the invitation can be resent. Requires tenant:manage permission (super_admin
+        only).'
       parameters:
       - description: Tenant details
         in: body
@@ -4786,6 +5074,194 @@ paths:
       summary: Activity feed for a target tenant
       tags:
       - admin-cross-tenant
+  /api/v1/tenants/{tid}/admins:
+    get:
+      description: Returns the tenant's owners and co-owners. An owner's applications
+        array is empty because they administer every application in the tenant, present
+        and future — read it together with role. status is "pending_invitation" until
+        the invitation is accepted and the address verified.
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.TenantAdminResult'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List tenant administrators
+      tags:
+      - admin-tenant-admins
+    post:
+      consumes:
+      - application/json
+      description: 'Adds an owner (tenant-wide) or co-owner (specific applications).
+        An address that is already a TENANT-LEVEL user is promoted in place and no
+        second identity is created; an application-scoped user with the same address
+        is unrelated and never collides, so being a customer of an application and
+        an administrator of its tenant are compatible. The response''s action field
+        reports what happened: "invited" (new account, invitation sent), "grants_added"
+        (existing user promoted or widened), or "invitation_resent". An invitation
+        that would change nothing returns 409.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      - description: Administrator details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.InviteTenantAdminRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.InviteTenantAdminResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Already an administrator with these grants
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Invite a tenant administrator
+      tags:
+      - admin-tenant-admins
+  /api/v1/tenants/{tid}/admins/{adminID}:
+    delete:
+      description: 'Withdraws administration. The user account itself survives — losing
+        an administrative role must not take the person''s identity or audit history
+        with it. Removing the last owner who can actually log in returns 409: a tenant
+        with no usable owner is administrable only by a platform admin. An owner who
+        has not yet accepted their invitation does not count as usable.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      - description: Administrator ID
+        in: path
+        name: adminID
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Would leave the tenant without a usable owner
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Remove a tenant administrator
+      tags:
+      - admin-tenant-admins
+  /api/v1/tenants/{tid}/admins/{adminID}/applications:
+    put:
+      consumes:
+      - application/json
+      description: 'Sets exactly which applications a co-owner administers. An empty
+        list is rejected — grants only ever narrow, so an administrator with none
+        could reach nothing; use DELETE to revoke administration outright. Owners
+        cannot be granted specific applications: they administer all of them. Every
+        live access token for the affected account is invalidated so a revoked grant
+        cannot outlive this call.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      - description: Administrator ID
+        in: path
+        name: adminID
+        required: true
+        type: integer
+      - description: Application IDs
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SetTenantAdminGrantsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.TenantAdminResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Replace a co-owner's application grants
+      tags:
+      - admin-tenant-admins
   /api/v1/tenants/{tid}/app-limits:
     get:
       description: Returns all per-app rate limit configs for the tenant. Requires
