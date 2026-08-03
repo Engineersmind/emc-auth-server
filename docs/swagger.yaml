@@ -2619,6 +2619,40 @@ paths:
       summary: Verify a magic sign-in link
       tags:
       - AUTH
+  /api/v1/auth/apps/me:
+    get:
+      description: Same payload as GET /auth/me, but additionally proves the token
+        was issued FOR the calling application. Requires a user Bearer token in Authorization
+        AND the application's credentials in X-Client-Authorization. Rejects app-scoped
+        tokens belonging to a different application in the same tenant, and rejects
+        first-party tokens (empty app_id).
+      parameters:
+      - description: Bearer <app-scoped end-user access token>
+        in: header
+        name: Authorization
+        required: true
+        type: string
+      - description: Basic base64(client_id:client_secret)
+        in: header
+        name: X-Client-Authorization
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MeResult'
+        "401":
+          description: token_invalid — generic for every rejection reason
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Current user, scoped to the calling application
+      tags:
+      - AUTH
   /api/v1/auth/apps/register:
     post:
       consumes:

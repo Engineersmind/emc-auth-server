@@ -471,6 +471,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Auth routes — protected with transparent renewal (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, jwtRenew, appRateLimit)
+
+	// App-scoped identity (issue #96). Additive — /auth/me above is untouched, so
+	// admin and browser sessions cannot regress.
+	//
+	// Mounted behind the SAME jwtRenew middleware as /auth/me, so it inherits
+	// signature, issuer, expiry, tenant, and audience verification rather than
+	// re-implementing them; the handler adds only the application-boundary check.
+	//
+	// appClientRateLimit rather than appRateLimit: this endpoint bears client
+	// credentials, so it is keyed on client_id like every other /apps/* route.
+	//
+	// NormalizeAppScopeUnauthorized must be listed first (outermost) so it
+	// also catches jwtRenew's own 401s (e.g. token_expired) and rewrites them
+	// to the same generic token_invalid AppMe uses — see that middleware's
+	// doc comment.
+	authGroup.GET("/apps/me", authHandler.AppMe, mw.NormalizeAppScopeUnauthorized, jwtRenew, appClientRateLimit)
 	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
 
 	// Self-service email change — authenticated: the user must prove who they are

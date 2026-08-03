@@ -916,6 +916,180 @@ func (h *AuthHandler) Me(c echo.Context) error {
 	return c.JSON(http.StatusOK, h.svc.Me(claims))
 }
 
+// appClientAuthHeader carries the calling application's credentials on endpoints
+// that ALSO require a user Bearer token.
+//
+// Why a second header rather than Authorization: one header cannot hold two
+// credentials, and Bearer has to stay in Authorization because that is where
+// every HTTP client, proxy, and JWT library expects it. The value format is
+// identical to the Authorization: Basic used by every other /apps/* route
+// (base64(client_id:client_secret)) and is parsed by the same code, so this adds
+// a header name, not a third credential scheme.
+const appClientAuthHeader = "X-Client-Authorization"
+
+// AppMe handles GET /api/v1/auth/apps/me (issue #96).
+//
+// The app-scoped counterpart to Me. It answers a question Me structurally
+// cannot: "was this token issued for the application that is asking?"
+//
+// Me is gated only on signature, tenant, expiry, and audience. It carries no
+// client credential, so the server has nothing to compare the token's app_id
+// claim against — it cannot know who is asking. Me also legitimately serves
+// admin and browser sessions, which have an empty app_id by design, so it cannot
+// be tightened without breaking the admin console. Hence a separate endpoint;
+// Me is left untouched.
+//
+// Before this, enforcement lived in each consumer's own middleware as an opt-in
+// local check (`decodeJwt(token).app_id === MY_APP_ID`). That is the kind of
+// control a new consumer silently omits, that cannot be audited centrally, and
+// that we could not assert was in place — because it wasn't, on our side.
+//
+// Token verification is inherited from the jwtRenew middleware this route is
+// mounted behind — the same middleware Me uses — so signature, algorithm,
+// issuer, expiry, and tenant are already enforced by the time this runs.
+// #84's audience machinery (VerifyForAudience / AudienceAPI) does not exist
+// in this codebase yet, so this handler cannot lean on it; the Role=="service"
+// check below is the interim substitute for rejecting non-user tokens until
+// that lands. This handler adds two things: the non-user-token check and the
+// app boundary.
+//
+// Every rejection returns the same generic 401. Following #84's no-oracle
+// philosophy, a caller must not be able to distinguish "wrong application" from
+// "bad client secret" from "expired token" — otherwise the endpoint becomes a
+// probe for which application a token belongs to. The jwtRenew middleware this
+// route is mounted behind is wrapped in NormalizeAppScopeUnauthorized (see
+// routes.go) so that an expired-token rejection there ALSO comes back as the
+// same generic token_invalid, not jwtRenew's usual token_expired.
+//
+// @Summary      Current user, scoped to the calling application
+// @Description  Same payload as GET /auth/me, but additionally proves the token was issued FOR the calling application. Requires a user Bearer token in Authorization AND the application's credentials in X-Client-Authorization. Rejects app-scoped tokens belonging to a different application in the same tenant, and rejects first-party tokens (empty app_id).
+// @Tags         AUTH
+// @Produce      json
+// @Param        Authorization          header  string  true  "Bearer <app-scoped end-user access token>"
+// @Param        X-Client-Authorization  header  string  true  "Basic base64(client_id:client_secret)"
+// @Success      200  {object}  auth.MeResult
+// @Failure      401  {object}  map[string]string  "token_invalid — generic for every rejection reason"
+// @Router       /api/v1/auth/apps/me [get]
+func (h *AuthHandler) AppMe(c echo.Context) error {
+	claims, ok := c.Get("user").(*auth.Claims)
+	if !ok || claims == nil {
+		return h.rejectAppScope(c, "unauthenticated", "missing_claims")
+	}
+
+	// Fail closed on non-user tokens. #84's audience machinery does not exist
+	// yet (m2m/service tokens are signed with the SAME audience literal as
+	// user login tokens — see IssueServiceToken), so audience alone cannot
+	// distinguish them. Role can: "service" is the one fixed, reserved value
+	// IssueServiceToken assigns machine clients, and no real user role is
+	// ever named "service". Without this check, an m2m token minted for an
+	// application (which DOES carry that application's real app_id) would
+	// pass every check below and return a live user's payload shape for a
+	// caller that is not a user at all.
+	// Email is checked alongside Role as the general form of the same rule: this
+	// endpoint answers "who is the signed-in person", so a token carrying no user
+	// identity has no answer regardless of what its role happens to say. Every
+	// path that mints a *Claims for a real person sets an email (registration
+	// requires one; API-key tokens use name@apikey), so an empty one here means a
+	// machine identity or a malformed token.
+	//
+	// Deliberately placed BEFORE client authentication: this token can never
+	// succeed, so there is no reason to spend a DB round-trip authenticating the
+	// caller first. The metric label is "unauthenticated" because at this point
+	// that is simply true — the client has not been checked yet.
+	if claims.Role == "service" || claims.Email == "" {
+		return h.rejectAppScope(c, "unauthenticated", "not_a_user_token")
+	}
+
+	if h.appSvc == nil {
+		// Misconfiguration, not a caller error — but fail closed rather than
+		// serving an endpoint whose entire purpose is a check we cannot perform.
+		h.logger.Error().Msg("apps/me: application service not configured — cannot enforce app scope")
+		return h.rejectAppScope(c, "unauthenticated", "appsvc_unconfigured")
+	}
+
+	clientID, clientSecret, present, err := clientCredentialsFromHeader(c, appClientAuthHeader)
+	if err != nil || !present {
+		return h.rejectAppScope(c, "unauthenticated", "client_credentials_missing")
+	}
+
+	// Server-authoritative: the application is resolved from its own credentials
+	// against oauth_clients, never from anything the caller asserts about itself.
+	appTenantID, appRowID, err := h.appSvc.AuthenticateClient(c.Request().Context(), clientID, clientSecret)
+	if err != nil {
+		// clientID is deliberately NOT used as a metric label here — see
+		// rejectAppScope. An unauthenticated value is attacker-chosen.
+		return h.rejectAppScope(c, "unauthenticated", "client_auth_failed")
+	}
+
+	// From here the client is authenticated, so clientID is a known, bounded value
+	// and safe to use as a label.
+
+	// Fail closed on an empty app_id. This is the important one: first-party
+	// admin and browser tokens carry an empty app_id by design, and they have no
+	// business on an app-scoped endpoint. Treating empty as "matches anything"
+	// would make this endpoint worse than useless — it would look enforced.
+	if claims.AppID == "" {
+		return h.rejectAppScope(c, clientID, "empty_app_id")
+	}
+
+	if claims.AppID != strconv.FormatInt(appRowID, 10) {
+		// The core case: a token minted for application A presented by
+		// application B in the same tenant.
+		return h.rejectAppScope(c, clientID, "app_mismatch")
+	}
+
+	// Defence in depth. If the app matched, the tenant necessarily matches too —
+	// an application belongs to exactly one tenant. Checking anyway means a future
+	// bug that lets app ids collide across tenants cannot silently become a
+	// cross-tenant hole.
+	if claims.TenantID != strconv.FormatInt(appTenantID, 10) {
+		h.logger.Error().
+			Str("token_tenant", claims.TenantID).
+			Int64("app_tenant", appTenantID).
+			Msg("apps/me: app matched but tenant did not — invariant violated")
+		return h.rejectAppScope(c, clientID, "tenant_mismatch")
+	}
+
+	return c.JSON(http.StatusOK, h.svc.Me(claims))
+}
+
+// rejectAppScope returns the single generic 401 used for every app-scope failure,
+// recording the real reason where only operators can see it.
+//
+// clientLabel must be an AUTHENTICATED client_id, or the literal
+// "unauthenticated". Prometheus labels are unbounded-cardinality by nature, so
+// putting an attacker-supplied client_id in one lets anyone inflate the metric
+// series count at will — a denial of service against our own monitoring. Bounding
+// it to real applications plus one sentinel keeps cardinality at
+// (number of applications + 1).
+func (h *AuthHandler) rejectAppScope(c echo.Context, clientLabel, reason string) error {
+	metrics.AppScopeRejections.WithLabelValues(clientLabel, reason).Inc()
+
+	// Fire-and-forget: an audit failure must never change the auth outcome.
+	if h.audit != nil {
+		h.audit.Log(c.Request().Context(), audit.Event{
+			Action:       "auth.app_scope_rejected",
+			ResourceType: "application",
+			ResourceID:   clientLabel,
+			Status:       audit.StatusFailure,
+			HTTPStatus:   http.StatusUnauthorized,
+			IPAddress:    c.RealIP(),
+			UserAgent:    c.Request().UserAgent(),
+			Metadata:     map[string]any{"reason": reason},
+		})
+	}
+
+	h.logger.Warn().
+		Str("client_id", clientLabel).
+		Str("reason", reason).
+		Msg("apps/me: app scope rejected")
+
+	return c.JSON(http.StatusUnauthorized, map[string]string{
+		"error": "invalid token",
+		"code":  "token_invalid",
+	})
+}
+
 // RefreshRequest is the JSON body for POST /api/v1/auth/refresh.
 type RefreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
@@ -2250,7 +2424,18 @@ const errBodyCredentials = "client_id and client_secret must be sent via the Aut
 // header. Returns ok=false when the header is absent; an error when the header
 // is present but malformed — the two cases get different HTTP responses.
 func clientCredentialsFromBasicAuth(c echo.Context) (clientID, clientSecret string, ok bool, err error) {
-	header := c.Request().Header.Get(echo.HeaderAuthorization)
+	return clientCredentialsFromHeader(c, echo.HeaderAuthorization)
+}
+
+// clientCredentialsFromHeader parses Basic base64(client_id:client_secret) from an
+// arbitrary header.
+//
+// Extracted from clientCredentialsFromBasicAuth so /auth/apps/me can read the same
+// credential format out of X-Client-Authorization — its Authorization header is
+// occupied by the user's Bearer token (issue #96). One parser, two headers: the
+// encoding, the validation, and the error messages cannot drift apart.
+func clientCredentialsFromHeader(c echo.Context, headerName string) (clientID, clientSecret string, ok bool, err error) {
+	header := c.Request().Header.Get(headerName)
 	const prefix = "Basic "
 	if header == "" || !strings.HasPrefix(header, prefix) {
 		return "", "", false, nil
