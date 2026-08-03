@@ -10,6 +10,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // Claims is the full JWT payload for emc-auth tokens.
@@ -90,6 +92,17 @@ type JWTService struct {
 	pool *pgxpool.Pool
 	// issuer is the value placed in the "iss" claim.
 	issuer string
+	// keys supplies per-tenant asymmetric signing keys (issue #95). When nil the
+	// service stays on legacy symmetric HS256; when set, tokens are signed RS256
+	// and verification resolves the key by the token's kid header.
+	keys *SigningKeyService
+	// allowLegacyHS256 keeps the symmetric verification path alive during the
+	// migration window (issue #95, Phases 2–3). Setting it false is the Phase 4
+	// cutover: HS256 is refused outright and both algorithm pins narrow to RS256.
+	//
+	// Only meaningful when keys != nil; without signing keys, refusing HS256 would
+	// leave nothing able to verify anything.
+	allowLegacyHS256 bool
 }
 
 // NewJWTService creates a JWTService backed by the given pool.
@@ -100,11 +113,100 @@ type JWTService struct {
 // unconditionally. Allowing an empty issuer would make that check depend on a
 // runtime value and silently disable it on a misconfigured deploy, letting a
 // token minted by another server that shares the tenant secret pass.
+//
+// Without WithSigningKeys the service signs HS256 with the per-tenant secret —
+// the pre-#95 behaviour, retained so tests and any embedder that has not wired
+// the key service keep working.
 func NewJWTService(pool *pgxpool.Pool, issuer string) (*JWTService, error) {
 	if issuer == "" {
 		return nil, ErrEmptyIssuer
 	}
 	return &JWTService{pool: pool, issuer: issuer}, nil
+}
+
+// WithSigningKeys switches signing to asymmetric RS256 using per-tenant key pairs
+// (issue #95, Phase 2). Verification then accepts RS256 by kid *and* legacy HS256
+// without one, so tokens minted before the switch stay valid until they expire.
+func (s *JWTService) WithSigningKeys(keys *SigningKeyService) *JWTService {
+	s.keys = keys
+	// Accept legacy HS256 by default: switching signing to RS256 must not
+	// invalidate tokens minted moments earlier. WithLegacyHS256(false) performs the
+	// Phase 4 cutover once none are left in circulation.
+	s.allowLegacyHS256 = true
+	return s
+}
+
+// WithLegacyHS256 controls whether symmetric HS256 tokens still verify
+// (issue #95, Phase 4 cutover).
+//
+// Passing false is the one-way step that actually removes the forging risk this
+// issue exists to fix: until HS256 is refused, anyone holding a tenant's
+// jwt_secret can still mint a token for any user in that tenant, no matter how
+// good the asymmetric path is. Phases 2–3 add the capability to verify safely;
+// only this removes the capability to forge.
+//
+// Do not flip it until no live HS256 token remains. The evidence for that is the
+// emc_auth_legacy_hs256_verifications_total counter sitting at zero, not a
+// stopwatch. The longest-lived symmetric token is the 1 h agent token.
+func (s *JWTService) WithLegacyHS256(allow bool) *JWTService {
+	s.allowLegacyHS256 = allow
+	return s
+}
+
+// signingKeyFor returns the tenant's active asymmetric key, or nil when the
+// service is still in legacy HS256 mode.
+func (s *JWTService) signingKeyFor(ctx context.Context, tenantID int64) (*SigningKey, error) {
+	if s.keys == nil {
+		return nil, nil
+	}
+	// Ensure rather than plain lookup: a tenant created before this feature (or by
+	// a fixture / restored backup) would otherwise be unable to issue any token.
+	key, err := s.keys.EnsureTenantKey(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve signing key for tenant %d: %w", tenantID, err)
+	}
+	return key, nil
+}
+
+// signClaims signs claims for a tenant, choosing the algorithm by configuration:
+// RS256 with the tenant's private key when asymmetric signing is wired, HS256
+// with the tenant's shared secret otherwise.
+//
+// Every token this server mints goes through here, so the kid header and the
+// algorithm choice cannot drift between token types — the class of bug where one
+// forgotten Sign* path keeps emitting the old format.
+func (s *JWTService) signClaims(ctx context.Context, tenantID int64, claims jwt.Claims, what string) (string, error) {
+	key, err := s.signingKeyFor(ctx, tenantID)
+	if err != nil {
+		return "", err
+	}
+
+	if key != nil {
+		token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+		token.Header["kid"] = key.KID
+		signed, err := token.SignedString(key.Private)
+		if err != nil {
+			return "", fmt.Errorf("sign %s (RS256): %w", what, err)
+		}
+		return signed, nil
+	}
+
+	// Legacy symmetric fallback, reached only when no signing keys are wired.
+	// No kid is set: a kid must name a key a verifier can actually resolve, and a
+	// symmetric secret appears in no JWKS. Emitting an identifier that looks like a
+	// key ID but resolves to nothing would send verifiers on a lookup that cannot
+	// succeed. Absence is the honest signal, and the verify path already treats a
+	// missing kid as "legacy, use the tenant secret".
+	secret, err := s.tenantSecret(ctx, tenantID)
+	if err != nil {
+		return "", err
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	signed, err := token.SignedString([]byte(secret))
+	if err != nil {
+		return "", fmt.Errorf("sign %s: %w", what, err)
+	}
+	return signed, nil
 }
 
 // tenantSecret fetches the jwt_secret for the given tenant from the DB.
@@ -137,11 +239,6 @@ const ManagementTokenTTL = 15 * time.Minute
 
 // Sign creates and signs a JWT for the given claims using the tenant's HS256 secret.
 func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, c *Claims) (string, error) {
-	secret, err := s.tenantSecret(ctx, tenantID)
-	if err != nil {
-		return "", err
-	}
-
 	now := time.Now().UTC()
 	c.RegisteredClaims = jwt.RegisteredClaims{
 		ID:        uuid.New().String(),
@@ -151,24 +248,13 @@ func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, 
 		IssuedAt:  jwt.NewNumericDate(now),
 		ExpiresAt: jwt.NewNumericDate(now.Add(AccessTokenTTL)),
 	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, c)
-	signed, err := token.SignedString([]byte(secret))
-	if err != nil {
-		return "", fmt.Errorf("sign jwt: %w", err)
-	}
-	return signed, nil
+	return s.signClaims(ctx, tenantID, c, "jwt")
 }
 
 // SignManagement issues a short-lived management JWT from an API key identity.
 // The token carries the API key's permissions so it can call /admin/* endpoints
 // for the key's tenant — equivalent to Auth0's client_credentials management token.
 func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentity) (string, error) {
-	secret, err := s.tenantSecret(ctx, identity.TenantID)
-	if err != nil {
-		return "", err
-	}
-
 	now := time.Now().UTC()
 	claims := &Claims{
 		UserID:      "key:" + strconv.FormatInt(identity.KeyID, 10),
@@ -186,12 +272,7 @@ func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentit
 		},
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := token.SignedString([]byte(secret))
-	if err != nil {
-		return "", fmt.Errorf("sign management token: %w", err)
-	}
-	return signed, nil
+	return s.signClaims(ctx, identity.TenantID, claims, "management token")
 }
 
 // SignAgent creates and signs a JWT for an authenticated agent identity.
@@ -204,11 +285,6 @@ func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentit
 // against user, management, or M2M routes. Wiring agent-token verification is
 // tracked separately from issue #84.
 func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (string, error) {
-	secret, err := s.tenantSecret(ctx, identity.TenantID)
-	if err != nil {
-		return "", err
-	}
-
 	now := time.Now().UTC()
 	claims := &AgentClaims{
 		AgentID:      identity.AgentID.String(),
@@ -224,12 +300,7 @@ func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (st
 		},
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	signed, err := token.SignedString([]byte(secret))
-	if err != nil {
-		return "", fmt.Errorf("sign agent jwt: %w", err)
-	}
-	return signed, nil
+	return s.signClaims(ctx, identity.TenantID, claims, "agent jwt")
 }
 
 // Verify parses and validates a user/session JWT (AudienceAPI only).
@@ -249,9 +320,9 @@ func (s *JWTService) VerifyM2M(ctx context.Context, tokenString string) (*Claims
 }
 
 // VerifyForAudience parses and validates a JWT string, accepting it only if its
-// "aud" claim is one of allowed. It fetches the tenant's secret from the DB
-// using the tenant_id embedded in the unverified claims first pass, then
-// verifies signature, algorithm, issuer, expiry, and audience.
+// "aud" claim is one of allowed. Key resolution happens inside the keyfunc (see
+// below), and signature, algorithm, issuer, expiry, and audience are all
+// verified before the claims are returned.
 //
 // Audience is checked only after the signature is proven, so an attacker cannot
 // use the audience result to learn anything about an unsigned token.
@@ -267,44 +338,48 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 		return nil, ErrNoAudienceAllowed
 	}
 
-	// First pass: extract tenant_id from unverified claims to look up the secret.
-	unverified, _, err := jwt.NewParser().ParseUnverified(tokenString, &Claims{})
-	if err != nil {
-		return nil, fmt.Errorf("parse unverified jwt: %w", err)
+	// Algorithm pins. There are TWO of them — this option and the keyfunc's own
+	// method check below — and both must list an algorithm for it to be accepted.
+	// Phase 2 widens both to {RS256, HS256}; Phase 4 narrows both to RS256 alone.
+	// Relaxing only one would be an alg-substitution hole.
+	methods := []string{jwt.SigningMethodHS256.Alg()}
+	switch {
+	case s.keys != nil && s.allowLegacyHS256:
+		// Migration window (Phases 2–3): sign RS256, verify either.
+		methods = []string{jwt.SigningMethodRS256.Alg(), jwt.SigningMethodHS256.Alg()}
+	case s.keys != nil:
+		// Phase 4 cutover: RS256 only. Narrowed here AND in the keyfunc below.
+		methods = []string{jwt.SigningMethodRS256.Alg()}
 	}
-	unverifiedClaims, ok := unverified.Claims.(*Claims)
-	if !ok || unverifiedClaims.TenantID == "" {
-		return nil, errors.New("jwt missing tenant_id claim")
-	}
-
-	tenantID, err := strconv.ParseInt(unverifiedClaims.TenantID, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid tenant_id in jwt: %w", err)
-	}
-
-	secret, err := s.tenantSecret(ctx, tenantID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Second pass: full parse + signature verification.
-	// WithValidMethods pins the exact algorithm (the keyfunc below only checks
-	// the HMAC family), closing off alg-substitution attempts.
-	//
-	// iss is enforced unconditionally: every token we mint carries
-	// iss = s.issuer, and NewJWTService refuses to build a service without one.
 	opts := []jwt.ParserOption{
 		jwt.WithExpirationRequired(),
-		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithValidMethods(methods),
+		// iss is enforced unconditionally: every token we mint carries
+		// iss = s.issuer, and NewJWTService refuses to build a service without
+		// one, so there is no runtime value that can switch this check off.
 		jwt.WithIssuer(s.issuer),
 	}
 
+	// Key resolution happens inside the keyfunc, which is what closes ME-07.
+	//
+	// Previously this function ran a separate ParseUnverified pass purely to read
+	// tenant_id and fetch a secret, so any unauthenticated caller could drive a DB
+	// query with a garbage token (REVIEW_PR4_PR5.md:435,650 — DB-lookup
+	// amplification). golang-jwt decodes the header and claims BEFORE invoking the
+	// keyfunc, so everything that pass provided is already available here for free.
+	//
+	// For RS256 the key is chosen by the header's kid alone and no claim is
+	// consulted, so the asymmetric path performs no claim-driven DB read at all.
 	claims := &Claims{}
 	parsed, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+		switch t.Method.(type) {
+		case *jwt.SigningMethodRSA:
+			return s.rsaKeyForToken(ctx, t)
+		case *jwt.SigningMethodHMAC:
+			return s.legacyHMACKeyForToken(ctx, t)
+		default:
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
-		return []byte(secret), nil
 	}, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("verify jwt: %w", err)
@@ -320,6 +395,92 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 			[]string(claims.Audience), allowed, ErrUnexpectedAudience)
 	}
 	return claims, nil
+}
+
+// tenantIDFromToken reads the tenant_id claim off a token whose signature is not
+// yet verified.
+//
+// Only the legacy HMAC path may use this. It is the untrusted-input problem in
+// miniature: the value decides which key we fetch, so an attacker picks the
+// lookup. The RS256 path deliberately does not call it — a kid identifies the key
+// directly, which is strictly better and is why ME-07 disappears with HS256.
+func tenantIDFromToken(t *jwt.Token) (int64, error) {
+	claims, ok := t.Claims.(*Claims)
+	if !ok || claims.TenantID == "" {
+		return 0, errors.New("jwt missing tenant_id claim")
+	}
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid tenant_id in jwt: %w", err)
+	}
+	return tenantID, nil
+}
+
+// rsaKeyForToken resolves the public key for an RS256 token from its kid header.
+//
+// The kid lookup is scoped to the token's tenant, which is what makes tenant
+// isolation cryptographic rather than advisory: a token claiming tenant B cannot
+// be verified with tenant A's key even if it names A's kid, because that kid is
+// not in B's key set. This is the property per-tenant keys exist to preserve —
+// with a single server-wide key it would rest entirely on the tenant_id claim.
+func (s *JWTService) rsaKeyForToken(ctx context.Context, t *jwt.Token) (interface{}, error) {
+	if s.keys == nil {
+		// Asymmetric signing is not configured, so an RS256 token cannot be one of
+		// ours. Refuse rather than reach for some other key.
+		return nil, errors.New("RS256 token but asymmetric signing is not configured")
+	}
+	kid, ok := t.Header["kid"].(string)
+	if !ok || kid == "" {
+		// RS256 without a kid is unresolvable: we hold one key pair per tenant per
+		// rotation generation and have no way to choose. Trial-verifying against
+		// every key would turn verification into an oracle.
+		return nil, errors.New("RS256 token has no kid header")
+	}
+	tenantID, err := tenantIDFromToken(t)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := s.keys.PublicKeyByKID(ctx, tenantID, kid)
+	if err != nil {
+		return nil, err
+	}
+	return pub, nil
+}
+
+// legacyHMACKeyForToken resolves the per-tenant shared secret for an HS256 token.
+//
+// This is the pre-#95 path, kept alive through Phases 2–3 so tokens minted before
+// the asymmetric switch keep working until they expire, and removed in Phase 4.
+// Every call increments LegacyHS256Verifications: that counter reaching and
+// staying at zero is the evidence that gates the Phase 4 cutover, replacing the
+// original plan of waiting out AgentTokenTTL and hoping.
+func (s *JWTService) legacyHMACKeyForToken(ctx context.Context, t *jwt.Token) (interface{}, error) {
+	// The second of the two algorithm pins. WithValidMethods above already refuses
+	// HS256 after the cutover; this makes the refusal independent of that option, so
+	// no single change can silently re-open the symmetric path.
+	if s.keys != nil && !s.allowLegacyHS256 {
+		metrics.LegacyHS256Verifications.WithLabelValues("rejected").Inc()
+		return nil, errors.New("HS256 tokens are no longer accepted")
+	}
+
+	reason := "no_kid"
+	if kid, ok := t.Header["kid"].(string); ok && kid != "" {
+		// A symmetric token carrying a kid did not come from a current code path —
+		// nothing we mint sets one on the HS256 branch. Worth distinguishing in the
+		// metric because it means either a very old token or a forged header.
+		reason = "unexpected_kid"
+	}
+	metrics.LegacyHS256Verifications.WithLabelValues(reason).Inc()
+
+	tenantID, err := tenantIDFromToken(t)
+	if err != nil {
+		return nil, err
+	}
+	secret, err := s.tenantSecret(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(secret), nil
 }
 
 // audienceAllowed reports whether aud names exactly one audience and that

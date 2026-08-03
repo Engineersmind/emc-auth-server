@@ -15,6 +15,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // RateLimitConfig holds the parameters for the login rate limiter.
@@ -474,4 +475,75 @@ func loginEmailFromBody(c echo.Context) string {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSpace(payload.Email))
+}
+
+// jwksStore holds the per-IP buckets for the public JWKS endpoint, kept separate
+// from ipStore so JWKS traffic and login traffic cannot exhaust each other's
+// budget — they have wildly different legitimate volumes.
+var jwksStore = &limiterStore{}
+
+// JWKSPerIPRate is the per-minute, per-IP allowance for the published JWKS.
+//
+// Deliberately far above the 5/min the login and OAuth limiters use, because the
+// failure mode here is an OUTAGE for the consumer, not a slowed-down attacker.
+// A tenant running 20 pods behind one NAT gateway presents as a single IP; if
+// their JWKS caches expire together, a 5/min limit returns 429 and every one of
+// those pods becomes unable to verify any token at all. JWKS is a hard dependency
+// for every offline verifier we just told to depend on it, so it must fail open
+// under legitimate load and only clamp genuine abuse.
+//
+// The response is also cheap and cacheable: a few hundred bytes of public key
+// material served from an in-memory cache, with an ETag so well-behaved clients
+// mostly get 304s. There is little to protect and much to break.
+const JWKSPerIPRate = 120
+
+// JWKSRateLimiter rate-limits the public JWKS endpoint per client IP (issue #95).
+//
+// A new public route inherits no throttling at all — every limiter in this server
+// is attached per route and there is no global one — so without this the endpoint
+// would be completely unbounded.
+//
+// Conditional requests that result in 304 Not Modified are NOT counted. A verifier
+// revalidating a cached key set is the behaviour we want to encourage, and charging
+// it against the same budget as a full fetch would punish the well-behaved clients
+// hardest — precisely the ones whose caches expire in lockstep across many pods.
+func JWKSRateLimiter() echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			limiter := jwksStore.getOrCreate("jwks:"+ip, JWKSPerIPRate)
+
+			// Reserve rather than Allow so the token can be handed back below.
+			// A reservation that cannot proceed immediately means the bucket is
+			// empty, which is the same condition Allow() reports as false.
+			res := limiter.ReserveN(time.Now(), 1)
+			if !res.OK() || res.Delay() > 0 {
+				res.Cancel()
+				metrics.RateLimitHits.WithLabelValues("jwks_ip").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many JWKS requests from your IP address",
+					"retry_after": "60",
+				})
+			}
+
+			if err := next(c); err != nil {
+				return err
+			}
+
+			// Give the token back when the response was a revalidation. Deciding
+			// after the handler runs keeps the hot path free of response-shape
+			// guesswork, and Cancel reverses the reservation's effect on the bucket.
+			if c.Response().Status == http.StatusNotModified {
+				res.Cancel()
+			}
+			return nil
+		}
+	}
 }

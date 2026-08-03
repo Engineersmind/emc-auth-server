@@ -175,16 +175,22 @@ type MeResult struct {
 	Permissions []string `json:"permissions"`
 }
 
-// resolveTenant fetches the tenant row by slug. Returns pgx.ErrNoRows if not found.
-func (s *AuthService) resolveTenant(ctx context.Context, slug string) (id int64, jwtSecret string, err error) {
+// resolveTenant fetches the tenant id by slug. Returns pgx.ErrNoRows if not found.
+//
+// It used to also SELECT jwt_secret, which both call sites discarded with `_`
+// (issue #95). Nothing leaked, but pulling signing authority into memory for no
+// reason is exactly the kind of gratuitous handling that turns into a leak the
+// day someone adds a log line or an error message that includes the row.
+// Signing now goes through JWTService, which fetches the key it needs itself.
+func (s *AuthService) resolveTenant(ctx context.Context, slug string) (id int64, err error) {
 	err = s.pool.QueryRow(ctx,
-		`SELECT id, jwt_secret FROM tenants WHERE slug = $1 AND is_active = true`,
+		`SELECT id FROM tenants WHERE slug = $1 AND is_active = true`,
 		slug,
-	).Scan(&id, &jwtSecret)
+	).Scan(&id)
 	if err != nil {
-		return 0, "", fmt.Errorf("resolve tenant %q: %w", slug, err)
+		return 0, fmt.Errorf("resolve tenant %q: %w", slug, err)
 	}
-	return id, jwtSecret, nil
+	return id, nil
 }
 
 // loadPermissions returns the list of permission names for a given user.
@@ -335,7 +341,7 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		// application's own tenant (confused-deputy guard). Same error as a
 		// bad secret so responses don't map app credentials to tenants.
 		if in.TenantSlug != "" {
-			slugTenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
+			slugTenantID, err := s.resolveTenant(ctx, in.TenantSlug)
 			if err != nil || slugTenantID != tid {
 				return nil, ErrInvalidClient
 			}
@@ -343,7 +349,7 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		tenantID, appRowID = tid, &aid
 		appID = strconv.FormatInt(aid, 10)
 	} else {
-		tid, _, err := s.resolveTenant(ctx, in.TenantSlug)
+		tid, err := s.resolveTenant(ctx, in.TenantSlug)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("tenant not found")
