@@ -157,8 +157,17 @@ func TestJWTService_Verify_RejectsCrossTenantKID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Sign(A): %v", err)
 	}
-	parsedA, _, _ := jwt.NewParser().ParseUnverified(tokenA, &auth.Claims{})
-	claims.RegisteredClaims = parsedA.Claims.(*auth.Claims).RegisteredClaims
+	// Reuse tenant A's registered claims (iss/aud/exp) so the forgery differs from
+	// a genuine token in exactly one respect: the tenant_id it claims.
+	parsedA, _, err := jwt.NewParser().ParseUnverified(tokenA, &auth.Claims{})
+	if err != nil {
+		t.Fatalf("ParseUnverified(tokenA): %v", err)
+	}
+	claimsA, ok := parsedA.Claims.(*auth.Claims)
+	if !ok {
+		t.Fatalf("parsed claims are %T, want *auth.Claims", parsedA.Claims)
+	}
+	claims.RegisteredClaims = claimsA.RegisteredClaims
 
 	forged := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 	forged.Header["kid"] = keyA.KID

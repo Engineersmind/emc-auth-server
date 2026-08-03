@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
@@ -261,7 +262,18 @@ func TestJWKS_ThirdPartyVerificationInSeparateProcess(t *testing.T) {
 		t.Fatalf("write script: %v", err)
 	}
 
-	out, err := exec.Command(node, scriptPath, tokenPath, jwksPath).CombinedOutput()
+	// Bounded so a wedged node process fails the test instead of hanging the suite.
+	// 30s is far more than the script needs (it does one RSA verify) but tolerates a
+	// cold Node start on a loaded CI runner.
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// #nosec G204 -- every argument is test-controlled, not caller-controlled:
+	// `node` comes from exec.LookPath, and the three paths are files this test just
+	// wrote inside t.TempDir(). Running the verifier out-of-process is the entire
+	// point — an in-process check would use our own Go code and so could pass even
+	// if the published JWKS were subtly wrong.
+	out, err := exec.CommandContext(execCtx, node, scriptPath, tokenPath, jwksPath).CombinedOutput()
 	if err != nil {
 		t.Fatalf("third-party verification FAILED — a real JWT consumer cannot verify our tokens from the published JWKS.\nnode output:\n%s", out)
 	}
