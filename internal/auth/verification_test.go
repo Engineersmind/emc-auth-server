@@ -29,7 +29,7 @@ func seededVerification(t *testing.T) (*auth.AuthService, *auth.VerificationServ
 
 	mail := &captureMailer{}
 	verifSvc := auth.NewVerificationService(pool, mail, "http://localhost:8080", logger)
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger).WithVerification(verifSvc)
 	return authSvc, verifSvc, mail, tenantID, ctx
 }

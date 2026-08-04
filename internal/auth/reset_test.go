@@ -101,7 +101,7 @@ func TestForgotPassword_UsesTenantSender(t *testing.T) {
 	}
 
 	// A tenant-level user to reset (application_id IS NULL).
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
 	email := uniqueEmail("reset-sender")
 	if _, err := authSvc.Register(ctx, auth.RegisterInput{
@@ -153,7 +153,7 @@ func TestResetPassword_ValidToken(t *testing.T) {
 	svc := auth.NewResetService(pool, m, "http://localhost:8080", logger)
 
 	// Register a user to get a real user_id in this tenant.
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
 	email := uniqueEmail("reset-valid")
 	_, err := authSvc.Register(ctx, auth.RegisterInput{

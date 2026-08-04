@@ -87,12 +87,14 @@ func JWTRenew(
 				})
 			}
 
-			// Verify accepts auth.AudienceAPI only, which is exactly right for the
-			// routes this middleware guards: they are user self-service endpoints
-			// (/me, /otp/*, /change-email) that assume a real user and a browser
-			// session. A service (M2M), management, or agent token is refused here
-			// even though it may be perfectly valid on admin routes (issue #84).
-			claims, err := jwtSvc.Verify(c.Request().Context(), tokenString)
+			// The accepted audience is named here rather than inherited from
+			// Verify(): the routes this middleware guards are user self-service
+			// endpoints (/me, /otp/*, /change-email) that assume a real user and a
+			// browser session, so a service (M2M), management, or agent token is
+			// refused here even though it may be perfectly valid on admin routes
+			// (issue #84). Declaring it at the call site keeps this route group
+			// pinned to AudienceAPI even if Verify() ever widens its own set.
+			claims, err := jwtSvc.VerifyForAudience(c.Request().Context(), tokenString, auth.AudienceAPI)
 			if err == nil {
 				c.Set(userContextKey, claims)
 				return next(c)

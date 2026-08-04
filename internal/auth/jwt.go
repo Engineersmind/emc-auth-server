@@ -80,6 +80,11 @@ var ErrUnexpectedAudience = errors.New("jwt: unexpected audience")
 // every audience, defeating the check.
 var ErrNoAudienceAllowed = errors.New("jwt: no allowed audience specified")
 
+// ErrEmptyIssuer is returned by NewJWTService when no issuer is configured.
+// Verification enforces iss unconditionally, so a service without an issuer
+// could never verify its own tokens — fail at construction, not at request time.
+var ErrEmptyIssuer = errors.New("jwt: issuer must not be empty")
+
 // JWTService signs and verifies JWTs using a per-tenant HS256 secret.
 type JWTService struct {
 	pool *pgxpool.Pool
@@ -89,8 +94,17 @@ type JWTService struct {
 
 // NewJWTService creates a JWTService backed by the given pool.
 // issuer should be the server's base URL, e.g. "https://auth.emc.local".
-func NewJWTService(pool *pgxpool.Pool, issuer string) *JWTService {
-	return &JWTService{pool: pool, issuer: issuer}
+//
+// An empty issuer is rejected at construction rather than tolerated at verify
+// time: every token this server mints carries iss, so verification enforces it
+// unconditionally. Allowing an empty issuer would make that check depend on a
+// runtime value and silently disable it on a misconfigured deploy, letting a
+// token minted by another server that shares the tenant secret pass.
+func NewJWTService(pool *pgxpool.Pool, issuer string) (*JWTService, error) {
+	if issuer == "" {
+		return nil, ErrEmptyIssuer
+	}
+	return &JWTService{pool: pool, issuer: issuer}, nil
 }
 
 // tenantSecret fetches the jwt_secret for the given tenant from the DB.
@@ -276,13 +290,13 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 	// Second pass: full parse + signature verification.
 	// WithValidMethods pins the exact algorithm (the keyfunc below only checks
 	// the HMAC family), closing off alg-substitution attempts.
+	//
+	// iss is enforced unconditionally: every token we mint carries
+	// iss = s.issuer, and NewJWTService refuses to build a service without one.
 	opts := []jwt.ParserOption{
 		jwt.WithExpirationRequired(),
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
-	}
-	// Every token we mint carries iss = s.issuer; enforce it when configured.
-	if s.issuer != "" {
-		opts = append(opts, jwt.WithIssuer(s.issuer))
+		jwt.WithIssuer(s.issuer),
 	}
 
 	claims := &Claims{}

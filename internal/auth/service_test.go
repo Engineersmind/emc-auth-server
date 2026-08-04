@@ -28,7 +28,7 @@ func newServiceForTest(t *testing.T) (*auth.AuthService, func()) {
 		t.Fatalf("RunSeed: %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 	svc = svc.WithTOTP(nil, rdb) // no TOTP for most service tests
 
@@ -356,7 +356,7 @@ func TestIssueServiceToken_SubIsClientID(t *testing.T) {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 
 	_, appID, err := appSvc.AuthenticateClient(ctx, created.ClientID, created.ClientSecret)
@@ -418,7 +418,7 @@ func TestIssueServiceToken_ScopesBecomePermissions(t *testing.T) {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 
 	_, appID, err := appSvc.AuthenticateClient(ctx, created.ClientID, created.ClientSecret)
@@ -463,7 +463,7 @@ func TestIssueServiceToken_AudienceIsM2M(t *testing.T) {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 
 	_, appID, err := appSvc.AuthenticateClient(ctx, created.ClientID, created.ClientSecret)
@@ -514,7 +514,7 @@ func newAppAuthFixture(t *testing.T) (*auth.AuthService, *auth.AppResult, int64,
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
 	return svc, app, tenantID, ctx
 }
@@ -615,7 +615,7 @@ func TestRegister_AssignsApplicationDefaultRole(t *testing.T) {
 		t.Fatalf("assign permission to role: %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
 
 	result, err := svc.Register(ctx, auth.RegisterInput{
@@ -677,7 +677,7 @@ func TestRegister_LegacyDoesNotInheritSystemRole(t *testing.T) {
 	}
 	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 
 	result, err := svc.Register(ctx, auth.RegisterInput{
@@ -816,7 +816,7 @@ func newAppRefreshFixture(t *testing.T) (*auth.AuthService, *auth.JWTService, *a
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
 	return svc, jwtSvc, app, ctx
 }

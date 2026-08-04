@@ -214,7 +214,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	})
 
 	// Build shared services
-	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
+	jwtSvc, jwtErr := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
+	if jwtErr != nil {
+		deps.Logger.Fatal().Err(jwtErr).Msg("JWT service init failed — check JWT_ISSUER")
+	}
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
 
 	// TOTP service — requires encryption key; logs warning in dev if missing.

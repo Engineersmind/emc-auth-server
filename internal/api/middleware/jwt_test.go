@@ -38,7 +38,12 @@ func jwtEnv(t *testing.T) (*auth.JWTService, int64, string) {
 		t.Fatalf("fetch seed user: %v", err)
 	}
 
-	return auth.NewJWTService(pool, "https://auth.emc.local"), tenantID, strconv.FormatInt(userID, 10)
+	jwtSvc, err := auth.NewJWTService(pool, "https://auth.emc.local")
+	if err != nil {
+		t.Fatalf("NewJWTService: %v", err)
+	}
+
+	return jwtSvc, tenantID, strconv.FormatInt(userID, 10)
 }
 
 // runWithBearerOn registers path on a real Echo router, guards it with mw, and
@@ -176,18 +181,32 @@ func TestAudienceRejection_IsCounted(t *testing.T) {
 		t.Fatalf("Sign: %v", err)
 	}
 
-	const route = "/api/v1/audience-metric-probe"
-	counter := metrics.TokenAudienceRejections.WithLabelValues(auth.AudienceM2M, route)
-	before := testutil.ToFloat64(counter)
-
-	status, code := runWithBearerOn(middleware.JWTRequired(jwtSvc, auth.AudienceAPI), route, m2mToken)
-	if status != http.StatusUnauthorized || code != "token_invalid" {
-		t.Fatalf("JWTRequired status = %d code = %q, want 401 token_invalid", status, code)
+	// A wrong-audience token is rejected before either middleware reaches the
+	// refresh-rotation path, so JWTRenew's service/Redis/audit dependencies are
+	// never touched here and can be nil.
+	mws := map[string]echo.MiddlewareFunc{
+		"JWTRequired": middleware.JWTRequired(jwtSvc, auth.AudienceAPI),
+		"JWTRenew": middleware.JWTRenew(
+			jwtSvc, nil, nil, middleware.CookieConfig{}, nil, testhelper.TestLogger(),
+		),
 	}
 
-	after := testutil.ToFloat64(counter)
-	if after != before+1 {
-		t.Errorf("counter = %v, want %v (rejection was not recorded)", after, before+1)
+	for name, mw := range mws {
+		t.Run(name, func(t *testing.T) {
+			route := "/api/v1/audience-metric-probe/" + name
+			counter := metrics.TokenAudienceRejections.WithLabelValues(auth.AudienceM2M, route)
+			before := testutil.ToFloat64(counter)
+
+			status, code := runWithBearerOn(mw, route, m2mToken)
+			if status != http.StatusUnauthorized || code != "token_invalid" {
+				t.Fatalf("status = %d code = %q, want 401 token_invalid", status, code)
+			}
+
+			after := testutil.ToFloat64(counter)
+			if after != before+1 {
+				t.Errorf("counter = %v, want %v (rejection was not recorded)", after, before+1)
+			}
+		})
 	}
 }
 

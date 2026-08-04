@@ -10,11 +10,42 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/store"
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
+
+// newTestJWTService builds a JWTService for tests, failing the test rather than
+// returning an error — NewJWTService only errors on an empty issuer, which is a
+// construction bug, not a case any test other than
+// TestNewJWTService_RejectsEmptyIssuer exercises.
+func newTestJWTService(t *testing.T, pool *pgxpool.Pool, issuer string) *auth.JWTService {
+	t.Helper()
+	svc, err := auth.NewJWTService(pool, issuer)
+	if err != nil {
+		t.Fatalf("NewJWTService(%q): %v", issuer, err)
+	}
+	return svc
+}
+
+// TestNewJWTService_RejectsEmptyIssuer pins that issuer validation happens at
+// construction. Verification enforces iss unconditionally, so a service built
+// without an issuer must not exist at all — otherwise a misconfigured deploy
+// would silently ship a server whose tokens cannot be told apart from those of
+// any other server sharing the tenant secret.
+func TestNewJWTService_RejectsEmptyIssuer(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+
+	svc, err := auth.NewJWTService(pool, "")
+	if !errors.Is(err, auth.ErrEmptyIssuer) {
+		t.Errorf("NewJWTService(\"\") error = %v, want ErrEmptyIssuer", err)
+	}
+	if svc != nil {
+		t.Error("NewJWTService(\"\") returned a service; want nil")
+	}
+}
 
 func TestJWTService_SignAndVerify(t *testing.T) {
 	pool := testhelper.NewTestDB(t)
@@ -35,7 +66,7 @@ func TestJWTService_SignAndVerify(t *testing.T) {
 		t.Fatalf("fetch seed user id: %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 
 	userIDStr := strconv.FormatInt(userID, 10)
 	tenantIDStr := strconv.FormatInt(tenantID, 10)
@@ -119,7 +150,7 @@ func TestJWTService_Verify_ExpiredToken(t *testing.T) {
 		t.Fatalf("sign expired token: %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	_, err = jwtSvc.Verify(ctx, signed)
 	if err == nil {
 		t.Fatal("Verify() expected error for expired token, got nil")
@@ -148,7 +179,7 @@ func TestJWTService_Verify_WrongTenant(t *testing.T) {
 		t.Fatalf("fetch seed user id: %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 
 	// Build a token with a non-existent tenant ID in claims.
 	// Use seed tenant's secret for signing but embed wrong TenantID in claims.
@@ -224,7 +255,7 @@ func audienceFixture(t *testing.T) (ctx context.Context, jwtSvc *auth.JWTService
 		t.Fatalf("fetch jwt_secret: %v", err)
 	}
 
-	return ctx, auth.NewJWTService(pool, testIssuer), tenantID, strconv.FormatInt(userID, 10), jwtSecret
+	return ctx, newTestJWTService(t, pool, testIssuer), tenantID, strconv.FormatInt(userID, 10), jwtSecret
 }
 
 // testIssuer is the issuer every audience-test token is minted with; Verify
