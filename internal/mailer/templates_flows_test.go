@@ -75,6 +75,95 @@ func TestBlockedAccountTemplate_ReasonVariants(t *testing.T) {
 	}
 }
 
+// The admin_activity template exists to answer "who did what, where" at a
+// glance, so the subject alone has to carry the action and the tenant — most
+// recipients will triage it from the inbox list without opening it.
+func TestAdminActivityTemplate_NamesActorActionAndPlace(t *testing.T) {
+	tmpl, ok := BuiltinTemplate(TemplateAdminActivity)
+	if !ok {
+		t.Fatal("no built-in admin_activity template")
+	}
+
+	out, err := tmpl.render(TemplateData{
+		ProductName:  "AuthCore",
+		ActorEmail:   "owner@acme.test",
+		ActorRole:    "owner",
+		ActionLabel:  "rotated a client secret",
+		TenantName:   "Revi",
+		ResourceName: "Web Dashboard",
+		OccurredAt:   "31 Jul 2026, 16:42",
+		IPAddress:    "203.0.113.9",
+		Link:         "https://console.example/dashboard/monitoring?event=1",
+		Count:        1,
+	})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	for _, want := range []string{"owner", "rotated a client secret", "Revi"} {
+		if !strings.Contains(out.Subject, want) {
+			t.Errorf("subject %q missing %q", out.Subject, want)
+		}
+	}
+	for _, want := range []string{"owner@acme.test", "Web Dashboard", "203.0.113.9", "31 Jul 2026, 16:42"} {
+		if !strings.Contains(out.HTML, want) {
+			t.Errorf("HTML missing %q:\n%s", want, out.HTML)
+		}
+		if !strings.Contains(out.Text, want) {
+			t.Errorf("text missing %q:\n%s", want, out.Text)
+		}
+	}
+
+	// A single occurrence must not read as a repeat.
+	if strings.Contains(out.HTML, "times in quick succession") {
+		t.Errorf("Count=1 rendered as a repeat:\n%s", out.HTML)
+	}
+}
+
+// Collapsed bursts have to say so. Reporting four rapid identical actions as one
+// silent event would misrepresent what happened, which is worse than the noise
+// collapsing was meant to avoid.
+func TestAdminActivityTemplate_ReportsCollapsedCount(t *testing.T) {
+	tmpl, _ := BuiltinTemplate(TemplateAdminActivity)
+	out, err := tmpl.render(TemplateData{
+		ProductName: "AuthCore",
+		ActorEmail:  "owner@acme.test",
+		ActionLabel: "changed an administrator's applications",
+		TenantName:  "Revi",
+		Count:       4,
+	})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	for _, body := range []string{out.HTML, out.Text} {
+		if !strings.Contains(body, "4 times in quick succession") {
+			t.Errorf("collapsed count not reported:\n%s", body)
+		}
+	}
+}
+
+// Optional fields are genuinely optional: a tenant-level action names no
+// application, and a background action has no IP. Neither should leave an empty
+// labelled row behind.
+func TestAdminActivityTemplate_OmitsAbsentDetail(t *testing.T) {
+	tmpl, _ := BuiltinTemplate(TemplateAdminActivity)
+	out, err := tmpl.render(TemplateData{
+		ProductName: "AuthCore",
+		ActorEmail:  "owner@acme.test",
+		ActionLabel: "deactivated the tenant",
+		TenantName:  "Revi",
+	})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(out.HTML, "Application") {
+		t.Errorf("empty application row rendered:\n%s", out.HTML)
+	}
+	if strings.Contains(out.HTML, "From</td>") {
+		t.Errorf("empty IP row rendered:\n%s", out.HTML)
+	}
+}
+
 // captureTransport records the message a send produced instead of delivering it.
 type captureTransport struct{ msgs []outMessage }
 

@@ -45,7 +45,7 @@ var (
 // EmailChangeService implements the request/confirm email-change flow.
 type EmailChangeService struct {
 	pool       *pgxpool.Pool
-	notify     emailNotifier
+	notify     EmailNotifier
 	appBaseURL string
 	logger     zerolog.Logger
 }
@@ -54,7 +54,7 @@ type EmailChangeService struct {
 func NewEmailChangeService(pool *pgxpool.Pool, m mailer.Mailer, appBaseURL string, logger zerolog.Logger) *EmailChangeService {
 	return &EmailChangeService{
 		pool:       pool,
-		notify:     emailNotifier{mailer: m, logger: logger},
+		notify:     EmailNotifier{mailer: m, logger: logger},
 		appBaseURL: appBaseURL,
 		logger:     logger,
 	}
@@ -146,7 +146,7 @@ func (s *EmailChangeService) Request(ctx context.Context, tenantID, userID int64
 		AppName:    appNameByRowID(ctx, s.pool, appRowID),
 		TTLMinutes: int(EmailChangeTTL.Minutes()),
 	}
-	sent, err := s.notify.send(ctx, tenantID, appRowID, mailer.TemplateChangeEmail,
+	sent, err := s.notify.Send(ctx, tenantID, appRowID, mailer.TemplateChangeEmail,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
 			return s.notify.mailer.SendChangeEmail(ctx, sender, tmpl, msg)
 		})
@@ -247,7 +247,7 @@ func (s *EmailChangeService) notifyOldAddress(ctx context.Context, tenantID int6
 		Reason:   mailer.EmailChangeApplied,
 		NewEmail: newEmail,
 	}
-	if _, err := s.notify.send(ctx, tenantID, appRowID, mailer.TemplateChangeEmail,
+	if _, err := s.notify.Send(ctx, tenantID, appRowID, mailer.TemplateChangeEmail,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
 			return s.notify.mailer.SendChangeEmail(ctx, sender, tmpl, msg)
 		}); err != nil {

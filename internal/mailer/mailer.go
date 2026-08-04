@@ -166,6 +166,43 @@ type PasswordBreachEmail struct {
 	AppName string
 }
 
+// AdminActivityEmail reports one privileged administrative action to somebody
+// accountable for it — the tier above the actor, or the actor themselves when
+// the action is sensitive enough that a copy is worth having.
+//
+// ActionLabel is the human phrasing ("rotated a client secret"), resolved by the
+// caller from the audit action key; this type carries no action key of its own,
+// so the wording lives in one place rather than being reinvented per template.
+type AdminActivityEmail struct {
+	To           string
+	ActorEmail   string
+	ActorRole    string // "owner", "co-owner" — spelled for humans
+	ActionLabel  string
+	TenantName   string
+	ResourceName string // application or other resource, when the action had one
+	OccurredAt   string // preformatted; templates do no date arithmetic
+	IPAddress    string
+	Link         string // deep link into monitoring for this event
+	// Count is how many identical actions in quick succession this message
+	// stands for. 0 or 1 reads as a single event.
+	Count int
+}
+
+// AccessChangedEmail tells somebody their own administrative access changed.
+//
+// ActionLabel is phrased in the second person ("Your applications were
+// changed"), unlike AdminActivityEmail's third — the reader is the subject here,
+// not an observer.
+type AccessChangedEmail struct {
+	To           string
+	ActionLabel  string
+	ActorEmail   string
+	ActorRole    string
+	TenantName   string
+	ResourceName string // the applications they administer after the change
+	OccurredAt   string
+}
+
 // Mailer sends transactional emails. Each method takes an optional per-scope
 // sender (nil = global) and an optional template override (nil = built-in).
 type Mailer interface {
@@ -179,6 +216,8 @@ type Mailer interface {
 	SendChangeEmail(ctx context.Context, sender *SMTPConfig, tmpl *Template, email ChangeEmailEmail) error
 	SendBlockedAccount(ctx context.Context, sender *SMTPConfig, tmpl *Template, email BlockedAccountEmail) error
 	SendPasswordBreach(ctx context.Context, sender *SMTPConfig, tmpl *Template, email PasswordBreachEmail) error
+	SendAdminActivity(ctx context.Context, sender *SMTPConfig, tmpl *Template, email AdminActivityEmail) error
+	SendAccessChanged(ctx context.Context, sender *SMTPConfig, tmpl *Template, email AccessChangedEmail) error
 	// SendTest renders the given template type with sample data and delivers it to
 	// `to`, so an admin can verify a sender/provider configuration end-to-end.
 	SendTest(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string) error
@@ -392,6 +431,41 @@ func (m *mailerImpl) SendPasswordBreach(ctx context.Context, sender *SMTPConfig,
 	return err
 }
 
+func (m *mailerImpl) SendAdminActivity(ctx context.Context, sender *SMTPConfig, tmpl *Template, e AdminActivityEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateAdminActivity, e.To, TemplateData{
+		ActorEmail:   e.ActorEmail,
+		ActorRole:    e.ActorRole,
+		ActionLabel:  e.ActionLabel,
+		TenantName:   e.TenantName,
+		ResourceName: e.ResourceName,
+		OccurredAt:   e.OccurredAt,
+		IPAddress:    e.IPAddress,
+		Link:         e.Link,
+		Count:        e.Count,
+	})
+	if err == nil {
+		m.logger.Info().
+			Str("to", e.To).Str("actor", e.ActorEmail).Str("action", e.ActionLabel).
+			Msg("admin-activity notification sent")
+	}
+	return err
+}
+
+func (m *mailerImpl) SendAccessChanged(ctx context.Context, sender *SMTPConfig, tmpl *Template, e AccessChangedEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateAccessChanged, e.To, TemplateData{
+		ActionLabel:  e.ActionLabel,
+		ActorEmail:   e.ActorEmail,
+		ActorRole:    e.ActorRole,
+		TenantName:   e.TenantName,
+		ResourceName: e.ResourceName,
+		OccurredAt:   e.OccurredAt,
+	})
+	if err == nil {
+		m.logger.Info().Str("to", e.To).Str("change", e.ActionLabel).Msg("access-changed notice sent")
+	}
+	return err
+}
+
 // sampleTestData is the placeholder variable set used when rendering a test
 // email — every template field gets a representative value so the preview looks
 // realistic regardless of the chosen template type.
@@ -404,6 +478,16 @@ func sampleTestData() TemplateData {
 		Name:        "Alex Doe",
 		InviterName: "Jordan Smith",
 		Reason:      BlockReasonFailedAttempts,
+		// admin_activity fields — without these the test send for that type
+		// renders a message with no subject content and empty rows.
+		ActorEmail:   "jordan.smith@example.com",
+		ActorRole:    "owner",
+		ActionLabel:  "rotated a client secret",
+		TenantName:   "Example Tenant",
+		ResourceName: "Example App",
+		OccurredAt:   "31 Jul 2026, 16:42",
+		IPAddress:    "203.0.113.9",
+		Count:        1,
 	}
 }
 
