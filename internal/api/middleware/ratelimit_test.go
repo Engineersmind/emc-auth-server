@@ -234,3 +234,47 @@ func TestTokenRateLimiter_NoClientIDFallsBackToIPOnly(t *testing.T) {
 		t.Errorf("ipB request after ipA throttled = %d, want 200", code)
 	}
 }
+
+// TestTokenRateLimiter_ReadsClientAuthHeader covers a limiter that was mounted
+// but inert.
+//
+// GET /auth/apps/me carries the user's Bearer token in Authorization and the
+// application's credentials in X-Client-Authorization. The client_id lookup only
+// consulted Authorization, so on that route it always came back empty and every
+// per-application bucket was skipped — the route looked rate limited and was not.
+//
+// Each request uses a distinct IP so the per-IP bucket cannot be what trips;
+// only the shared client_id bucket can produce the 429.
+func TestTokenRateLimiter_ReadsClientAuthHeader(t *testing.T) {
+	middleware.ResetStoresForTest()
+
+	cfg := middleware.DefaultRateLimitConfig() // PerTenantRate: 10 per client_id
+	mw := middleware.TokenRateLimiter(cfg)
+	creds := "Basic " + base64.StdEncoding.EncodeToString([]byte("app_scoped_client:secret"))
+
+	call := func(n int) int {
+		e := echo.New()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/apps/me", nil)
+		req.Header.Set("Authorization", "Bearer some.user.jwt")
+		req.Header.Set(middleware.ClientAuthHeader, creds)
+		// A fresh IP every call: TEST-NET-1 is reserved for documentation.
+		req.RemoteAddr = fmt.Sprintf("192.0.2.%d:12345", n)
+		rec := httptest.NewRecorder()
+		c := e.NewContext(req, rec)
+		handler := mw(func(c echo.Context) error {
+			return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+		})
+		_ = handler(c)
+		return rec.Code
+	}
+
+	for i := 1; i <= cfg.PerTenantRate; i++ {
+		if code := call(i); code != http.StatusOK {
+			t.Fatalf("call %d = %d, want 200 (inside the client budget)", i, code)
+		}
+	}
+	if code := call(cfg.PerTenantRate + 1); code != http.StatusTooManyRequests {
+		t.Errorf("call %d = %d, want 429 — the client_id in %s was never read, so the bucket never filled",
+			cfg.PerTenantRate+1, code, middleware.ClientAuthHeader)
+	}
+}

@@ -438,7 +438,34 @@ func otpSessionTokenFromBody(c echo.Context) string {
 // the handler contract — body-sent credentials are rejected by the handler and
 // never key a bucket. Returns "" when no well-formed header is present.
 func tokenClientID(c echo.Context) string {
-	header := c.Request().Header.Get(echo.HeaderAuthorization)
+	if id := basicClientID(c.Request().Header.Get(echo.HeaderAuthorization)); id != "" {
+		return id
+	}
+	// Routes that need BOTH a user Bearer token and application credentials
+	// cannot put the latter in Authorization, so they carry it here (see
+	// ClientAuthHeader). Without this fallback the per-application limiters read
+	// an empty client_id on those routes and pass every request straight through
+	// — the limiter is mounted but inert.
+	return basicClientID(c.Request().Header.Get(ClientAuthHeader))
+}
+
+// ClientAuthHeader carries the calling application's credentials on endpoints
+// that ALSO require a user Bearer token (currently GET /auth/apps/me).
+//
+// Why a second header: one header cannot hold two credentials, and Bearer has to
+// stay in Authorization because that is where every HTTP client, proxy, and JWT
+// library expects it. The value format is identical to the Authorization: Basic
+// used by every other /apps/* route, so this adds a header name, not a third
+// credential scheme.
+//
+// Defined here rather than in the handler package because the rate limiters read
+// it too, and a limiter looking at a different header than the parser is exactly
+// how the limiter ends up doing nothing.
+const ClientAuthHeader = "X-Client-Authorization"
+
+// basicClientID extracts the client_id from a "Basic base64(id:secret)" header
+// value, or "" if the value is absent, not Basic, or malformed.
+func basicClientID(header string) string {
 	if !strings.HasPrefix(header, "Basic ") {
 		return ""
 	}

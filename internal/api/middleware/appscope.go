@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -35,6 +36,28 @@ func (w *bufferedResponseWriter) WriteHeader(code int) {
 	}
 }
 
+// Flush satisfies http.Flusher. Nothing to do — the whole point of this writer
+// is that nothing leaves it until the wrapping middleware decides what the
+// response is. It exists so a middleware that type-asserts the writer to
+// http.Flusher (Echo's own gzip middleware does) finds the interface it expects
+// rather than silently degrading.
+func (w *bufferedResponseWriter) Flush() {}
+
+// isUnauthorized reports whether this exchange ended in a 401, whether the
+// downstream wrote the response itself or reported it as an error.
+//
+// Both forms occur on this route: jwtRenew writes its own 401 body, while a
+// middleware failing early returns echo.NewHTTPError(401) and lets Echo render
+// it. Normalization has to cover both, or the error form becomes the oracle the
+// written form was closed against.
+func isUnauthorized(err error, bufferedStatus int) bool {
+	if bufferedStatus == http.StatusUnauthorized {
+		return true
+	}
+	var httpErr *echo.HTTPError
+	return errors.As(err, &httpErr) && httpErr.Code == http.StatusUnauthorized
+}
+
 // NormalizeAppScopeUnauthorized wraps jwtRenew (and anything else in the
 // chain) so that every 401 it produces comes back as the single generic
 // {"code":"token_invalid"} body AppMe itself uses for every rejection reason.
@@ -52,21 +75,41 @@ func (w *bufferedResponseWriter) WriteHeader(code int) {
 // wraps every downstream rejection, not just the ones after the handler runs.
 func NormalizeAppScopeUnauthorized(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		realWriter := c.Response().Writer
+		resp := c.Response()
+		realWriter := resp.Writer
 		buf := newBufferedResponseWriter()
-		c.Response().Writer = buf
+		resp.Writer = buf
 
 		err := next(c)
 
-		c.Response().Writer = realWriter
+		resp.Writer = realWriter
 
-		if buf.statusCode == http.StatusUnauthorized {
+		// Everything downstream wrote went into the buffer, so nothing has
+		// actually reached the client — but Echo's Response still believes it is
+		// committed and will refuse to write a status onto it. Clearing the flag
+		// is what makes the rewrite below take effect; without it Echo skipped the
+		// 401 header and emitted only the body, so every normalized rejection went
+		// out as HTTP 200 carrying a token_invalid payload.
+		wasCommitted := resp.Committed
+		resp.Committed = false
+		resp.Size = 0
+
+		if isUnauthorized(err, buf.statusCode) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{
 				"error": "invalid token",
 				"code":  "token_invalid",
 			})
 		}
 
+		// Any other error: discard the buffer and let Echo's error handler own the
+		// response. Replaying the buffer first would commit a header — a buffered
+		// status of 0 defaults to 200 — and the error handler would then write a
+		// second body onto it, so a 5xx reached the client as a garbled 200.
+		if err != nil {
+			return err
+		}
+
+		resp.Committed = wasCommitted
 		status := buf.statusCode
 		if status == 0 {
 			status = http.StatusOK
@@ -77,11 +120,15 @@ func NormalizeAppScopeUnauthorized(next echo.HandlerFunc) echo.HandlerFunc {
 			}
 		}
 		realWriter.WriteHeader(status)
+		resp.Status = status
+		resp.Committed = true
 		if buf.body.Len() > 0 {
-			if _, werr := realWriter.Write(buf.body.Bytes()); werr != nil {
+			n, werr := realWriter.Write(buf.body.Bytes())
+			resp.Size = int64(n)
+			if werr != nil {
 				return werr
 			}
 		}
-		return err
+		return nil
 	}
 }

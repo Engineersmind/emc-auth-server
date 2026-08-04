@@ -925,7 +925,11 @@ func (h *AuthHandler) Me(c echo.Context) error {
 // identical to the Authorization: Basic used by every other /apps/* route
 // (base64(client_id:client_secret)) and is parsed by the same code, so this adds
 // a header name, not a third credential scheme.
-const appClientAuthHeader = "X-Client-Authorization"
+//
+// Aliased from the middleware package rather than redeclared: the per-application
+// rate limiters read the same header to find the client_id, and a limiter reading
+// a different header than this parser is a limiter that does nothing.
+const appClientAuthHeader = mw.ClientAuthHeader
 
 // AppMe handles GET /api/v1/auth/apps/me (issue #96).
 //
@@ -964,6 +968,7 @@ const appClientAuthHeader = "X-Client-Authorization"
 // @Summary      Current user, scoped to the calling application
 // @Description  Same payload as GET /auth/me, but additionally proves the token was issued FOR the calling application. Requires a user Bearer token in Authorization AND the application's credentials in X-Client-Authorization. Rejects app-scoped tokens belonging to a different application in the same tenant, and rejects first-party tokens (empty app_id).
 // @Tags         AUTH
+// @Security     BearerAuth
 // @Produce      json
 // @Param        Authorization          header  string  true  "Bearer <app-scoped end-user access token>"
 // @Param        X-Client-Authorization  header  string  true  "Basic base64(client_id:client_secret)"
@@ -1079,7 +1084,19 @@ func (h *AuthHandler) rejectAppScope(c echo.Context, clientLabel, reason string)
 		})
 	}
 
-	h.logger.Warn().
+	// Level by what the reason actually indicates, not by the fact that a request
+	// was refused. Most rejections here are ordinary bad-request traffic — a
+	// client that forgot a header, a caller whose session lapsed — and logging
+	// those at Warn buries the ones that matter under volume an unauthenticated
+	// caller controls. Warn stays for the reasons that describe a token being
+	// used somewhere it was not issued for; Prometheus counts every reason
+	// regardless, so nothing stops being observable.
+	event := h.logger.Warn()
+	switch reason {
+	case "client_credentials_missing", "missing_claims", "not_a_user_token", "client_auth_failed":
+		event = h.logger.Debug()
+	}
+	event.
 		Str("client_id", clientLabel).
 		Str("reason", reason).
 		Msg("apps/me: app scope rejected")

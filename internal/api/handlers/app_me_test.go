@@ -39,6 +39,14 @@ type appMeFixture struct {
 	appA     *auth.AppResult // the "correct" application
 	appB     *auth.AppResult // a sibling application in the same tenant
 	otherApp *auth.AppResult // an application in a DIFFERENT tenant
+
+	// userID/userEmail identify a real seeded row rather than a made-up id.
+	// Me() reads only the claims today, but the moment it fetches the user (to
+	// pick up a profile change, or to confirm the account still exists) claims
+	// pointing at no row would make the 200-path tests assert on empty data
+	// instead of failing honestly.
+	userID    string
+	userEmail string
 }
 
 func newAppMeFixture(t *testing.T) *appMeFixture {
@@ -70,6 +78,18 @@ func newAppMeFixture(t *testing.T) *appMeFixture {
 		t.Fatalf("insert second tenant: %v", err)
 	}
 
+	// A real user in the seed tenant for the 200 path. The rejection cases never
+	// get far enough to need one.
+	const userEmail = "app-me-user@test.example.com"
+	var userID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO users (tenant_id, email, is_active, email_verified)
+		VALUES ($1, $2, true, true)
+		RETURNING id`, tenantID, userEmail,
+	).Scan(&userID); err != nil {
+		t.Fatalf("insert app-me user: %v", err)
+	}
+
 	appSvc := auth.NewApplicationService(pool, logger)
 	mk := func(tid int64, name string) *auth.AppResult {
 		app, err := appSvc.CreateApplication(ctx, tid, name, "web", nil)
@@ -87,17 +107,33 @@ func newAppMeFixture(t *testing.T) *appMeFixture {
 		WithJWT(jwtSvc)
 
 	return &appMeFixture{
-		handler:  h,
-		tenantID: tenantID,
-		appA:     mk(tenantID, "pm-app-a"),
-		appB:     mk(tenantID, "pm-app-b"),
-		otherApp: mk(otherTenantID, "pm-app-other-tenant"),
+		handler:   h,
+		tenantID:  tenantID,
+		userID:    strconv.FormatInt(userID, 10),
+		userEmail: userEmail,
+		appA:      mk(tenantID, "pm-app-a"),
+		appB:      mk(tenantID, "pm-app-b"),
+		otherApp:  mk(otherTenantID, "pm-app-other-tenant"),
 	}
 }
 
 // claimsFor builds the claim set jwtRenew would have placed in the context for a
-// token minted through the given application.
-func claimsFor(tenantID int64, appID string) *auth.Claims {
+// token minted through the given application, naming the fixture's real seeded
+// user so a 200 response describes a row that actually exists.
+func (f *appMeFixture) claimsFor(appID string) *auth.Claims {
+	return &auth.Claims{
+		UserID:      f.userID,
+		TenantID:    strconv.FormatInt(f.tenantID, 10),
+		AppID:       appID,
+		Email:       f.userEmail,
+		Role:        "user",
+		Permissions: []string{},
+	}
+}
+
+// syntheticClaims is for the cases that never reach a user lookup — they are
+// rejected on configuration or credentials first, so no seeded row is needed.
+func syntheticClaims(tenantID int64, appID string) *auth.Claims {
 	return &auth.Claims{
 		UserID:      "42",
 		TenantID:    strconv.FormatInt(tenantID, 10),
@@ -138,7 +174,7 @@ func TestAppMe_AppScopeEnforcement(t *testing.T) {
 	appAID := f.appA.ID
 
 	t.Run("correct application and matching token → 200", func(t *testing.T) {
-		rec := f.callAppMe(t, claimsFor(f.tenantID, appAID), f.appA.ClientID, f.appA.ClientSecret)
+		rec := f.callAppMe(t, f.claimsFor(appAID), f.appA.ClientID, f.appA.ClientSecret)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200. body=%s", rec.Code, rec.Body.String())
 		}
@@ -146,22 +182,25 @@ func TestAppMe_AppScopeEnforcement(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		if body["email"] != "user@example.com" {
-			t.Errorf("email = %v, want the /auth/me payload shape", body["email"])
+		if body["email"] != f.userEmail {
+			t.Errorf("email = %v, want %q — the /auth/me payload for the seeded user", body["email"], f.userEmail)
+		}
+		if body["user_id"] != f.userID {
+			t.Errorf("user_id = %v, want %q", body["user_id"], f.userID)
 		}
 	})
 
 	// THE core case. Two applications, one tenant, one token. Before #96 this
 	// returned 200 — the server had nothing to compare app_id against.
 	t.Run("token from a DIFFERENT app in the SAME tenant → 401", func(t *testing.T) {
-		rec := f.callAppMe(t, claimsFor(f.tenantID, appAID), f.appB.ClientID, f.appB.ClientSecret)
+		rec := f.callAppMe(t, f.claimsFor(appAID), f.appB.ClientID, f.appB.ClientSecret)
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401 — application A's token was accepted by application B", rec.Code)
 		}
 	})
 
 	t.Run("token from a different tenant → 401", func(t *testing.T) {
-		rec := f.callAppMe(t, claimsFor(f.tenantID, appAID), f.otherApp.ClientID, f.otherApp.ClientSecret)
+		rec := f.callAppMe(t, f.claimsFor(appAID), f.otherApp.ClientID, f.otherApp.ClientSecret)
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", rec.Code)
 		}
@@ -171,28 +210,28 @@ func TestAppMe_AppScopeEnforcement(t *testing.T) {
 	// empty were treated as "matches anything", this endpoint would look enforced
 	// while accepting exactly the tokens it must refuse.
 	t.Run("empty app_id (first-party admin token) → 401", func(t *testing.T) {
-		rec := f.callAppMe(t, claimsFor(f.tenantID, ""), f.appA.ClientID, f.appA.ClientSecret)
+		rec := f.callAppMe(t, f.claimsFor(""), f.appA.ClientID, f.appA.ClientSecret)
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401 — a first-party token must not pass an app-scoped endpoint", rec.Code)
 		}
 	})
 
 	t.Run("wrong client secret → 401", func(t *testing.T) {
-		rec := f.callAppMe(t, claimsFor(f.tenantID, appAID), f.appA.ClientID, "not-the-secret")
+		rec := f.callAppMe(t, f.claimsFor(appAID), f.appA.ClientID, "not-the-secret")
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", rec.Code)
 		}
 	})
 
 	t.Run("unknown client_id → 401", func(t *testing.T) {
-		rec := f.callAppMe(t, claimsFor(f.tenantID, appAID), "app_does_not_exist", "whatever")
+		rec := f.callAppMe(t, f.claimsFor(appAID), "app_does_not_exist", "whatever")
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", rec.Code)
 		}
 	})
 
 	t.Run("missing client credentials → 401", func(t *testing.T) {
-		rec := f.callAppMe(t, claimsFor(f.tenantID, appAID), "", "")
+		rec := f.callAppMe(t, f.claimsFor(appAID), "", "")
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", rec.Code)
 		}
@@ -222,45 +261,35 @@ func TestAppMe_RejectionsAreIndistinguishable(t *testing.T) {
 		claims                 *auth.Claims
 		clientID, clientSecret string
 	}{
-		{"wrong app", claimsFor(f.tenantID, appAID), f.appB.ClientID, f.appB.ClientSecret},
-		{"wrong secret", claimsFor(f.tenantID, appAID), f.appA.ClientID, "wrong"},
-		{"unknown client", claimsFor(f.tenantID, appAID), "app_nope", "wrong"},
-		{"empty app_id", claimsFor(f.tenantID, ""), f.appA.ClientID, f.appA.ClientSecret},
-		{"cross tenant", claimsFor(f.tenantID, appAID), f.otherApp.ClientID, f.otherApp.ClientSecret},
-		{"no credentials", claimsFor(f.tenantID, appAID), "", ""},
+		{"wrong app", f.claimsFor(appAID), f.appB.ClientID, f.appB.ClientSecret},
+		{"wrong secret", f.claimsFor(appAID), f.appA.ClientID, "wrong"},
+		{"unknown client", f.claimsFor(appAID), "app_nope", "wrong"},
+		{"empty app_id", f.claimsFor(""), f.appA.ClientID, f.appA.ClientSecret},
+		{"cross tenant", f.claimsFor(appAID), f.otherApp.ClientID, f.otherApp.ClientSecret},
+		{"no credentials", f.claimsFor(appAID), "", ""},
 	}
 
-	var reference string
-	for i, tc := range cases {
+	// A literal, not the first case's own output. Deriving the reference at
+	// runtime makes the test self-consistent rather than correct: if the first
+	// case ever started returning something distinguishable, every later case
+	// would be compared against that new value and the suite would keep
+	// reporting the rejections as identical while the oracle was wide open.
+	//
+	// Echo serialises map[string]string with sorted keys, so this byte sequence
+	// is stable.
+	const reference = "{\"code\":\"token_invalid\",\"error\":\"invalid token\"}\n"
+
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := f.callAppMe(t, tc.claims, tc.clientID, tc.clientSecret)
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("status = %d, want 401", rec.Code)
 			}
-			body := rec.Body.String()
-			if i == 0 {
-				reference = body
-				// Confirm the shape is the documented one, not just self-consistent.
-				if !jsonHasCode(t, body, "token_invalid") {
-					t.Errorf(`body = %s, want code "token_invalid"`, body)
-				}
-				return
-			}
-			if body != reference {
-				t.Errorf("rejection body differs between reasons — this is an oracle.\n got: %s\nwant: %s", body, reference)
+			if body := rec.Body.String(); body != reference {
+				t.Errorf("rejection body differs from the documented generic response — this is an oracle.\n got: %q\nwant: %q", body, reference)
 			}
 		})
 	}
-}
-
-func jsonHasCode(t *testing.T, body, want string) bool {
-	t.Helper()
-
-	var parsed map[string]string
-	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
-		t.Fatalf("unmarshal %q: %v", body, err)
-	}
-	return parsed["code"] == want
 }
 
 // TestAppMe_UnconfiguredAppServiceFailsClosed covers the misconfiguration path.
@@ -274,7 +303,7 @@ func TestAppMe_UnconfiguredAppServiceFailsClosed(t *testing.T) {
 	req.Header.Set(appClientAuthHeader, "Basic "+base64.StdEncoding.EncodeToString([]byte("app_x:secret")))
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
-	c.Set("user", claimsFor(1, "1"))
+	c.Set("user", syntheticClaims(1, "1"))
 
 	if err := h.AppMe(c); err != nil {
 		t.Fatalf("AppMe transport error: %v", err)
@@ -367,7 +396,7 @@ func TestAppMe_RejectsMachineTokens(t *testing.T) {
 	// Email is the general form of the same check: any token with no user
 	// identity behind it, whatever its role happens to say.
 	t.Run("token with empty email → 401", func(t *testing.T) {
-		noEmail := claimsFor(f.tenantID, f.appA.ID)
+		noEmail := f.claimsFor(f.appA.ID)
 		noEmail.Email = ""
 		rec := f.callAppMe(t, noEmail, f.appA.ClientID, f.appA.ClientSecret)
 		if rec.Code != http.StatusUnauthorized {
