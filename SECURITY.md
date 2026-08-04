@@ -51,7 +51,7 @@ If you cannot use GitHub advisories, email the maintainer listed in CODEOWNERS w
 | Control | Implementation |
 |---------|---------------|
 | Password hashing | bcrypt cost 12 |
-| JWT signing | HS256, per-tenant secret, 1h TTL |
+| JWT signing | RS256, per-tenant RSA-2048 key pair, private key AES-256-GCM encrypted at rest, 15-min access TTL. Public keys published at `/tenants/{slug}/.well-known/jwks.json` (ADR-16). |
 | Refresh tokens | Atomic rotation, replay returns 401 |
 | TOTP secrets | AES-256-GCM encrypted at rest |
 | API keys | SHA-256 hash stored, raw shown once |

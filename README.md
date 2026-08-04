@@ -11,7 +11,7 @@ Built with Go + Echo + PostgreSQL + Redis. Ships as a **single binary** that boo
 | Capability | Details |
 |------------|---------|
 | Multi-tenant | Tenant-scoped users, roles, permissions, and JWT secrets |
-| JWT auth | HS256, per-tenant secret, 1-hour access + 30-day refresh |
+| JWT auth | RS256, per-tenant RSA key pair + published JWKS, 15-min access + 30-day refresh (ADR-16) |
 | Refresh rotation | Atomic — old token revoked before new one issued; replay returns 401 |
 | Password reset | SHA-256 hashed token, 15-min TTL, revokes all sessions on use |
 | Rate limiting | 5 req/min/IP + 10 req/min/tenant on login |
@@ -41,7 +41,7 @@ Built with Go + Echo + PostgreSQL + Redis. Ships as a **single binary** that boo
 | Logging | Zerolog (structured JSON) |
 | API docs | Swaggo / echo-swagger |
 | Passwords | bcrypt cost 12 |
-| Tokens | JWT HS256 (golang-jwt/jwt v5) |
+| Tokens | JWT RS256, per-tenant keys, JWKS published (golang-jwt/jwt v5 + go-jose/v4) |
 | TOTP | github.com/pquerna/otp |
 | Metrics | github.com/prometheus/client_golang v1.19 |
 
@@ -72,7 +72,7 @@ Client
 │              │   /auth/*  /health  │   │ /admin/*  /auth/me  │  │
 │              │                     │   │                     │  │
 │              │  Rate Limiter       │   │  JWT Middleware      │  │
-│              │  (login: 5/min/IP   │   │  (verify HS256,     │  │
+│              │  (login: 5/min/IP   │   │  (verify RS256,     │  │
 │              │   10/min/tenant)    │   │   extract claims)   │  │
 │              │                     │   │                     │  │
 │              │  Tenant Resolution  │   │  Permission Guard   │  │
@@ -103,7 +103,7 @@ POST /auth/login
   ├─► Resolve tenant (X-Tenant-Slug → tenants table)
   ├─► Verify bcrypt hash (cost 12)
   ├─► Load user roles + permissions from DB
-  ├─► Sign JWT (HS256, per-tenant secret, 1-hour TTL)
+  ├─► Sign JWT (RS256, tenant's private key, kid header, 15-min TTL)
   │     Payload: { user_id, tenant_id, email, role, permissions[], iss, aud, exp }
   ├─► Generate refresh token (32-byte crypto/rand → SHA-256 hash stored in Redis)
   └─► Return { access_token, refresh_token, token_type, expires_in }
@@ -486,7 +486,7 @@ ORDER BY created_at DESC;
 
 | # | Decision | Choice | Rationale |
 |---|----------|--------|-----------|
-| ADR-01 | JWT signing algorithm | HS256 per-tenant secret | Simpler key management for self-hosted deployments; RS256 (asymmetric) deferred to v2 when external verifiers need public keys |
+| ADR-01 | JWT signing algorithm | HS256 per-tenant secret | Simpler key management for self-hosted deployments; RS256 (asymmetric) deferred to v2 when external verifiers need public keys — **SUPERSEDED BY ADR-16** |
 | ADR-02 | Multi-tenancy strategy | `tenant_id` column (row-level) | Schema-per-tenant adds migration complexity and doesn't scale past ~100 tenants; row-level isolation is simpler and proven at scale |
 | ADR-03 | Migration tool | Goose v3 (embedded SQL) | Plain SQL files version-controlled alongside code; embedded via `embed.FS` — zero external tooling at runtime |
 | ADR-04 | ORM vs raw SQL | Raw SQL (pgx v5) | Auth queries are security-critical and latency-sensitive; full control over parameterization, no magic, no N+1 surprises |
@@ -501,6 +501,28 @@ ORDER BY created_at DESC;
 | ADR-13 | TOTP encryption | AES-256-GCM with per-server key | Secret rotation deferred; dev uses zero-key with warning |
 | ADR-14 | Cookie vs Bearer | Both supported | `JWTRequired` checks Bearer first, falls back to HttpOnly cookie |
 | ADR-15 | Metrics auth | `GET /metrics` unauthenticated | Intended for Prometheus; restrict via network policy in production |
+| ADR-16 | JWT signing algorithm (supersedes ADR-01) | RS256, per-tenant RSA key pairs, published JWKS | ADR-01's own trigger — "when external verifiers need public keys" — was met. See below. |
+
+### ADR-16 — Asymmetric JWT signing (supersedes ADR-01)
+
+**Status:** accepted, issue #95. ADR-01 is preserved above unchanged; this record replaces it.
+
+**Context.** ADR-01 chose HS256 and deferred RS256 "to v2 when external verifiers need public keys." Two things met that trigger: tenant-owned resource servers now need to verify EMC tokens, and `FRONTEND_M2M_PLAN.md` had begun telling consumers to hold a tenant's secret and verify locally.
+
+HS256 is symmetric, so **the capability to verify and the capability to forge are the same capability.** A tenant could not be given the ability to check a token without also being given the ability to mint one — including a `super_admin` token for that entire tenant. A compromised consuming app was therefore a full tenant takeover, not a single-account breach.
+
+**Decision.** RS256 with **one RSA-2048 key pair per tenant**. The private key never leaves the server (AES-256-GCM encrypted at rest under `JWT_SIGNING_KEY_ENCRYPTION_KEY`); the public half is published unauthenticated at `{APP_BASE_URL}/tenants/{slug}/.well-known/jwks.json`. Tokens carry a `kid` header set to the RFC 7638 thumbprint of the signing key.
+
+**Why per-tenant and not one server-wide key.** A single key pair would have been simpler and is what standard single-issuer OIDC assumes, but it would have *lost* the one good property HS256 had: a tenant's key cannot verify another tenant's tokens. With a shared key, a genuine signature no longer proves which tenant a token belongs to, so every integrator would have to remember `claims.tenant_id === MY_TENANT` — an opt-in check that nothing compels and that is the same failure shape as the unenforced `app_id` claim. Per-tenant keys make cross-tenant isolation cryptographic. Keycloak (per realm), Auth0 (per tenant domain), and Cognito (per user pool) all do this.
+
+**Consequences.**
+- Tenants verify offline with any standard JWT library and have zero forging ability.
+- Rotation is zero-downtime and possible at all: `POST /api/v1/signing-keys/prepare` publishes the next key, `/complete` activates it, and the retired public key stays published for `RetiredKeyGrace` (3 h > the 1 h `AgentTokenTTL`). Previously there was no rotation mechanism — the documented remedy was a manual DB edit.
+- Access tokens grow from roughly 450 to 750 characters (RS256 signature ~342 chars vs ~43).
+- `JWT_ISSUER` is **not** derived from `APP_BASE_URL`; the JWKS URL is given to consumers explicitly. Changing `iss` would break every consumer pinning it, so the two remain separate and a host mismatch is warned about at startup.
+- Legacy HS256 verification is still accepted (tokens with no `kid`) so the change invalidates no live session. **The forging risk is only actually removed at the Phase 4 cutover**, when HS256 is rejected and `tenants.jwt_secret` is dropped. `emc_auth_legacy_hs256_verifications_total` reaching and staying at zero is the evidence that gates it.
+
+**Rejected:** ES256 (smaller/faster, less universal library support — revisit via the `algorithm` column, not a migration); keeping HS256 and distributing the secret (the status quo being replaced); encrypting `tenants.jwt_secret` at rest as an interim step (the secret must still be handed over in plaintext to be usable, and the column is dropped in Phase 4).
 
 ---
 
@@ -513,7 +535,7 @@ ORDER BY created_at DESC;
 | Password storage | bcrypt cost 12 — plaintext never persisted |
 | SQL injection | Parameterized queries via pgx v5 positional args (`$1, $2, ...`) throughout |
 | Token storage | Refresh and reset tokens stored as SHA-256 hashes — raw values never in DB |
-| JWT integrity | HS256 signed with per-tenant secret; signature verified on every protected request |
+| JWT integrity | RS256 signed with the tenant's private key (never leaves the server); verified on every protected request by `kid` against the tenant's public key. Legacy HS256 tokens still verify until the Phase 4 cutover. |
 | Session revocation | Logout and password reset atomically delete all Redis session keys for the user |
 | Rate limiting | 5 req/min/IP + 10 req/min/tenant on `/auth/login` — returns `429 Too Many Requests` |
 | Security headers | HSTS (1 year), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin` |

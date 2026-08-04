@@ -479,3 +479,126 @@ func TestJWTService_Verify_RejectsWrongIssuer(t *testing.T) {
 		t.Errorf("Verify(wrong issuer) error = %v, want ErrTokenInvalidIssuer", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Issue #95: "kid" (key ID) header and the legacy symmetric verify path.
+//
+// Signing itself is RS256 and is covered in signingkey_test.go. What is tested
+// here is the LEGACY path — a JWTService with no signing keys wired, which is what
+// every token minted before this change came from. Those tokens carry no kid, and
+// they must keep verifying until the Phase 4 cutover, or deploying RS256 would log
+// out every active session.
+// ---------------------------------------------------------------------------
+
+// kidOf returns the "kid" header of a signed token, failing the test if absent.
+func kidOf(t *testing.T, token string) string {
+	t.Helper()
+
+	raw, ok := mustParseHeader(t, token)["kid"]
+	if !ok {
+		t.Fatal("token has no kid header, want one")
+	}
+	kid, ok := raw.(string)
+	if !ok {
+		t.Fatalf("kid header = %T, want string", raw)
+	}
+	return kid
+}
+
+// TestJWTService_LegacySigningEmitsNoKID pins down a deliberate decision.
+//
+// An earlier revision emitted a kid derived from the HS256 secret on symmetric
+// tokens. That was dropped: a kid names a key a verifier is expected to resolve,
+// and a symmetric secret appears in no JWKS, so such a value would send a verifier
+// on a lookup that can never succeed. Absence is the honest signal, and the verify
+// path already reads "no kid" as "legacy, use the tenant secret".
+func TestJWTService_LegacySigningEmitsNoKID(t *testing.T) {
+	ctx, jwtSvc, tenantID, userIDStr, _ := audienceFixture(t)
+
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	if err != nil {
+		t.Fatalf("Sign() error = %v", err)
+	}
+	if kid, present := mustParseHeader(t, token)["kid"]; present {
+		t.Errorf("legacy HS256 token carries kid %v — it resolves to no published key", kid)
+	}
+	if alg := mustParseHeader(t, token)["alg"]; alg != "HS256" {
+		t.Errorf("alg = %v, want HS256 for a service with no signing keys", alg)
+	}
+}
+
+// TestJWTService_Verify_KIDIsBackwardCompatible is the no-regression guarantee for
+// the migration: tokens minted before asymmetric signing carry no kid and must keep
+// verifying, and a kid must never be able to steer verification on its own — it is
+// an unauthenticated header.
+func TestJWTService_Verify_KIDIsBackwardCompatible(t *testing.T) {
+	ctx, jwtSvc, tenantID, userIDStr, jwtSecret := audienceFixture(t)
+
+	now := time.Now().UTC()
+	registered := jwt.RegisteredClaims{
+		ID:        uuid.New().String(),
+		Issuer:    testIssuer,
+		Audience:  jwt.ClaimStrings{auth.AudienceAPI},
+		Subject:   userIDStr,
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(auth.AccessTokenTTL)),
+	}
+
+	t.Run("token without kid still verifies", func(t *testing.T) {
+		claims := userClaims(userIDStr, tenantID)
+		claims.RegisteredClaims = registered
+		signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(jwtSecret))
+		if err != nil {
+			t.Fatalf("SignedString() error = %v", err)
+		}
+		if _, ok := mustParseHeader(t, signed)["kid"]; ok {
+			t.Fatal("fixture unexpectedly carries a kid — it must model a pre-#95 token")
+		}
+		if _, err := jwtSvc.Verify(ctx, signed); err != nil {
+			t.Errorf("Verify(token without kid) error = %v, want nil", err)
+		}
+	})
+
+	// An attacker-chosen kid must not change anything: the signature decides. A
+	// verifier that trusted the kid would let an unauthenticated header steer key
+	// selection.
+	t.Run("bogus kid does not change the outcome", func(t *testing.T) {
+		claims := userClaims(userIDStr, tenantID)
+		claims.RegisteredClaims = registered
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		token.Header["kid"] = "attacker-supplied"
+		signed, err := token.SignedString([]byte(jwtSecret))
+		if err != nil {
+			t.Fatalf("SignedString() error = %v", err)
+		}
+		if _, err := jwtSvc.Verify(ctx, signed); err != nil {
+			t.Errorf("Verify(correctly signed, bogus kid) error = %v, want nil", err)
+		}
+	})
+
+	t.Run("plausible kid with a bad signature still fails", func(t *testing.T) {
+		claims := userClaims(userIDStr, tenantID)
+		claims.RegisteredClaims = registered
+		forged := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		forged.Header["kid"] = "looks-legitimate"
+		signed, err := forged.SignedString([]byte("not-the-tenant-secret"))
+		if err != nil {
+			t.Fatalf("SignedString() error = %v", err)
+		}
+		if _, err := jwtSvc.Verify(ctx, signed); err == nil {
+			t.Error("Verify(plausible kid, wrong signing key) error = nil, want signature failure")
+		}
+	})
+}
+
+// mustParseHeader returns a signed token's JOSE header.
+func mustParseHeader(t *testing.T, token string) map[string]interface{} {
+	t.Helper()
+
+	parsed, _, err := jwt.NewParser().ParseUnverified(token, &auth.Claims{})
+	if err != nil {
+		t.Fatalf("ParseUnverified() error = %v", err)
+	}
+	return parsed.Header
+}

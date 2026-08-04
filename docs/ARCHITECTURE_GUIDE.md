@@ -60,7 +60,7 @@ Your diagram was close but needed refinement. Here's the actual flow:
 │     ├─► Resolve tenant (outreach → UUID)                   │
 │     ├─► Fetch user from DB → verify bcrypt hash           │
 │     ├─► Load user's role + permissions                     │
-│     ├─► Sign JWT (HS256, 1-hour TTL)                       │
+│     ├─► Sign JWT (RS256, kid header, 15-min TTL)            │
 │     ├─► Generate refresh token (32-byte random)            │
 │     └─► Store refresh token hash in Redis                  │
 │                                                             │
@@ -359,7 +359,7 @@ ORDER BY created_at DESC;
 | Layer | Mechanism |
 |-------|-----------|
 | **Password Storage** | bcrypt (cost 12) — ~100ms per hash |
-| **Token Signing** | HS256 (per-tenant secret) — cryptographically signed |
+| **Token Signing** | RS256 (per-tenant RSA key pair) — private key stays on the server; public keys published as JWKS |
 | **Token Storage** | JWT stored in HttpOnly cookies (browser-side) |
 | **API Key Storage** | SHA-256 hash only (raw key shown once at creation) |
 | **Refresh Rotation** | Atomic: old token revoked before new issued; replay returns 401 |

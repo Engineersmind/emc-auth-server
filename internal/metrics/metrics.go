@@ -15,6 +15,7 @@
 //   - emc_auth_tokens_issued_total           — tokens issued (grant_type)
 //   - emc_auth_tokens_revoked_total          — tokens/sessions revoked (reason)
 //   - emc_auth_token_audience_rejections_total — tokens refused on a route by aud
+//   - emc_auth_legacy_hs256_verifications_total — symmetric-path verifications (Phase 4 gate)
 //   - emc_auth_apikey_auth_total             — API-key auth attempts (outcome)
 //   - emc_auth_social_login_total            — social login (provider, outcome)
 //   - emc_auth_risk_signals_total            — risk signals raised (signal)
@@ -73,6 +74,36 @@ var (
 			Help:      "Total number of requests rejected by rate limiters.",
 		},
 		[]string{"limiter"},
+	)
+
+	// LegacyHS256Verifications counts tokens verified through the legacy
+	// symmetric HS256 path rather than by asymmetric key id (issue #95).
+	//
+	// This metric exists to GATE the Phase 4 cutover. Phase 4 rejects HS256
+	// outright, which is only safe once no live token is still signed that way.
+	// The issue's original plan was "restart at least one AgentTokenTTL (1 h)
+	// after Phase 2" — an unverifiable instruction that trusts a clock. Watching
+	// this counter flatten to zero turns that guess into an observation.
+	//
+	// It is also the alarm for the reverse case: a non-zero rate long after
+	// Phase 2 means something is still minting or replaying symmetric tokens,
+	// i.e. a holder of a tenant's jwt_secret is still active and must be
+	// identified before the secret can be decommissioned.
+	//
+	// Labels: reason —
+	//   no_kid          a pre-#95 token, the normal case during migration
+	//   unexpected_kid  a symmetric token carrying a kid; no current code path
+	//                   mints one, so it is an old token or a forged header
+	//   rejected        refused because JWT_ALLOW_LEGACY_HS256=false (Phase 4 is
+	//                   done). A climbing "rejected" count means a consumer is
+	//                   still sending symmetric tokens and needs migrating.
+	LegacyHS256Verifications = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "legacy_hs256_verifications_total",
+			Help:      "Tokens verified via the legacy symmetric HS256 path. Must reach zero before the Phase 4 RS256-only cutover.",
+		},
+		[]string{"reason"},
 	)
 
 	// ---------------------------------------------------------------------
