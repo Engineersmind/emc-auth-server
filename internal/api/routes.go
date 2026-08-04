@@ -393,8 +393,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
 
-	// /api/v1 route group
-	apiV1 := e.Group("/api/v1")
+	// /api/v1 route group.
+	//
+	// CookieCSRF guards the whole surface against cross-site writes made with the
+	// browser session cookies, which SameSite=None (staging/production) would
+	// otherwise let any page attach. It is inert for Bearer clients, for safe
+	// methods, and for requests carrying no auth cookie — see its doc comment.
+	apiV1 := e.Group("/api/v1", mw.CookieCSRF(cookieCfg))
 
 	// Auth routes — public (no JWT required)
 	authGroup := apiV1.Group("/auth")
@@ -493,11 +498,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	otpGroup.POST("/email/send", authHandler.EmailMFASendCode)     // fresh code as proof for self-service actions
 	otpGroup.DELETE("/email", authHandler.EmailMFADisable)         // code-verified; last-factor guard under 'required'
 
-	// Admin routes — require a valid JWT. JWTRequired (not JWTRenew) is used here
-	// because the refresh cookie is scoped to /api/v1/auth; browsers will not send
-	// it to non-auth paths, so transparent renewal is impossible. Browser
-	// clients must call /auth/session/refresh when they receive 401 token_expired,
-	// then retry the admin request.
+	// Admin routes — require a valid JWT, supplied either as a Bearer token or as
+	// the emc_access_token cookie (scoped to /api/v1, so browser sessions reach
+	// these routes). JWTRequired (not JWTRenew) is used here because the refresh
+	// cookie stays scoped to /api/v1/auth; browsers will not send it to non-auth
+	// paths, so transparent renewal is impossible. Browser clients must call
+	// /auth/session/refresh when they receive 401 token_expired, then retry the
+	// admin request.
 	// appRateLimit is a pass-through for first-party admin/tenant tokens: those
 	// JWTs are minted with an empty app_id claim (only application-scoped end-user
 	// tokens carry a numeric app_id), and AppRateLimiter skips any request whose

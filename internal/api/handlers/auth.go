@@ -2049,6 +2049,16 @@ func appIDFromClaim(s string) *int64 {
 // SessionLoginRequest is the body for POST /api/v1/auth/session.
 type SessionLoginRequest = LoginRequest
 
+// accessTokenExpiresIn is the access token's lifetime in seconds, reported to
+// cookie-session clients so they can schedule a proactive refresh.
+//
+// Derived from auth.AccessTokenTTL rather than written as a literal: these
+// endpoints previously advertised a hardcoded "3600" against a 15-minute TTL, so
+// any client trusting it would refresh 45 minutes after its session had already
+// started failing. The cookie's Max-Age was always correct — only the advertised
+// number was wrong, which is exactly the kind of drift a literal invites.
+var accessTokenExpiresIn = strconv.Itoa(int(auth.AccessTokenTTL.Seconds()))
+
 // SessionLogin handles POST /api/v1/auth/session.
 //
 // @Summary      Cookie-based login
@@ -2116,7 +2126,7 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"message":    "logged in",
-		"expires_in": "3600",
+		"expires_in": accessTokenExpiresIn,
 	})
 }
 
@@ -2194,7 +2204,7 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"message":    "session refreshed",
-		"expires_in": "3600",
+		"expires_in": accessTokenExpiresIn,
 	})
 }
 
@@ -2363,7 +2373,27 @@ func (h *AuthHandler) Token(c echo.Context) error {
 // Cookie helpers
 // ---------------------------------------------------------------------------
 
+// setAuthCookies writes the browser session cookies — but only for a first-party
+// session, i.e. the management portal.
+//
+// Application-scoped end-user logins are deliberately excluded. Those flows
+// (/auth/apps/register, /auth/apps/login, magic-link verify, and any MFA
+// continuation that completes one) authenticate the calling application with
+// client_id/client_secret and return the token pair in the response body, for
+// the application to present as `Authorization: Bearer`. Handing them a cookie
+// as well would mint an ambient credential the integrator never asked for and
+// does not manage — a second, silent way into the same account, carrying the
+// CSRF exposure that only cookies have.
+//
+// The token's app_id claim is the discriminator: issueTokenPair populates it
+// only for application-scoped tokens and leaves it empty for first-party
+// admin/tenant tokens. The check lives here, not at the call sites, so a future
+// login flow cannot reintroduce end-user cookies by forgetting about it. The
+// rule is: cookies are for the portal, headers are for applications.
 func setAuthCookies(c echo.Context, accessToken, refreshToken string, cfg mw.CookieConfig) {
+	if _, _, appID := claimsFromToken(accessToken); appID != nil {
+		return
+	}
 	for _, cookie := range mw.BuildAuthCookies(accessToken, refreshToken, cfg) {
 		http.SetCookie(c.Response().Writer, cookie)
 	}

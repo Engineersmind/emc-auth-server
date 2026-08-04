@@ -40,11 +40,20 @@ func BuildCookieConfig(env, domain string) CookieConfig {
 	}
 }
 
+// Cookie Path scopes. The two credentials are deliberately scoped differently:
+//
+//	AccessCookiePath  — every API route, because a browser session must
+//	                    authenticate the management endpoints (/api/v1/tenants,
+//	                    /api/v1/applications, …), not just /api/v1/auth.
+//	RefreshCookiePath — only the auth endpoints that consume it, so the 30-day
+//	                    credential is not attached to ordinary API traffic.
+const (
+	AccessCookiePath  = "/api/v1"
+	RefreshCookiePath = "/api/v1/auth"
+)
+
 // BuildAuthCookies constructs the access and refresh token cookie objects.
 // The caller is responsible for writing them to the response.
-//
-// The refresh cookie is scoped to /api/v1/auth so browsers only transmit
-// the 30-day credential to the auth endpoints that actually need it.
 func BuildAuthCookies(accessToken, refreshToken string, cfg CookieConfig) []*http.Cookie {
 	access := &http.Cookie{
 		Name:     AccessTokenCookie,
@@ -53,7 +62,7 @@ func BuildAuthCookies(accessToken, refreshToken string, cfg CookieConfig) []*htt
 		Secure:   cfg.Secure,
 		SameSite: cfg.SameSite,
 		Domain:   cfg.Domain,
-		Path:     "/api/v1/auth",
+		Path:     AccessCookiePath,
 		MaxAge:   int(auth.AccessTokenTTL.Seconds()),
 	}
 	refresh := &http.Cookie{
@@ -63,15 +72,16 @@ func BuildAuthCookies(accessToken, refreshToken string, cfg CookieConfig) []*htt
 		Secure:   cfg.Secure,
 		SameSite: cfg.SameSite,
 		Domain:   cfg.Domain,
-		Path:     "/api/v1/auth",
+		Path:     RefreshCookiePath,
 		MaxAge:   int(auth.RefreshTokenTTL.Seconds()),
 	}
 	return []*http.Cookie{access, refresh}
 }
 
 // ClearAuthCookies expires both auth cookies immediately on the response.
-// Domain, Secure, and SameSite must match what was set in BuildAuthCookies;
-// RFC 6265 §5.2.3 treats a missing Domain as a different entry than an explicit one.
+// Domain, Path, Secure, and SameSite must match what was set in BuildAuthCookies;
+// RFC 6265 §5.2.3 treats a missing Domain as a different entry than an explicit one,
+// and a deletion whose Path differs leaves the original cookie in place.
 func ClearAuthCookies(c echo.Context, cfg CookieConfig) {
 	http.SetCookie(c.Response().Writer, &http.Cookie{
 		Name:     AccessTokenCookie,
@@ -80,7 +90,7 @@ func ClearAuthCookies(c echo.Context, cfg CookieConfig) {
 		Secure:   cfg.Secure,
 		SameSite: cfg.SameSite,
 		Domain:   cfg.Domain,
-		Path:     "/api/v1/auth",
+		Path:     AccessCookiePath,
 		MaxAge:   -1,
 	})
 	http.SetCookie(c.Response().Writer, &http.Cookie{
@@ -90,7 +100,7 @@ func ClearAuthCookies(c echo.Context, cfg CookieConfig) {
 		Secure:   cfg.Secure,
 		SameSite: cfg.SameSite,
 		Domain:   cfg.Domain,
-		Path:     "/api/v1/auth",
+		Path:     RefreshCookiePath,
 		MaxAge:   -1,
 	})
 }
