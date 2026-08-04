@@ -400,10 +400,11 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 // tenantIDFromToken reads the tenant_id claim off a token whose signature is not
 // yet verified.
 //
-// Only the legacy HMAC path may use this. It is the untrusted-input problem in
-// miniature: the value decides which key we fetch, so an attacker picks the
-// lookup. The RS256 path deliberately does not call it — a kid identifies the key
-// directly, which is strictly better and is why ME-07 disappears with HS256.
+// It is the untrusted-input problem in miniature: the value decides which key we
+// fetch, so a caller picks the lookup. Both key paths call it — the RS256 path
+// uses it to scope the kid lookup to a tenant — so the exposure is the same for
+// each, and the caches it can reach are what bound it. See rsaKeyForToken for the
+// trust model that applies there.
 func tenantIDFromToken(t *jwt.Token) (int64, error) {
 	claims, ok := t.Claims.(*Claims)
 	if !ok || claims.TenantID == "" {
@@ -423,6 +424,23 @@ func tenantIDFromToken(t *jwt.Token) (int64, error) {
 // be verified with tenant A's key even if it names A's kid, because that kid is
 // not in B's key set. This is the property per-tenant keys exist to preserve —
 // with a single server-wide key it would rest entirely on the tenant_id claim.
+//
+// The trust model, stated precisely, because it is easy to overclaim: the tenant
+// used for scoping comes from the token's *unverified* tenant_id claim, so an
+// unauthenticated caller does choose which tenant's key set is consulted. That is
+// not a bypass — naming a different tenant only makes the lookup miss, and a hit
+// still has to survive signature verification — but it does mean this path is not
+// header-only, and the DB reads it can drive are what must stay bounded. Two
+// things bound them: SigningKeyService caches per tenant and collapses concurrent
+// misses into one load, and it declines to cache a tenant that resolves to no
+// keys, so cycling arbitrary ids cannot grow the cache.
+//
+// Making the lookup genuinely header-only means encoding the tenant into the kid
+// (tenant:thumbprint). That is deferred deliberately: the kid is currently an
+// RFC 7638 thumbprint that any verifier can recompute from the published JWKS to
+// confirm a kid names the key it claims to, and prefixing it forfeits that check
+// for every already-published key. It is worth doing at the next kid-format
+// change, not as a review fix that would silently break external verifiers.
 func (s *JWTService) rsaKeyForToken(ctx context.Context, t *jwt.Token) (interface{}, error) {
 	if s.keys == nil {
 		// Asymmetric signing is not configured, so an RS256 token cannot be one of

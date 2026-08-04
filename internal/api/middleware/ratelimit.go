@@ -78,6 +78,21 @@ func (s *limiterStore) getOrCreate(key string, r int) *rate.Limiter {
 	return e.limiter
 }
 
+// getOrCreateEvery is getOrCreate for buckets slower than one token per minute,
+// where the per-minute integer rate cannot express the interval. interval is the
+// time to refill a single token; burst is how many may be spent at once.
+func (s *limiterStore) getOrCreateEvery(key string, interval time.Duration, burst int) *rate.Limiter {
+	entry, loaded := s.store.LoadOrStore(key, &limiterEntry{
+		limiter:  rate.NewLimiter(rate.Every(interval), burst),
+		lastSeen: time.Now(),
+	})
+	e, _ := entry.(*limiterEntry)
+	if loaded {
+		e.lastSeen = time.Now()
+	}
+	return e.limiter
+}
+
 // cleanup removes entries not seen for more than ttl. Call periodically to prevent
 // unbounded memory growth (one entry per unique IP/tenant slug ever seen).
 func (s *limiterStore) cleanup(ttl time.Duration) {
@@ -122,6 +137,12 @@ func startCleanup() {
 				tenantStore.cleanup(10 * time.Minute)
 				oauthClientStore.cleanup(10 * time.Minute)
 				auditMaintStore.cleanup(10 * time.Minute)
+				jwksStore.cleanup(10 * time.Minute)
+				// Evicting a bucket resets it to full burst, so a store may not
+				// be swept faster than its own refill interval or idling becomes
+				// a way to skip the limit. Rotation refills one token every
+				// signingKeyRotationInterval, hence the much longer TTL.
+				signingKeyRotationStore.cleanup(time.Hour)
 			}
 		}()
 	})
@@ -136,6 +157,8 @@ func ResetStoresForTest() {
 	tenantStore.store.Range(func(k, _ any) bool { tenantStore.store.Delete(k); return true })
 	oauthClientStore.store.Range(func(k, _ any) bool { oauthClientStore.store.Delete(k); return true })
 	auditMaintStore.store.Range(func(k, _ any) bool { auditMaintStore.store.Delete(k); return true })
+	jwksStore.store.Range(func(k, _ any) bool { jwksStore.store.Delete(k); return true })
+	signingKeyRotationStore.store.Range(func(k, _ any) bool { signingKeyRotationStore.store.Delete(k); return true })
 }
 
 // defaultAuditMaintRate is the per-tenant per-minute cap on the expensive audit
@@ -544,6 +567,66 @@ func JWKSRateLimiter() echo.MiddlewareFunc {
 				res.Cancel()
 			}
 			return nil
+		}
+	}
+}
+
+// Signing-key rotation budget (issue #95 review). A rotation is a deliberate,
+// rare operation — the runbook expects one per scheduled interval, not one per
+// minute — so the bucket is sized for exactly that.
+//
+// The threat is not load. CompleteRotation retires the outgoing key, and a
+// retired key drops out of the published set once RetiredKeyGrace elapses; an
+// authorised-but-hostile (or scripted-and-buggy) caller cycling prepare→complete
+// can therefore march a tenant through generations faster than outstanding
+// tokens expire, and every token signed by a key pushed past its grace window
+// fails verification. Rate limiting is what makes that take hours instead of
+// seconds.
+//
+// Burst 2 so one honest rotation — prepare then complete, the two calls the
+// two-step design requires — always goes through immediately.
+const (
+	signingKeyRotationInterval = 10 * time.Minute
+	signingKeyRotationBurst    = 2
+)
+
+// signingKeyRotationStore is separate from every other store so a rotation
+// bucket can never share a key with a tenant or IP bucket.
+var signingKeyRotationStore = &limiterStore{}
+
+// SigningKeyRotationRateLimiter bounds prepare/complete rotation calls per tenant.
+//
+// Keyed on the JWT tenant claim rather than the IP: the operation is tenant-wide,
+// so an operator with two machines must still share one budget, and the endpoints
+// sit behind JWTRequired + tenant:manage so claims are always present. It falls
+// back to the IP only so a wiring mistake fails closed-ish rather than unlimited.
+func SigningKeyRotationRateLimiter() echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			key := "signing-key-rotation:"
+			if claims, ok := c.Get("user").(*auth.Claims); ok && claims != nil && claims.TenantID != "" {
+				key += "tenant:" + claims.TenantID
+			} else {
+				ip := c.RealIP()
+				if ip == "" {
+					ip = c.Request().RemoteAddr
+				}
+				key += "ip:" + ip
+			}
+
+			limiter := signingKeyRotationStore.getOrCreateEvery(
+				key, signingKeyRotationInterval, signingKeyRotationBurst)
+			if !limiter.Allow() {
+				metrics.RateLimitHits.WithLabelValues("signing_key_rotation").Inc()
+				c.Response().Header().Set("Retry-After", "600")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many signing-key rotations for this tenant — rotation is rate limited to protect outstanding tokens",
+					"retry_after": "600",
+				})
+			}
+			return next(c)
 		}
 	}
 }

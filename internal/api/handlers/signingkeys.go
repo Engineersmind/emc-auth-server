@@ -221,7 +221,10 @@ func (h *SigningKeyHandler) response(c echo.Context, tenantID int64, keys []*aut
 func (h *SigningKeyHandler) jwksURL(c echo.Context, tenantID int64) string {
 	var slug string
 	if err := h.pool.QueryRow(c.Request().Context(),
-		`SELECT slug FROM tenants WHERE id = $1`, tenantID,
+		// Same predicate as GetTenantJWKS. Without it this field would hand an
+		// operator a URL that 404s, because the endpoint it points at refuses
+		// deactivated and soft-deleted tenants.
+		`SELECT slug FROM tenants WHERE id = $1 AND is_active = true AND deleted_at IS NULL`, tenantID,
 	).Scan(&slug); err != nil || slug == "" {
 		h.logger.Warn().Err(err).Int64("tenant_id", tenantID).Msg("signing keys: could not resolve tenant slug for jwks_url")
 		return ""

@@ -466,7 +466,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Drop retired keys whose grace window has elapsed. Without this every rotation
 	// leaves a row behind forever and the published JWKS grows without bound.
-	if _, err := signingKeySvc.CollectGarbage(startupCtx); err != nil {
+	if _, err := signingKeySvc.CollectGarbageAllTenants(startupCtx); err != nil {
 		deps.Logger.Error().Err(err).Msg("retired signing key GC failed")
 	}
 
@@ -925,9 +925,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// caches pick it up, complete then activates it. A single-shot rotate endpoint
 	// would reintroduce the window where a token is signed by a key no verifier has
 	// seen yet.
+	//
+	// Both mutating steps are rate limited per tenant. Authorisation alone is not
+	// enough here: completing a rotation retires the outgoing key, so a caller
+	// that already holds tenant:manage can cycle prepare→complete to push keys
+	// past RetiredKeyGrace faster than issued tokens expire, invalidating them.
+	// The limiter turns that from seconds into hours. Listing is read-only and
+	// stays unthrottled.
+	rotationLimit := mw.SigningKeyRotationRateLimiter()
 	tenantMgmt.GET("/signing-keys", signingKeyHandler.ListSigningKeys)
-	tenantMgmt.POST("/signing-keys/prepare", signingKeyHandler.PrepareSigningKeyRotation)
-	tenantMgmt.POST("/signing-keys/complete", signingKeyHandler.CompleteSigningKeyRotation)
+	tenantMgmt.POST("/signing-keys/prepare", signingKeyHandler.PrepareSigningKeyRotation, rotationLimit)
+	tenantMgmt.POST("/signing-keys/complete", signingKeyHandler.CompleteSigningKeyRotation, rotationLimit)
 
 	// SAML admin config — saml:manage (04-01)
 	adminGroup.GET("/saml-config", samlHandler.GetSAMLConfig, samlManage)

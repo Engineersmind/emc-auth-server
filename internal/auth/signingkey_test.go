@@ -3,6 +3,8 @@ package auth_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/store"
@@ -297,7 +300,7 @@ func TestSigningKeyService_RotationDrill(t *testing.T) {
 	})
 
 	t.Run("GC keeps an in-grace retired key", func(t *testing.T) {
-		if _, err := keys.CollectGarbage(ctx); err != nil {
+		if _, err := keys.CollectGarbage(ctx, tenantID); err != nil {
 			t.Fatalf("CollectGarbage: %v", err)
 		}
 		if !jwksHasKID(t, ctx, keys, tenantID, oldKey.KID) {
@@ -466,4 +469,203 @@ func TestJWTService_Phase4Cutover(t *testing.T) {
 			t.Errorf("Verify(freshly signed) error = %v", err)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// PR #98 review fixes
+// ---------------------------------------------------------------------------
+
+// gcFixture returns the key service plus two tenants, each with an active key,
+// so a sweep aimed at one can be checked for not touching the other.
+func gcFixture(t *testing.T) (context.Context, *auth.SigningKeyService, *pgxpool.Pool, int64, int64) {
+	t.Helper()
+
+	ctx, _, keys, tenantA, _ := signingFixture(t)
+	pool := testhelper.NewTestDB(t)
+
+	var tenantB int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		 VALUES ('gc-other', 'gc-other', 'gc-other-secret', true) RETURNING id`,
+	).Scan(&tenantB); err != nil {
+		t.Fatalf("insert second tenant: %v", err)
+	}
+
+	for _, id := range []int64{tenantA, tenantB} {
+		if _, err := keys.EnsureTenantKey(ctx, id); err != nil {
+			t.Fatalf("EnsureTenantKey(%d): %v", id, err)
+		}
+	}
+	return ctx, keys, pool, tenantA, tenantB
+}
+
+// retireKey adds a retired key to a tenant, backdated past the grace window so
+// it is eligible for collection.
+func retireKey(t *testing.T, ctx context.Context, pool *pgxpool.Pool, keys *auth.SigningKeyService, tenantID int64) string {
+	t.Helper()
+
+	key, err := keys.GenerateKey(ctx, tenantID, auth.KeyStatusNext)
+	if err != nil {
+		t.Fatalf("GenerateKey(next) for tenant %d: %v", tenantID, err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE signing_keys SET status = 'retired', retired_at = NOW() - $1::interval
+		  WHERE tenant_id = $2 AND kid = $3`,
+		fmt.Sprintf("%d seconds", int(auth.RetiredKeyGrace.Seconds())+3600), tenantID, key.KID,
+	); err != nil {
+		t.Fatalf("backdate retired key: %v", err)
+	}
+	return key.KID
+}
+
+func keyExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, kid string) bool {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM signing_keys WHERE kid = $1`, kid).Scan(&n); err != nil {
+		t.Fatalf("count signing_keys: %v", err)
+	}
+	return n > 0
+}
+
+// TestSigningKeyService_CollectGarbageIsTenantScoped is the regression guard for
+// the unscoped DELETE: garbage collection aimed at one tenant must not reach
+// another tenant's key material, whatever the grace predicate says.
+func TestSigningKeyService_CollectGarbageIsTenantScoped(t *testing.T) {
+	ctx, keys, pool, tenantA, tenantB := gcFixture(t)
+
+	kidA := retireKey(t, ctx, pool, keys, tenantA)
+	kidB := retireKey(t, ctx, pool, keys, tenantB)
+
+	n, err := keys.CollectGarbage(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("CollectGarbage(tenantA): %v", err)
+	}
+	if n != 1 {
+		t.Errorf("deleted = %d, want 1", n)
+	}
+	if keyExists(t, ctx, pool, kidA) {
+		t.Error("tenant A's expired key survived its own sweep")
+	}
+	if !keyExists(t, ctx, pool, kidB) {
+		t.Error("tenant B's key was deleted by a sweep scoped to tenant A")
+	}
+}
+
+// TestSigningKeyService_CollectGarbageRequiresTenants pins the fail-closed
+// guard: an empty tenant list must not degrade into a delete-everything sweep.
+func TestSigningKeyService_CollectGarbageRequiresTenants(t *testing.T) {
+	ctx, keys, pool, tenantA, _ := gcFixture(t)
+	kidA := retireKey(t, ctx, pool, keys, tenantA)
+
+	n, err := keys.CollectGarbage(ctx)
+	if !errors.Is(err, auth.ErrNoTenantsToCollect) {
+		t.Errorf("CollectGarbage() error = %v, want ErrNoTenantsToCollect", err)
+	}
+	if n != 0 {
+		t.Errorf("deleted = %d, want 0", n)
+	}
+	if !keyExists(t, ctx, pool, kidA) {
+		t.Error("an unscoped call deleted keys — the guard did not hold")
+	}
+}
+
+// TestSigningKeyService_CollectGarbageSkipsTenantsWithoutActiveKey covers the
+// fail-safe: a tenant holding only retired keys is already broken, and deleting
+// what is left would make every token it ever issued permanently unverifiable.
+func TestSigningKeyService_CollectGarbageSkipsTenantsWithoutActiveKey(t *testing.T) {
+	ctx, keys, pool, tenantA, _ := gcFixture(t)
+	kid := retireKey(t, ctx, pool, keys, tenantA)
+
+	// Retire the active key too, leaving the tenant with no active key at all.
+	if _, err := pool.Exec(ctx,
+		`UPDATE signing_keys SET status = 'retired', retired_at = NOW() - $1::interval
+		  WHERE tenant_id = $2 AND status = 'active'`,
+		fmt.Sprintf("%d seconds", int(auth.RetiredKeyGrace.Seconds())+3600), tenantA,
+	); err != nil {
+		t.Fatalf("retire active key: %v", err)
+	}
+
+	n, err := keys.CollectGarbage(ctx, tenantA)
+	if err != nil {
+		t.Fatalf("CollectGarbage: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("deleted = %d, want 0 — a tenant with no active key must be left alone", n)
+	}
+	if !keyExists(t, ctx, pool, kid) {
+		t.Error("GC stripped the last keys from a tenant with no active key")
+	}
+}
+
+// TestSigningKeyService_CollectGarbageAllTenantsSweepsEveryTenant pins that
+// scoping the DELETE did not narrow what a full sweep actually collects.
+func TestSigningKeyService_CollectGarbageAllTenantsSweepsEveryTenant(t *testing.T) {
+	ctx, keys, pool, tenantA, tenantB := gcFixture(t)
+
+	kidA := retireKey(t, ctx, pool, keys, tenantA)
+	kidB := retireKey(t, ctx, pool, keys, tenantB)
+
+	n, err := keys.CollectGarbageAllTenants(ctx)
+	if err != nil {
+		t.Fatalf("CollectGarbageAllTenants: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("deleted = %d, want 2", n)
+	}
+	if keyExists(t, ctx, pool, kidA) || keyExists(t, ctx, pool, kidB) {
+		t.Error("a full sweep left an expired key behind")
+	}
+}
+
+// TestSigningKeyService_PublishableKeysCarryNoPrivateHalf pins the split between
+// the JWKS-facing key structs and the signing one.
+//
+// JWKS() already extracts only the public half, so this is not about the wire
+// format — it is about what PublishableKeys hands to any future caller. When the
+// active key's struct was shared between the two, every publishable entry held a
+// live *rsa.PrivateKey, and one log line or struct marshal away from exposure.
+func TestSigningKeyService_PublishableKeysCarryNoPrivateHalf(t *testing.T) {
+	ctx, _, keys, tenantID, _ := signingFixture(t)
+
+	active, err := keys.EnsureTenantKey(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureTenantKey: %v", err)
+	}
+	if _, err := keys.PrepareRotation(ctx, tenantID); err != nil {
+		t.Fatalf("PrepareRotation: %v", err)
+	}
+
+	published, err := keys.PublishableKeys(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("PublishableKeys: %v", err)
+	}
+	if len(published) < 2 {
+		t.Fatalf("published %d keys, want at least the active and next keys", len(published))
+	}
+
+	sawActive := false
+	for _, k := range published {
+		if k.KID == active.KID {
+			sawActive = true
+		}
+		if k.Private != nil {
+			t.Errorf("published key %q carries a private half", k.KID)
+		}
+		if k.Public == nil {
+			t.Errorf("published key %q has no public half", k.KID)
+		}
+	}
+	if !sawActive {
+		t.Error("active key missing from the published set")
+	}
+
+	// The signing path must still get its private half — the split must not have
+	// been achieved by simply dropping it everywhere.
+	signer, err := keys.ActiveKey(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("ActiveKey: %v", err)
+	}
+	if signer.Private == nil {
+		t.Error("ActiveKey has no private half — the tenant can no longer sign")
+	}
 }

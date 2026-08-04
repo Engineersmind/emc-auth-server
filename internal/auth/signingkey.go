@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 )
 
 // Signing-key lifecycle states. See migrations/00062_signing_keys.sql for the
@@ -64,6 +66,11 @@ var (
 	// verification, where it must read as a signature failure, not as a hint
 	// about which keys exist.
 	ErrUnknownKID = errors.New("unknown signing key id")
+
+	// ErrNoTenantsToCollect guards against a programming error: calling
+	// CollectGarbage with an empty tenant list would otherwise widen a scoped
+	// delete of signing-key material into an unscoped one.
+	ErrNoTenantsToCollect = errors.New("collect garbage: no tenants specified")
 )
 
 // SigningKey is one asymmetric key pair for a tenant.
@@ -106,6 +113,13 @@ type SigningKeyService struct {
 
 	mu    sync.RWMutex
 	cache map[int64]*tenantKeySet
+
+	// loading collapses concurrent cache misses for the same tenant into one
+	// load. Without it, a cold start or a TTL expiry under load has every
+	// in-flight request issue its own query plus an AES-GCM decrypt and an RSA
+	// PEM parse — the classic cache stampede, and the decrypt makes it expensive
+	// rather than merely wasteful.
+	loading singleflight.Group
 }
 
 // NewSigningKeyService builds the service. box must be non-nil — it protects the
@@ -236,7 +250,15 @@ func (s *SigningKeyService) EnsureTenantKey(ctx context.Context, tenantID int64)
 		return key, nil
 	}
 
-	// Another process won the race and inserted the active key first.
+	// Only a unique-violation means another process won the race. Any other
+	// failure — a SecretBox encryption error, an exhausted pool, RSA generation
+	// failing — must surface: treating them all as a lost race would let a
+	// concurrently-succeeding ActiveKey() swallow the real error and log a broken
+	// encryption subsystem as routine contention.
+	if !isUniqueViolation(err) {
+		return nil, err
+	}
+
 	s.invalidate(tenantID)
 	if existing, reErr := s.ActiveKey(ctx, tenantID); reErr == nil {
 		s.logger.Debug().Int64("tenant_id", tenantID).Msg("signing key race lost — using the key that won")
@@ -297,7 +319,18 @@ func (s *SigningKeyService) PublishableKeys(ctx context.Context, tenantID int64)
 	return set.publishable, nil
 }
 
+// signingKeyLoadTimeout bounds a shared load. The load runs detached from the
+// requesting context (see keySet), so it needs a deadline of its own or a stalled
+// query would pin every waiter for that tenant indefinitely.
+const signingKeyLoadTimeout = 10 * time.Second
+
 // keySet returns the tenant's cached key set, loading it if absent or stale.
+//
+// Concurrent misses for the same tenant share a single load. The detail that
+// makes sharing safe is that the shared load does not inherit the first caller's
+// context: with a plain ctx, that caller disconnecting would cancel the load for
+// everyone waiting behind it, converting one client hang-up into a burst of
+// verification failures across unrelated requests.
 func (s *SigningKeyService) keySet(ctx context.Context, tenantID int64) (*tenantKeySet, error) {
 	s.mu.RLock()
 	set, ok := s.cache[tenantID]
@@ -306,14 +339,34 @@ func (s *SigningKeyService) keySet(ctx context.Context, tenantID int64) (*tenant
 		return set, nil
 	}
 
-	set, err := s.load(ctx, tenantID)
+	loaded, err, _ := s.loading.Do(strconv.FormatInt(tenantID, 10), func() (any, error) {
+		loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), signingKeyLoadTimeout)
+		defer cancel()
+
+		set, err := s.load(loadCtx, tenantID)
+		if err != nil {
+			return nil, err
+		}
+
+		// An empty set is not cached. A tenant id that resolves to no keys is
+		// either broken (EnsureTenantKey repairs it on the next issue) or does
+		// not exist — and the id reaching this far can come from an unverified
+		// token claim, so caching those would let a caller cycling ids grow the
+		// map without bound.
+		if len(set.byKID) > 0 {
+			s.mu.Lock()
+			s.cache[tenantID] = set
+			s.mu.Unlock()
+		}
+		return set, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	s.mu.Lock()
-	s.cache[tenantID] = set
-	s.mu.Unlock()
+	set, ok = loaded.(*tenantKeySet)
+	if !ok {
+		return nil, fmt.Errorf("signing key cache: unexpected %T from shared load", loaded)
+	}
 	return set, nil
 }
 
@@ -362,9 +415,18 @@ func (s *SigningKeyService) load(ctx context.Context, tenantID int64) (*tenantKe
 		}
 		key.Public = pub
 
-		stored := key
-		set.byKID[key.KID] = &stored
-		set.publishable = append(set.publishable, &stored)
+		// byKID and publishable get a public-only copy, and set.active gets a
+		// separate struct that carries the private half. Sharing one struct
+		// between them would mean the later `Private = priv` assignment mutated
+		// the entry already handed to the JWKS path: JWKS() reads only .Public
+		// so nothing reaches the wire, but PublishableKeys returns the slice
+		// itself, and any future caller that logs, reflects over, or marshals it
+		// would export private key material. Keeping the split makes that class
+		// of leak impossible rather than merely absent today.
+		pubOnly := key
+		pubOnly.Private = nil
+		set.byKID[key.KID] = &pubOnly
+		set.publishable = append(set.publishable, &pubOnly)
 
 		// Only the active key needs its private half, so it is the only one we
 		// decrypt — a retired key's private material has no remaining use.
@@ -377,8 +439,9 @@ func (s *SigningKeyService) load(ctx context.Context, tenantID int64) (*tenantKe
 			if err != nil {
 				return nil, fmt.Errorf("decode signing private key (kid %s): %w", key.KID, err)
 			}
-			stored.Private = priv
-			set.active = &stored
+			signer := key
+			signer.Private = priv
+			set.active = &signer
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -478,28 +541,91 @@ func (s *SigningKeyService) CompleteRotation(ctx context.Context, tenantID int64
 // material at rest for zero benefit. Nothing audits against these rows (rotation
 // events go to the audit log instead), so there is no trail to preserve.
 //
+// The DELETE is scoped to an explicit tenant list. Every other DML in this file
+// is tenant-scoped, and a signing-key delete is the last statement that should
+// be the exception: an unscoped sweep makes the blast radius of any mistake in
+// the predicate — a future edit to the grace expression, a shortened
+// RetiredKeyGrace shipped in a rolling deploy — every tenant at once instead of
+// one. Passing no tenants is a programming error rather than a silent
+// delete-everything; CollectGarbageAllTenants is the deliberate way to sweep.
+//
+// Tenants without a live active key are skipped. Deleting the last verifiable
+// key a tenant has would fail every outstanding token it issued, and a tenant in
+// that state is already broken in a way GC must not make permanent.
+//
 // Returns the number of keys deleted.
-func (s *SigningKeyService) CollectGarbage(ctx context.Context) (int64, error) {
+func (s *SigningKeyService) CollectGarbage(ctx context.Context, tenantIDs ...int64) (int64, error) {
+	if len(tenantIDs) == 0 {
+		return 0, ErrNoTenantsToCollect
+	}
+
 	tag, err := s.pool.Exec(ctx, `
-		DELETE FROM signing_keys
-		 WHERE status = 'retired'
-		   AND retired_at IS NOT NULL
-		   AND retired_at < NOW() - $1::interval`,
-		fmt.Sprintf("%d seconds", int(RetiredKeyGrace.Seconds())),
+		DELETE FROM signing_keys k
+		 WHERE k.status = 'retired'
+		   AND k.retired_at IS NOT NULL
+		   AND k.retired_at < NOW() - $1::interval
+		   AND k.tenant_id = ANY($2)
+		   AND EXISTS (
+		       SELECT 1 FROM signing_keys a
+		        WHERE a.tenant_id = k.tenant_id
+		          AND a.status = 'active'
+		          AND a.deleted_at IS NULL
+		   )`,
+		fmt.Sprintf("%d seconds", int(RetiredKeyGrace.Seconds())), tenantIDs,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("collect retired signing keys: %w", err)
 	}
 	n := tag.RowsAffected()
 	if n > 0 {
-		// Cached sets may still hold the deleted keys; clear everything rather
-		// than tracking which tenants were affected.
+		// Only the tenants named here can have lost a key, so drop exactly those
+		// cache entries instead of flushing every tenant's set.
 		s.mu.Lock()
-		s.cache = make(map[int64]*tenantKeySet)
+		for _, id := range tenantIDs {
+			delete(s.cache, id)
+		}
 		s.mu.Unlock()
-		s.logger.Info().Int64("deleted", n).Msg("garbage-collected retired signing keys")
+		s.logger.Info().
+			Int64("deleted", n).
+			Int("tenants", len(tenantIDs)).
+			Msg("garbage-collected retired signing keys")
 	}
 	return n, nil
+}
+
+// CollectGarbageAllTenants sweeps every tenant that currently holds an expired
+// retired key. It resolves that list first so the DELETE stays tenant-scoped and
+// the number of affected tenants is known and logged, rather than discovered
+// after the fact from a row count.
+func (s *SigningKeyService) CollectGarbageAllTenants(ctx context.Context) (int64, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT tenant_id
+		  FROM signing_keys
+		 WHERE status = 'retired'
+		   AND retired_at IS NOT NULL
+		   AND retired_at < NOW() - $1::interval`,
+		fmt.Sprintf("%d seconds", int(RetiredKeyGrace.Seconds())),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("find tenants with expired signing keys: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, fmt.Errorf("scan tenant id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate tenants with expired signing keys: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return s.CollectGarbage(ctx, ids...)
 }
 
 // BackfillAllTenants gives every active tenant without one an active signing key.
