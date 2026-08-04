@@ -71,6 +71,25 @@ func (e flowEnv) seedUser(t *testing.T, email, passwordHash string) int64 {
 	return id
 }
 
+// seedSession inserts one live refresh token for a user, so that revocation can
+// be observed. session_family_id is NOT NULL and each new session seeds its own
+// family from its primary key, matching migration 00026.
+func (e flowEnv) seedSession(t *testing.T, userID int64, raw string) {
+	t.Helper()
+	var id int64
+	if err := e.pool.QueryRow(e.ctx, `
+		INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, session_family_id)
+		VALUES ($1, $2, $3, NOW() + INTERVAL '30 days', 0)
+		RETURNING id
+	`, userID, e.tenantID, auth.HashToken(raw)).Scan(&id); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx,
+		`UPDATE refresh_tokens SET session_family_id = id WHERE id = $1`, id); err != nil {
+		t.Fatalf("set session family: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Invitations
 // ---------------------------------------------------------------------------
@@ -203,6 +222,147 @@ func TestInvitation_ConfirmsAdminGrantWithoutTouchingPassword(t *testing.T) {
 	// Preview must refuse a spent token rather than reporting it live.
 	if _, err := invSvc.Preview(e.ctx, raw); !errors.Is(err, auth.ErrInvalidInvitation) {
 		t.Errorf("Preview after accept = %v, want ErrInvalidInvitation", err)
+	}
+}
+
+// Activating an administrative grant must end every session that predates it,
+// even on the keep-my-password path — the path that does NOT otherwise revoke
+// anything, and the one an existing tenant user actually takes.
+//
+// A refresh token captured before the grant existed would otherwise keep
+// rotating, and each rotation re-reads the grant, so the stolen session
+// silently acquires admin_scope it never had when it was taken. The
+// token_version bump does not cover this: nothing verifies that counter.
+func TestInvitation_ActivatingAGrantRevokesEarlierSessions(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	const knownPassword = "ExistingPassw0rd!"
+	hashed, err := bcrypt.GenerateFromPassword([]byte(knownPassword), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash existing password: %v", err)
+	}
+	email := uniqueEmail("grant-revokes")
+	userID := e.seedUser(t, email, string(hashed))
+
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO roles (tenant_id, name, is_system, created_at)
+		VALUES ($1, 'co_owner', true, NOW())
+	`, e.tenantID); err != nil {
+		t.Fatalf("seed co_owner role: %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role) VALUES ($1, $2, 'co_owner')
+	`, e.tenantID, userID); err != nil {
+		t.Fatalf("seed pending grant: %v", err)
+	}
+
+	// A session taken before the grant was accepted.
+	e.seedSession(t, userID, "pre-grant-session")
+
+	var beforeVersion int
+	if err := e.pool.QueryRow(e.ctx, `SELECT token_version FROM users WHERE id = $1`, userID).Scan(&beforeVersion); err != nil {
+		t.Fatalf("read token_version: %v", err)
+	}
+
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	raw := tokenFromLink(t, e.mail.invitations[len(e.mail.invitations)-1].Link)
+
+	// Keep the existing password: the branch that sets no credentials and so
+	// revokes nothing of its own accord.
+	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{CurrentPassword: knownPassword}); err != nil {
+		t.Fatalf("Accept keeping the current password: %v", err)
+	}
+
+	var live, afterVersion int
+	if err := e.pool.QueryRow(e.ctx, `
+		SELECT (SELECT count(*) FROM refresh_tokens
+		        WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL),
+		       (SELECT token_version FROM users WHERE id = $1)
+	`, userID, e.tenantID).Scan(&live, &afterVersion); err != nil {
+		t.Fatalf("read state after accept: %v", err)
+	}
+	if live != 0 {
+		t.Errorf("live refresh tokens after activating a grant = %d, want 0", live)
+	}
+	if afterVersion <= beforeVersion {
+		t.Errorf("token_version = %d, want greater than %d", afterVersion, beforeVersion)
+	}
+}
+
+// GrantsAdmin answers "will accepting THIS invitation activate a grant?", so it
+// must be scoped to the invitation's own tenant.
+//
+// Unscoped, a pending grant in any tenant made every ordinary invitation report
+// grants_admin: true. Accept then resolves the grant by (user, invitation
+// tenant), finds none, and no-ops — so the page told the recipient they were
+// confirming administrative access and nothing of the kind happened.
+func TestInvitationPreview_GrantsAdminIsScopedToTheInvitationTenant(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	// A second tenant, and the same person holding a pending grant there.
+	var otherTenantID int64
+	if err := e.pool.QueryRow(e.ctx, `
+		INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		VALUES ('Other Co', 'other-co-preview', 'secret-for-other-co-tenant', true)
+		RETURNING id
+	`).Scan(&otherTenantID); err != nil {
+		t.Fatalf("seed second tenant: %v", err)
+	}
+
+	email := uniqueEmail("cross-tenant-grant")
+	// The invited identity, in the seed tenant, with no grant of its own.
+	userID := e.seedUser(t, email, "")
+
+	// The same address as a separate identity in the other tenant, holding a
+	// pending administrative grant there. Distinct users row: identities do not
+	// cross tenant boundaries.
+	var otherUserID int64
+	if err := e.pool.QueryRow(e.ctx, `
+		INSERT INTO users (tenant_id, email, first_name, last_name, is_active)
+		VALUES ($1, $2, 'Other', 'Identity', true) RETURNING id
+	`, otherTenantID, email).Scan(&otherUserID); err != nil {
+		t.Fatalf("seed other-tenant user: %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role) VALUES ($1, $2, 'co_owner')
+	`, otherTenantID, otherUserID); err != nil {
+		t.Fatalf("seed other-tenant grant: %v", err)
+	}
+
+	// An ordinary invitation into the seed tenant.
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	preview, err := invSvc.Preview(e.ctx, tokenFromLink(t, e.mail.invitations[len(e.mail.invitations)-1].Link))
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if preview.GrantsAdmin {
+		t.Error("GrantsAdmin = true for an ordinary invitation; a pending grant in another tenant leaked into this one")
+	}
+
+	// The same user WITH a pending grant in the invitation's own tenant must
+	// still report true — the predicate has to narrow, not disable.
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role) VALUES ($1, $2, 'co_owner')
+	`, e.tenantID, userID); err != nil {
+		t.Fatalf("seed same-tenant grant: %v", err)
+	}
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("re-Invite: %v", err)
+	}
+	preview, err = invSvc.Preview(e.ctx, tokenFromLink(t, e.mail.invitations[len(e.mail.invitations)-1].Link))
+	if err != nil {
+		t.Fatalf("Preview after same-tenant grant: %v", err)
+	}
+	if !preview.GrantsAdmin {
+		t.Error("GrantsAdmin = false for a pending grant in the invitation's own tenant")
 	}
 }
 

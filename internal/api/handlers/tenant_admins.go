@@ -65,7 +65,7 @@ func (h *AdminHandler) ListTenantAdmins(c echo.Context) error {
 // InviteTenantAdmin handles POST /api/v1/tenants/:tid/admins.
 //
 // @Summary      Invite a tenant administrator
-// @Description  Adds an owner (tenant-wide) or co-owner (specific applications). An address that is already a TENANT-LEVEL user is promoted in place and no second identity is created; an application-scoped user with the same address is unrelated and never collides, so being a customer of an application and an administrator of its tenant are compatible. The response's action field reports what happened: "invited" (new account, invitation sent), "grants_added" (existing user promoted or widened), or "invitation_resent". An invitation that would change nothing returns 409.
+// @Description  Adds an owner (tenant-wide) or co-owner (specific applications). An address that is already a TENANT-LEVEL user is promoted in place and no second identity is created; an application-scoped user with the same address is unrelated and never collides, so being a customer of an application and an administrator of its tenant are compatible. The response's action field reports what happened: "invited" (new account, invitation sent), "grants_added" (existing user promoted or widened), or "invitation_resent". An invitation that would change nothing returns 409, as does a tenant already holding the maximum number of administrators. A repeat resend to the same address within a minute returns 429. Returns 503 when the server has no email delivery configured — nothing is recorded, because an administrator who cannot be told they are one could never sign in.
 // @Tags         admin-tenant-admins
 // @Accept       json
 // @Produce      json
@@ -75,7 +75,9 @@ func (h *AdminHandler) ListTenantAdmins(c echo.Context) error {
 // @Success      201   {object}  admin.InviteTenantAdminResult
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
-// @Failure      409   {object}  map[string]string  "Already an administrator with these grants"
+// @Failure      409   {object}  map[string]string  "Already an administrator with these grants, or the administrator limit is reached"
+// @Failure      429   {object}  map[string]string  "An invitation was sent to this address moments ago"
+// @Failure      503   {object}  map[string]string  "Invitations are not configured; nothing was recorded"
 // @Router       /api/v1/tenants/{tid}/admins [post]
 func (h *AdminHandler) InviteTenantAdmin(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
@@ -153,7 +155,7 @@ func (h *AdminHandler) SetTenantAdminGrants(c echo.Context) error {
 // RemoveTenantAdmin handles DELETE /api/v1/tenants/:tid/admins/:adminID.
 //
 // @Summary      Remove a tenant administrator
-// @Description  Withdraws administration. The user account itself survives — losing an administrative role must not take the person's identity or audit history with it. Removing the last owner who can actually log in returns 409: a tenant with no usable owner is administrable only by a platform admin. An owner who has not yet accepted their invitation does not count as usable.
+// @Description  Withdraws administration and revokes the administrator's live sessions, so a removed administrator cannot keep rotating a refresh token into fresh access tokens that still carry their old reach. The user account itself survives — losing an administrative role must not take the person's identity or audit history with it. Removing the last owner who can actually log in returns 409: a tenant with no usable owner is administrable only by a platform admin. Removing a co-owner also returns 409 when they are the tenant's only administrator who can sign in, which happens when the owner never accepted their invitation. An administrator who has not yet accepted does not count as usable, and removing such a pending administrator is always allowed — they could not sign in, so their removal takes nothing away.
 // @Tags         admin-tenant-admins
 // @Produce      json
 // @Security     BearerAuth
@@ -162,7 +164,7 @@ func (h *AdminHandler) SetTenantAdminGrants(c echo.Context) error {
 // @Success      204
 // @Failure      403      {object}  map[string]string
 // @Failure      404      {object}  map[string]string
-// @Failure      409      {object}  map[string]string  "Would leave the tenant without a usable owner"
+// @Failure      409      {object}  map[string]string  "Would leave the tenant without an administrator who can sign in"
 // @Router       /api/v1/tenants/{tid}/admins/{adminID} [delete]
 func (h *AdminHandler) RemoveTenantAdmin(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
@@ -264,6 +266,24 @@ func (h *AdminHandler) tenantAdminError(c echo.Context, err error, op string) er
 		return c.JSON(http.StatusBadRequest, map[string]string{
 			"error": "one or more application_ids do not belong to this tenant",
 			"code":  "unknown_application",
+		})
+	case errors.Is(err, admin.ErrTooManyAdmins):
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error": err.Error(),
+			"code":  "admin_limit_reached",
+		})
+	case errors.Is(err, admin.ErrInviteCooldown):
+		c.Response().Header().Set("Retry-After", "60")
+		return c.JSON(http.StatusTooManyRequests, map[string]string{
+			"error": "an invitation was sent to this address moments ago; wait a minute before resending",
+			"code":  "invite_cooldown",
+		})
+	case errors.Is(err, admin.ErrInvitationsUnavailable):
+		// 503, not 500: the request is valid and will succeed once the server is
+		// configured to send mail.
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{
+			"error": "this server cannot send invitations, so an administrator cannot be added; configure email delivery first",
+			"code":  "invitations_unavailable",
 		})
 	case errors.Is(err, auth.ErrInvitationSuppressed):
 		return c.JSON(http.StatusConflict, map[string]string{

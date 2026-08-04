@@ -685,7 +685,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// administers the tenant. Guarded by users:* because administrators are
 	// users; there is no separate admins:* permission to add to every role.
 	adminGroup.GET("/tenants/:tid/admins", adminHandler.ListTenantAdmins, tidUsersRead)
-	adminGroup.POST("/tenants/:tid/admins", adminHandler.InviteTenantAdmin, tidUsersWrite)
+	// TokenRateLimiter, as on every other route that dispatches mail: inviting
+	// (and re-inviting) an administrator sends to an arbitrary external address,
+	// so without it a tenant owner is an open relay bounded only by request rate.
+	adminGroup.POST("/tenants/:tid/admins", adminHandler.InviteTenantAdmin, tidUsersWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.PUT("/tenants/:tid/admins/:adminID/applications", adminHandler.SetTenantAdminGrants, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/admins/:adminID", adminHandler.RemoveTenantAdmin, tidUsersWrite)
 

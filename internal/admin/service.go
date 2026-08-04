@@ -365,6 +365,21 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// matches on an exact string.
 	ownerEmailAddr := ownerAddr.Address
 
+	// Refused up front, before a single row is written.
+	//
+	// The invitation is the owner's ONLY route to a password — no credentials row
+	// is created here by design. Creating the tenant anyway and reporting
+	// invite_sent=false hands back a 201 for a tenant whose owner can never sign
+	// in and which no endpoint can repair, because every route that could is
+	// guarded by an administrator who does not yet exist. A configuration fault
+	// the operator can fix in a minute is a far better outcome than a tenant that
+	// has to be deleted.
+	if s.invSvc == nil {
+		s.logger.Error().Str("owner_email", ownerEmailAddr).
+			Msg("admin: refusing to create a tenant — no invitation service is wired, so the owner could never sign in")
+		return nil, ErrInvitationsUnavailable
+	}
+
 	secret, err := generateSecret()
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
@@ -499,11 +514,7 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// round-trip would let a slow mail server stall it, and rolling the tenant
 	// back because mail failed would be worse than reporting the failure. The
 	// caller gets 201 with invite_sent=false and can resend.
-	if s.invSvc == nil {
-		owner.InviteError = "invitations are not configured on this server"
-		s.logger.Error().Str("owner_email", ownerEmail).Msg("admin: tenant created but no invitation service is wired")
-		return &CreateTenantResult{Tenant: *tenant, Owner: owner}, nil
-	}
+	// s.invSvc is non-nil: checked before any row was written.
 	if err := s.invSvc.InviteRequired(ctx, tenantID, nil, userID, ownerEmail, "", nil); err != nil {
 		owner.InviteError = err.Error()
 		s.logger.Error().Err(err).

@@ -148,7 +148,7 @@ type SlugCheckResponse struct {
 // CreateTenant handles POST /api/v1/tenants.
 //
 // @Summary      Create tenant
-// @Description  Creates a new isolated tenant and auto-seeds the granular permission catalog, an owner role holding all of it, an owner user for the provided owner_email, and the matching tenant_admins record. The owner account is created WITHOUT a password: an invitation link is emailed, and accepting it sets the password and marks the address verified. The response carries owner.status = "pending_invitation" and owner.invite_sent; when invite_sent is false the tenant still exists and the invitation can be resent. Requires tenant:manage permission (super_admin only).
+// @Description  Creates a new isolated tenant and auto-seeds the granular permission catalog, an owner role holding all of it, an owner user for the provided owner_email, and the matching tenant_admins record. The owner account is created WITHOUT a password: an invitation link is emailed, and accepting it sets the password and marks the address verified. The response carries owner.status = "pending_invitation" and owner.invite_sent; when invite_sent is false the tenant exists but the invitation must be resent before the owner can sign in. Requires tenant:manage permission (super_admin only). Returns 503 when the server has no email delivery configured at all — in that case NOTHING is created, because the invitation is the owner's only route to a password.
 // @Tags         admin-tenants
 // @Accept       json
 // @Produce      json
@@ -158,6 +158,7 @@ type SlugCheckResponse struct {
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
 // @Failure      409   {object}  map[string]string  "Slug already taken"
+// @Failure      503   {object}  map[string]string  "Invitations are not configured; no tenant was created"
 // @Router       /api/v1/tenants [post]
 func (h *AdminHandler) CreateTenant(c echo.Context) error {
 	var req CreateTenantRequest
@@ -191,6 +192,14 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 	if err != nil {
 		if errors.Is(err, admin.ErrAlreadyExists) {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "slug already taken"})
+		}
+		if errors.Is(err, admin.ErrInvitationsUnavailable) {
+			// Nothing was created — the owner's only route to a password is the
+			// invitation, so the tenant is refused rather than left unreachable.
+			return c.JSON(http.StatusServiceUnavailable, map[string]string{
+				"error": "this server cannot send the owner invitation, so no tenant was created; configure email delivery first",
+				"code":  "invitations_unavailable",
+			})
 		}
 		h.logger.Error().Err(err).Msg("admin: create tenant failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to create tenant"})

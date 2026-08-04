@@ -51,8 +51,12 @@ func (h *AuthHandler) notifyRiskySignIn(c echo.Context, tenantID, userID, appID 
 // replace it. Supplying neither is refused, so activating an administrative
 // grant always takes more than possession of the emailed link.
 type AcceptInvitationRequest struct {
-	Token           string `json:"token" validate:"required"`
-	Password        string `json:"password"`
+	Token string `json:"token" validate:"required"`
+	// omitempty, not required: this field is optional now that an existing
+	// account may confirm with CurrentPassword instead. min=8 still applies
+	// whenever it is supplied, restoring the HTTP-layer floor that the service's
+	// ErrWeakPassword otherwise enforces alone.
+	Password        string `json:"password" validate:"omitempty,min=8"`
 	CurrentPassword string `json:"current_password"`
 }
 

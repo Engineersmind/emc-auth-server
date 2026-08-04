@@ -49,7 +49,18 @@ var (
 	// ErrUnknownApplication is returned when a grant names an application that
 	// does not belong to the tenant.
 	ErrUnknownApplication = errors.New("application does not belong to this tenant")
+	// ErrTooManyAdmins is returned when a tenant is already at maxTenantAdmins.
+	ErrTooManyAdmins = fmt.Errorf("a tenant may have at most %d administrators", maxTenantAdmins)
+	// ErrInviteCooldown is returned when an invitation for the same account was
+	// sent moments ago. The route's rate limiter bounds requests per caller; this
+	// bounds mail per recipient, which is the quantity a mailbox owner and the
+	// sending domain's reputation actually feel.
+	ErrInviteCooldown = errors.New("an invitation was sent to this address moments ago; wait before resending")
 )
+
+// inviteResendCooldown is the minimum gap between two invitations for one
+// account.
+const inviteResendCooldown = 60 * time.Second
 
 // maxTenantAdmins caps administrators per tenant. The limit exists to bound the
 // invitation endpoint as a mail-sending primitive, and to keep admin_apps small
@@ -143,14 +154,12 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		return nil, err
 	}
 
-	var count int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT count(*) FROM tenant_admins WHERE tenant_id = $1 AND deleted_at IS NULL`, in.TenantID,
-	).Scan(&count); err != nil {
-		return nil, fmt.Errorf("count tenant admins: %w", err)
-	}
-	if count >= maxTenantAdmins {
-		return nil, fmt.Errorf("tenant already has the maximum of %d administrators", maxTenantAdmins)
+	// An administrator with no way to be told they are one is not an
+	// administrator; it is an inert row and a support ticket. Refused before
+	// anything is written, so a misconfigured server creates nothing rather than
+	// half of something.
+	if s.invSvc == nil {
+		return nil, ErrInvitationsUnavailable
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -158,6 +167,19 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		return nil, fmt.Errorf("begin invite admin tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Serialise every admin mutation for this tenant on the tenants row before
+	// counting. The count and the insert it authorises have to be one atomic
+	// decision: read outside the transaction, two concurrent invitations at
+	// count = maxTenantAdmins-1 both see room and both insert, and the cap that
+	// bounds the admin_apps claim is silently exceeded. The lock is per tenant,
+	// so it costs nothing beyond serialising writes that were already rare.
+	// The cap itself is enforced in upsertTenantAdmin, where it is known whether
+	// a row is actually being added — re-inviting someone who already
+	// administers the tenant adds nobody and must not be refused at the cap.
+	if _, err = tx.Exec(ctx, `SELECT 1 FROM tenants WHERE id = $1 FOR UPDATE`, in.TenantID); err != nil {
+		return nil, fmt.Errorf("lock tenant for admin invite: %w", err)
+	}
 
 	// Seed the role now even though nobody is assigned to it yet: confirmation
 	// attaches it, and creating it up front means that path cannot fail because
@@ -236,14 +258,61 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		action = "invitation_resent"
 	}
 
-	// Changing who administers what invalidates any token that still asserts
-	// the old reach. Access tokens carry admin_scope/admin_apps, so a revoked
-	// grant would otherwise stay usable until the token expired.
+	// Per-recipient cooldown, bounding mail per mailbox where the route's rate
+	// limiter bounds requests per caller. A resend loop targets one address, so
+	// the caller-side limit alone still lets an operator hammer a single inbox and
+	// the sending domain's reputation with it.
+	//
+	// Confined to the pure-resend path, which is the one with no other bound on
+	// it. A call that genuinely changes something — a new administrator, widened
+	// grants, someone re-added after removal — is a deliberate operation whose
+	// mail is incidental, and refusing it would make an operator wait out a
+	// cooldown to do real work. A call that changes nothing at all has already
+	// been refused above as ErrAlreadyAdmin; what is left here is a resend, whose
+	// entire effect IS the mail.
+	//
+	// Read under the tenant lock, so two concurrent resends cannot both find the
+	// field clear.
+	if action == "invitation_resent" {
+		var recent bool
+		if err = tx.QueryRow(ctx, `
+			SELECT EXISTS (
+			    SELECT 1 FROM user_invitations
+			    WHERE user_id = $1 AND created_at > NOW() - $2::interval
+			)
+		`, userID, inviteResendCooldown.String()).Scan(&recent); err != nil {
+			return nil, fmt.Errorf("check invitation cooldown: %w", err)
+		}
+		if recent {
+			return nil, ErrInviteCooldown
+		}
+	}
+
+	// Changing who administers what invalidates any token that still asserts the
+	// old reach. Access tokens carry admin_scope/admin_apps, so a narrowed grant
+	// would otherwise stay usable until the token expired.
+	//
+	// Gated on the grant already being live. A grant that is still pending carries
+	// no reach at all — no RBAC role is attached and loadAdminScope skips it — so
+	// creating one changes nothing that a token could be asserting, and revoking
+	// on it would sign an ordinary tenant user out of their work merely because
+	// somebody invited them to administer something. What must revoke is a change
+	// to an ALREADY ACTIVE grant: a demotion from owner to co-owner narrows reach
+	// the moment it is written, and the session that predates it does not know.
+	//
+	// Activation itself revokes separately, in auth.activatePendingAdminGrant —
+	// which is where the reach actually starts.
 	if changed || !existed {
-		if _, err = tx.Exec(ctx,
-			`UPDATE users SET token_version = token_version + 1, updated_at = NOW() WHERE id = $1`, userID,
-		); err != nil {
-			return nil, fmt.Errorf("bump token version: %w", err)
+		var live bool
+		if err = tx.QueryRow(ctx,
+			`SELECT activated_at IS NOT NULL FROM tenant_admins WHERE id = $1`, adminID,
+		).Scan(&live); err != nil {
+			return nil, fmt.Errorf("check grant activation: %w", err)
+		}
+		if live {
+			if err = revokeAdminScopeTokens(ctx, tx, in.TenantID, userID); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -262,9 +331,8 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 	// For an account that already has a password the link only confirms — it
 	// does not reset the password or end their sessions. See
 	// auth.InvitationService.Accept.
-	if s.invSvc == nil {
-		res.InviteError = "invitations are not configured on this server"
-	} else if err := s.invSvc.InviteRequired(ctx, in.TenantID, nil, userID, email, in.InviterName, nil); err != nil {
+	// s.invSvc is non-nil: checked before the transaction opened.
+	if err := s.invSvc.InviteRequired(ctx, in.TenantID, nil, userID, email, in.InviterName, nil); err != nil {
 		res.InviteError = err.Error()
 		s.logger.Error().Err(err).Str("email", email).Int64("tenant_id", in.TenantID).
 			Msg("admin: administrator added but the confirmation was not delivered")
@@ -333,10 +401,8 @@ func (s *Service) SetTenantAdminGrants(ctx context.Context, tenantID, adminID in
 		return nil, err
 	}
 	if changed {
-		if _, err = tx.Exec(ctx,
-			`UPDATE users SET token_version = token_version + 1, updated_at = NOW() WHERE id = $1`, userID,
-		); err != nil {
-			return nil, fmt.Errorf("bump token version: %w", err)
+		if err = revokeAdminScopeTokens(ctx, tx, tenantID, userID); err != nil {
+			return nil, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -360,11 +426,13 @@ func (s *Service) RemoveTenantAdmin(ctx context.Context, tenantID, adminID int64
 	var userID int64
 	var role string
 	var previousRoleID *int64
+	var wasActivated bool
 	err = tx.QueryRow(ctx, `
-		SELECT user_id, admin_role, previous_role_id FROM tenant_admins
+		SELECT user_id, admin_role, previous_role_id, activated_at IS NOT NULL
+		FROM tenant_admins
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 		FOR UPDATE
-	`, adminID, tenantID).Scan(&userID, &role, &previousRoleID)
+	`, adminID, tenantID).Scan(&userID, &role, &previousRoleID, &wasActivated)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -372,8 +440,13 @@ func (s *Service) RemoveTenantAdmin(ctx context.Context, tenantID, adminID int64
 		return fmt.Errorf("load administrator: %w", err)
 	}
 
+	// tenant_id in the predicate as well as id. The FOR UPDATE select above
+	// already established both, so this is defence in depth rather than a fix:
+	// the statement should not be capable of crossing a tenant boundary when read
+	// on its own, by a script or a test helper that skipped the select.
 	if _, err = tx.Exec(ctx,
-		`UPDATE tenant_admins SET deleted_at = NOW(), updated_at = NOW() WHERE id = $1`, adminID,
+		`UPDATE tenant_admins SET deleted_at = NOW(), updated_at = NOW()
+		 WHERE id = $1 AND tenant_id = $2`, adminID, tenantID,
 	); err != nil {
 		return fmt.Errorf("remove administrator: %w", err)
 	}
@@ -399,16 +472,41 @@ func (s *Service) RemoveTenantAdmin(ctx context.Context, tenantID, adminID int64
 		return fmt.Errorf("clear primary administrator: %w", err)
 	}
 
+	// Two distinct guards, because "the tenant still has an owner" and "the
+	// tenant still has anybody" are different failures.
+	//
+	// Removing an owner must leave a usable owner: only an owner can appoint
+	// administrators, so an owner-less tenant cannot repair itself even while a
+	// co-owner is still working in it.
+	//
+	// Removing a co-owner must leave a usable administrator of either tier. That
+	// case is not covered by the owner guard and is reachable: a tenant whose only
+	// owner never accepted their invitation is being administered by its co-owner
+	// alone, and removing that co-owner empties it. Nobody can sign in afterwards
+	// and no endpoint can put it right, because every route that could is guarded
+	// by the administrator who just left.
+	//
+	// Conditional on the co-owner having been usable, and that condition is not a
+	// softening of the rule — it is the rule. Removing a co-owner who never
+	// accepted cannot reduce the number of people who can sign in, because they
+	// were not one of them. Guarding it anyway would refuse to clean up a
+	// mistyped invitation in exactly the tenant that most needs the mistake
+	// undone: one whose owner has not accepted either. The owner branch is
+	// deliberately unconditional by contrast — a tenant must be left with an
+	// owner who can appoint administrators, whether or not the departing one
+	// could.
 	if role == auth.AdminRoleOwner {
 		if err := assertUsableOwnerRemains(ctx, tx, tenantID); err != nil {
 			return err
 		}
+	} else if wasActivated {
+		if err := assertUsableAdminRemains(ctx, tx, tenantID); err != nil {
+			return err
+		}
 	}
 
-	if _, err = tx.Exec(ctx,
-		`UPDATE users SET token_version = token_version + 1, updated_at = NOW() WHERE id = $1`, userID,
-	); err != nil {
-		return fmt.Errorf("bump token version: %w", err)
+	if err = revokeAdminScopeTokens(ctx, tx, tenantID, userID); err != nil {
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -582,6 +680,17 @@ func upsertTenantAdmin(ctx context.Context, tx pgx.Tx, tenantID, userID int64, r
 	`, userID, tenantID).Scan(&adminID, &existingRole)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
+		// Counted here, inside the caller's transaction and under its per-tenant
+		// lock, and only on the branch that adds a row.
+		var count int
+		if err = tx.QueryRow(ctx,
+			`SELECT count(*) FROM tenant_admins WHERE tenant_id = $1 AND deleted_at IS NULL`, tenantID,
+		).Scan(&count); err != nil {
+			return 0, false, fmt.Errorf("count tenant admins: %w", err)
+		}
+		if count >= maxTenantAdmins {
+			return 0, false, ErrTooManyAdmins
+		}
 		if err = tx.QueryRow(ctx, `
 			INSERT INTO tenant_admins (tenant_id, user_id, admin_role, invited_by, previous_role_id)
 			VALUES ($1, $2, $3, $4, $5)
@@ -658,6 +767,37 @@ func replaceGrants(ctx context.Context, tx pgx.Tx, adminID int64, appIDs []int64
 	return false, nil
 }
 
+// revokeAdminScopeTokens invalidates everything a user holds that still asserts
+// an administrative reach they no longer have.
+//
+// Both halves are needed and neither substitutes for the other. The
+// token_version bump marks the account; revoking the refresh tokens is what
+// stops a new access token being minted with the old reach. Without the second
+// step a withdrawn grant survives in whatever session was already open, for as
+// long as that session keeps rotating — which is indefinitely.
+//
+// Access tokens already issued still carry the old admin_scope until they expire
+// (15 minutes). Closing that window requires the token_version counter to be
+// checked at verification time. Nothing in this codebase does that yet: the
+// counter is written by every credential and authority change and read by
+// nobody, so it is currently a marker rather than a revocation. Treat the
+// refresh-token revocation as the mechanism that works.
+func revokeAdminScopeTokens(ctx context.Context, tx pgx.Tx, tenantID, userID int64) error {
+	if _, err := tx.Exec(ctx,
+		`UPDATE users SET token_version = token_version + 1, updated_at = NOW()
+		 WHERE id = $1 AND tenant_id = $2`, userID, tenantID,
+	); err != nil {
+		return fmt.Errorf("bump token version: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW()
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, userID, tenantID); err != nil {
+		return fmt.Errorf("revoke sessions: %w", err)
+	}
+	return nil
+}
+
 func hasPendingInvitation(ctx context.Context, tx pgx.Tx, userID int64) (bool, error) {
 	var n int
 	if err := tx.QueryRow(ctx, `
@@ -681,24 +821,52 @@ func hasPendingInvitation(ctx context.Context, tx pgx.Tx, userID int64) (bool, e
 // trigger would either false-positive on the first row of a two-row demotion or
 // miss the case entirely.
 func assertUsableOwnerRemains(ctx context.Context, tx pgx.Tx, tenantID int64) error {
-	var remaining int
-	if err := tx.QueryRow(ctx, `
+	n, err := countUsableAdmins(ctx, tx, tenantID, auth.AdminRoleOwner)
+	if err != nil {
+		return fmt.Errorf("count usable owners: %w", err)
+	}
+	if n == 0 {
+		return ErrLastOwner
+	}
+	return nil
+}
+
+// assertUsableAdminRemains enforces that a tenant is never emptied of
+// administrators outright, whatever tier the last one held. Applied to co-owner
+// removal, where assertUsableOwnerRemains does not apply: a tenant whose only
+// owner is still unactivated is nonetheless administrable through its co-owner,
+// and removing that co-owner is what would strand it.
+func assertUsableAdminRemains(ctx context.Context, tx pgx.Tx, tenantID int64) error {
+	n, err := countUsableAdmins(ctx, tx, tenantID, "")
+	if err != nil {
+		return fmt.Errorf("count usable administrators: %w", err)
+	}
+	if n == 0 {
+		return ErrLastOwner
+	}
+	return nil
+}
+
+// countUsableAdmins counts administrators of a tenant who can actually sign in
+// and exercise the grant. An empty adminRole counts both tiers.
+//
+// "Usable" excludes a grant the recipient has not accepted: two
+// invited-but-never-accepted owners satisfy a naive count while nobody can enter
+// the tenant at all.
+func countUsableAdmins(ctx context.Context, tx pgx.Tx, tenantID int64, adminRole string) (int, error) {
+	var n int
+	err := tx.QueryRow(ctx, `
 		SELECT count(*)
 		FROM tenant_admins ta
 		JOIN users u ON u.id = ta.user_id
 		WHERE ta.tenant_id = $1
-		  AND ta.admin_role = $2
+		  AND ($2 = '' OR ta.admin_role = $2)
 		  AND ta.deleted_at IS NULL
 		  AND ta.activated_at IS NOT NULL
 		  AND u.deleted_at IS NULL
 		  AND u.is_active
 		  AND u.blocked_at IS NULL
 		  AND u.email_verified
-	`, tenantID, auth.AdminRoleOwner).Scan(&remaining); err != nil {
-		return fmt.Errorf("count usable owners: %w", err)
-	}
-	if remaining == 0 {
-		return ErrLastOwner
-	}
-	return nil
+	`, tenantID, adminRole).Scan(&n)
+	return n, err
 }

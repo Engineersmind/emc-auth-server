@@ -5005,7 +5005,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Creates a new isolated tenant and auto-seeds the granular permission catalog, an owner role holding all of it, an owner user for the provided owner_email, and the matching tenant_admins record. The owner account is created WITHOUT a password: an invitation link is emailed, and accepting it sets the password and marks the address verified. The response carries owner.status = \"pending_invitation\" and owner.invite_sent; when invite_sent is false the tenant still exists and the invitation can be resent. Requires tenant:manage permission (super_admin only).",
+                "description": "Creates a new isolated tenant and auto-seeds the granular permission catalog, an owner role holding all of it, an owner user for the provided owner_email, and the matching tenant_admins record. The owner account is created WITHOUT a password: an invitation link is emailed, and accepting it sets the password and marks the address verified. The response carries owner.status = \"pending_invitation\" and owner.invite_sent; when invite_sent is false the tenant exists but the invitation must be resent before the owner can sign in. Requires tenant:manage permission (super_admin only). Returns 503 when the server has no email delivery configured at all — in that case NOTHING is created, because the invitation is the owner's only route to a password.",
                 "consumes": [
                     "application/json"
                 ],
@@ -5054,6 +5054,15 @@
                     },
                     "409": {
                         "description": "Slug already taken",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Invitations are not configured; no tenant was created",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5560,7 +5569,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Adds an owner (tenant-wide) or co-owner (specific applications). An address that is already a TENANT-LEVEL user is promoted in place and no second identity is created; an application-scoped user with the same address is unrelated and never collides, so being a customer of an application and an administrator of its tenant are compatible. The response's action field reports what happened: \"invited\" (new account, invitation sent), \"grants_added\" (existing user promoted or widened), or \"invitation_resent\". An invitation that would change nothing returns 409.",
+                "description": "Adds an owner (tenant-wide) or co-owner (specific applications). An address that is already a TENANT-LEVEL user is promoted in place and no second identity is created; an application-scoped user with the same address is unrelated and never collides, so being a customer of an application and an administrator of its tenant are compatible. The response's action field reports what happened: \"invited\" (new account, invitation sent), \"grants_added\" (existing user promoted or widened), or \"invitation_resent\". An invitation that would change nothing returns 409, as does a tenant already holding the maximum number of administrators. A repeat resend to the same address within a minute returns 429. Returns 503 when the server has no email delivery configured — nothing is recorded, because an administrator who cannot be told they are one could never sign in.",
                 "consumes": [
                     "application/json"
                 ],
@@ -5615,7 +5624,25 @@
                         }
                     },
                     "409": {
-                        "description": "Already an administrator with these grants",
+                        "description": "Already an administrator with these grants, or the administrator limit is reached",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "An invitation was sent to this address moments ago",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Invitations are not configured; nothing was recorded",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5633,7 +5660,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Withdraws administration. The user account itself survives — losing an administrative role must not take the person's identity or audit history with it. Removing the last owner who can actually log in returns 409: a tenant with no usable owner is administrable only by a platform admin. An owner who has not yet accepted their invitation does not count as usable.",
+                "description": "Withdraws administration and revokes the administrator's live sessions, so a removed administrator cannot keep rotating a refresh token into fresh access tokens that still carry their old reach. The user account itself survives — losing an administrative role must not take the person's identity or audit history with it. Removing the last owner who can actually log in returns 409: a tenant with no usable owner is administrable only by a platform admin. Removing a co-owner also returns 409 when they are the tenant's only administrator who can sign in, which happens when the owner never accepted their invitation. An administrator who has not yet accepted does not count as usable, and removing such a pending administrator is always allowed — they could not sign in, so their removal takes nothing away.",
                 "produces": [
                     "application/json"
                 ],
@@ -5680,7 +5707,7 @@
                         }
                     },
                     "409": {
-                        "description": "Would leave the tenant without a usable owner",
+                        "description": "Would leave the tenant without an administrator who can sign in",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -8631,7 +8658,9 @@
                     "type": "string"
                 },
                 "password": {
-                    "type": "string"
+                    "description": "omitempty, not required: this field is optional now that an existing\naccount may confirm with CurrentPassword instead. min=8 still applies\nwhenever it is supplied, restoring the HTTP-layer floor that the service's\nErrWeakPassword otherwise enforces alone.",
+                    "type": "string",
+                    "minLength": 8
                 },
                 "token": {
                     "type": "string"

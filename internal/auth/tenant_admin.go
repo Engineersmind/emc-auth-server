@@ -75,10 +75,30 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	); err != nil {
 		return fmt.Errorf("activate admin grant: %w", err)
 	}
+	// token_version is bumped here rather than relying on the caller. Accept
+	// bumps it too, but this function is the one that changes what the account
+	// may do, so the invalidation belongs with the change: any future caller
+	// gets it without having to know to ask.
 	if _, err = tx.Exec(ctx,
-		`UPDATE users SET role_id = $1, updated_at = NOW() WHERE id = $2`, roleID, userID,
+		`UPDATE users SET role_id = $1, token_version = token_version + 1, updated_at = NOW()
+		 WHERE id = $2 AND tenant_id = $3`, roleID, userID, tenantID,
 	); err != nil {
 		return fmt.Errorf("attach administrative role: %w", err)
+	}
+	// Every live session ends when a grant activates, and unlike the password
+	// branch in Accept this is unconditional.
+	//
+	// It has to be. Accepting without changing the password is the ordinary path
+	// for someone already working in the tenant, and it is exactly the path that
+	// raises their authority. A refresh token captured before the grant existed
+	// would otherwise keep minting access tokens — now carrying admin_scope,
+	// because rotation re-reads the grant it was stolen ahead of. Signing an
+	// incoming administrator out once is a cheap price for that not being true.
+	if _, err = tx.Exec(ctx, `
+		UPDATE refresh_tokens SET revoked_at = NOW()
+		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, userID, tenantID); err != nil {
+		return fmt.Errorf("revoke sessions on admin grant activation: %w", err)
 	}
 	return nil
 }

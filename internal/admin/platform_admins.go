@@ -115,6 +115,12 @@ const platformAdminSelect = `
 	         OR EXISTS (SELECT 1 FROM email_mfa_settings em WHERE em.user_id = u.id AND em.is_active),
 	       (SELECT MAX(COALESCE(rt.last_used_at, rt.created_at))
 	        FROM refresh_tokens rt WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id),
+	       -- Served by idx_audit_logs_user_action_created
+	       -- (user_id, action, created_at DESC) WHERE user_id IS NOT NULL, from
+	       -- migration 00055: the leading two columns match this predicate
+	       -- exactly. tenant_id is a residual check over rows that are already
+	       -- only this user's logins, so it does not widen the scan. Bounded by
+	       -- the page size, like every other subquery here.
 	       (SELECT COUNT(*) FROM audit_logs al
 	        WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id AND al.action = 'auth.login'),
 	       ta.created_at

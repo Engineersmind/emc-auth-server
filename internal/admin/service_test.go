@@ -19,8 +19,13 @@ import (
 // a freshly created application, plus the pool for assertions that need to
 // read rows the Service doesn't expose directly (e.g. the seeded owner role).
 type adminFixture struct {
-	pool     *pgxpool.Pool
-	svc      *admin.Service
+	pool *pgxpool.Pool
+	svc  *admin.Service
+	// mail records the invitations the service dispatched. A real invitation
+	// service is wired rather than left nil, because the flows under test now
+	// refuse to run without one: an administrator who cannot be told they are
+	// one is an inert row, so CreateTenant and InviteTenantAdmin fail closed.
+	mail     *testhelper.RecordingMailer
 	tenantID int64
 	appID    int64
 }
@@ -52,7 +57,11 @@ func newAdminFixture(t *testing.T) adminFixture {
 		t.Fatalf("fetch app id: %v", err)
 	}
 
-	return adminFixture{pool: pool, svc: admin.New(pool, nil, logger), tenantID: tenantID, appID: appID}
+	mail := &testhelper.RecordingMailer{}
+	invSvc := auth.NewInvitationService(pool, mail, "https://console.test", logger)
+	svc := admin.New(pool, nil, logger).WithInvitations(invSvc)
+
+	return adminFixture{pool: pool, svc: svc, mail: mail, tenantID: tenantID, appID: appID}
 }
 
 // seedSystemRoleID returns the id of the tenant-level system role that

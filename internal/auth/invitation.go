@@ -197,9 +197,14 @@ func (s *InvitationService) Preview(ctx context.Context, rawToken string) (*Invi
 	err := s.pool.QueryRow(ctx, `
 		SELECT u.email,
 		       NOT EXISTS (SELECT 1 FROM user_credentials c WHERE c.user_id = u.id),
+		       -- ta.tenant_id = i.tenant_id, or a pending grant in ANOTHER tenant
+		       -- reads as one this invitation would activate. Accept resolves the
+		       -- grant by (user, invitation tenant); this predicate is what keeps
+		       -- the two answering the same question.
 		       EXISTS (
 		           SELECT 1 FROM tenant_admins ta
-		           WHERE ta.user_id = u.id AND ta.deleted_at IS NULL AND ta.activated_at IS NULL
+		           WHERE ta.user_id = u.id AND ta.tenant_id = i.tenant_id
+		             AND ta.deleted_at IS NULL AND ta.activated_at IS NULL
 		       )
 		FROM user_invitations i
 		JOIN users u ON u.id = i.user_id
@@ -315,9 +320,14 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 		`, t.UserID, t.TenantID, string(hash)); err != nil {
 			return nil, fmt.Errorf("set invitation password: %w", err)
 		}
-		// A credential change ends any session that existed beforehand. Only
-		// done when the password actually changed — a confirmation must not sign
-		// the person out of work they are in the middle of.
+		// A credential change ends any session that existed beforehand. Confined
+		// to the branch where the password actually changed: a bare confirmation
+		// must not sign the person out of work they are in the middle of.
+		//
+		// Activating an administrative grant revokes unconditionally — see
+		// activatePendingAdminGrant. The distinction is what changed: a
+		// confirmation that raises nothing leaves sessions alone, one that raises
+		// authority does not.
 		if _, err := tx.Exec(ctx, `
 			UPDATE refresh_tokens SET revoked_at = NOW()
 			WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
