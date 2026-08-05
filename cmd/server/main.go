@@ -65,6 +65,12 @@ func main() {
 		Str("env", cfg.Env).
 		Logger()
 
+	// Refuse to boot on a configuration that would break cookie sessions at
+	// runtime — a fail-closed CSRF check turns these into a silent portal outage.
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal().Err(err).Msg("invalid configuration")
+	}
+
 	// An invitation is the ONLY route to a password for a newly seeded tenant
 	// owner, and its link is built from DashboardBaseURL. Left at the dev default
 	// in production, every invitation points at the operator's own machine — the

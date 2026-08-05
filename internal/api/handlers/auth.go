@@ -2049,6 +2049,46 @@ func appIDFromClaim(s string) *int64 {
 // SessionLoginRequest is the body for POST /api/v1/auth/session.
 type SessionLoginRequest = LoginRequest
 
+// accessTokenExpiresIn is the access token's lifetime in seconds, reported to
+// cookie-session clients so they can schedule a proactive refresh.
+//
+// Derived from auth.AccessTokenTTL rather than written as a literal: these
+// endpoints previously advertised a hardcoded "3600" against a 15-minute TTL, so
+// any client trusting it would refresh 45 minutes after its session had already
+// started failing. The cookie's Max-Age was always correct — only the advertised
+// number was wrong, which is exactly the kind of drift a literal invites.
+//
+// A const, so no init() or test helper can reassign it. Go cannot format a
+// string at compile time, so the literal cannot be derived from the TTL
+// directly; the assertion below closes that gap instead — if AccessTokenTTL
+// changes and this literal does not, the package stops compiling.
+const accessTokenExpiresIn = "900"
+
+// Compile-time assertion that accessTokenExpiresIn matches auth.AccessTokenTTL.
+// Converting a negative constant to uint is a compile error, so the pair holds
+// only when the two are equal: one catches drift in each direction. Keep this
+// adjacent to the literal above — the two are a single declaration in effect.
+const (
+	_ = uint(auth.AccessTokenTTLSeconds - 900)
+	_ = uint(900 - auth.AccessTokenTTLSeconds)
+)
+
+// errCookieSessionForApps rejects an attempt to obtain a browser cookie session
+// for an application-scoped identity.
+//
+// setAuthCookies enforces the same rule as a backstop, but silently: it just
+// declines to write the cookies. At /auth/session and /auth/session/refresh
+// that silence is indistinguishable from success — the caller receives
+// 200 "logged in" with no Set-Cookie, reloads, and lands back on the login
+// screen, which is the exact defect #101 exists to fix. These two endpoints
+// therefore fail loudly instead.
+func errCookieSessionForApps(c echo.Context) error {
+	return c.JSON(http.StatusBadRequest, map[string]string{
+		"error": "cookie sessions are not available to application-scoped logins — use /auth/apps/login and present the token pair as Authorization: Bearer",
+		"code":  "cookie_session_not_available_for_applications",
+	})
+}
+
 // SessionLogin handles POST /api/v1/auth/session.
 //
 // @Summary      Cookie-based login
@@ -2099,9 +2139,17 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
 	}
 
+	tid, uid, appID := claimsFromToken(result.Token.AccessToken)
+
+	// An X-Client-ID header scopes the login to an application, and application
+	// identities never get cookies. Say so rather than returning a cookie-less
+	// 200 the caller cannot distinguish from a working session.
+	if appID != nil {
+		return errCookieSessionForApps(c)
+	}
+
 	setAuthCookies(c, result.Token.AccessToken, result.Token.RefreshToken, h.cookieCfg)
 
-	tid, uid, appID := claimsFromToken(result.Token.AccessToken)
 	h.auditEvent(c, audit.Event{
 		TenantID:      tid,
 		UserID:        uid,
@@ -2116,7 +2164,7 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"message":    "logged in",
-		"expires_in": "3600",
+		"expires_in": accessTokenExpiresIn,
 	})
 }
 
@@ -2178,9 +2226,20 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		})
 	}
 
+	tid, uid, appID := claimsFromToken(result.AccessToken)
+
+	// Application-scoped refresh cookies can only exist from a build that
+	// predates the cookie/header split. Rotation has already consumed the old
+	// token by this point, so the session is over either way — clear the stale
+	// cookies and say why, instead of a 200 "session refreshed" that silently
+	// signed the caller out.
+	if appID != nil {
+		clearAuthCookies(c, h.cookieCfg)
+		return errCookieSessionForApps(c)
+	}
+
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
 
-	tid, uid, appID := claimsFromToken(result.AccessToken)
 	h.auditEvent(c, audit.Event{
 		TenantID:      tid,
 		UserID:        uid,
@@ -2194,7 +2253,7 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, map[string]string{
 		"message":    "session refreshed",
-		"expires_in": "3600",
+		"expires_in": accessTokenExpiresIn,
 	})
 }
 
@@ -2363,7 +2422,37 @@ func (h *AuthHandler) Token(c echo.Context) error {
 // Cookie helpers
 // ---------------------------------------------------------------------------
 
+// setAuthCookies writes the browser session cookies — but only for a first-party
+// session, i.e. the management portal.
+//
+// Application-scoped end-user logins are deliberately excluded. Those flows
+// (/auth/apps/register, /auth/apps/login, magic-link verify, and any MFA
+// continuation that completes one) authenticate the calling application with
+// client_id/client_secret and return the token pair in the response body, for
+// the application to present as `Authorization: Bearer`. Handing them a cookie
+// as well would mint an ambient credential the integrator never asked for and
+// does not manage — a second, silent way into the same account, carrying the
+// CSRF exposure that only cookies have.
+//
+// The token's app_id claim is the discriminator: issueTokenPair populates it
+// only for application-scoped tokens and leaves it empty for first-party
+// admin/tenant tokens. The check lives here, not at the call sites, so a future
+// login flow cannot reintroduce end-user cookies by forgetting about it. The
+// rule is: cookies are for the portal, headers are for applications.
+//
+// The app_id claim is read by unsigned decode. That is sound here only because
+// every caller passes a token this process signed moments earlier — the claim
+// cannot have been tampered with in between. Do not call setAuthCookies with an
+// externally sourced token (a token-exchange or impersonation flow, say):
+// against one, the gate is forgeable by simply omitting the claim.
+//
+// Note the skip is silent. /auth/session and /auth/session/refresh reject
+// app-scoped identities explicitly before reaching here, because at those two
+// endpoints a missing cookie is the whole failure; see errCookieSessionForApps.
 func setAuthCookies(c echo.Context, accessToken, refreshToken string, cfg mw.CookieConfig) {
+	if _, _, appID := claimsFromToken(accessToken); appID != nil {
+		return
+	}
 	for _, cookie := range mw.BuildAuthCookies(accessToken, refreshToken, cfg) {
 		http.SetCookie(c.Response().Writer, cookie)
 	}
