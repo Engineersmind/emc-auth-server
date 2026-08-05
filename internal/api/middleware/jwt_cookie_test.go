@@ -23,7 +23,12 @@ import (
 // asserted is token_missing (no credential found) vs token_invalid (a credential
 // was found in the cookie and handed to Verify).
 func TestJWTGuards_ReadAccessTokenFromCookie(t *testing.T) {
-	jwtSvc := auth.NewJWTService(nil, "test-issuer")
+	// Issuer must be non-empty: #84 made NewJWTService reject an empty one so that
+	// iss verification cannot be silently disabled by a misconfigured deploy.
+	jwtSvc, err := auth.NewJWTService(nil, "https://auth.emc.local")
+	if err != nil {
+		t.Fatalf("NewJWTService: %v", err)
+	}
 
 	guards := map[string]echo.MiddlewareFunc{
 		// Guards adminGroup: /tenants, /applications, /audit-logs, /agents, …
