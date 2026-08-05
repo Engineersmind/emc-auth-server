@@ -62,6 +62,12 @@ func main() {
 		Str("env", cfg.Env).
 		Logger()
 
+	// Refuse to boot on a configuration that would break cookie sessions at
+	// runtime — a fail-closed CSRF check turns these into a silent portal outage.
+	if err := cfg.Validate(); err != nil {
+		logger.Fatal().Err(err).Msg("invalid configuration")
+	}
+
 	ctx := context.Background()
 
 	// Initialise OpenTelemetry (no-op when OTEL_EXPORTER_OTLP_ENDPOINT is unset)

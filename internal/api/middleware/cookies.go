@@ -46,7 +46,15 @@ func BuildCookieConfig(env, domain string) CookieConfig {
 //	                    authenticate the management endpoints (/api/v1/tenants,
 //	                    /api/v1/applications, …), not just /api/v1/auth.
 //	RefreshCookiePath — only the auth endpoints that consume it, so the 30-day
-//	                    credential is not attached to ordinary API traffic.
+//	                    credential is not attached to ordinary API traffic. It
+//	                    covers the whole /api/v1/auth prefix rather than just
+//	                    /api/v1/auth/session/refresh because logout
+//	                    (/api/v1/auth/session/logout) must also receive the
+//	                    cookie in order to revoke and clear it — a deletion the
+//	                    browser never delivers the cookie to cannot revoke it.
+//	                    Consequence: any route added under /api/v1/auth will
+//	                    receive the refresh cookie. Keep lower-trust or public
+//	                    routes off that prefix.
 const (
 	AccessCookiePath  = "/api/v1"
 	RefreshCookiePath = "/api/v1/auth"
@@ -95,6 +103,21 @@ func ClearAuthCookies(c echo.Context, cfg CookieConfig) {
 	})
 	http.SetCookie(c.Response().Writer, &http.Cookie{
 		Name:     RefreshTokenCookie,
+		Value:    "",
+		HttpOnly: true,
+		Secure:   cfg.Secure,
+		SameSite: cfg.SameSite,
+		Domain:   cfg.Domain,
+		Path:     RefreshCookiePath,
+		MaxAge:   -1,
+	})
+	// Transitional: before #102 the access cookie was scoped to /api/v1/auth.
+	// By the same §5.2.3 rule that entry is distinct from the /api/v1 one, so a
+	// browser holding the old cookie would keep it through logout until its
+	// Max-Age lapses. Emit a third deletion at the legacy path to close that
+	// window. Remove after one release cycle.
+	http.SetCookie(c.Response().Writer, &http.Cookie{
+		Name:     AccessTokenCookie,
 		Value:    "",
 		HttpOnly: true,
 		Secure:   cfg.Secure,

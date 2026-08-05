@@ -53,18 +53,30 @@ func TestClearAuthCookies_PathsMatchBuild(t *testing.T) {
 	c := echo.New().NewContext(httptest.NewRequest(http.MethodPost, "/api/v1/auth/session/logout", nil), rec)
 	ClearAuthCookies(c, cfg)
 
-	cleared := map[string]string{}
+	// Keyed by name to a set of paths: the access cookie is cleared at more than
+	// one path (see the transitional legacy deletion in ClearAuthCookies), so
+	// what matters is that the path it was *set* with is among them.
+	cleared := map[string]map[string]bool{}
 	for _, c := range rec.Result().Cookies() {
 		if c.MaxAge != -1 {
 			t.Errorf("%s: MaxAge = %d, want -1", c.Name, c.MaxAge)
 		}
-		cleared[c.Name] = c.Path
+		if cleared[c.Name] == nil {
+			cleared[c.Name] = map[string]bool{}
+		}
+		cleared[c.Name][c.Path] = true
 	}
 
 	for name, path := range built {
-		if cleared[name] != path {
-			t.Errorf("%s: cleared Path = %q, but set with %q — cookie would survive logout", name, cleared[name], path)
+		if !cleared[name][path] {
+			t.Errorf("%s: set with Path %q but no deletion at that path (%v) — cookie would survive logout", name, path, cleared[name])
 		}
+	}
+
+	// The pre-#102 access cookie lived at RefreshCookiePath; browsers still
+	// holding it would otherwise keep it through logout until Max-Age lapsed.
+	if !cleared[AccessTokenCookie][RefreshCookiePath] {
+		t.Errorf("access cookie not cleared at the legacy path %q — a session predating #102 survives logout", RefreshCookiePath)
 	}
 }
 
@@ -189,7 +201,15 @@ func TestCookieCSRF(t *testing.T) {
 			rec := httptest.NewRecorder()
 			c := echo.New().NewContext(req, rec)
 
+			// reached is the assertion that matters: a 403 status proves only
+			// that the header was written, and echo writes it before the
+			// middleware decides whether to continue. Asserting rec.Code alone
+			// passes against a middleware that rejects the request and then
+			// runs the handler anyway — the mutation happening while the caller
+			// is told it was forbidden.
+			reached := false
 			handler := CookieCSRF(tc.cfg)(func(c echo.Context) error {
+				reached = true
 				return c.NoContent(http.StatusOK)
 			})
 			if err := handler(c); err != nil {
@@ -198,6 +218,63 @@ func TestCookieCSRF(t *testing.T) {
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			wantReached := tc.wantStatus == http.StatusOK
+			if reached != wantReached {
+				t.Errorf("handler reached = %v, want %v — a rejected request must not execute the handler", reached, wantReached)
+			}
+		})
+	}
+}
+
+// SessionCSRF guards the three endpoints that mint, rotate and revoke the
+// session itself, and unlike CookieCSRF it fires regardless of whether a cookie
+// is present — /auth/session has none yet when it is called. The handler-reached
+// assertion is the point: a rotation that happens behind a 403 has still
+// revoked the victim's refresh token.
+func TestSessionCSRF(t *testing.T) {
+	prodCfg := BuildCookieConfig("production", ".engineersmind.com")
+
+	tests := []struct {
+		name       string
+		cfg        CookieConfig
+		origin     string
+		wantStatus int
+	}{
+		{"trusted subdomain passes", prodCfg, "https://admin.engineersmind.com", http.StatusOK},
+		{"exact domain passes", prodCfg, "https://engineersmind.com", http.StatusOK},
+		{"missing origin passes", prodCfg, "", http.StatusOK},
+		{"attacker origin is rejected", prodCfg, "https://evil.example.com", http.StatusForbidden},
+		{"lookalike domain is rejected", prodCfg, "https://evil-engineersmind.com", http.StatusForbidden},
+		{"opaque origin is rejected", prodCfg, "null", http.StatusForbidden},
+		{"unset cookie domain fails closed", BuildCookieConfig("production", ""), "https://admin.engineersmind.com", http.StatusForbidden},
+		{"development skips the check", BuildCookieConfig("development", ""), "https://evil.example.com", http.StatusOK},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/session/refresh", nil)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			rec := httptest.NewRecorder()
+			c := echo.New().NewContext(req, rec)
+
+			reached := false
+			handler := SessionCSRF(tc.cfg)(func(c echo.Context) error {
+				reached = true
+				return c.NoContent(http.StatusOK)
+			})
+			if err := handler(c); err != nil {
+				t.Fatalf("handler returned error: %v", err)
+			}
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			wantReached := tc.wantStatus == http.StatusOK
+			if reached != wantReached {
+				t.Errorf("handler reached = %v, want %v — a rejected request must not rotate the session", reached, wantReached)
 			}
 		})
 	}

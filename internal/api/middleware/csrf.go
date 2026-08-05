@@ -40,8 +40,8 @@ func SessionCSRF(cfg CookieConfig) echo.MiddlewareFunc {
 			if !cfg.Secure {
 				return next(c)
 			}
-			if err := checkTrustedOrigin(c, cfg); err != nil {
-				return err
+			if rejection, blocked := checkTrustedOrigin(c, cfg); blocked {
+				return rejection
 			}
 			return next(c)
 		}
@@ -84,8 +84,8 @@ func CookieCSRF(cfg CookieConfig) echo.MiddlewareFunc {
 			if !hasAuthCookie(c) {
 				return next(c)
 			}
-			if err := checkTrustedOrigin(c, cfg); err != nil {
-				return err
+			if rejection, blocked := checkTrustedOrigin(c, cfg); blocked {
+				return rejection
 			}
 			return next(c)
 		}
@@ -103,6 +103,12 @@ func isMutating(method string) bool {
 }
 
 // hasAuthCookie reports whether the request carries either session cookie.
+//
+// Either cookie counts, deliberately: the presence of one means a
+// browser-managed session is in use, and a cross-site request carrying only the
+// refresh cookie can still rotate the family — obtaining a fresh access token
+// and revoking the victim's in-flight one. Do not narrow this to the access
+// cookie alone.
 func hasAuthCookie(c echo.Context) bool {
 	for _, name := range []string{AccessTokenCookie, RefreshTokenCookie} {
 		if cookie, err := c.Cookie(name); err == nil && cookie.Value != "" {
@@ -112,13 +118,26 @@ func hasAuthCookie(c echo.Context) bool {
 	return false
 }
 
-// checkTrustedOrigin returns a 403 response error when the request's Origin is
-// not the trusted cookie domain. A missing Origin passes: that means a
-// non-browser client or a same-origin request, neither of which is forgeable.
-func checkTrustedOrigin(c echo.Context, cfg CookieConfig) error {
+// checkTrustedOrigin reports whether the request must be blocked, and returns
+// the error from writing the 403 response when it is.
+//
+// blocked is returned separately because echo's c.JSON returns nil on success:
+// a single error return would read as "allowed" immediately after the 403 body
+// was written, and the caller would go on to invoke the handler anyway. Any
+// future rejection site must return (…, true).
+//
+// A missing Origin passes. This is a policy choice, not an inference about the
+// caller: same-origin form submits omit Origin, as do some browsers in privacy
+// modes and many non-browser clients, so rejecting on absence would break
+// legitimate traffic. It is safe against the threat this guards — a cross-site
+// page cannot suppress the Origin header on a real browser fetch or form post.
+// The consequence is that a non-browser client is not covered by this check;
+// such callers hold no ambient cookie credential to forge, and are bounded by
+// the token rate limiter instead.
+func checkTrustedOrigin(c echo.Context, cfg CookieConfig) (rejection error, blocked bool) {
 	origin := c.Request().Header.Get("Origin")
 	if origin == "" {
-		return nil
+		return nil, false
 	}
 
 	// cfg.Domain is e.g. ".engineersmind.com"; strip the leading dot to get
@@ -131,14 +150,14 @@ func checkTrustedOrigin(c echo.Context, cfg CookieConfig) error {
 		return c.JSON(http.StatusForbidden, map[string]string{
 			"error": "CSRF check misconfigured: COOKIE_DOMAIN must be set in production",
 			"code":  "csrf_misconfigured",
-		})
+		}), true
 	}
 
 	// Parse the Origin header to extract the hostname.
 	// Malformed or opaque origins (e.g. "null") are treated as untrusted.
 	u, parseErr := url.Parse(origin)
 	if parseErr != nil || u.Host == "" {
-		return csrfRejected(c)
+		return csrfRejected(c), true
 	}
 
 	// u.Hostname() strips any port suffix so "app.engineersmind.com:443"
@@ -148,10 +167,10 @@ func checkTrustedOrigin(c echo.Context, cfg CookieConfig) error {
 	// Label-boundary match: exact equality OR subdomain with a "." separator.
 	// This prevents "evil-engineersmind.com" from matching "engineersmind.com".
 	if host != trusted && !strings.HasSuffix(host, "."+trusted) {
-		return csrfRejected(c)
+		return csrfRejected(c), true
 	}
 
-	return nil
+	return nil, false
 }
 
 func csrfRejected(c echo.Context) error {

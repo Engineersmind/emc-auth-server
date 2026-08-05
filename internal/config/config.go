@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -150,6 +152,28 @@ func Load() *Config {
 		AuditSIEMWebhookURL:                    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
 		AuditSIEMWebhookSecret:                 getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
 	}
+}
+
+// Validate refuses a deployed configuration that would leave cookie sessions
+// broken at runtime rather than at boot.
+//
+// Both checks became boot-critical with the portal's move to cookie sessions:
+// the CSRF middleware fails closed, so a misconfiguration here is not a degraded
+// mode, it is a total outage of every cookie-authenticated write on the API —
+// surfacing as scattered 403s rather than as a failed deploy. Development is
+// exempt: it runs on SameSite=Lax with no cookie domain, and the CSRF check is
+// skipped entirely there.
+func (c *Config) Validate() error {
+	if c.Env != "production" && c.Env != "staging" {
+		return nil
+	}
+	if c.CookieDomain == "" {
+		return errors.New("COOKIE_DOMAIN must be set when ENV=production or staging: cookie sessions and the CSRF trusted-origin check both derive from it, and the CSRF check fails closed without it")
+	}
+	if slices.Contains(c.GlobalCORSOrigins, "*") {
+		return errors.New("GLOBAL_CORS_ORIGINS must name the portal origin explicitly when ENV=production or staging: a wildcard suppresses Access-Control-Allow-Credentials, so the browser will never send the session cookies")
+	}
+	return nil
 }
 
 // mustAtoi parses an integer env value, returning 0 on any parse error so a
