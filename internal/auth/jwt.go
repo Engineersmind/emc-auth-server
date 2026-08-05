@@ -107,6 +107,12 @@ func (s *JWTService) tenantSecret(ctx context.Context, tenantID int64) (string, 
 // browser sessions alive without client-side retry logic.
 const AccessTokenTTL = 15 * time.Minute
 
+// AccessTokenTTLSeconds is AccessTokenTTL in whole seconds, as an untyped
+// constant. Division of a constant Duration by time.Second is a constant
+// expression, whereas AccessTokenTTL.Seconds() is a method call — so this is the
+// form callers can use in const declarations and compile-time assertions.
+const AccessTokenTTLSeconds = AccessTokenTTL / time.Second
+
 // RefreshTokenTTL is the lifetime of a refresh token (AUTH-06).
 const RefreshTokenTTL = 30 * 24 * time.Hour
 

@@ -2058,9 +2058,20 @@ type SessionLoginRequest = LoginRequest
 // started failing. The cookie's Max-Age was always correct — only the advertised
 // number was wrong, which is exactly the kind of drift a literal invites.
 //
-// Effectively immutable: it is a var only because strconv.Itoa is not a
-// constant expression. Nothing may assign to it.
-var accessTokenExpiresIn = strconv.Itoa(int(auth.AccessTokenTTL.Seconds()))
+// A const, so no init() or test helper can reassign it. Go cannot format a
+// string at compile time, so the literal cannot be derived from the TTL
+// directly; the assertion below closes that gap instead — if AccessTokenTTL
+// changes and this literal does not, the package stops compiling.
+const accessTokenExpiresIn = "900"
+
+// Compile-time assertion that accessTokenExpiresIn matches auth.AccessTokenTTL.
+// Converting a negative constant to uint is a compile error, so the pair holds
+// only when the two are equal: one catches drift in each direction. Keep this
+// adjacent to the literal above — the two are a single declaration in effect.
+const (
+	_ = uint(auth.AccessTokenTTLSeconds - 900)
+	_ = uint(900 - auth.AccessTokenTTLSeconds)
+)
 
 // errCookieSessionForApps rejects an attempt to obtain a browser cookie session
 // for an application-scoped identity.
