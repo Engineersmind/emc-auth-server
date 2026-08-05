@@ -131,6 +131,14 @@ type AppFilter struct {
 	Status string // "active", "inactive", or "" for all
 	Page   int    // 1-based; defaults to 1
 	Limit  int    // rows per page; defaults to 25, max 100
+	// OnlyIDs restricts the page to these application ids. It is the server-side
+	// half of application-scoped administration (issue #97): a co-owner may list
+	// the tenant's applications, but must see only the ones granted to them.
+	//
+	// nil means unrestricted. An EMPTY non-nil slice means nothing matches — the
+	// fail-closed reading, and the right one for a co-owner whose last grant was
+	// revoked. Do not collapse the two.
+	OnlyIDs []int64
 }
 
 // AppsPage wraps a paginated application list.
@@ -259,6 +267,12 @@ func (s *ApplicationService) ListApplicationsPaginated(ctx context.Context, tena
 	if f.Type != "" {
 		args = append(args, f.Type)
 		where += " AND app_type = $" + strconv.Itoa(len(args))
+	}
+	// Applied to the COUNT as well as the page, so an app-scoped administrator's
+	// total reflects what they can actually see rather than the tenant's size.
+	if f.OnlyIDs != nil {
+		args = append(args, f.OnlyIDs)
+		where += " AND id = ANY($" + strconv.Itoa(len(args)) + ")"
 	}
 	switch f.Status {
 	case "active":

@@ -21,6 +21,115 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/api/v1/administrators": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists owners and co-owners in EVERY tenant, for platform oversight — the per-tenant equivalent is /tenants/{tid}/admins. Rows carry the tenant, sign-in history and second-factor state because the reader has no other context. An owner's applications array is empty because they administer every application in their tenant; a co-owner's lists exactly theirs, so read it together with role. Requires tenant:manage (super_admin only).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-platform"
+                ],
+                "summary": "Directory of every administrator across all tenants",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Match on email, name, tenant name or slug",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "owner | co_owner",
+                        "name": "role",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "active | pending_invitation | blocked",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "1-based page number",
+                        "name": "page",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Rows per page (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.PlatformAdminsPage"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/administrators/stats": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Counts across every tenant: total administrators, owners, co-owners, unaccepted invitations, administrators without a second factor, and tenants with no owner who can sign in. The last two are the numbers worth acting on — privileged accounts protected by a password alone, and tenants nobody has taken ownership of. Requires tenant:manage.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-platform"
+                ],
+                "summary": "Administrator directory summary",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.PlatformAdminStats"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/agents": {
             "get": {
                 "security": [
@@ -2298,6 +2407,44 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Invalid client credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/invitation": {
+            "get": {
+                "description": "Returns what a live invitation token is for, WITHOUT consuming it, so the landing page can ask for a password only when there is one to set. requires_password is false for an account that already has credentials — an existing user being made an administrator, or an administrator being re-instated — and for those the link only confirms the grant. grants_admin reports that accepting will activate a pending administrative grant.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Inspect an invitation link",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Invitation token from the email",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.InvitationPreview"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4864,7 +5011,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Creates a new isolated tenant and auto-seeds an owner role with 8 default permissions and an owner user using the provided owner_email. The owner.temp_password in the response is shown once and never stored — hand it to the tenant owner. Requires tenant:manage permission (super_admin only).",
+                "description": "Creates a new isolated tenant and auto-seeds the granular permission catalog, an owner role holding all of it, an owner user for the provided owner_email, and the matching tenant_admins record. The owner account is created WITHOUT a password: an invitation link is emailed, and accepting it sets the password and marks the address verified. The response carries owner.status = \"pending_invitation\" and owner.invite_sent; when invite_sent is false the tenant exists but the invitation must be resent before the owner can sign in. Requires tenant:manage permission (super_admin only). Returns 503 when the server has no email delivery configured at all — in that case NOTHING is created, because the invitation is the owner's only route to a password.",
                 "consumes": [
                     "application/json"
                 ],
@@ -4913,6 +5060,15 @@ const docTemplate = `{
                     },
                     "409": {
                         "description": "Slug already taken",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Invitations are not configured; no tenant was created",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5358,6 +5514,286 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/admins": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the tenant's owners and co-owners. An owner's applications array is empty because they administer every application in the tenant, present and future — read it together with role. status is \"pending_invitation\" until the invitation is accepted and the address verified.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-tenant-admins"
+                ],
+                "summary": "List tenant administrators",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/admin.TenantAdminResult"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Adds an owner (tenant-wide) or co-owner (specific applications). An address that is already a TENANT-LEVEL user is promoted in place and no second identity is created; an application-scoped user with the same address is unrelated and never collides, so being a customer of an application and an administrator of its tenant are compatible. The response's action field reports what happened: \"invited\" (new account, invitation sent), \"grants_added\" (existing user promoted or widened), or \"invitation_resent\". An invitation that would change nothing returns 409, as does a tenant already holding the maximum number of administrators. A repeat resend to the same address within a minute returns 429. Returns 503 when the server has no email delivery configured — nothing is recorded, because an administrator who cannot be told they are one could never sign in.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-tenant-admins"
+                ],
+                "summary": "Invite a tenant administrator",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Administrator details",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.InviteTenantAdminRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/admin.InviteTenantAdminResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Already an administrator with these grants, or the administrator limit is reached",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "An invitation was sent to this address moments ago",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "Invitations are not configured; nothing was recorded",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/admins/{adminID}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Withdraws administration and revokes the administrator's live sessions, so a removed administrator cannot keep rotating a refresh token into fresh access tokens that still carry their old reach. The user account itself survives — losing an administrative role must not take the person's identity or audit history with it. Removing the last owner who can actually log in returns 409: a tenant with no usable owner is administrable only by a platform admin. Removing a co-owner also returns 409 when they are the tenant's only administrator who can sign in, which happens when the owner never accepted their invitation. An administrator who has not yet accepted does not count as usable, and removing such a pending administrator is always allowed — they could not sign in, so their removal takes nothing away.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-tenant-admins"
+                ],
+                "summary": "Remove a tenant administrator",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Administrator ID",
+                        "name": "adminID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Would leave the tenant without an administrator who can sign in",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/admins/{adminID}/applications": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets exactly which applications a co-owner administers. An empty list is rejected — grants only ever narrow, so an administrator with none could reach nothing; use DELETE to revoke administration outright. Owners cannot be granted specific applications: they administer all of them. Every live access token for the affected account is invalidated so a revoked grant cannot outlive this call.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-tenant-admins"
+                ],
+                "summary": "Replace a co-owner's application grants",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Administrator ID",
+                        "name": "adminID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Application IDs",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SetTenantAdminGrantsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.TenantAdminResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -6953,6 +7389,24 @@ const docTemplate = `{
                 }
             }
         },
+        "admin.InviteTenantAdminResult": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "description": "Action is one of:\n\n\tinvited            a new account was created and an invitation sent\n\tgrants_added       the address was already a tenant-level user; it was\n\t                   made an administrator (or its grants widened) without\n\t                   creating a second identity\n\tinvitation_resent  an invitation was already outstanding and has been\n\t                   superseded by a fresh one",
+                    "type": "string"
+                },
+                "admin": {
+                    "$ref": "#/definitions/admin.TenantAdminResult"
+                },
+                "invite_error": {
+                    "type": "string"
+                },
+                "invite_sent": {
+                    "type": "boolean"
+                }
+            }
+        },
         "admin.OwnerResult": {
             "type": "object",
             "properties": {
@@ -6962,10 +7416,16 @@ const docTemplate = `{
                 "id": {
                     "type": "string"
                 },
+                "invite_error": {
+                    "type": "string"
+                },
+                "invite_sent": {
+                    "type": "boolean"
+                },
                 "role": {
                     "type": "string"
                 },
-                "temp_password": {
+                "status": {
                     "type": "string"
                 }
             }
@@ -6990,6 +7450,112 @@ const docTemplate = `{
                 },
                 "tenant_id": {
                     "type": "string"
+                }
+            }
+        },
+        "admin.PlatformAdminResult": {
+            "type": "object",
+            "properties": {
+                "applications": {
+                    "description": "Applications names the applications a co-owner administers. Empty for an\nowner, who administers every application in their tenant — the two empties\nmean opposite things, so read this with Role.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "email_verified": {
+                    "type": "boolean"
+                },
+                "id": {
+                    "description": "ID is the tenant_admins row, which is what the per-tenant management\nendpoints take. UserID is the account behind it, for the user-detail and\nsession endpoints.",
+                    "type": "string"
+                },
+                "is_primary": {
+                    "type": "boolean"
+                },
+                "last_login_at": {
+                    "type": "string"
+                },
+                "logins_count": {
+                    "type": "integer"
+                },
+                "mfa_enabled": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "role": {
+                    "description": "Role is \"owner\" or \"co_owner\".",
+                    "type": "string"
+                },
+                "status": {
+                    "description": "Status is \"active\", \"pending_invitation\" (granted but never accepted), or\n\"blocked\". Distinguishing the last matters: a blocked administrator still\nholds their grant and regains it the moment the block is lifted.",
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                },
+                "tenant_name": {
+                    "type": "string"
+                },
+                "tenant_slug": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.PlatformAdminStats": {
+            "type": "object",
+            "properties": {
+                "co_owners": {
+                    "type": "integer"
+                },
+                "no_mfa": {
+                    "type": "integer"
+                },
+                "owners": {
+                    "type": "integer"
+                },
+                "pending_invitations": {
+                    "type": "integer"
+                },
+                "tenants_without_owner": {
+                    "type": "integer"
+                },
+                "total_admins": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admin.PlatformAdminsPage": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.PlatformAdminResult"
+                    }
+                },
+                "page": {
+                    "type": "integer"
+                },
+                "per_page": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                },
+                "total_pages": {
+                    "type": "integer"
                 }
             }
         },
@@ -7021,6 +7587,41 @@ const docTemplate = `{
                     }
                 },
                 "tenant_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.TenantAdminResult": {
+            "type": "object",
+            "properties": {
+                "applications": {
+                    "description": "Applications is empty for an owner — not because they administer none,\nbut because they administer all of them. Read it together with Role.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "is_primary": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "role": {
+                    "description": "Role is \"owner\" or \"co_owner\".",
+                    "type": "string"
+                },
+                "status": {
+                    "description": "Status is \"active\" once the invitation has been accepted and the address\nverified, \"pending_invitation\" until then. An administrator who is\npending does not count toward the last-usable-owner guard.",
                     "type": "string"
                 }
             }
@@ -7855,6 +8456,21 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.InvitationPreview": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "grants_admin": {
+                    "description": "GrantsAdmin reports that accepting will also activate a pending\nadministrative grant, so the page can say what is being confirmed.",
+                    "type": "boolean"
+                },
+                "requires_password": {
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.MFAPolicy": {
             "type": "object",
             "properties": {
@@ -7899,6 +8515,16 @@ const docTemplate = `{
         "auth.MeResult": {
             "type": "object",
             "properties": {
+                "admin_apps": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "admin_scope": {
+                    "description": "AdminScope and AdminApps mirror the token's administrative reach (issue\n#97) so a client can render the same boundary the server enforces —\nshowing a co-owner only the applications they administer, rather than\noffering every tenant-level control and letting each one 403 on submit.\nEmpty for callers who are not tenant administrators.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 },
@@ -8031,11 +8657,14 @@ const docTemplate = `{
         "handlers.AcceptInvitationRequest": {
             "type": "object",
             "required": [
-                "password",
                 "token"
             ],
             "properties": {
+                "current_password": {
+                    "type": "string"
+                },
                 "password": {
+                    "description": "omitempty, not required: this field is optional now that an existing\naccount may confirm with CurrentPassword instead. min=8 still applies\nwhenever it is supplied, restoring the HTTP-layer floor that the service's\nErrWeakPassword otherwise enforces alone.",
                     "type": "string",
                     "minLength": 8
                 },
@@ -8271,6 +8900,25 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.InviteTenantAdminRequest": {
+            "type": "object",
+            "properties": {
+                "application_ids": {
+                    "description": "ApplicationIDs is required for a co-owner and must be absent for an\nowner, whose reach is every application in the tenant.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "email": {
+                    "type": "string"
+                },
+                "role": {
+                    "description": "Role is \"owner\" or \"co_owner\".",
+                    "type": "string"
+                }
+            }
+        },
         "handlers.LoginOTPRequest": {
             "type": "object",
             "properties": {
@@ -8487,6 +9135,17 @@ const docTemplate = `{
                 },
                 "password": {
                     "type": "string"
+                }
+            }
+        },
+        "handlers.SetTenantAdminGrantsRequest": {
+            "type": "object",
+            "properties": {
+                "application_ids": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },

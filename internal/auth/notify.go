@@ -15,14 +15,23 @@ import (
 // Every transactional email follows the same five steps: honour the per-scope
 // disable flag (auditing the suppression), resolve the white-label sender
 // (application → tenant → global), resolve the template override, send, and
-// retry once via the global sender if a tenant's own sender fails. emailNotifier
+// retry once via the global sender if a tenant's own sender fails. EmailNotifier
 // factors those steps out so each flow only supplies the payload.
+//
+// It is exported because the notification sink (internal/notify) sends on the
+// same terms — per-scope suppression, white-label sender, template override,
+// global-sender retry. Duplicating that there would mean two implementations of
+// the retry rule, and the second one drifting is exactly how a tenant with a
+// broken SMTP server silently stops receiving one class of email.
 // ---------------------------------------------------------------------------
 
-// emailNotifier carries the dependencies a transactional send needs. All fields
-// are optional: a nil mailer disables sending, a nil tmplSvc means "no override,
+// EmailNotifier carries the dependencies a transactional send needs. All are
+// optional: a nil mailer disables sending, a nil tmplSvc means "no override,
 // nothing suppressed", a nil senderSvc means "always the global sender".
-type emailNotifier struct {
+//
+// Construct with NewEmailNotifier and the With* builders from outside the
+// package; inside it, a struct literal is equivalent.
+type EmailNotifier struct {
 	mailer    mailer.Mailer
 	senderSvc *EmailSenderService
 	tmplSvc   *EmailTemplateService
@@ -30,10 +39,35 @@ type emailNotifier struct {
 	logger    zerolog.Logger
 }
 
+// NewEmailNotifier creates a notifier that sends via the global sender and the
+// built-in templates. Layer on the rest with the With* builders.
+func NewEmailNotifier(m mailer.Mailer, logger zerolog.Logger) EmailNotifier {
+	return EmailNotifier{mailer: m, logger: logger}
+}
+
+// WithSenders wires white-label sender resolution (application → tenant → global).
+func (n EmailNotifier) WithSenders(s *EmailSenderService) EmailNotifier {
+	n.senderSvc = s
+	return n
+}
+
+// WithTemplates wires per-scope template overrides and the disable flag.
+func (n EmailNotifier) WithTemplates(t *EmailTemplateService) EmailNotifier {
+	n.tmplSvc = t
+	return n
+}
+
+// WithAudit records suppressed sends, so a disabled template leaves a trace
+// rather than looking like a delivery that never happened.
+func (n EmailNotifier) WithAudit(a *audit.Logger) EmailNotifier {
+	n.audit = a
+	return n
+}
+
 // auditUserEvent records a security event these flows raise on their own (a
 // lockout, an unblock, a breach hit) rather than in response to a request, so
 // there is no handler to attribute it. Nil-safe and non-blocking.
-func (n emailNotifier) auditUserEvent(ctx context.Context, action string, tenantID int64, appRowID *int64, userID int64, meta map[string]any) {
+func (n EmailNotifier) auditUserEvent(ctx context.Context, action string, tenantID int64, appRowID *int64, userID int64, meta map[string]any) {
 	if n.audit == nil {
 		return
 	}
@@ -49,7 +83,7 @@ func (n emailNotifier) auditUserEvent(ctx context.Context, action string, tenant
 
 // resolveSender resolves the white-label sender chain, degrading to the global
 // sender (nil) on any error — a broken tenant sender must never block a send.
-func (n emailNotifier) resolveSender(ctx context.Context, tenantID int64, appRowID *int64) *mailer.SMTPConfig {
+func (n EmailNotifier) resolveSender(ctx context.Context, tenantID int64, appRowID *int64) *mailer.SMTPConfig {
 	if n.senderSvc == nil {
 		return nil
 	}
@@ -61,13 +95,13 @@ func (n emailNotifier) resolveSender(ctx context.Context, tenantID int64, appRow
 	return sender
 }
 
-// send runs the shared pipeline for one email. deliver receives the resolved
+// Send runs the shared pipeline for one email. deliver receives the resolved
 // sender (nil = global) and template override (nil = built-in default) and calls
 // the matching mailer method.
 //
 // It reports whether the message was handed to a transport. A suppressed type
 // returns (false, nil) — not an error, since suppression is a configured choice.
-func (n emailNotifier) send(
+func (n EmailNotifier) Send(
 	ctx context.Context,
 	tenantID int64,
 	appRowID *int64,
