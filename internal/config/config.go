@@ -44,6 +44,30 @@ type Config struct {
 	// Example: "https://auth.emc.local"
 	AppBaseURL string
 
+	// DashboardBaseURL is the origin of the admin console SPA. It is prepended
+	// to emailed links whose destination is a PAGE rather than an API endpoint.
+	//
+	// The distinction matters: verify-email, confirm-email-change and
+	// unblock-account are GET endpoints that act on the token directly, so their
+	// links point at AppBaseURL. An invitation cannot — the recipient has to
+	// choose a password first, so accept-invitation is POST-only and a link to
+	// it produces "authorization required" in a browser. That link must land on
+	// the console page that collects the password and then calls the API.
+	//
+	// Set via DASHBOARD_BASE_URL. The default is the Vite dev server; any
+	// deployment where the console is not on localhost must set it explicitly.
+	DashboardBaseURL string
+
+	// PlatformNotifyEmails receive the admin-activity notifications raised when a
+	// tenant OWNER takes a privileged action — the platform tier's oversight
+	// mail. Comma-separated; set via PLATFORM_NOTIFY_EMAIL.
+	//
+	// When empty the notifier falls back to every active super_admin user, so
+	// the feature works unconfigured. Naming an address is preferable in a real
+	// deployment: it survives super_admin churn and routes to a shared mailbox
+	// or a ticket queue rather than fanning out to individuals.
+	PlatformNotifyEmails []string
+
 	// TOTPEncryptionKey is a 32-byte hex-encoded key used to AES-256-GCM encrypt
 	// TOTP secrets at rest. Generate with: openssl rand -hex 32
 	// Required when TOTP is used. Must be exactly 64 hex characters.
@@ -61,6 +85,38 @@ type Config struct {
 	// old one here. Decryption falls back to this key; rows re-encrypt under
 	// the new key on their next admin write. Remove once rotation completes.
 	OAuthClientSecretEncryptionKeyPrevious string
+
+	// JWTSigningKeyEncryptionKey is a 32-byte hex-encoded key used to
+	// AES-256-GCM encrypt JWT signing private keys at rest
+	// (signing_keys.private_key_enc). Generate with: openssl rand -hex 32.
+	// Follows the OAuthClientSecretEncryptionKey precedent — NO zero-key
+	// fallback in production/staging, the server refuses to start (issue #95).
+	//
+	// This key protects token-signing authority: whoever can decrypt these rows
+	// can mint a token for any user in the affected tenant. Treat its loss as
+	// more severe than a database leak of hashed passwords.
+	JWTSigningKeyEncryptionKey string
+
+	// JWTSigningKeyEncryptionKeyPrevious enables zero-downtime rotation of the
+	// key above: set the NEW key as JWT_SIGNING_KEY_ENCRYPTION_KEY and the old
+	// one here. Decryption falls back to it transparently. Note this rotates the
+	// ENCRYPTION key, not the signing keys themselves — signing-key rotation is
+	// a separate operation (see the admin rotate endpoint).
+	JWTSigningKeyEncryptionKeyPrevious string
+
+	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable during the
+	// migration to RS256. Set JWT_ALLOW_LEGACY_HS256=false to perform the Phase 4
+	// cutover (issue #95).
+	//
+	// Defaults to true so upgrading to RS256 signing does not invalidate tokens
+	// minted seconds earlier. Setting it false is what actually removes the forging
+	// risk: while HS256 verifies, any holder of a tenant's jwt_secret can still mint
+	// a token for any user in that tenant.
+	//
+	// Flip it only once emc_auth_legacy_hs256_verifications_total has been flat at
+	// zero — that counter, not a stopwatch, is the evidence. The longest-lived
+	// symmetric token is the 1 h agent token.
+	JWTAllowLegacyHS256 bool
 
 	// CookieDomain sets the Domain attribute on auth cookies.
 	// Leave empty for localhost development (browser scopes to current host).
@@ -137,18 +193,26 @@ func Load() *Config {
 		SMTPPassword:                           getEnv("SMTP_PASSWORD", ""),
 		SMTPTLS:                                getEnv("SMTP_TLS", ""),
 		AppBaseURL:                             getEnv("APP_BASE_URL", "http://localhost:9090"),
+		DashboardBaseURL:                       getEnv("DASHBOARD_BASE_URL", "http://localhost:5173"),
+		PlatformNotifyEmails:                   getEnvList("PLATFORM_NOTIFY_EMAIL", ""),
 		TOTPEncryptionKey:                      getEnv("TOTP_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKey:         getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKeyPrevious: getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS", ""),
-		CookieDomain:                           getEnv("COOKIE_DOMAIN", ""),
-		GlobalCORSOrigins:                      getEnvList("GLOBAL_CORS_ORIGINS", ""),
-		GeoIPDatabasePath:                      getEnv("GEOIP_DATABASE_PATH", ""),
-		UntrustedIPCIDRs:                       getEnvList("UNTRUSTED_IP_CIDRS", ""),
-		BreachDetectionEnabled:                 getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
-		AuditCaptureResponseBody:               getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
-		AuditRetentionDays:                     mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
-		AuditSIEMWebhookURL:                    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
-		AuditSIEMWebhookSecret:                 getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		JWTSigningKeyEncryptionKey:             getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY", ""),
+		JWTSigningKeyEncryptionKeyPrevious:     getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS", ""),
+		// Fails closed towards COMPATIBILITY, not towards strictness: only the
+		// exact string "false" disables legacy verification, so a typo cannot
+		// accidentally reject every live token.
+		JWTAllowLegacyHS256:      getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
+		CookieDomain:             getEnv("COOKIE_DOMAIN", ""),
+		GlobalCORSOrigins:        getEnvList("GLOBAL_CORS_ORIGINS", ""),
+		GeoIPDatabasePath:        getEnv("GEOIP_DATABASE_PATH", ""),
+		UntrustedIPCIDRs:         getEnvList("UNTRUSTED_IP_CIDRS", ""),
+		BreachDetectionEnabled:   getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
+		AuditCaptureResponseBody: getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
+		AuditRetentionDays:       mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
+		AuditSIEMWebhookURL:      getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
+		AuditSIEMWebhookSecret:   getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
 	}
 }
 

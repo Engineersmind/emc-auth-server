@@ -271,8 +271,8 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 // change). Best-effort and never returns an error: the change has already
 // happened by the time this runs.
 func (s *ResetService) NotifyPasswordChanged(ctx context.Context, tenantID int64, appRowID *int64, email string) {
-	n := emailNotifier{mailer: s.mailer, senderSvc: s.senderSvc, tmplSvc: s.tmplSvc, audit: s.audit, logger: s.logger}
-	_, err := n.send(ctx, tenantID, appRowID, mailer.TemplatePasswordChanged,
+	n := EmailNotifier{mailer: s.mailer, senderSvc: s.senderSvc, tmplSvc: s.tmplSvc, audit: s.audit, logger: s.logger}
+	_, err := n.Send(ctx, tenantID, appRowID, mailer.TemplatePasswordChanged,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
 			return s.mailer.SendPasswordChanged(ctx, sender, tmpl, mailer.PasswordChangedEmail{To: email})
 		})

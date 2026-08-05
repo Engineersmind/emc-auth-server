@@ -99,7 +99,10 @@ func newAppMeFixture(t *testing.T) *appMeFixture {
 		return app
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc, err := auth.NewJWTService(pool, "https://auth.emc.local")
+	if err != nil {
+		t.Fatalf("NewJWTService: %v", err)
+	}
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
 
 	h := NewAuthHandler(authSvc, nil, nil, logger).

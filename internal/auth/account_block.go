@@ -58,7 +58,7 @@ const riskAlertTimeout = 20 * time.Second
 // AccountBlockService owns lockout state and the blocked_account notifications.
 type AccountBlockService struct {
 	pool       *pgxpool.Pool
-	notify     emailNotifier
+	notify     EmailNotifier
 	risk       audit.RiskAssessor // nil when risk assessment is not configured
 	appBaseURL string
 	logger     zerolog.Logger
@@ -68,7 +68,7 @@ type AccountBlockService struct {
 func NewAccountBlockService(pool *pgxpool.Pool, m mailer.Mailer, appBaseURL string, logger zerolog.Logger) *AccountBlockService {
 	return &AccountBlockService{
 		pool:       pool,
-		notify:     emailNotifier{mailer: m, logger: logger},
+		notify:     EmailNotifier{mailer: m, logger: logger},
 		appBaseURL: appBaseURL,
 		logger:     logger,
 	}
@@ -248,7 +248,7 @@ func (s *AccountBlockService) blockForFailedAttempts(ctx context.Context, tenant
 		Reason:     mailer.BlockReasonFailedAttempts,
 		TTLMinutes: int(UnblockTokenTTL.Minutes()),
 	}
-	if _, err := s.notify.send(ctx, tenantID, appRowID, mailer.TemplateBlockedAccount,
+	if _, err := s.notify.Send(ctx, tenantID, appRowID, mailer.TemplateBlockedAccount,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
 			return s.notify.mailer.SendBlockedAccount(ctx, sender, tmpl, msg)
 		}); err != nil {
@@ -308,7 +308,7 @@ func (s *AccountBlockService) notifyAlert(ctx context.Context, tenantID int64, a
 		AppName: appNameByRowID(ctx, s.pool, appRowID),
 		Reason:  reason,
 	}
-	if _, err := s.notify.send(ctx, tenantID, appRowID, mailer.TemplateBlockedAccount,
+	if _, err := s.notify.Send(ctx, tenantID, appRowID, mailer.TemplateBlockedAccount,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
 			return s.notify.mailer.SendBlockedAccount(ctx, sender, tmpl, msg)
 		}); err != nil {

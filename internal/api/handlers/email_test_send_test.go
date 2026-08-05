@@ -68,6 +68,12 @@ func (m *recordingMailer) SendBlockedAccount(context.Context, *mailer.SMTPConfig
 func (m *recordingMailer) SendPasswordBreach(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.PasswordBreachEmail) error {
 	return nil
 }
+func (m *recordingMailer) SendAdminActivity(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.AdminActivityEmail) error {
+	return nil
+}
+func (m *recordingMailer) SendAccessChanged(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.AccessChangedEmail) error {
+	return nil
+}
 func (m *recordingMailer) GlobalProvider() string { return "sendgrid" }
 
 func (m *recordingMailer) SendTest(_ context.Context, sender *mailer.SMTPConfig, tmpl *mailer.Template, tt mailer.TemplateType, to string) error {

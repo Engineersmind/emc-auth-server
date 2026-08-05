@@ -32,6 +32,8 @@ type captureMailer struct {
 	emailChanges  []mailer.ChangeEmailEmail
 	blocks        []mailer.BlockedAccountEmail
 	breaches      []mailer.PasswordBreachEmail
+	adminActivity []mailer.AdminActivityEmail
+	accessChanges []mailer.AccessChangedEmail
 	senders       []*mailer.SMTPConfig // parallel to sends; nil = global sender
 }
 
@@ -111,6 +113,22 @@ func (m *captureMailer) SendPasswordBreach(ctx context.Context, sender *mailer.S
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.breaches = append(m.breaches, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendAdminActivity(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.AdminActivityEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.adminActivity = append(m.adminActivity, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendAccessChanged(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.AccessChangedEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.accessChanges = append(m.accessChanges, e)
 	m.senders = append(m.senders, sender)
 	return nil
 }
@@ -211,7 +229,7 @@ func newMFAFixture(t *testing.T) *mfaFixture {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 	appSvc := auth.NewApplicationService(pool, logger)
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	mail := &captureMailer{}
 	senderSvc := auth.NewEmailSenderService(pool, totpSvc.EncryptionKey(), logger)
 	emailSvc := auth.NewEmailMFAService(pool, rdb, mail, logger).WithSenders(senderSvc)

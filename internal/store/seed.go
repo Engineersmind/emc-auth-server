@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
@@ -12,6 +14,17 @@ import (
 )
 
 const defaultSeedPassword = "ChangeMe123!"
+
+// generateTenantSecret returns 32 bytes of crypto/rand as hex — the same strength
+// the admin API's tenant creation has always used. Kept here (rather than shared
+// with internal/admin) because store must not import admin.
+func generateTenantSecret() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // RunSeed creates the default emc tenant, super_admin role, and super-admin user.
 // All inserts use ON CONFLICT DO NOTHING for idempotency — safe to run multiple times.
@@ -38,11 +51,22 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 	}
 
 	// 1. Seed default tenant (idempotent via slug unique index).
-	_, err := pool.Exec(ctx, `
+	//
+	// The secret is generated with crypto/rand rather than gen_random_uuid()::text
+	// (issue #95). A v4 UUID carries ~122 bits of entropy in a fixed, recognisable
+	// 36-character shape; this is 256 bits of unstructured hex, matching what the
+	// admin API's generateSecret() has always produced. Seeded tenants were the
+	// weakest signing keys in the system purely because the value was convenient
+	// to write in SQL — and the seed tenant is the one every deployment has.
+	seedSecret, err := generateTenantSecret()
+	if err != nil {
+		return fmt.Errorf("seed: generate tenant jwt_secret: %w", err)
+	}
+	_, err = pool.Exec(ctx, `
 		INSERT INTO tenants (name, slug, jwt_secret, is_active)
-		VALUES ('EMC', 'emc', gen_random_uuid()::text, true)
+		VALUES ('EMC', 'emc', $1, true)
 		ON CONFLICT (slug) WHERE deleted_at IS NULL DO NOTHING
-	`)
+	`, seedSecret)
 	if err != nil {
 		return fmt.Errorf("seed tenant: %w", err)
 	}

@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
@@ -46,12 +49,25 @@ type RoutesConfig struct {
 	Env string
 	// AppBaseURL is prepended to the reset token link in emails.
 	AppBaseURL string
+	// DashboardBaseURL is the admin console origin, used for emailed links whose
+	// destination is a page rather than an API endpoint (the invitation link).
+	DashboardBaseURL string
 	// TOTPEncryptionKey is the 64-char hex key for AES-256-GCM TOTP secret encryption.
 	TOTPEncryptionKey string
 	// OAuthClientSecretEncryptionKey is the 64-char hex key for AES-256-GCM
 	// encryption of social-login provider client secrets (issue #64).
 	// Required in production/staging — the server refuses to start without it.
 	OAuthClientSecretEncryptionKey string
+	// JWTSigningKeyEncryptionKey is the 64-char hex key for AES-256-GCM
+	// encryption of asymmetric JWT signing private keys at rest
+	// (signing_keys.private_key_enc). Required in production/staging (issue #95).
+	JWTSigningKeyEncryptionKey string
+	// JWTSigningKeyEncryptionKeyPrevious is the old key accepted for decryption
+	// during rotation of the key above.
+	JWTSigningKeyEncryptionKeyPrevious string
+	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable. False performs
+	// the issue #95 Phase 4 cutover (RS256 only).
+	JWTAllowLegacyHS256 bool
 	// OAuthClientSecretEncryptionKeyPrevious is the old key accepted for
 	// decryption during rotation (empty when no rotation is in progress).
 	OAuthClientSecretEncryptionKeyPrevious string
@@ -170,6 +186,47 @@ func sentryMiddleware() echo.MiddlewareFunc {
 	}
 }
 
+// warnIssuerHostMismatch flags a JWT_ISSUER whose host differs from APP_BASE_URL
+// (issue #95).
+//
+// The two are independent settings that ship with different defaults
+// ("https://auth.emc.local" vs "http://localhost:9090"). That was harmless while
+// we published nothing, but a JWKS endpoint changes it: OIDC convention says a
+// relying party derives the key-set URL from the token's "iss", so a verifier
+// following convention would look for our keys on a host that does not serve them.
+//
+// APP_BASE_URL is authoritative for discovery here — it is where the endpoint
+// actually is — and "iss" is left alone deliberately, because changing it would
+// invalidate every consumer that has pinned the current value. So this warns
+// rather than rewrites: reconciling them is an operator decision with external
+// consequences, not something to do silently at startup.
+//
+// Production is escalated to an error-level log because a mismatch there is a
+// live integration hazard for real relying parties.
+func warnIssuerHostMismatch(issuer, appBaseURL, env string, logger zerolog.Logger) {
+	if issuer == "" || appBaseURL == "" {
+		return
+	}
+	iss, errIss := url.Parse(issuer)
+	base, errBase := url.Parse(appBaseURL)
+	if errIss != nil || errBase != nil || iss.Host == "" || base.Host == "" {
+		return
+	}
+	if strings.EqualFold(iss.Host, base.Host) {
+		return
+	}
+
+	evt := logger.Warn()
+	if env == "production" {
+		evt = logger.Error()
+	}
+	evt.
+		Str("jwt_issuer", issuer).
+		Str("app_base_url", appBaseURL).
+		Str("jwks_url", strings.TrimRight(appBaseURL, "/")+"/tenants/{slug}/.well-known/jwks.json").
+		Msg("JWT_ISSUER host differs from APP_BASE_URL — verifiers deriving the JWKS URL from the iss claim (standard OIDC discovery) will look on the wrong host. JWKS is served from APP_BASE_URL; give consumers that URL explicitly, or set the two to the same host.")
+}
+
 // RegisterRoutes configures all route groups and middleware on the Echo instance.
 func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Middleware stack — order matters:
@@ -214,7 +271,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	})
 
 	// Build shared services
-	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
+	jwtSvc, jwtErr := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
+	if jwtErr != nil {
+		deps.Logger.Fatal().Err(jwtErr).Msg("JWT service init failed — check JWT_ISSUER")
+	}
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
 
 	// TOTP service — requires encryption key; logs warning in dev if missing.
@@ -279,7 +339,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// password warnings — the remaining transactional email flows. Each reuses
 	// the same sender + template resolvers, so their mail is branded per scope
 	// and can be customized or disabled per application like every other type.
-	invSvc := auth.NewInvitationService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
+	invSvc := auth.NewInvitationService(deps.Pool, m, deps.Config.DashboardBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
@@ -373,6 +433,62 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	if err := secretBox.WithPreviousKey(deps.Config.OAuthClientSecretEncryptionKeyPrevious, "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS"); err != nil {
 		deps.Logger.Fatal().Err(err).Msg("social login init failed — check OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS")
 	}
+	// Asymmetric JWT signing keys (issue #95). Separate SecretBox from the OAuth
+	// one: these protect token-SIGNING authority, so a compromise of the social
+	// login secrets must not also hand over the ability to mint tokens, and the two
+	// keys must be rotatable independently. Same fail-closed contract — no
+	// zero-key fallback in production/staging.
+	signingKeyBox, skbErr := auth.NewSecretBox(deps.Config.JWTSigningKeyEncryptionKey, deps.Config.Env, "JWT_SIGNING_KEY_ENCRYPTION_KEY", deps.Logger)
+	if skbErr != nil {
+		deps.Logger.Fatal().Err(skbErr).Msg("JWT signing key init failed — check JWT_SIGNING_KEY_ENCRYPTION_KEY")
+	}
+	if err := signingKeyBox.WithPreviousKey(deps.Config.JWTSigningKeyEncryptionKeyPrevious, "JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS"); err != nil {
+		deps.Logger.Fatal().Err(err).Msg("JWT signing key init failed — check JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS")
+	}
+	signingKeySvc, skErr := auth.NewSigningKeyService(deps.Pool, signingKeyBox, deps.Logger)
+	if skErr != nil {
+		deps.Logger.Fatal().Err(skErr).Msg("JWT signing key service init failed")
+	}
+	// Switch signing to RS256. Verification continues to accept legacy HS256
+	// tokens (no kid) until the Phase 4 cutover, so no live session breaks here.
+	jwtSvc.WithSigningKeys(signingKeySvc).WithLegacyHS256(deps.Config.JWTAllowLegacyHS256)
+	if !deps.Config.JWTAllowLegacyHS256 {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=false — HS256 tokens are REJECTED (issue #95 Phase 4 cutover). Any token minted before RS256 signing went live will fail; tenants.jwt_secret is now unused and can be dropped.")
+	}
+
+	// Backfill keys for tenants that predate this feature so their JWKS endpoint is
+	// live immediately rather than on their next login. Non-fatal: EnsureTenantKey
+	// generates lazily, so a backfill failure costs latency, not availability.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelStartup()
+	if created, err := signingKeySvc.BackfillAllTenants(startupCtx); err != nil {
+		deps.Logger.Error().Err(err).Msg("signing key backfill failed — keys will be generated lazily")
+	} else if created > 0 {
+		deps.Logger.Info().Int("tenants", created).Msg("backfilled JWT signing keys")
+	}
+
+	// Drop retired keys whose grace window has elapsed. Without this every rotation
+	// leaves a row behind forever and the published JWKS grows without bound.
+	if _, err := signingKeySvc.CollectGarbageAllTenants(startupCtx); err != nil {
+		deps.Logger.Error().Err(err).Msg("retired signing key GC failed")
+	}
+
+	// JWT_ISSUER and APP_BASE_URL are independent settings that default to
+	// different hosts, and OIDC convention derives a JWKS URL from the issuer. Now
+	// that we publish keys, a mismatch means a verifier that follows convention
+	// looks for our keys at the wrong host. APP_BASE_URL is authoritative for
+	// discovery (it is where the endpoint actually is); warn loudly when the issuer
+	// disagrees so an operator reconciles them deliberately.
+	warnIssuerHostMismatch(deps.Config.JWTIssuer, deps.Config.AppBaseURL, deps.Config.Env, deps.Logger)
+
+	// JWKS publication + signing-key rotation handlers (issue #95).
+	jwksHandler := handlers.NewJWKSHandler(deps.Pool, signingKeySvc, deps.Logger)
+	signingKeyHandler := handlers.NewSigningKeyHandler(deps.Pool, signingKeySvc, deps.Config.AppBaseURL, auditLog, deps.Logger)
+
+	// Give newly created tenants their key pair up front rather than lazily on
+	// first login.
+	adminSvc.WithSigningKeys(signingKeySvc)
+
 	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Config.AppBaseURL, deps.Logger)
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
 	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
@@ -426,6 +542,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// public but rate-limited: a bearer-token guard would be impossible to
 	// satisfy from a link in an email.
 	authGroup.POST("/accept-invitation", authHandler.AcceptInvitation, mw.TokenRateLimiter(rlCfg))
+	// Read-only companion so the landing page can tell an onboarding link (set a
+	// password) from a confirmation link (an existing account accepting an
+	// administrative grant). Does not consume the token.
+	authGroup.GET("/invitation", authHandler.PreviewInvitation, mw.TokenRateLimiter(rlCfg))
 	authGroup.GET("/confirm-email-change", authHandler.ConfirmEmailChange, mw.TokenRateLimiter(rlCfg))
 	authGroup.GET("/unblock-account", authHandler.UnblockAccount, mw.TokenRateLimiter(rlCfg))
 
@@ -537,7 +657,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// app_id is empty. So mounting it here cannot rate-limit an operator out of
 	// the rate-limit CRUD routes below — the limiter only ever engages for
 	// application-scoped traffic, never for the admin console's own calls.
-	adminGroup := apiV1.Group("", mw.JWTRequired(jwtSvc), appRateLimit)
+	//
+	// Accepted token types (issue #84): admin/management routes have three
+	// legitimate kinds of caller, so all three audiences are allowed here and
+	// authorization stays with the RequirePermission guards below —
+	//   - AudienceAPI:        a human operator in the admin SPA
+	//   - AudienceManagement: an API-key integration (POST /auth/management-token)
+	//   - AudienceM2M:        a client_credentials machine client, whose grants
+	//                         come from oauth_clients.scopes
+	// Agent tokens are deliberately absent — nothing verifies them yet.
+	adminGroup := apiV1.Group("", mw.JWTRequired(
+		jwtSvc,
+		auth.AudienceAPI,
+		auth.AudienceManagement,
+		auth.AudienceM2M,
+	), appRateLimit)
 
 	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {
@@ -556,6 +690,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt := adminGroup.Group("", mw.RequirePermission("tenant:manage"))
 	tenantMgmt.POST("/tenants", adminHandler.CreateTenant)
 	// Static sub-paths registered before /:id so Echo does not treat them as ID params.
+	// Cross-tenant administrator directory. Platform oversight, so it lives on
+	// tenantMgmt (tenant:manage) rather than the tenant-scoped family, and is
+	// registered before /tenants/:id so the static path is not read as an id.
+	tenantMgmt.GET("/administrators", adminHandler.ListPlatformAdministrators)
+	tenantMgmt.GET("/administrators/stats", adminHandler.PlatformAdminSummary)
+
 	tenantMgmt.GET("/tenants/check-slug", adminHandler.CheckSlug)
 	tenantMgmt.GET("/tenants/:id", adminHandler.GetTenant)
 	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
@@ -574,8 +714,32 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tidUsersRead := mw.RequireTenantSelfOrAny("users:read")
 	tidUsersWrite := mw.RequireTenantSelfOrAny("users:write")
 	tidAppsRead := mw.RequireTenantSelfOrAny("apps:read")
+	tidAppsList := mw.RequireTenantSelfScoped("apps:read")
 	tidAppsWrite := mw.RequireTenantSelfOrAny("apps:write")
-	tidStatsRead := mw.RequireTenantSelfOrAny("stats:read")
+	// Monitoring is scoped, not withheld: a co-owner reaches these and the
+	// handlers narrow the result to the applications they administer
+	// (monitoringScope). An owner sees the whole tenant; super_admin sees
+	// everything.
+	tidStatsRead := mw.RequireTenantSelfScoped("stats:read")
+
+	// Per-application variants (issue #97). Same tenant + permission check as
+	// above, plus "does this administrator's scope actually cover THIS
+	// application?" — the question RequireTenantSelfOrAny cannot ask, and which
+	// a co-owner granted one application would otherwise pass for every
+	// application in the tenant.
+	//
+	// The "id" suffixed pair guard /applications/:id, where the application's
+	// own row id is bound to :id rather than :appID.
+	appPermsRead := mw.RequireAppScope("appID", "permissions:read")
+	appPermsWrite := mw.RequireAppScope("appID", "permissions:write")
+	appRolesRead := mw.RequireAppScope("appID", "roles:read")
+	appRolesWrite := mw.RequireAppScope("appID", "roles:write")
+	appUsersRead := mw.RequireAppScope("appID", "users:read")
+	appUsersWrite := mw.RequireAppScope("appID", "users:write")
+	appAppsRead := mw.RequireAppScope("appID", "apps:read")
+	appAppsWrite := mw.RequireAppScope("appID", "apps:write")
+	appIDAppsRead := mw.RequireAppScope("id", "apps:read")
+	appIDAppsWrite := mw.RequireAppScope("id", "apps:write")
 
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
@@ -603,35 +767,38 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Application management under the canonical family — same handlers as
 	// the flat /applications aliases; the :tid path param overrides the JWT
 	// tenant (super_admin) or must equal it (tenant admins).
-	adminGroup.GET("/tenants/:tid/applications", adminHandler.ListApplications, tidAppsRead)
+	// The list is the one tenant-level route a co-owner must reach: it is how
+	// they find the applications they administer. ListApplications narrows the
+	// response to their grants — see RequireTenantSelfScoped.
+	adminGroup.GET("/tenants/:tid/applications", adminHandler.ListApplications, tidAppsList)
 	adminGroup.POST("/tenants/:tid/applications", adminHandler.CreateApplication, tidAppsWrite)
-	adminGroup.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication, tidAppsWrite)
-	adminGroup.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication, appIDAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication, appIDAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication, appIDAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, appIDAppsWrite)
 
 	// End-user application roles under the canonical family (mirrors the flat
 	// /applications/:appID/roles aliases registered below).
-	adminGroup.POST("/tenants/:tid/applications/:appID/roles", adminHandler.CreateApplicationRole, tidRolesWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/roles", adminHandler.ListApplicationRoles, tidRolesRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id", adminHandler.UpdateApplicationRole, tidRolesWrite)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, tidRolesWrite)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, tidRolesWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/roles/:id", adminHandler.DeleteRole, tidRolesWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/roles", adminHandler.CreateApplicationRole, appRolesWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/roles", adminHandler.ListApplicationRoles, appRolesRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id", adminHandler.UpdateApplicationRole, appRolesWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, appRolesWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, appRolesWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/roles/:id", adminHandler.DeleteRole, appRolesWrite)
 
 	// End-user application permissions under the canonical family.
-	adminGroup.POST("/tenants/:tid/applications/:appID/permissions", adminHandler.CreatePermission, tidPermsWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/permissions", adminHandler.ListPermissions, tidPermsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.DeletePermission, tidPermsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/permissions", adminHandler.CreatePermission, appPermsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/permissions", adminHandler.ListPermissions, appPermsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, appPermsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.DeletePermission, appPermsWrite)
 
 	// Per-application MFA policy under the canonical family (issue #63) —
 	// owner (apps:read/apps:write, own tenant) and super_admin (tenant:manage,
 	// any tenant) manage each application's MFA mode; MFA policy is
 	// application configuration, so it rides the apps:* permissions.
-	adminGroup.GET("/tenants/:tid/applications/:appID/mfa", adminHandler.GetApplicationMFA, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/mfa", adminHandler.GetApplicationMFA, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, appUsersWrite)
 
 	// White-label email senders under the canonical family (issue #63
 	// follow-on) — tenant-level sender plus optional per-application override;
@@ -640,37 +807,50 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
 	adminGroup.POST("/tenants/:tid/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
-	adminGroup.GET("/tenants/:tid/applications/:appID/email-settings", adminHandler.GetEmailSender, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
-	adminGroup.POST("/tenants/:tid/applications/:appID/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-settings", adminHandler.GetEmailSender, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/email-settings", adminHandler.UpsertEmailSender, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-settings", adminHandler.DeleteEmailSender, appAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/email-settings/test", adminHandler.SendTestEmail, appAppsWrite, mw.TokenRateLimiter(rlCfg))
 
 	// Per-scope email templates (Auth0-style) — same guards as senders.
 	adminGroup.GET("/tenants/:tid/email-templates", adminHandler.ListEmailTemplates, tidAppsRead)
 	adminGroup.GET("/tenants/:tid/email-templates/:type", adminHandler.GetEmailTemplate, tidAppsRead)
 	adminGroup.PUT("/tenants/:tid/email-templates/:type", adminHandler.UpsertEmailTemplate, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/email-templates/:type", adminHandler.DeleteEmailTemplate, tidAppsWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates", adminHandler.ListEmailTemplates, tidAppsRead)
-	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.GetEmailTemplate, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.UpsertEmailTemplate, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.DeleteEmailTemplate, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates", adminHandler.ListEmailTemplates, appAppsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.GetEmailTemplate, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.UpsertEmailTemplate, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.DeleteEmailTemplate, appAppsWrite)
 
 	// End-user application users under the canonical family — each
 	// application manages its own isolated user base.
-	adminGroup.GET("/tenants/:tid/applications/:appID/users", adminHandler.ListUsers, tidUsersRead)
-	adminGroup.POST("/tenants/:tid/applications/:appID/users", adminHandler.CreateAdminUser, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid", adminHandler.GetAdminUser, tidUsersRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, tidUsersWrite)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
-	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
-	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/invite", adminHandler.ResendInvitation, tidUsersWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, tidUsersRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users", adminHandler.ListUsers, appUsersRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users", adminHandler.CreateAdminUser, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid", adminHandler.GetAdminUser, appUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, appUsersWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/invite", adminHandler.ResendInvitation, appUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, appUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, appUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, appUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, appUsersRead)
+
+	// Tenant administration — owners and co-owners (issue #97). Tenant-level
+	// routes, so RequireTenantSelfOrAny already refuses a co-owner: an
+	// administrator scoped to particular applications has no say in who else
+	// administers the tenant. Guarded by users:* because administrators are
+	// users; there is no separate admins:* permission to add to every role.
+	adminGroup.GET("/tenants/:tid/admins", adminHandler.ListTenantAdmins, tidUsersRead)
+	// TokenRateLimiter, as on every other route that dispatches mail: inviting
+	// (and re-inviting) an administrator sends to an arbitrary external address,
+	// so without it a tenant owner is an open relay bounded only by request rate.
+	adminGroup.POST("/tenants/:tid/admins", adminHandler.InviteTenantAdmin, tidUsersWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.PUT("/tenants/:tid/admins/:adminID/applications", adminHandler.SetTenantAdminGrants, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/admins/:adminID", adminHandler.RemoveTenantAdmin, tidUsersWrite)
 
 	// Tenant stats + activity feed (EMC-004 tenant overview page).
 	adminGroup.GET("/tenants/:tid/stats", adminHandler.TenantGetStats, tidStatsRead)
@@ -687,8 +867,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	usersWrite := mw.RequireAnyPermission("users:write", "admin:access")
 	appsRead := mw.RequireAnyPermission("apps:read", "admin:access")
 	appsWrite := mw.RequireAnyPermission("apps:write", "admin:access")
-	auditRead := mw.RequireAnyPermission("audit:read", "admin:access")
-	statsRead := mw.RequireAnyPermission("stats:read", "admin:access")
+	// Monitoring is the one flat family a co-owner may call: the handlers narrow
+	// audit events and stats to the applications they administer
+	// (monitoringScope). Everything else on the flat routes acts on the tenant
+	// as a whole and is tenant-wide only.
+	auditRead := mw.RequireAnyPermissionScoped("audit:read", "admin:access")
+	statsRead := mw.RequireAnyPermissionScoped("stats:read", "admin:access")
 	samlManage := mw.RequireAnyPermission("saml:manage", "admin:access")
 
 	// Permission management — permissions:read / permissions:write
@@ -824,9 +1008,43 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/rate-limit", adminHandler.SetAppLimit, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, tidAppsWrite)
 
+	// JWT signing-key management (issue #95) — tenant:manage, because rotating a
+	// signing key is a tenant-wide security operation, not an application-level one.
+	//
+	// Two-step rotation by design: prepare publishes the incoming key so verifier
+	// caches pick it up, complete then activates it. A single-shot rotate endpoint
+	// would reintroduce the window where a token is signed by a key no verifier has
+	// seen yet.
+	//
+	// Both mutating steps are rate limited per tenant. Authorisation alone is not
+	// enough here: completing a rotation retires the outgoing key, so a caller
+	// that already holds tenant:manage can cycle prepare→complete to push keys
+	// past RetiredKeyGrace faster than issued tokens expire, invalidating them.
+	// The limiter turns that from seconds into hours. Listing is read-only and
+	// stays unthrottled.
+	rotationLimit := mw.SigningKeyRotationRateLimiter()
+	tenantMgmt.GET("/signing-keys", signingKeyHandler.ListSigningKeys)
+	tenantMgmt.POST("/signing-keys/prepare", signingKeyHandler.PrepareSigningKeyRotation, rotationLimit)
+	tenantMgmt.POST("/signing-keys/complete", signingKeyHandler.CompleteSigningKeyRotation, rotationLimit)
+
 	// SAML admin config — saml:manage (04-01)
 	adminGroup.GET("/saml-config", samlHandler.GetSAMLConfig, samlManage)
 	adminGroup.PUT("/saml-config", samlHandler.UpsertSAMLConfig, samlManage)
+
+	// Published JWKS — public, unauthenticated, top-level (issue #95, Phase 3).
+	//
+	// Mounted with e.GET like /saml/metadata below: there is no SPA catch-all or
+	// RouteNotFound handler in this server (the only wildcard is the scoped
+	// /api/* 404 at the end of this function), so a top-level path is unshadowed.
+	//
+	// Per-tenant by path because the slug cannot travel in X-Tenant-Slug here — a
+	// JWKS library or browser fetching a URL sends no custom headers.
+	//
+	// The rate limiter is deliberately generous (JWKSPerIPRate) and refunds 304s:
+	// a public route inherits no throttling at all, but throttling this one too
+	// hard breaks every offline verifier we are asking to depend on it.
+	// TenantCORS skips this path entirely — see isPublicCORSExempt.
+	e.GET("/tenants/:slug/.well-known/jwks.json", jwksHandler.GetTenantJWKS, mw.JWKSRateLimiter())
 
 	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
 	e.GET("/saml/metadata", samlHandler.GetMetadata)

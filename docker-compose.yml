@@ -62,11 +62,27 @@ services:
       SEED_ADMIN_PASSWORD: "ChangeMe123!"
       JWT_ISSUER: "http://localhost:9090"
       APP_BASE_URL: "http://localhost:9090"
+      # Admin console origin (Vite dev server). The invitation link must open a
+      # page that can collect a password — POST /api/v1/auth/accept-invitation
+      # answers a browser GET with "authorization required".
+      DASHBOARD_BASE_URL: "http://localhost:5173"
+      # Admin-activity notifications about what tenant owners do. Left empty
+      # locally so they fall back to the seeded super_admin and land in Mailpit.
+      PLATFORM_NOTIFY_EMAIL: "${PLATFORM_NOTIFY_EMAIL:-}"
       TOTP_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
       # Social login (issue #64): value comes from .env in this directory via
       # compose interpolation — never hardcode the key in this committed file.
       OAUTH_CLIENT_SECRET_ENCRYPTION_KEY: "${OAUTH_CLIENT_SECRET_ENCRYPTION_KEY:-}"
       OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS: "${OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS:-}"
+      # JWT signing keys (issue #95): same contract as the OAuth key above — the
+      # value comes from .env via interpolation, never hardcoded here. Kept
+      # separate from the OAuth key on purpose: this one protects token-SIGNING
+      # authority, so a social-login secret leak must not also grant the ability
+      # to mint tokens. Unset here means the server falls back to the insecure
+      # zero key, and any signing_keys rows written under a different key then
+      # fail to decrypt (login returns 500).
+      JWT_SIGNING_KEY_ENCRYPTION_KEY: "${JWT_SIGNING_KEY_ENCRYPTION_KEY:-}"
+      JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS: "${JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS:-}"
       SEED_DEMO_DATA: "true"
       SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
       GLOBAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090,https://emc-auth.senie.ai"

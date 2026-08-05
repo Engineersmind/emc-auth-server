@@ -51,6 +51,19 @@ const (
 	// their inbox cannot tell a configuration test from a real verification bug.
 	// A test email should announce itself as a test.
 	TemplateProviderTest TemplateType = "provider_test"
+
+	// TemplateAdminActivity reports a privileged administrative action to the
+	// people accountable for it: the tier above the actor (a platform admin for an
+	// owner's action, the tenant's owners for a co-owner's), and for sensitive
+	// actions the actor themselves — the same reasoning as password_changed,
+	// where a copy of your own action is how you discover it was not you.
+	TemplateAdminActivity TemplateType = "admin_activity"
+	// TemplateAccessChanged tells someone that THEIR OWN administrative access
+	// was granted, narrowed or withdrawn. Distinct from admin_activity, which
+	// reports an action to the people overseeing it: this one is addressed to
+	// the person the action was taken on, who would otherwise discover it only
+	// by being refused something they could do yesterday.
+	TemplateAccessChanged TemplateType = "access_changed"
 )
 
 // AllTemplateTypes lists every customizable template, for admin listing and
@@ -66,6 +79,8 @@ var AllTemplateTypes = []TemplateType{
 	TemplateChangeEmail,
 	TemplateBlockedAccount,
 	TemplatePasswordBreach,
+	TemplateAdminActivity,
+	TemplateAccessChanged,
 }
 
 // ValidTemplateType reports whether t is a known template type.
@@ -106,6 +121,33 @@ type TemplateData struct {
 	// NewEmail is the address an account was moved to (change_email's
 	// EmailChangeApplied variant, sent to the previous address). Empty elsewhere.
 	NewEmail string
+
+	// Fields below describe an administrative action for admin_activity. Empty
+	// in every other template.
+	//
+	// ActionLabel carries the human phrasing ("rotated a client secret") rather
+	// than the raw action key, and is resolved in Go. A template covering a dozen
+	// actions cannot branch on each one the way Reason does for the three
+	// blocked_account variants — it would be unreadable and every new action
+	// would mean editing the template as well as the catalogue.
+	ActionLabel string
+	// ActorEmail and ActorRole identify who acted. The role is spelled for
+	// humans ("owner", "co-owner"), since the point of the email is that the
+	// recipient can judge whether the action was appropriate for that tier.
+	ActorEmail string
+	ActorRole  string
+	// TenantName and ResourceName answer "where" — the tenant and, where the
+	// action had one, the application or other resource it touched.
+	TenantName   string
+	ResourceName string
+	// OccurredAt is preformatted for display; templates must not do date
+	// arithmetic. IPAddress may be empty for actions with no request context.
+	OccurredAt string
+	IPAddress  string
+	// Count is the number of collapsed occurrences when several identical
+	// actions in quick succession became one email. Zero or one renders as a
+	// single event.
+	Count int
 }
 
 // EmailChangeApplied is the TemplateData.Reason value that turns the
@@ -400,6 +442,64 @@ This link is valid for {{.TTLMinutes}} minutes and can be used once. If this was
 {{.Link}}
 
 Reusing a breached password puts your account at risk.
+
+- {{.ProductName}}`,
+	},
+
+	// No CTA button: there is no single action to take, and the recipient may be
+	// reading this only to confirm the change was expected. The monitoring link
+	// is offered as plain text so it survives a text-only client.
+	TemplateAdminActivity: {
+		Subject: "{{if .ActorRole}}{{.ActorRole}}{{else}}An administrator{{end}} {{.ActionLabel}}{{if .TenantName}} in {{.TenantName}}{{end}}",
+		HTML: shell(`<h2>Administrator activity</h2>
+<p><strong>{{.ActorEmail}}</strong>{{if .ActorRole}} ({{.ActorRole}}){{end}} {{.ActionLabel}}{{if gt .Count 1}}, {{.Count}} times in quick succession{{end}}.</p>
+<table style="font-size:14px;border-collapse:collapse">
+{{if .TenantName}}<tr><td style="padding:2px 16px 2px 0;color:#666">Tenant</td><td>{{.TenantName}}</td></tr>{{end}}
+{{if .ResourceName}}<tr><td style="padding:2px 16px 2px 0;color:#666">Application</td><td>{{.ResourceName}}</td></tr>{{end}}
+{{if .OccurredAt}}<tr><td style="padding:2px 16px 2px 0;color:#666">When</td><td>{{.OccurredAt}}</td></tr>{{end}}
+{{if .IPAddress}}<tr><td style="padding:2px 16px 2px 0;color:#666">From</td><td>{{.IPAddress}}</td></tr>{{end}}
+</table>
+{{if .Link}}<p style="font-size:12px;color:#666">Review in monitoring:<br>{{.Link}}</p>{{end}}
+<p style="font-size:12px;color:#666">You are receiving this because you are responsible for this tenant. If this change was not expected, review it now.</p>`),
+		Text: `{{.ActorEmail}}{{if .ActorRole}} ({{.ActorRole}}){{end}} {{.ActionLabel}}{{if gt .Count 1}}, {{.Count}} times in quick succession{{end}}.
+
+{{if .TenantName}}Tenant:      {{.TenantName}}
+{{end}}{{if .ResourceName}}Application: {{.ResourceName}}
+{{end}}{{if .OccurredAt}}When:        {{.OccurredAt}}
+{{end}}{{if .IPAddress}}From:        {{.IPAddress}}
+{{end}}{{if .Link}}
+Review in monitoring: {{.Link}}
+{{end}}
+If this change was not expected, review it now.
+
+- {{.ProductName}}`,
+	},
+
+	// Addressed to the person the change was made TO, so it speaks in the second
+	// person and leads with what they can do now rather than who did it. Who did
+	// it still matters — it is how they tell an expected change from one worth
+	// querying — so it appears, just not first.
+	TemplateAccessChanged: {
+		Subject: "Your administrator access{{if .TenantName}} in {{.TenantName}}{{end}} has changed",
+		HTML: shell(`<h2>Your access has changed</h2>
+<p>{{.ActionLabel}}{{if .ActorEmail}}, by {{.ActorEmail}}{{if .ActorRole}} ({{.ActorRole}}){{end}}{{end}}.</p>
+<table style="font-size:14px;border-collapse:collapse">
+{{if .TenantName}}<tr><td style="padding:2px 16px 2px 0;color:#666">Tenant</td><td>{{.TenantName}}</td></tr>{{end}}
+{{if .ResourceName}}<tr><td style="padding:2px 16px 2px 0;color:#666">Applications</td><td>{{.ResourceName}}</td></tr>{{end}}
+{{if .OccurredAt}}<tr><td style="padding:2px 16px 2px 0;color:#666">When</td><td>{{.OccurredAt}}</td></tr>{{end}}
+</table>
+<p>You will see the change the next time you sign in.</p>
+<p style="font-size:12px;color:#666">If you were not expecting this, contact whoever administers this tenant.</p>`),
+		Text: `Your administrator access has changed.
+
+{{.ActionLabel}}{{if .ActorEmail}}, by {{.ActorEmail}}{{if .ActorRole}} ({{.ActorRole}}){{end}}{{end}}.
+
+{{if .TenantName}}Tenant:       {{.TenantName}}
+{{end}}{{if .ResourceName}}Applications: {{.ResourceName}}
+{{end}}{{if .OccurredAt}}When:         {{.OccurredAt}}
+{{end}}
+You will see the change the next time you sign in. If you were not expecting
+this, contact whoever administers this tenant.
 
 - {{.ProductName}}`,
 	},

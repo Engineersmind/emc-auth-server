@@ -173,18 +173,31 @@ type MeResult struct {
 	Email       string   `json:"email"`
 	Role        string   `json:"role"`
 	Permissions []string `json:"permissions"`
+	// AdminScope and AdminApps mirror the token's administrative reach (issue
+	// #97) so a client can render the same boundary the server enforces —
+	// showing a co-owner only the applications they administer, rather than
+	// offering every tenant-level control and letting each one 403 on submit.
+	// Empty for callers who are not tenant administrators.
+	AdminScope string   `json:"admin_scope,omitempty"`
+	AdminApps  []string `json:"admin_apps,omitempty"`
 }
 
-// resolveTenant fetches the tenant row by slug. Returns pgx.ErrNoRows if not found.
-func (s *AuthService) resolveTenant(ctx context.Context, slug string) (id int64, jwtSecret string, err error) {
+// resolveTenant fetches the tenant id by slug. Returns pgx.ErrNoRows if not found.
+//
+// It used to also SELECT jwt_secret, which both call sites discarded with `_`
+// (issue #95). Nothing leaked, but pulling signing authority into memory for no
+// reason is exactly the kind of gratuitous handling that turns into a leak the
+// day someone adds a log line or an error message that includes the row.
+// Signing now goes through JWTService, which fetches the key it needs itself.
+func (s *AuthService) resolveTenant(ctx context.Context, slug string) (id int64, err error) {
 	err = s.pool.QueryRow(ctx,
-		`SELECT id, jwt_secret FROM tenants WHERE slug = $1 AND is_active = true`,
+		`SELECT id FROM tenants WHERE slug = $1 AND is_active = true`,
 		slug,
-	).Scan(&id, &jwtSecret)
+	).Scan(&id)
 	if err != nil {
-		return 0, "", fmt.Errorf("resolve tenant %q: %w", slug, err)
+		return 0, fmt.Errorf("resolve tenant %q: %w", slug, err)
 	}
-	return id, jwtSecret, nil
+	return id, nil
 }
 
 // loadPermissions returns the list of permission names for a given user.
@@ -236,7 +249,18 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 		Permissions: perms,
 	}
 
-	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
+	// Administrative reach is resolved here rather than at each caller because
+	// every path that mints a user token — Login, Register, Refresh, MFA
+	// completion, magic link, OAuth callbacks — funnels through this function.
+	// Resolving it once means a co-owner's grants cannot survive their own
+	// revocation by riding a refresh rotation that forgot to reload them.
+	adminScope, adminApps, err := loadAdminScope(ctx, s.pool, userID, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	claims.AdminScope, claims.AdminApps = adminScope, adminApps
+
+	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, claims)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -335,7 +359,7 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		// application's own tenant (confused-deputy guard). Same error as a
 		// bad secret so responses don't map app credentials to tenants.
 		if in.TenantSlug != "" {
-			slugTenantID, _, err := s.resolveTenant(ctx, in.TenantSlug)
+			slugTenantID, err := s.resolveTenant(ctx, in.TenantSlug)
 			if err != nil || slugTenantID != tid {
 				return nil, ErrInvalidClient
 			}
@@ -343,7 +367,7 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 		tenantID, appRowID = tid, &aid
 		appID = strconv.FormatInt(aid, 10)
 	} else {
-		tid, _, err := s.resolveTenant(ctx, in.TenantSlug)
+		tid, err := s.resolveTenant(ctx, in.TenantSlug)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("tenant not found")
@@ -1074,6 +1098,8 @@ func (s *AuthService) Me(claims *Claims) *MeResult {
 		Email:       claims.Email,
 		Role:        claims.Role,
 		Permissions: claims.Permissions,
+		AdminScope:  claims.AdminScope,
+		AdminApps:   claims.AdminApps,
 	}
 }
 
@@ -1386,6 +1412,11 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 // oauth_clients.id remains available in the app_id claim. Scopes are loaded
 // from the oauth_clients.scopes column so downstream permission checks receive
 // the correct grants.
+//
+// The token carries AudienceM2M so it is distinguishable from a user session
+// token (issue #84): it is accepted on admin/management routes, where a machine
+// client is a legitimate caller subject to its scopes, but refused on user
+// self-service routes, which assume a real user behind the token.
 func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int64) (string, int, error) {
 	var clientID string
 	var scopes []string
@@ -1406,7 +1437,7 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 		Role:        "service",
 		Permissions: scopes,
 	}
-	token, err := s.jwtSvc.Sign(ctx, tenantID, "emc-auth-server", claims)
+	token, err := s.jwtSvc.Sign(ctx, tenantID, AudienceM2M, claims)
 	if err != nil {
 		return "", 0, fmt.Errorf("sign service token: %w", err)
 	}

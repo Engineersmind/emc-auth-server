@@ -57,7 +57,7 @@ func newTOTPService(t *testing.T) (*auth.TOTPService, context.Context, *pgxpool.
 func insertTOTPTestUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, email string) int64 {
 	t.Helper()
 	logger := testhelper.TestLogger()
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
 	_, err := authSvc.Register(ctx, auth.RegisterInput{
 		TenantSlug: "emc",

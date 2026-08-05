@@ -31,7 +31,7 @@ func newSecurityTestServices(t *testing.T) (*auth.AuthService, *auth.ResetServic
 		t.Fatalf("RunSeed: %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 
 	totpEncKey := os.Getenv("TOTP_ENCRYPTION_KEY")
 	totpSvc, err := auth.NewTOTPService(pool, totpEncKey, logger)
@@ -186,7 +186,7 @@ func TestTOTPBypass_InvalidCode(t *testing.T) {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	svc := auth.NewAuthService(pool, jwtSvc, logger).WithTOTP(totpSvc, rdb)
 
 	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
