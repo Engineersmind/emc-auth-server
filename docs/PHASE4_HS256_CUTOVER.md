@@ -127,7 +127,7 @@ column on the very first deploy, while HS256 verification was still expected to 
 -- +goose StatementBegin
 
 -- Issue #95, Phase 4. Removes the symmetric signing secret. Signing keys have lived
--- in signing_keys since migration 00062; this column has been verification-only
+-- in signing_keys since migration 00065; this column has been verification-only
 -- since, and unused entirely since JWT_ALLOW_LEGACY_HS256=false.
 --
 -- PREREQUISITES (see docs/PHASE4_HS256_CUTOVER.md):

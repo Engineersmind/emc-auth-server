@@ -40,7 +40,7 @@ const breachCheckTimeout = 20 * time.Second
 type BreachService struct {
 	pool       *pgxpool.Pool
 	checker    *breach.Checker
-	notify     emailNotifier
+	notify     EmailNotifier
 	appBaseURL string
 	logger     zerolog.Logger
 }
@@ -51,7 +51,7 @@ func NewBreachService(pool *pgxpool.Pool, checker *breach.Checker, m mailer.Mail
 	return &BreachService{
 		pool:       pool,
 		checker:    checker,
-		notify:     emailNotifier{mailer: m, logger: logger},
+		notify:     EmailNotifier{mailer: m, logger: logger},
 		appBaseURL: appBaseURL,
 		logger:     logger,
 	}
@@ -147,7 +147,7 @@ func (s *BreachService) CheckNow(ctx context.Context, tenantID int64, appRowID *
 		Link:    fmt.Sprintf("%s/forgot-password", s.appBaseURL),
 		AppName: appNameByRowID(ctx, s.pool, appRowID),
 	}
-	if _, err := s.notify.send(ctx, tenantID, appRowID, mailer.TemplatePasswordBreach,
+	if _, err := s.notify.Send(ctx, tenantID, appRowID, mailer.TemplatePasswordBreach,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
 			return s.notify.mailer.SendPasswordBreach(ctx, sender, tmpl, msg)
 		}); err != nil {

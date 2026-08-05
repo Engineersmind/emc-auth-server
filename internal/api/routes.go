@@ -49,6 +49,9 @@ type RoutesConfig struct {
 	Env string
 	// AppBaseURL is prepended to the reset token link in emails.
 	AppBaseURL string
+	// DashboardBaseURL is the admin console origin, used for emailed links whose
+	// destination is a page rather than an API endpoint (the invitation link).
+	DashboardBaseURL string
 	// TOTPEncryptionKey is the 64-char hex key for AES-256-GCM TOTP secret encryption.
 	TOTPEncryptionKey string
 	// OAuthClientSecretEncryptionKey is the 64-char hex key for AES-256-GCM
@@ -336,7 +339,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// password warnings — the remaining transactional email flows. Each reuses
 	// the same sender + template resolvers, so their mail is branded per scope
 	// and can be customized or disabled per application like every other type.
-	invSvc := auth.NewInvitationService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
+	invSvc := auth.NewInvitationService(deps.Pool, m, deps.Config.DashboardBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
@@ -486,7 +489,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// first login.
 	adminSvc.WithSigningKeys(signingKeySvc)
 
-	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Logger)
+	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Config.AppBaseURL, deps.Logger)
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
 	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
 
@@ -539,6 +542,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// public but rate-limited: a bearer-token guard would be impossible to
 	// satisfy from a link in an email.
 	authGroup.POST("/accept-invitation", authHandler.AcceptInvitation, mw.TokenRateLimiter(rlCfg))
+	// Read-only companion so the landing page can tell an onboarding link (set a
+	// password) from a confirmation link (an existing account accepting an
+	// administrative grant). Does not consume the token.
+	authGroup.GET("/invitation", authHandler.PreviewInvitation, mw.TokenRateLimiter(rlCfg))
 	authGroup.GET("/confirm-email-change", authHandler.ConfirmEmailChange, mw.TokenRateLimiter(rlCfg))
 	authGroup.GET("/unblock-account", authHandler.UnblockAccount, mw.TokenRateLimiter(rlCfg))
 
@@ -650,6 +657,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tenantMgmt := adminGroup.Group("", mw.RequirePermission("tenant:manage"))
 	tenantMgmt.POST("/tenants", adminHandler.CreateTenant)
 	// Static sub-paths registered before /:id so Echo does not treat them as ID params.
+	// Cross-tenant administrator directory. Platform oversight, so it lives on
+	// tenantMgmt (tenant:manage) rather than the tenant-scoped family, and is
+	// registered before /tenants/:id so the static path is not read as an id.
+	tenantMgmt.GET("/administrators", adminHandler.ListPlatformAdministrators)
+	tenantMgmt.GET("/administrators/stats", adminHandler.PlatformAdminSummary)
+
 	tenantMgmt.GET("/tenants/check-slug", adminHandler.CheckSlug)
 	tenantMgmt.GET("/tenants/:id", adminHandler.GetTenant)
 	tenantMgmt.PUT("/tenants/:id", adminHandler.UpdateTenant)
@@ -668,8 +681,32 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	tidUsersRead := mw.RequireTenantSelfOrAny("users:read")
 	tidUsersWrite := mw.RequireTenantSelfOrAny("users:write")
 	tidAppsRead := mw.RequireTenantSelfOrAny("apps:read")
+	tidAppsList := mw.RequireTenantSelfScoped("apps:read")
 	tidAppsWrite := mw.RequireTenantSelfOrAny("apps:write")
-	tidStatsRead := mw.RequireTenantSelfOrAny("stats:read")
+	// Monitoring is scoped, not withheld: a co-owner reaches these and the
+	// handlers narrow the result to the applications they administer
+	// (monitoringScope). An owner sees the whole tenant; super_admin sees
+	// everything.
+	tidStatsRead := mw.RequireTenantSelfScoped("stats:read")
+
+	// Per-application variants (issue #97). Same tenant + permission check as
+	// above, plus "does this administrator's scope actually cover THIS
+	// application?" — the question RequireTenantSelfOrAny cannot ask, and which
+	// a co-owner granted one application would otherwise pass for every
+	// application in the tenant.
+	//
+	// The "id" suffixed pair guard /applications/:id, where the application's
+	// own row id is bound to :id rather than :appID.
+	appPermsRead := mw.RequireAppScope("appID", "permissions:read")
+	appPermsWrite := mw.RequireAppScope("appID", "permissions:write")
+	appRolesRead := mw.RequireAppScope("appID", "roles:read")
+	appRolesWrite := mw.RequireAppScope("appID", "roles:write")
+	appUsersRead := mw.RequireAppScope("appID", "users:read")
+	appUsersWrite := mw.RequireAppScope("appID", "users:write")
+	appAppsRead := mw.RequireAppScope("appID", "apps:read")
+	appAppsWrite := mw.RequireAppScope("appID", "apps:write")
+	appIDAppsRead := mw.RequireAppScope("id", "apps:read")
+	appIDAppsWrite := mw.RequireAppScope("id", "apps:write")
 
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
@@ -697,35 +734,38 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Application management under the canonical family — same handlers as
 	// the flat /applications aliases; the :tid path param overrides the JWT
 	// tenant (super_admin) or must equal it (tenant admins).
-	adminGroup.GET("/tenants/:tid/applications", adminHandler.ListApplications, tidAppsRead)
+	// The list is the one tenant-level route a co-owner must reach: it is how
+	// they find the applications they administer. ListApplications narrows the
+	// response to their grants — see RequireTenantSelfScoped.
+	adminGroup.GET("/tenants/:tid/applications", adminHandler.ListApplications, tidAppsList)
 	adminGroup.POST("/tenants/:tid/applications", adminHandler.CreateApplication, tidAppsWrite)
-	adminGroup.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication, tidAppsWrite)
-	adminGroup.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication, appIDAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication, appIDAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication, appIDAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, appIDAppsWrite)
 
 	// End-user application roles under the canonical family (mirrors the flat
 	// /applications/:appID/roles aliases registered below).
-	adminGroup.POST("/tenants/:tid/applications/:appID/roles", adminHandler.CreateApplicationRole, tidRolesWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/roles", adminHandler.ListApplicationRoles, tidRolesRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id", adminHandler.UpdateApplicationRole, tidRolesWrite)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, tidRolesWrite)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, tidRolesWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/roles/:id", adminHandler.DeleteRole, tidRolesWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/roles", adminHandler.CreateApplicationRole, appRolesWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/roles", adminHandler.ListApplicationRoles, appRolesRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id", adminHandler.UpdateApplicationRole, appRolesWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, appRolesWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, appRolesWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/roles/:id", adminHandler.DeleteRole, appRolesWrite)
 
 	// End-user application permissions under the canonical family.
-	adminGroup.POST("/tenants/:tid/applications/:appID/permissions", adminHandler.CreatePermission, tidPermsWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/permissions", adminHandler.ListPermissions, tidPermsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.DeletePermission, tidPermsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/permissions", adminHandler.CreatePermission, appPermsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/permissions", adminHandler.ListPermissions, appPermsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.UpdatePermission, appPermsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/permissions/:pid", adminHandler.DeletePermission, appPermsWrite)
 
 	// Per-application MFA policy under the canonical family (issue #63) —
 	// owner (apps:read/apps:write, own tenant) and super_admin (tenant:manage,
 	// any tenant) manage each application's MFA mode; MFA policy is
 	// application configuration, so it rides the apps:* permissions.
-	adminGroup.GET("/tenants/:tid/applications/:appID/mfa", adminHandler.GetApplicationMFA, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/mfa", adminHandler.GetApplicationMFA, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, appUsersWrite)
 
 	// White-label email senders under the canonical family (issue #63
 	// follow-on) — tenant-level sender plus optional per-application override;
@@ -734,37 +774,50 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
 	adminGroup.POST("/tenants/:tid/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
-	adminGroup.GET("/tenants/:tid/applications/:appID/email-settings", adminHandler.GetEmailSender, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/email-settings", adminHandler.UpsertEmailSender, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-settings", adminHandler.DeleteEmailSender, tidAppsWrite)
-	adminGroup.POST("/tenants/:tid/applications/:appID/email-settings/test", adminHandler.SendTestEmail, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-settings", adminHandler.GetEmailSender, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/email-settings", adminHandler.UpsertEmailSender, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-settings", adminHandler.DeleteEmailSender, appAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/email-settings/test", adminHandler.SendTestEmail, appAppsWrite, mw.TokenRateLimiter(rlCfg))
 
 	// Per-scope email templates (Auth0-style) — same guards as senders.
 	adminGroup.GET("/tenants/:tid/email-templates", adminHandler.ListEmailTemplates, tidAppsRead)
 	adminGroup.GET("/tenants/:tid/email-templates/:type", adminHandler.GetEmailTemplate, tidAppsRead)
 	adminGroup.PUT("/tenants/:tid/email-templates/:type", adminHandler.UpsertEmailTemplate, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/email-templates/:type", adminHandler.DeleteEmailTemplate, tidAppsWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates", adminHandler.ListEmailTemplates, tidAppsRead)
-	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.GetEmailTemplate, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.UpsertEmailTemplate, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.DeleteEmailTemplate, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates", adminHandler.ListEmailTemplates, appAppsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.GetEmailTemplate, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.UpsertEmailTemplate, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/email-templates/:type", adminHandler.DeleteEmailTemplate, appAppsWrite)
 
 	// End-user application users under the canonical family — each
 	// application manages its own isolated user base.
-	adminGroup.GET("/tenants/:tid/applications/:appID/users", adminHandler.ListUsers, tidUsersRead)
-	adminGroup.POST("/tenants/:tid/applications/:appID/users", adminHandler.CreateAdminUser, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid", adminHandler.GetAdminUser, tidUsersRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, tidUsersWrite)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
-	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
-	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/invite", adminHandler.ResendInvitation, tidUsersWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, tidUsersRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users", adminHandler.ListUsers, appUsersRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users", adminHandler.CreateAdminUser, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid", adminHandler.GetAdminUser, appUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, appUsersWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/invite", adminHandler.ResendInvitation, appUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, appUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, appUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, appUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.GetUserMFAStatus, appUsersRead)
+
+	// Tenant administration — owners and co-owners (issue #97). Tenant-level
+	// routes, so RequireTenantSelfOrAny already refuses a co-owner: an
+	// administrator scoped to particular applications has no say in who else
+	// administers the tenant. Guarded by users:* because administrators are
+	// users; there is no separate admins:* permission to add to every role.
+	adminGroup.GET("/tenants/:tid/admins", adminHandler.ListTenantAdmins, tidUsersRead)
+	// TokenRateLimiter, as on every other route that dispatches mail: inviting
+	// (and re-inviting) an administrator sends to an arbitrary external address,
+	// so without it a tenant owner is an open relay bounded only by request rate.
+	adminGroup.POST("/tenants/:tid/admins", adminHandler.InviteTenantAdmin, tidUsersWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.PUT("/tenants/:tid/admins/:adminID/applications", adminHandler.SetTenantAdminGrants, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/admins/:adminID", adminHandler.RemoveTenantAdmin, tidUsersWrite)
 
 	// Tenant stats + activity feed (EMC-004 tenant overview page).
 	adminGroup.GET("/tenants/:tid/stats", adminHandler.TenantGetStats, tidStatsRead)
@@ -781,8 +834,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	usersWrite := mw.RequireAnyPermission("users:write", "admin:access")
 	appsRead := mw.RequireAnyPermission("apps:read", "admin:access")
 	appsWrite := mw.RequireAnyPermission("apps:write", "admin:access")
-	auditRead := mw.RequireAnyPermission("audit:read", "admin:access")
-	statsRead := mw.RequireAnyPermission("stats:read", "admin:access")
+	// Monitoring is the one flat family a co-owner may call: the handlers narrow
+	// audit events and stats to the applications they administer
+	// (monitoringScope). Everything else on the flat routes acts on the tenant
+	// as a whole and is tenant-wide only.
+	auditRead := mw.RequireAnyPermissionScoped("audit:read", "admin:access")
+	statsRead := mw.RequireAnyPermissionScoped("stats:read", "admin:access")
 	samlManage := mw.RequireAnyPermission("saml:manage", "admin:access")
 
 	// Permission management — permissions:read / permissions:write
@@ -979,6 +1036,23 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// identities (users:read / users:write).
 	adminGroup.GET("/users/:id/identities", oauthHandler.ListUserIdentities, usersRead)
 	adminGroup.DELETE("/users/:id/identities/:provider", oauthHandler.UnlinkUserIdentity, usersWrite)
+
+	// Tenant-nested aliases for the identity provider + user identity APIs.
+	// The flat routes above resolve the tenant from the caller's JWT, so a
+	// super_admin drilling into another tenant would silently manage their
+	// OWN tenant's providers. These carry the target tenant in the path,
+	// guarded by RequireTenantSelfOrAny exactly like every other
+	// /tenants/:tid resource family (email settings, roles, users, ...).
+	adminGroup.GET("/tenants/:tid/applications/:appID/identity-providers", oauthHandler.ListProviderConfigs, tidAppsRead)
+	// The two mutating routes carry the same token rate limiter as /test: each
+	// performs AES-256-GCM work, a DB upsert/delete and an audit write, so
+	// leaving the heavier endpoints unguarded while the lighter one is limited
+	// would be the wrong asymmetry.
+	adminGroup.PUT("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.UpsertProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.DeleteProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.POST("/tenants/:tid/applications/:appID/identity-providers/:provider/test", oauthHandler.TestProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/identities", oauthHandler.ListUserIdentities, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/identities/:provider", oauthHandler.UnlinkUserIdentity, tidUsersWrite)
 
 	// Agent management — apps:read / apps:write (agents are machine clients) (08-01, 08-04)
 	adminGroup.POST("/agents", agentHandler.RegisterAgent, appsWrite)

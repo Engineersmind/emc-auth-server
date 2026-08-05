@@ -34,8 +34,11 @@ import (
 	"github.com/engineersmind/emc-auth-server/docs" // swagger generated docs
 	"github.com/engineersmind/emc-auth-server/internal/api"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
+	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/config"
 	"github.com/engineersmind/emc-auth-server/internal/enrich"
+	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	"github.com/engineersmind/emc-auth-server/internal/notify"
 	"github.com/engineersmind/emc-auth-server/internal/security/risk"
 	"github.com/engineersmind/emc-auth-server/internal/store"
 	"github.com/engineersmind/emc-auth-server/internal/telemetry"
@@ -61,6 +64,18 @@ func main() {
 		Str("service", "emc-auth-server").
 		Str("env", cfg.Env).
 		Logger()
+
+	// An invitation is the ONLY route to a password for a newly seeded tenant
+	// owner, and its link is built from DashboardBaseURL. Left at the dev default
+	// in production, every invitation points at the operator's own machine — the
+	// tenant is created, the mail arrives, and nobody can act on it. The failure
+	// is silent at the point it happens and only surfaces as a confused owner, so
+	// it is worth a loud line at boot.
+	if cfg.Env == "production" && strings.Contains(cfg.DashboardBaseURL, "localhost") {
+		logger.Error().
+			Str("dashboard_base_url", cfg.DashboardBaseURL).
+			Msg("DASHBOARD_BASE_URL still points at localhost in production — invitation links will be unusable")
+	}
 
 	ctx := context.Background()
 
@@ -147,10 +162,40 @@ func main() {
 		defer siemSink.Close()
 	}
 
+	// Admin-activity notifications (#97 follow-on) — emails a privileged action
+	// to the tier above the actor, and to the actor for sensitive ones.
+	//
+	// Built here, before the audit logger, because it is registered as one of
+	// its sinks. It constructs its own mailer rather than borrowing the one in
+	// RegisterRoutes, which does not exist yet; both come from the same config,
+	// so they behave identically.
+	notifySink := notify.NewEmailSink(
+		pool,
+		mailer.NewMailer(mailer.MailerConfig{
+			Env:            cfg.Env,
+			Provider:       cfg.EmailProvider,
+			SMTPHost:       cfg.SMTPHost,
+			SMTPPort:       cfg.SMTPPort,
+			SMTPUsername:   cfg.SMTPUsername,
+			SMTPPassword:   cfg.SMTPPassword,
+			SMTPTLS:        cfg.SMTPTLS,
+			SendGridAPIKey: cfg.SendGridAPIKey,
+			EmailFrom:      cfg.SMTPFrom,
+			FromName:       cfg.EmailFromName,
+			Logger:         logger,
+		}),
+		auth.NewEmailTemplateService(pool, logger),
+		cfg.DashboardBaseURL,
+		cfg.PlatformNotifyEmails,
+		logger,
+	)
+	defer notifySink.Close()
+
 	// Async audit logger — owned here so shutdown can drain its buffer
 	// after the HTTP server stops and before the DB pool closes.
 	auditOpts := []audit.Option{
 		audit.WithRiskAssessor(risk.New(pool, cfg.UntrustedIPCIDRs, logger)),
+		audit.WithSink(notifySink),
 	}
 	if geoResolver != nil {
 		auditOpts = append(auditOpts, audit.WithGeoIP(geoResolver))
@@ -159,6 +204,11 @@ func main() {
 		auditOpts = append(auditOpts, audit.WithSink(siemSink))
 	}
 	auditLog := audit.New(pool, logger, auditOpts...)
+
+	// Close the loop: the sink records its own deliveries, but the logger it
+	// records them to only exists now. Safe here — nothing is served yet, so no
+	// event can reach the sink before this assignment.
+	notifySink.WithAudit(auditLog)
 
 	// Background retention purge (no-op when AUDIT_RETENTION_DAYS <= 0).
 	stopRetention := auditLog.StartRetention(cfg.AuditRetentionDays)
@@ -179,6 +229,7 @@ func main() {
 			JWTIssuer:                              cfg.JWTIssuer,
 			Env:                                    cfg.Env,
 			AppBaseURL:                             cfg.AppBaseURL,
+			DashboardBaseURL:                       cfg.DashboardBaseURL,
 			TOTPEncryptionKey:                      cfg.TOTPEncryptionKey,
 			OAuthClientSecretEncryptionKey:         cfg.OAuthClientSecretEncryptionKey,
 			OAuthClientSecretEncryptionKeyPrevious: cfg.OAuthClientSecretEncryptionKeyPrevious,

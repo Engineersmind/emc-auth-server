@@ -21,7 +21,7 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// Signing-key lifecycle states. See migrations/00062_signing_keys.sql for the
+// Signing-key lifecycle states. See migrations/00065_signing_keys.sql for the
 // rationale; the short version is that a key is published (next) before it ever
 // signs, and stays published (retired) after it stops, so rotation never
 // invalidates a live token.

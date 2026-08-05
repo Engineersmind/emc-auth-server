@@ -7,15 +7,36 @@ definitions:
       tenant:
         $ref: '#/definitions/admin.TenantResult'
     type: object
+  admin.InviteTenantAdminResult:
+    properties:
+      action:
+        description: "Action is one of:\n\n\tinvited            a new account was
+          created and an invitation sent\n\tgrants_added       the address was already
+          a tenant-level user; it was\n\t                   made an administrator
+          (or its grants widened) without\n\t                   creating a second
+          identity\n\tinvitation_resent  an invitation was already outstanding and
+          has been\n\t                   superseded by a fresh one"
+        type: string
+      admin:
+        $ref: '#/definitions/admin.TenantAdminResult'
+      invite_error:
+        type: string
+      invite_sent:
+        type: boolean
+    type: object
   admin.OwnerResult:
     properties:
       email:
         type: string
       id:
         type: string
+      invite_error:
+        type: string
+      invite_sent:
+        type: boolean
       role:
         type: string
-      temp_password:
+      status:
         type: string
     type: object
   admin.PermissionResult:
@@ -32,6 +53,86 @@ definitions:
         type: string
       tenant_id:
         type: string
+    type: object
+  admin.PlatformAdminResult:
+    properties:
+      applications:
+        description: |-
+          Applications names the applications a co-owner administers. Empty for an
+          owner, who administers every application in their tenant — the two empties
+          mean opposite things, so read this with Role.
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      email:
+        type: string
+      email_verified:
+        type: boolean
+      id:
+        description: |-
+          ID is the tenant_admins row, which is what the per-tenant management
+          endpoints take. UserID is the account behind it, for the user-detail and
+          session endpoints.
+        type: string
+      is_primary:
+        type: boolean
+      last_login_at:
+        type: string
+      logins_count:
+        type: integer
+      mfa_enabled:
+        type: boolean
+      name:
+        type: string
+      role:
+        description: Role is "owner" or "co_owner".
+        type: string
+      status:
+        description: |-
+          Status is "active", "pending_invitation" (granted but never accepted), or
+          "blocked". Distinguishing the last matters: a blocked administrator still
+          holds their grant and regains it the moment the block is lifted.
+        type: string
+      tenant_id:
+        type: string
+      tenant_name:
+        type: string
+      tenant_slug:
+        type: string
+      user_id:
+        type: string
+    type: object
+  admin.PlatformAdminStats:
+    properties:
+      co_owners:
+        type: integer
+      no_mfa:
+        type: integer
+      owners:
+        type: integer
+      pending_invitations:
+        type: integer
+      tenants_without_owner:
+        type: integer
+      total_admins:
+        type: integer
+    type: object
+  admin.PlatformAdminsPage:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/admin.PlatformAdminResult'
+        type: array
+      page:
+        type: integer
+      per_page:
+        type: integer
+      total:
+        type: integer
+      total_pages:
+        type: integer
     type: object
   admin.RoleResult:
     properties:
@@ -52,6 +153,35 @@ definitions:
           $ref: '#/definitions/admin.PermissionResult'
         type: array
       tenant_id:
+        type: string
+    type: object
+  admin.TenantAdminResult:
+    properties:
+      applications:
+        description: |-
+          Applications is empty for an owner — not because they administer none,
+          but because they administer all of them. Read it together with Role.
+        items:
+          type: string
+        type: array
+      created_at:
+        type: string
+      email:
+        type: string
+      id:
+        type: string
+      is_primary:
+        type: boolean
+      name:
+        type: string
+      role:
+        description: Role is "owner" or "co_owner".
+        type: string
+      status:
+        description: |-
+          Status is "active" once the invitation has been accepted and the address
+          verified, "pending_invitation" until then. An administrator who is
+          pending does not count toward the last-usable-owner guard.
         type: string
     type: object
   admin.TenantDashboardDelta:
@@ -128,6 +258,15 @@ definitions:
         type: integer
       application_id:
         type: string
+      block_reason:
+        type: string
+      blocked_at:
+        description: |-
+          Lockout state. BlockReason distinguishes an automatic failed-attempt
+          lockout (which the user can lift via an emailed link) from an operator
+          block (which they cannot) — without it an admin cannot tell why an account
+          is inactive. Both are nil for an account that was never blocked.
+        type: string
       connections:
         description: |-
           Connections lists how this user can sign in: "password" when a
@@ -142,6 +281,11 @@ definitions:
         type: string
       email_verified:
         type: boolean
+      failed_login_attempts:
+        description: |-
+          FailedLoginAttempts is the current consecutive-failure count, so an admin
+          can see an account approaching the lockout threshold.
+        type: integer
       first_name:
         type: string
       id:
@@ -165,6 +309,11 @@ definitions:
         type: integer
       mfa:
         $ref: '#/definitions/admin.UserMFAStatus'
+      pending_invitation:
+        description: |-
+          PendingInvitation is true when an unused, unexpired invitation exists —
+          the account has been created but never claimed.
+        type: boolean
       role:
         type: string
       role_id:
@@ -547,6 +696,9 @@ definitions:
         type: string
       from_name:
         type: string
+      has_api_key:
+        description: 'sendgrid: an API key is stored'
+        type: boolean
       has_password:
         type: boolean
       is_active:
@@ -554,6 +706,9 @@ definitions:
       logo_url:
         type: string
       product_name:
+        type: string
+      provider:
+        description: '"smtp" | "sendgrid"'
         type: string
       reply_to:
         type: string
@@ -572,6 +727,29 @@ definitions:
       updated_at:
         type: string
     type: object
+  auth.EmailTemplate:
+    properties:
+      application_id:
+        description: nil = tenant-level
+        type: string
+      html_body:
+        type: string
+      is_active:
+        type: boolean
+      is_default:
+        description: true when returned from the built-in fallback
+        type: boolean
+      subject:
+        type: string
+      template_type:
+        type: string
+      tenant_id:
+        type: string
+      text_body:
+        type: string
+      updated_at:
+        type: string
+    type: object
   auth.EnrollResult:
     properties:
       backup_codes:
@@ -580,6 +758,18 @@ definitions:
         type: array
       otp_uri:
         type: string
+    type: object
+  auth.InvitationPreview:
+    properties:
+      email:
+        type: string
+      grants_admin:
+        description: |-
+          GrantsAdmin reports that accepting will also activate a pending
+          administrative grant, so the page can say what is being confirmed.
+        type: boolean
+      requires_password:
+        type: boolean
     type: object
   auth.MFAPolicy:
     properties:
@@ -616,6 +806,18 @@ definitions:
     type: object
   auth.MeResult:
     properties:
+      admin_apps:
+        items:
+          type: string
+        type: array
+      admin_scope:
+        description: |-
+          AdminScope and AdminApps mirror the token's administrative reach (issue
+          #97) so a client can render the same boundary the server enforces —
+          showing a co-owner only the applications they administer, rather than
+          offering every tenant-level control and letting each one 403 on submit.
+          Empty for callers who are not tenant administrators.
+        type: string
       email:
         type: string
       permissions:
@@ -631,11 +833,15 @@ definitions:
     type: object
   auth.ProviderConfigDetail:
     properties:
+      callback_url:
+        type: string
       client_id:
         type: string
       created_at:
         type: string
       enabled:
+        type: boolean
+      has_secret:
         type: boolean
       id:
         type: string
@@ -647,6 +853,32 @@ definitions:
         type: array
       updated_at:
         type: string
+    type: object
+  auth.ProviderTestCheck:
+    properties:
+      detail:
+        type: string
+      name:
+        type: string
+      passed:
+        type: boolean
+    type: object
+  auth.ProviderTestResult:
+    properties:
+      callback_url:
+        type: string
+      checks:
+        items:
+          $ref: '#/definitions/auth.ProviderTestCheck'
+        type: array
+      enabled:
+        type: boolean
+      ok:
+        type: boolean
+      provider:
+        type: string
+      secret_verified:
+        type: boolean
     type: object
   auth.TOTPStatus:
     properties:
@@ -669,6 +901,23 @@ definitions:
         type: string
       provider_email:
         type: string
+    type: object
+  handlers.AcceptInvitationRequest:
+    properties:
+      current_password:
+        type: string
+      password:
+        description: |-
+          omitempty, not required: this field is optional now that an existing
+          account may confirm with CurrentPassword instead. min=8 still applies
+          whenever it is supplied, restoring the HTTP-layer floor that the service's
+          ErrWeakPassword otherwise enforces alone.
+        minLength: 8
+        type: string
+      token:
+        type: string
+    required:
+    - token
     type: object
   handlers.AppLimitRequest:
     properties:
@@ -715,6 +964,13 @@ definitions:
         type: string
       tenant_id:
         type: string
+    type: object
+  handlers.ChangeEmailRequest:
+    properties:
+      new_email:
+        type: string
+    required:
+    - new_email
     type: object
   handlers.CreateAPIKeyRequest:
     properties:
@@ -785,6 +1041,12 @@ definitions:
         type: string
       role_id:
         type: string
+      send_invitation:
+        description: |-
+          SendInvitation emails the user a link to set their own password instead of
+          the admin choosing one. When true, Password must be omitted — supplying
+          both is contradictory and is rejected rather than silently resolved.
+        type: boolean
     type: object
   handlers.EmailMFACodeRequest:
     properties:
@@ -806,6 +1068,21 @@ definitions:
       service:
         type: string
       status:
+        type: string
+    type: object
+  handlers.InviteTenantAdminRequest:
+    properties:
+      application_ids:
+        description: |-
+          ApplicationIDs is required for a co-owner and must be absent for an
+          owner, whose reach is every application in the tenant.
+        items:
+          type: string
+        type: array
+      email:
+        type: string
+      role:
+        description: Role is "owner" or "co_owner".
         type: string
     type: object
   handlers.LoginOTPRequest:
@@ -900,11 +1177,56 @@ definitions:
     - email
     - password
     type: object
+  handlers.ResendVerificationRequest:
+    properties:
+      email:
+        type: string
+    required:
+    - email
+    type: object
   handlers.ResetPasswordRequest:
     properties:
       new_password:
         type: string
       token:
+        type: string
+    type: object
+  handlers.SendTestEmailRequest:
+    properties:
+      allow_inherited:
+        description: |-
+          AllowInherited permits an application-addressed test to proceed when the
+          application has no sender of its own and would fall through to the
+          tenant's or the platform's. Default false; see PR #91 for the reasoning.
+        type: boolean
+      template_type:
+        description: TemplateType selects which template to render (empty = email_verification).
+        type: string
+      to:
+        description: |-
+          To is the recipient. Empty = the requesting admin's own address.
+
+          INVARIANT: a recipient other than the caller's own address always gets the
+          built-in diagnostic template, never a per-scope override — see the
+          enforcement in SendTestEmail. Template bodies are editable at this same
+          permission level, so allowing both an arbitrary recipient and arbitrary
+          content would make this a phishing relay from a verified sender identity.
+          See PR #91 for the full threat model.
+        type: string
+    type: object
+  handlers.SendTestEmailResponse:
+    properties:
+      message:
+        type: string
+      provider:
+        description: smtp | sendgrid | dev
+        type: string
+      scope:
+        description: application | tenant | global
+        type: string
+      template:
+        type: string
+      to:
         type: string
     type: object
   handlers.SessionLoginRequest:
@@ -916,6 +1238,13 @@ definitions:
     required:
     - email
     - password
+    type: object
+  handlers.SetTenantAdminGrantsRequest:
+    properties:
+      application_ids:
+        items:
+          type: string
+        type: array
     type: object
   handlers.SetUserStatusRequest:
     properties:
@@ -1019,6 +1348,11 @@ definitions:
     type: object
   handlers.UpsertEmailSenderRequest:
     properties:
+      api_key:
+        description: |-
+          APIKey is the SendGrid API key (provider="sendgrid"); write-only. Empty on
+          update keeps the stored key. Response exposes only has_api_key.
+        type: string
       from_address:
         type: string
       from_name:
@@ -1029,6 +1363,9 @@ definitions:
       logo_url:
         type: string
       product_name:
+        type: string
+      provider:
+        description: 'Provider: "smtp" (default) or "sendgrid".'
         type: string
       reply_to:
         type: string
@@ -1045,6 +1382,17 @@ definitions:
       tls_mode:
         description: 'TLSMode: "ssl" | "starttls" | "opportunistic" | "none" (empty
           = derive from port).'
+        type: string
+    type: object
+  handlers.UpsertEmailTemplateRequest:
+    properties:
+      html_body:
+        type: string
+      is_active:
+        type: boolean
+      subject:
+        type: string
+      text_body:
         type: string
     type: object
   handlers.UpsertProviderConfigRequest:
@@ -1089,6 +1437,84 @@ info:
   title: EMC Auth Server
   version: 1.5.0
 paths:
+  /api/v1/administrators:
+    get:
+      description: Lists owners and co-owners in EVERY tenant, for platform oversight
+        — the per-tenant equivalent is /tenants/{tid}/admins. Rows carry the tenant,
+        sign-in history and second-factor state because the reader has no other context.
+        An owner's applications array is empty because they administer every application
+        in their tenant; a co-owner's lists exactly theirs, so read it together with
+        role. Requires tenant:manage (super_admin only).
+      parameters:
+      - description: Match on email, name, tenant name or slug
+        in: query
+        name: search
+        type: string
+      - description: owner | co_owner
+        in: query
+        name: role
+        type: string
+      - description: active | pending_invitation | blocked
+        in: query
+        name: status
+        type: string
+      - description: 1-based page number
+        in: query
+        name: page
+        type: integer
+      - description: Rows per page (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.PlatformAdminsPage'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Directory of every administrator across all tenants
+      tags:
+      - admin-platform
+  /api/v1/administrators/stats:
+    get:
+      description: 'Counts across every tenant: total administrators, owners, co-owners,
+        unaccepted invitations, administrators without a second factor, and tenants
+        with no owner who can sign in. The last two are the numbers worth acting on
+        — privileged accounts protected by a password alone, and tenants nobody has
+        taken ownership of. Requires tenant:manage.'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.PlatformAdminStats'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Administrator directory summary
+      tags:
+      - admin-platform
   /api/v1/agents:
     get:
       description: Returns all active agent registrations for the requesting tenant.
@@ -2283,6 +2709,43 @@ paths:
       summary: Verify audit trail integrity
       tags:
       - admin-audit
+  /api/v1/auth/accept-invitation:
+    post:
+      consumes:
+      - application/json
+      description: Sets the password for an invited account using the token from the
+        invitation email, and marks the address verified. Single-use.
+      parameters:
+      - description: Invitation token and chosen password
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AcceptInvitationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Accept an invitation
+      tags:
+      - AUTH
   /api/v1/auth/apps/login:
     post:
       consumes:
@@ -2464,16 +2927,92 @@ paths:
       summary: Register an end user via application credentials
       tags:
       - AUTH
+  /api/v1/auth/change-email:
+    post:
+      consumes:
+      - application/json
+      description: Sends a confirmation link to the new address. The account email
+        changes only after the link is followed. Requires a valid access token.
+      parameters:
+      - description: New email address
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ChangeEmailRequest'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Request an email change
+      tags:
+      - AUTH
+  /api/v1/auth/confirm-email-change:
+    get:
+      description: Applies a pending email change using the token sent to the new
+        address, and marks it verified. Single-use.
+      parameters:
+      - description: Email change token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Confirm an email change
+      tags:
+      - AUTH
   /api/v1/auth/forgot-password:
     post:
       consumes:
       - application/json
-      description: Sends a reset link to the email address. ALWAYS returns 200 regardless
-        of whether the email is registered (prevents email enumeration).
+      description: 'Sends a reset link to the email address for the authenticated
+        application''s user. The application authenticates with Authorization: Basic
+        base64(client_id:client_secret) — this identifies both the tenant and application,
+        scoping the reset to that app''s account. ALWAYS returns 200 for a valid client
+        regardless of whether the email is registered (prevents email enumeration).'
       parameters:
-      - description: Tenant slug
+      - description: Basic base64(client_id:client_secret)
         in: header
-        name: X-Tenant-Slug
+        name: Authorization
         required: true
         type: string
       - description: Email address
@@ -2491,7 +3030,43 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "401":
+          description: Invalid client credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       summary: Request password reset
+      tags:
+      - AUTH
+  /api/v1/auth/invitation:
+    get:
+      description: Returns what a live invitation token is for, WITHOUT consuming
+        it, so the landing page can ask for a password only when there is one to set.
+        requires_password is false for an account that already has credentials — an
+        existing user being made an administrator, or an administrator being re-instated
+        — and for those the link only confirms the grant. grants_admin reports that
+        accepting will activate a pending administrative grant.
+      parameters:
+      - description: Invitation token from the email
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.InvitationPreview'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Inspect an invitation link
       tags:
       - AUTH
   /api/v1/auth/login:
@@ -3324,6 +3899,36 @@ paths:
       summary: Register a new user
       tags:
       - AUTH
+  /api/v1/auth/resend-verification:
+    post:
+      consumes:
+      - application/json
+      description: Re-sends the email-verification link for an unverified tenant-level
+        user. Always returns 200 to prevent account enumeration.
+      parameters:
+      - description: Tenant slug
+        in: header
+        name: X-Tenant-Slug
+        required: true
+        type: string
+      - description: Email to resend to
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ResendVerificationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Resend verification email
+      tags:
+      - AUTH
   /api/v1/auth/reset-password:
     post:
       consumes:
@@ -3486,6 +4091,63 @@ paths:
       summary: Client credentials token
       tags:
       - AUTH
+  /api/v1/auth/unblock-account:
+    get:
+      description: Lifts an automatic failed-attempt lockout using the token from
+        the blocked-account email. Single-use. Admin blocks cannot be lifted this
+        way.
+      parameters:
+      - description: Unblock token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Unblock an account
+      tags:
+      - AUTH
+  /api/v1/auth/verify-email:
+    get:
+      description: Confirms ownership of an email address via the token from the verification
+        link. Single-use.
+      parameters:
+      - description: Verification token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Verify email address
+      tags:
+      - AUTH
   /api/v1/email-settings:
     delete:
       description: Removes the white-label sender at this scope; sends fall back to
@@ -3584,6 +4246,153 @@ paths:
       summary: Set email sender settings
       tags:
       - admin-email-senders
+  /api/v1/email-settings/test:
+    post:
+      consumes:
+      - application/json
+      description: Sends a sample email using the sender configured at this scope
+        and the chosen template type, so an admin can confirm the SMTP/SendGrid configuration
+        delivers mail. The response reports which scope and provider handled the send.
+        Recipient defaults to the requesting admin's own address; any valid address
+        may be supplied (rate-limited, and audited with the recipient). Returns 409
+        when this scope has no sender of its own — pass allow_inherited=true to deliberately
+        test the inherited (tenant or platform) sender instead.
+      parameters:
+      - description: Recipient, template type, allow_inherited
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/handlers.SendTestEmailRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.SendTestEmailResponse'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: This scope has no sender of its own
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "502":
+          description: Delivery failed
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Send a test email
+      tags:
+      - admin-email-senders
+  /api/v1/email-templates:
+    get:
+      description: Returns every customizable email template at this scope. Rows with
+        is_default=true are the built-in defaults (no override stored).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.EmailTemplate'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List email templates
+      tags:
+      - admin-email-templates
+  /api/v1/email-templates/{type}:
+    delete:
+      description: Removes the template override at this scope; sends revert to the
+        next level (application → tenant → built-in default).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: No override configured at this scope
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Delete an email template
+      tags:
+      - admin-email-templates
+    get:
+      description: Returns the stored template for a type, or the built-in default
+        (is_default=true) when none is configured.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailTemplate'
+        "400":
+          description: Unknown template type
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get one email template
+      tags:
+      - admin-email-templates
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the template for a type at this scope. subject/html_body/text_body
+        are Go-template source with variables like {{.Link}}, {{.Code}}, {{.ProductName}},
+        {{.AppName}}, {{.TTLMinutes}}. Invalid template syntax is rejected.
+      parameters:
+      - description: Template content
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpsertEmailTemplateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.EmailTemplate'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an email template
+      tags:
+      - admin-email-templates
   /api/v1/permissions:
     get:
       description: Returns all permissions for the caller's tenant. Requires admin:access.
@@ -3986,10 +4795,16 @@ paths:
     post:
       consumes:
       - application/json
-      description: Creates a new isolated tenant and auto-seeds an owner role with
-        8 default permissions and an owner user using the provided owner_email. The
-        owner.temp_password in the response is shown once and never stored — hand
-        it to the tenant owner. Requires tenant:manage permission (super_admin only).
+      description: 'Creates a new isolated tenant and auto-seeds the granular permission
+        catalog, an owner role holding all of it, an owner user for the provided owner_email,
+        and the matching tenant_admins record. The owner account is created WITHOUT
+        a password: an invitation link is emailed, and accepting it sets the password
+        and marks the address verified. The response carries owner.status = "pending_invitation"
+        and owner.invite_sent; when invite_sent is false the tenant exists but the
+        invitation must be resent before the owner can sign in. Requires tenant:manage
+        permission (super_admin only). Returns 503 when the server has no email delivery
+        configured at all — in that case NOTHING is created, because the invitation
+        is the owner''s only route to a password.'
       parameters:
       - description: Tenant details
         in: body
@@ -4018,6 +4833,12 @@ paths:
             type: object
         "409":
           description: Slug already taken
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: Invitations are not configured; no tenant was created
           schema:
             additionalProperties:
               type: string
@@ -4267,6 +5088,218 @@ paths:
       summary: Activity feed for a target tenant
       tags:
       - admin-cross-tenant
+  /api/v1/tenants/{tid}/admins:
+    get:
+      description: Returns the tenant's owners and co-owners. An owner's applications
+        array is empty because they administer every application in the tenant, present
+        and future — read it together with role. status is "pending_invitation" until
+        the invitation is accepted and the address verified.
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.TenantAdminResult'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List tenant administrators
+      tags:
+      - admin-tenant-admins
+    post:
+      consumes:
+      - application/json
+      description: 'Adds an owner (tenant-wide) or co-owner (specific applications).
+        An address that is already a TENANT-LEVEL user is promoted in place and no
+        second identity is created; an application-scoped user with the same address
+        is unrelated and never collides, so being a customer of an application and
+        an administrator of its tenant are compatible. The response''s action field
+        reports what happened: "invited" (new account, invitation sent), "grants_added"
+        (existing user promoted or widened), or "invitation_resent". An invitation
+        that would change nothing returns 409, as does a tenant already holding the
+        maximum number of administrators. A repeat resend to the same address within
+        a minute returns 429. Returns 503 when the server has no email delivery configured
+        — nothing is recorded, because an administrator who cannot be told they are
+        one could never sign in.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      - description: Administrator details
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.InviteTenantAdminRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/admin.InviteTenantAdminResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Already an administrator with these grants, or the administrator
+            limit is reached
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: An invitation was sent to this address moments ago
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: Invitations are not configured; nothing was recorded
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Invite a tenant administrator
+      tags:
+      - admin-tenant-admins
+  /api/v1/tenants/{tid}/admins/{adminID}:
+    delete:
+      description: 'Withdraws administration and revokes the administrator''s live
+        sessions, so a removed administrator cannot keep rotating a refresh token
+        into fresh access tokens that still carry their old reach. The user account
+        itself survives — losing an administrative role must not take the person''s
+        identity or audit history with it. Removing the last owner who can actually
+        log in returns 409: a tenant with no usable owner is administrable only by
+        a platform admin. Removing a co-owner also returns 409 when they are the tenant''s
+        only administrator who can sign in, which happens when the owner never accepted
+        their invitation. An administrator who has not yet accepted does not count
+        as usable, and removing such a pending administrator is always allowed — they
+        could not sign in, so their removal takes nothing away.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      - description: Administrator ID
+        in: path
+        name: adminID
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Would leave the tenant without an administrator who can sign
+            in
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Remove a tenant administrator
+      tags:
+      - admin-tenant-admins
+  /api/v1/tenants/{tid}/admins/{adminID}/applications:
+    put:
+      consumes:
+      - application/json
+      description: 'Sets exactly which applications a co-owner administers. An empty
+        list is rejected — grants only ever narrow, so an administrator with none
+        could reach nothing; use DELETE to revoke administration outright. Owners
+        cannot be granted specific applications: they administer all of them. Every
+        live access token for the affected account is invalidated so a revoked grant
+        cannot outlive this call.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      - description: Administrator ID
+        in: path
+        name: adminID
+        required: true
+        type: integer
+      - description: Application IDs
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SetTenantAdminGrantsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.TenantAdminResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Replace a co-owner's application grants
+      tags:
+      - admin-tenant-admins
   /api/v1/tenants/{tid}/app-limits:
     get:
       description: Returns all per-app rate limit configs for the tenant. Requires
@@ -4290,6 +5323,49 @@ paths:
       summary: List app rate limits
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/identity-providers/{provider}/test:
+    post:
+      description: 'Dry-runs the stored configuration and returns a per-check report:
+        config present, secret decrypts, redirect allow-list usable, provider authorization
+        URL builds (for Google this also proves OIDC discovery succeeded), provider
+        enabled. Note that a passing result does NOT prove the client secret is correct
+        — the secret is only exercised at the token endpoint, which needs a real user
+        authorization code. Requires apps:write.'
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Provider (google, github)
+        in: path
+        name: provider
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.ProviderTestResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Test a social login provider configuration
+      tags:
+      - oauth
   /api/v1/tenants/{tid}/applications/{appID}/rate-limit:
     delete:
       description: Removes the custom rate limit; the app falls back to the default.
@@ -4911,6 +5987,36 @@ paths:
       summary: Unlink a social identity from a user
       tags:
       - oauth
+  /api/v1/users/{id}/invite:
+    post:
+      description: Emails a fresh invitation link to the user, invalidating any previous
+        one. Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Resend a user invitation
+      tags:
+      - admin-users
   /api/v1/users/{id}/mfa:
     get:
       description: Returns the user's enrolled MFA methods and remaining backup codes.

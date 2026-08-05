@@ -166,6 +166,43 @@ type PasswordBreachEmail struct {
 	AppName string
 }
 
+// AdminActivityEmail reports one privileged administrative action to somebody
+// accountable for it — the tier above the actor, or the actor themselves when
+// the action is sensitive enough that a copy is worth having.
+//
+// ActionLabel is the human phrasing ("rotated a client secret"), resolved by the
+// caller from the audit action key; this type carries no action key of its own,
+// so the wording lives in one place rather than being reinvented per template.
+type AdminActivityEmail struct {
+	To           string
+	ActorEmail   string
+	ActorRole    string // "owner", "co-owner" — spelled for humans
+	ActionLabel  string
+	TenantName   string
+	ResourceName string // application or other resource, when the action had one
+	OccurredAt   string // preformatted; templates do no date arithmetic
+	IPAddress    string
+	Link         string // deep link into monitoring for this event
+	// Count is how many identical actions in quick succession this message
+	// stands for. 0 or 1 reads as a single event.
+	Count int
+}
+
+// AccessChangedEmail tells somebody their own administrative access changed.
+//
+// ActionLabel is phrased in the second person ("Your applications were
+// changed"), unlike AdminActivityEmail's third — the reader is the subject here,
+// not an observer.
+type AccessChangedEmail struct {
+	To           string
+	ActionLabel  string
+	ActorEmail   string
+	ActorRole    string
+	TenantName   string
+	ResourceName string // the applications they administer after the change
+	OccurredAt   string
+}
+
 // Mailer sends transactional emails. Each method takes an optional per-scope
 // sender (nil = global) and an optional template override (nil = built-in).
 type Mailer interface {
@@ -179,9 +216,16 @@ type Mailer interface {
 	SendChangeEmail(ctx context.Context, sender *SMTPConfig, tmpl *Template, email ChangeEmailEmail) error
 	SendBlockedAccount(ctx context.Context, sender *SMTPConfig, tmpl *Template, email BlockedAccountEmail) error
 	SendPasswordBreach(ctx context.Context, sender *SMTPConfig, tmpl *Template, email PasswordBreachEmail) error
+	SendAdminActivity(ctx context.Context, sender *SMTPConfig, tmpl *Template, email AdminActivityEmail) error
+	SendAccessChanged(ctx context.Context, sender *SMTPConfig, tmpl *Template, email AccessChangedEmail) error
 	// SendTest renders the given template type with sample data and delivers it to
 	// `to`, so an admin can verify a sender/provider configuration end-to-end.
 	SendTest(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string) error
+	// GlobalProvider names the transport the global sender uses ("smtp",
+	// "sendgrid", or "dev" when nothing is configured). Reported by the test
+	// endpoint so an admin can see that a send fell through to the server
+	// default — or, in dev, that it was only logged and never transmitted.
+	GlobalProvider() string
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +431,41 @@ func (m *mailerImpl) SendPasswordBreach(ctx context.Context, sender *SMTPConfig,
 	return err
 }
 
+func (m *mailerImpl) SendAdminActivity(ctx context.Context, sender *SMTPConfig, tmpl *Template, e AdminActivityEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateAdminActivity, e.To, TemplateData{
+		ActorEmail:   e.ActorEmail,
+		ActorRole:    e.ActorRole,
+		ActionLabel:  e.ActionLabel,
+		TenantName:   e.TenantName,
+		ResourceName: e.ResourceName,
+		OccurredAt:   e.OccurredAt,
+		IPAddress:    e.IPAddress,
+		Link:         e.Link,
+		Count:        e.Count,
+	})
+	if err == nil {
+		m.logger.Info().
+			Str("to", e.To).Str("actor", e.ActorEmail).Str("action", e.ActionLabel).
+			Msg("admin-activity notification sent")
+	}
+	return err
+}
+
+func (m *mailerImpl) SendAccessChanged(ctx context.Context, sender *SMTPConfig, tmpl *Template, e AccessChangedEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateAccessChanged, e.To, TemplateData{
+		ActionLabel:  e.ActionLabel,
+		ActorEmail:   e.ActorEmail,
+		ActorRole:    e.ActorRole,
+		TenantName:   e.TenantName,
+		ResourceName: e.ResourceName,
+		OccurredAt:   e.OccurredAt,
+	})
+	if err == nil {
+		m.logger.Info().Str("to", e.To).Str("change", e.ActionLabel).Msg("access-changed notice sent")
+	}
+	return err
+}
+
 // sampleTestData is the placeholder variable set used when rendering a test
 // email — every template field gets a representative value so the preview looks
 // realistic regardless of the chosen template type.
@@ -399,12 +478,38 @@ func sampleTestData() TemplateData {
 		Name:        "Alex Doe",
 		InviterName: "Jordan Smith",
 		Reason:      BlockReasonFailedAttempts,
+		// admin_activity fields — without these the test send for that type
+		// renders a message with no subject content and empty rows.
+		ActorEmail:   "jordan.smith@example.com",
+		ActorRole:    "owner",
+		ActionLabel:  "rotated a client secret",
+		TenantName:   "Example Tenant",
+		ResourceName: "Example App",
+		OccurredAt:   "31 Jul 2026, 16:42",
+		IPAddress:    "203.0.113.9",
+		Count:        1,
 	}
 }
 
+// GlobalProvider names the global transport. The empty Provider set by
+// NewMailer's default branch means the log-only dev transport, which is
+// reported as "dev" rather than blank — an admin seeing a successful test that
+// never arrives needs to be told nothing was actually transmitted.
+func (m *mailerImpl) GlobalProvider() string {
+	if m.global.Provider == "" {
+		return "dev"
+	}
+	return m.global.Provider
+}
+
 func (m *mailerImpl) SendTest(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string) error {
-	if !ValidTemplateType(tt) {
-		tt = TemplateEmailVerification
+	// TemplateProviderTest is intentionally absent from AllTemplateTypes (it is
+	// not customizable), so ValidTemplateType rejects it — accept it explicitly
+	// rather than silently coercing a provider test into a verification email.
+	// Anything else unrecognised falls back to the diagnostic template too: a
+	// test send should never impersonate a real account email.
+	if tt != TemplateProviderTest && !ValidTemplateType(tt) {
+		tt = TemplateProviderTest
 	}
 	err := m.dispatch(ctx, sender, tmpl, tt, to, sampleTestData())
 	if err == nil {
@@ -468,18 +573,20 @@ func NewMailer(cfg MailerConfig) Mailer {
 		logger: cfg.Logger,
 		global: SMTPConfig{From: cfg.EmailFrom, FromName: cfg.FromName},
 	}
+	// Same trimming rationale as pickTransport: a trailing newline on an env
+	// var is invisible in a 401 and costs hours to find.
 	switch cfg.resolveProvider() {
 	case ProviderSendGrid:
 		m.global.Provider = ProviderSendGrid
-		m.global.APIKey = cfg.SendGridAPIKey
-		m.globalTr = &sendGridTransport{apiKey: cfg.SendGridAPIKey, logger: cfg.Logger}
+		m.global.APIKey = strings.TrimSpace(cfg.SendGridAPIKey)
+		m.globalTr = &sendGridTransport{apiKey: strings.TrimSpace(cfg.SendGridAPIKey), logger: cfg.Logger}
 	case ProviderSMTP:
 		m.global.Provider = ProviderSMTP
 		m.globalTr = &smtpTransport{
-			host:     cfg.SMTPHost,
+			host:     strings.TrimSpace(cfg.SMTPHost),
 			port:     cfg.SMTPPort,
-			username: cfg.SMTPUsername,
-			password: cfg.SMTPPassword,
+			username: strings.TrimSpace(cfg.SMTPUsername),
+			password: strings.TrimSpace(cfg.SMTPPassword),
 			tlsMode:  cfg.SMTPTLS,
 			logger:   cfg.Logger,
 		}

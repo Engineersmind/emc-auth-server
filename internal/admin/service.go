@@ -98,13 +98,33 @@ type TenantsPage struct {
 	PerPage    int            `json:"per_page"`
 }
 
+// Owner account states reported in OwnerResult.Status.
+const (
+	// OwnerStatusPendingInvitation means the account exists with no password;
+	// the owner claims it by following the emailed invitation link.
+	OwnerStatusPendingInvitation = "pending_invitation"
+)
+
 // OwnerResult carries the auto-created owner user returned once on tenant creation.
-// TempPassword is the plaintext password — it is never stored and is shown only this once.
+//
+// It no longer carries a temp_password. Returning a live credential in an HTTP
+// response body meant the owner's first password existed in whatever logged,
+// proxied, or screenshotted that response, and the address it belonged to had
+// never been proven deliverable — a typo produced a tenant nobody could enter,
+// with no error to show for it. The owner now proves control of the inbox by
+// following the invitation link, which is also what marks the address verified.
+//
+// InviteSent is false when the invitation could not be delivered. The tenant is
+// still created: a mail failure is a reason to resend, not a reason to discard a
+// tenant the caller asked for. InviteError then carries the reason, and the
+// super-admin break-glass path remains available.
 type OwnerResult struct {
-	ID           string `json:"id"`
-	Email        string `json:"email"`
-	TempPassword string `json:"temp_password"`
-	Role         string `json:"role"`
+	ID          string `json:"id"`
+	Email       string `json:"email"`
+	Role        string `json:"role"`
+	Status      string `json:"status"`
+	InviteSent  bool   `json:"invite_sent"`
+	InviteError string `json:"invite_error,omitempty"`
 }
 
 // CreateTenantResult is returned by CreateTenant; it combines the new tenant with
@@ -330,18 +350,21 @@ var defaultPermissions = []struct{ name, description string }{
 // CreateTenant creates a new tenant inside a single transaction that also seeds:
 //   - the default granular permissions (see defaultPermissions)
 //   - an "owner" system role holding all of them
-//   - an owner user (email: in.OwnerEmail) with a one-time temp password
+//   - an owner user (email: in.OwnerEmail) with NO credentials row
+//   - the matching tenant_admins row, and the tenant's primary_admin_id
+//
+// The owner has no password until they accept the invitation sent immediately
+// after commit; auth.InvitationService.Accept sets it, marks the address
+// verified, and activates the account in one transaction.
 //
 // The same email may be used as OwnerEmail across multiple CreateTenant calls —
 // each call creates an independent users row scoped to its own tenant, so one
 // person can own multiple tenants without any shared credentials between them.
-// IMPORTANT: if that owner later sets the same password on two or more of
+// IMPORTANT: if that owner later chooses the same password on two or more of
 // their tenants, Login cannot tell which tenant they mean and rejects the
-// attempt entirely — advise owners who manage multiple tenants to keep a
-// distinct password per tenant when handing off the temp password below.
-//
-// The plaintext temp password is returned in CreateTenantResult.Owner.TempPassword
-// and is never stored anywhere — only the bcrypt hash is persisted.
+// attempt entirely. That hazard now lives at invitation-accept time rather than
+// at hand-off time, but it has not gone away — advise owners who manage
+// multiple tenants to keep a distinct password per tenant.
 func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*CreateTenantResult, error) {
 	ownerAddr, err := mail.ParseAddress(in.OwnerEmail)
 	if err != nil {
@@ -354,6 +377,21 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// matches on an exact string.
 	ownerEmailAddr := ownerAddr.Address
 
+	// Refused up front, before a single row is written.
+	//
+	// The invitation is the owner's ONLY route to a password — no credentials row
+	// is created here by design. Creating the tenant anyway and reporting
+	// invite_sent=false hands back a 201 for a tenant whose owner can never sign
+	// in and which no endpoint can repair, because every route that could is
+	// guarded by an administrator who does not yet exist. A configuration fault
+	// the operator can fix in a minute is a far better outcome than a tenant that
+	// has to be deleted.
+	if s.invSvc == nil {
+		s.logger.Error().Str("owner_email", ownerEmailAddr).
+			Msg("admin: refusing to create a tenant — no invitation service is wired, so the owner could never sign in")
+		return nil, ErrInvitationsUnavailable
+	}
+
 	secret, err := generateSecret()
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
@@ -362,16 +400,6 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	plan := in.Plan
 	if plan == "" {
 		plan = "free"
-	}
-
-	tempPassword, err := generateTempPassword()
-	if err != nil {
-		return nil, fmt.Errorf("generate temp password: %w", err)
-	}
-
-	hash, err := bcrypt.GenerateFromPassword([]byte(tempPassword), auth.BcryptCost)
-	if err != nil {
-		return nil, fmt.Errorf("hash owner password: %w", err)
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -433,24 +461,42 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	}
 
 	// Step 5: create owner user.
+	//
+	// role_id is left NULL: like every other administrative grant, the owner's
+	// takes effect when they accept the invitation, and the role is what carries
+	// its permissions. auth.activatePendingAdminGrant attaches roleID then.
 	ownerEmail := ownerEmailAddr
 	var userID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES ($1, $2, 'Owner', $3, $4, true)
+		INSERT INTO users (tenant_id, email, first_name, last_name, is_active)
+		VALUES ($1, $2, 'Owner', $3, true)
 		RETURNING id
-	`, tenantID, ownerEmail, in.Slug, roleID).Scan(&userID)
+	`, tenantID, ownerEmail, in.Slug).Scan(&userID)
 	if err != nil {
 		return nil, fmt.Errorf("create owner user: %w", err)
 	}
 
-	// Step 6: store bcrypt hash — never the plaintext.
-	_, err = tx.Exec(ctx, `
-		INSERT INTO user_credentials (user_id, tenant_id, password_hash)
+	// Step 6: record the owner as a tenant administrator. This is the row that
+	// answers "who administers this tenant?" — deliberately not inferred from
+	// users.role_id, so that an application end user can never be mistaken for
+	// an administrator by a query that forgets a scope predicate.
+	//
+	// No user_credentials row is written: the account has no password until the
+	// invitation is accepted.
+	var adminID int64
+	err = tx.QueryRow(ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role)
 		VALUES ($1, $2, $3)
-	`, userID, tenantID, string(hash))
+		RETURNING id
+	`, tenantID, userID, auth.AdminRoleOwner).Scan(&adminID)
 	if err != nil {
-		return nil, fmt.Errorf("store owner credentials: %w", err)
+		return nil, fmt.Errorf("create tenant admin: %w", err)
+	}
+
+	if _, err = tx.Exec(ctx,
+		`UPDATE tenants SET primary_admin_id = $1 WHERE id = $2`, adminID, tenantID,
+	); err != nil {
+		return nil, fmt.Errorf("set primary admin: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -485,15 +531,30 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 		return nil, err
 	}
 
-	return &CreateTenantResult{
-		Tenant: *tenant,
-		Owner: OwnerResult{
-			ID:           strconv.FormatInt(userID, 10),
-			Email:        ownerEmail,
-			TempPassword: tempPassword,
-			Role:         "owner",
-		},
-	}, nil
+	owner := OwnerResult{
+		ID:     strconv.FormatInt(userID, 10),
+		Email:  ownerEmail,
+		Role:   "owner",
+		Status: OwnerStatusPendingInvitation,
+	}
+
+	// The invitation is sent after commit, deliberately outside the
+	// transaction: holding a tenant-creation transaction open across an SMTP
+	// round-trip would let a slow mail server stall it, and rolling the tenant
+	// back because mail failed would be worse than reporting the failure. The
+	// caller gets 201 with invite_sent=false and can resend.
+	// s.invSvc is non-nil: checked before any row was written.
+	if err := s.invSvc.InviteRequired(ctx, tenantID, nil, userID, ownerEmail, "", nil); err != nil {
+		owner.InviteError = err.Error()
+		s.logger.Error().Err(err).
+			Str("owner_email", ownerEmail).
+			Int64("tenant_id", tenantID).
+			Msg("admin: tenant created but owner invitation was not delivered")
+		return &CreateTenantResult{Tenant: *tenant, Owner: owner}, nil
+	}
+	owner.InviteSent = true
+
+	return &CreateTenantResult{Tenant: *tenant, Owner: owner}, nil
 }
 
 // ListTenantsPaginated returns a filtered, paginated list of tenants.
@@ -1228,16 +1289,26 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 // CreateUser creates a new user with a hashed password. applicationID nil
 // creates a tenant-level user; set, an end user belonging to that
 // application's isolated user base. An optional role must belong to the same
-// scope as the user (ErrRoleScope otherwise).
+// scope as the user (ErrRoleScope otherwise) and must not be a system role
+// (ErrSystemRole) — see AssignUserRole for why, which applies identically here:
+// creating the account and granting it an administrative role in one call is the
+// same bypass, minus a step.
 func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID *int64, email, password, firstName, lastName string, roleID *int64) (*UserResult, error) {
 	if roleID != nil {
 		var roleAppID *int64
-		err := s.pool.QueryRow(ctx, `SELECT application_id FROM roles WHERE id = $1 AND tenant_id = $2`, *roleID, tenantID).Scan(&roleAppID)
+		var roleIsSystem bool
+		err := s.pool.QueryRow(ctx,
+			`SELECT application_id, is_system FROM roles WHERE id = $1 AND tenant_id = $2`,
+			*roleID, tenantID,
+		).Scan(&roleAppID, &roleIsSystem)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, ErrNotFound
 			}
 			return nil, fmt.Errorf("create user: lookup role: %w", err)
+		}
+		if roleIsSystem {
+			return nil, ErrSystemRole
 		}
 		if !int64PtrEqual(roleAppID, applicationID) {
 			return nil, ErrRoleScope
@@ -1373,15 +1444,38 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID int64, applicationID 
 // AssignUserRole sets the role for a user. The role must belong to the same
 // scope as the user — an application's users may only hold that application's
 // roles, tenant-level users only tenant-level roles (ErrRoleScope otherwise).
+//
+// System roles are refused outright (ErrSystemRole). They are the administrative
+// tiers — a tenant's "owner"/"co_owner" and the platform's "super_admin" — and
+// this route is not how anyone acquires one. The supported path is an invitation
+// whose acceptance calls auth.activatePendingAdminGrant, which writes role_id
+// itself alongside the tenant_admins row that records the grant.
+//
+// Allowing it here would let an operator hand out administrative permissions
+// with no tenant_admins row behind them. Such an account holds every admin
+// permission but resolves to an EMPTY admin_scope claim, which
+// RequireTenantSelfOrAny reads as tenant-wide; it never accepted an invitation,
+// defeating the activation gate in migration 00064; and it appears in neither
+// the tenant's administrator list nor the platform directory, both of which read
+// tenant_admins. In the platform's own seeded tenant the reachable system role
+// is "super_admin", so the same call would confer tenant:manage — authority over
+// every tenant.
 // applicationID optionally pins the user lookup to one application.
 func (s *Service) AssignUserRole(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64) error {
 	var roleAppID *int64
-	err := s.pool.QueryRow(ctx, `SELECT application_id FROM roles WHERE id = $1 AND tenant_id = $2`, roleID, tenantID).Scan(&roleAppID)
+	var roleIsSystem bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT application_id, is_system FROM roles WHERE id = $1 AND tenant_id = $2`,
+		roleID, tenantID,
+	).Scan(&roleAppID, &roleIsSystem)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("assign role: lookup role: %w", err)
+	}
+	if roleIsSystem {
+		return ErrSystemRole
 	}
 
 	var userAppID *int64

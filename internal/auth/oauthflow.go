@@ -116,10 +116,146 @@ func (s *OAuthLoginService) driver(providerName string) (flowDriver, error) {
 }
 
 // callbackURL is the redirect_uri registered with every provider for this
-// deployment: baseURL + "/oauth/<provider>/callback".
+// deployment. Delegates to callbackURLFor, the shared implementation the admin
+// read APIs also use, so the two can never disagree.
 func (s *OAuthLoginService) callbackURL(providerName string) string {
-	return s.baseURL + "/oauth/" + providerName + "/callback"
+	return callbackURLFor(s.baseURL, providerName)
 }
+
+// ProviderTestCheck is one named assertion in a provider config test.
+type ProviderTestCheck struct {
+	Name   string `json:"name"`
+	Passed bool   `json:"passed"`
+	Detail string `json:"detail"`
+}
+
+// ProviderTestResult is the outcome of a dry-run against one application's
+// provider config.
+//
+// IMPORTANT: OK = true does NOT prove the client secret is correct. The secret
+// is only ever exercised at the token endpoint, which requires a real user
+// authorization code — so no server-side dry run can validate it. What this
+// reports is everything that CAN be checked without a user: the config is
+// stored, the secret decrypts, the redirect allow-list is usable, and the
+// provider authorization URL builds (which for Google also proves OIDC
+// discovery against the issuer succeeded). SecretVerified makes that limit
+// explicit rather than letting a green check imply more than it means.
+type ProviderTestResult struct {
+	Provider       string              `json:"provider"`
+	OK             bool                `json:"ok"`
+	Enabled        bool                `json:"enabled"`
+	CallbackURL    string              `json:"callback_url"`
+	SecretVerified bool                `json:"secret_verified"`
+	Checks         []ProviderTestCheck `json:"checks"`
+}
+
+// TestConfig dry-runs an application's provider configuration and reports each
+// check individually, so the admin UI can point at the specific thing that is
+// wrong instead of showing an opaque failure.
+//
+// Returns an error only for conditions that make the test itself impossible
+// (unknown provider, nothing configured). Everything else is a failed check on
+// a successfully returned result.
+func (s *OAuthLoginService) TestConfig(ctx context.Context, tenantID, appID int64, providerName string) (*ProviderTestResult, error) {
+	if !supportedProviders[providerName] {
+		return nil, ErrProviderNotSupported
+	}
+	d, err := s.driver(providerName)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &ProviderTestResult{
+		Provider:    providerName,
+		CallbackURL: s.callbackURL(providerName),
+		Checks:      []ProviderTestCheck{},
+	}
+	add := func(name string, passed bool, detail string) {
+		res.Checks = append(res.Checks, ProviderTestCheck{Name: name, Passed: passed, Detail: detail})
+	}
+
+	cfg, enabled, err := s.idpSvc.getTestConfig(ctx, tenantID, appID, providerName)
+	switch {
+	case errors.Is(err, ErrProviderNotConfigured):
+		return nil, err
+	case errors.Is(err, ErrProviderSecretUndecryptable):
+		// Every check name is still emitted, so the result shape is identical on
+		// every returned path and a UI iterating checks by name never finds an
+		// entry simply missing. The ones that genuinely cannot run without a
+		// decrypted secret are reported as skipped rather than as passing.
+		res.Enabled = enabled
+		add("config_stored", true, "provider configuration found")
+		add("client_id", true, "client_id is set")
+		add("client_secret", false, "stored client secret cannot be decrypted with the current key")
+		add("redirect_allow", false, checkSkipped)
+		add("authorization_url", false, checkSkipped)
+		if enabled {
+			add("enabled", true, "provider is enabled")
+		} else {
+			add("enabled", false, "provider is configured but disabled — logins are rejected until it is enabled")
+		}
+		res.OK = allPassed(res.Checks)
+		return res, nil
+	case err != nil:
+		return nil, err
+	}
+
+	res.Enabled = enabled
+	add("config_stored", true, "provider configuration found")
+	add("client_id", cfg.ClientID != "", "client_id is set")
+	add("client_secret", cfg.ClientSecret != "", "client secret decrypts (validity is only provable by a real login)")
+
+	if len(cfg.RedirectAllow) == 0 {
+		add("redirect_allow", false, "no redirect targets allow-listed — every login attempt will be rejected")
+	} else if err := validateRedirectAllow(cfg.RedirectAllow); err != nil {
+		add("redirect_allow", false, err.Error())
+	} else {
+		add("redirect_allow", true, fmt.Sprintf("%d redirect target(s) allow-listed", len(cfg.RedirectAllow)))
+	}
+
+	// Exercises the same driver path a real login takes. For Google this
+	// performs OIDC discovery against the issuer, so a failure here is a
+	// genuine reachability/config problem and not just string assembly.
+	// Bounded so an unreachable issuer cannot hang the admin request.
+	probeCtx, cancel := context.WithTimeout(ctx, providerProbeTimeout)
+	defer cancel()
+	verifier := oauth2.GenerateVerifier()
+	if _, err := d.authCodeURL(probeCtx, cfg, res.CallbackURL, "test-state", verifier); err != nil {
+		add("authorization_url", false, "could not build the provider authorization URL: "+err.Error())
+	} else {
+		add("authorization_url", true, "provider authorization URL builds")
+	}
+
+	if !enabled {
+		add("enabled", false, "provider is configured but disabled — logins are rejected until it is enabled")
+	} else {
+		add("enabled", true, "provider is enabled")
+	}
+
+	res.OK = allPassed(res.Checks)
+	return res, nil
+}
+
+// checkSkipped is the detail for a check that could not be attempted because an
+// earlier one failed. It is reported as not passed — "not proven" is the honest
+// reading, and it keeps res.OK false without a separate flag.
+const checkSkipped = "skipped — the stored client secret is unavailable"
+
+// allPassed is the ONLY place res.OK is derived. Every return path in
+// TestConfig goes through it, so a result can never carry an OK that was set
+// before the checks it is supposed to summarise.
+func allPassed(checks []ProviderTestCheck) bool {
+	for _, c := range checks {
+		if !c.Passed {
+			return false
+		}
+	}
+	return len(checks) > 0
+}
+
+// providerProbeTimeout bounds the driver probe in TestConfig — an unreachable
+// provider issuer must fail the check, not hang the admin request.
+const providerProbeTimeout = 10 * time.Second
 
 // OAuthState is the server-side per-login-attempt record. It is the ONLY
 // source of tenant/application/redirect context at callback time — nothing

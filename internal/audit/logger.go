@@ -124,6 +124,25 @@ const (
 	ActionAuthAccountUnblocked    = "auth.account_unblocked"
 	ActionAuthPasswordBreachFound = "auth.password_breach_detected"
 
+	// Admin — a privileged route refused the caller. Recorded because a refusal
+	// is a security signal in its own right: somebody probing for access they do
+	// not have leaves no other trace, since the handler never runs.
+	ActionAdminAccessDenied = "admin.access_denied"
+
+	// Notifications — the admin-activity emails raised by internal/notify.
+	// Recorded so "was the owner actually told?" has an answer; that question is
+	// asked after an incident, when reconstructing who knew what and when.
+	//
+	// The notify sink never treats its own actions as notable, or auditing a
+	// notification would produce a notification.
+	ActionNotificationSent       = "notification.sent"
+	ActionNotificationSuppressed = "notification.suppressed"
+
+	// Admin — tenant administration: owners and co-owners (issue #97)
+	ActionAdminTenantAdminInvited   = "admin.tenant_admin_invited"
+	ActionAdminTenantAdminGrantsSet = "admin.tenant_admin_grants_set"
+	ActionAdminTenantAdminRemoved   = "admin.tenant_admin_removed"
+
 	// Admin — per-application MFA policy management (issue #63)
 	ActionAdminMFAPolicyUpdated = "admin.mfa_policy_updated"
 	ActionAdminUserMFAReset     = "admin.user_mfa_reset"
@@ -154,6 +173,7 @@ const (
 	// Admin — identity provider (social login) configuration
 	ActionAdminIdPConfigUpdated = "admin.identity_provider_updated"
 	ActionAdminIdPConfigDeleted = "admin.identity_provider_deleted"
+	ActionAdminIdPConfigTested  = "admin.identity_provider_tested"
 
 	// Admin — user identity management
 	ActionAdminUserIdentityUnlinked = "admin.user_identity_unlinked"
@@ -317,6 +337,19 @@ type QueryParams struct {
 	// TenantID it can only narrow the tenant scope, never widen it — an ID
 	// from another tenant simply matches zero rows.
 	ApplicationID string
+	// OnlyApplicationIDs restricts results to events under these applications.
+	// Unlike ApplicationID this is not a user-supplied filter — it is the
+	// caller's own reach (issue #97), so a co-owner monitoring the tenant sees
+	// only the applications they administer.
+	//
+	// nil means unrestricted. An EMPTY non-nil slice means nothing matches,
+	// which is the fail-closed reading and the right one for an administrator
+	// with no grants. The two must not be collapsed.
+	//
+	// Rows with a NULL application_id — tenant-level events belonging to no
+	// application — are excluded when this is set. They are the tenant's own
+	// business, not any one application's.
+	OnlyApplicationIDs []int64
 	// Status filters by outcome — "success" or "failure". Empty = all.
 	Status string
 	// AuthMethod filters by credential/mechanism (one of the AuthMethod*
@@ -364,9 +397,10 @@ type Logger struct {
 	lastHash    string
 	chainSeeded bool
 
-	// sink is an optional external stream (SIEM) fed each persisted batch
-	// (nil = streaming disabled).
-	sink Sink
+	// sinks are optional external streams (SIEM, notification emails) fed each
+	// persisted batch. Empty = streaming disabled. Written only by WithSink
+	// during construction, read only by the writer goroutine, so no lock.
+	sinks []Sink
 }
 
 // Option customises the async pipeline. Production code uses the defaults;
@@ -416,11 +450,21 @@ func WithRiskAssessor(r RiskAssessor) Option {
 	}
 }
 
-// WithSink streams each persisted batch to an external destination (SIEM).
-// Pass nil (or omit) to leave streaming off.
+// WithSink streams each persisted batch to an external destination (SIEM,
+// notification emails, …). Repeatable: each call adds a sink, and every one
+// receives every batch.
+//
+// A nil interface is ignored rather than stored, so the length check in flush
+// stays meaningful. Note this cannot catch a TYPED nil — NewWebhookSink returns
+// (*WebhookSink)(nil) when no URL is configured, which is non-nil as an
+// interface — so callers still guard at the concrete type, as main.go does. The
+// sinks themselves are nil-receiver-safe as a second line of defence.
 func WithSink(s Sink) Option {
 	return func(l *Logger) {
-		l.sink = s
+		if s == nil {
+			return
+		}
+		l.sinks = append(l.sinks, s)
 	}
 }
 
@@ -487,11 +531,25 @@ type StatsResult struct {
 // Stats returns aggregated counts for the monitoring dashboard.
 // When tenantID is nil, returns system-wide counts.
 func (l *Logger) Stats(ctx context.Context, tenantID *int64) (*StatsResult, error) {
+	return l.StatsScoped(ctx, tenantID, nil)
+}
+
+// StatsScoped is Stats restricted to a set of applications — the caller's own
+// administrative reach (issue #97), not a user-chosen filter.
+//
+// nil onlyAppIDs means unrestricted, which is what an owner and a platform admin
+// get. An empty non-nil slice means nothing, so the counts an administrator with
+// no grants sees are zeros rather than the tenant's totals.
+func (l *Logger) StatsScoped(ctx context.Context, tenantID *int64, onlyAppIDs []int64) (*StatsResult, error) {
 	where := "WHERE 1=1"
 	args := []any{}
 	if tenantID != nil {
 		args = append(args, *tenantID)
 		where += fmt.Sprintf(" AND tenant_id = $%d", len(args))
+	}
+	if onlyAppIDs != nil {
+		args = append(args, onlyAppIDs)
+		where += fmt.Sprintf(" AND application_id = ANY($%d)", len(args))
 	}
 
 	var s StatsResult
@@ -511,7 +569,15 @@ func (l *Logger) Stats(ctx context.Context, tenantID *int64) (*StatsResult, erro
 		return nil, fmt.Errorf("audit stats: %w", err)
 	}
 
-	page, err := l.Query(ctx, QueryParams{TenantID: tenantID, Page: 1, Limit: 10})
+	// The recent-events list carries the same restriction as the counts.
+	// Without it a scoped administrator would read zeroed totals above and then
+	// the whole tenant's most recent events underneath them.
+	page, err := l.Query(ctx, QueryParams{
+		TenantID:           tenantID,
+		OnlyApplicationIDs: onlyAppIDs,
+		Page:               1,
+		Limit:              10,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("audit stats recent: %w", err)
 	}
@@ -623,6 +689,13 @@ func (l *Logger) Query(ctx context.Context, p QueryParams) (*LogsPage, error) {
 			args = append(args, appID)
 			where += fmt.Sprintf(" AND al.application_id = $%d", len(args))
 		}
+	}
+	// The caller's own reach, applied after any requested filter so it can only
+	// narrow. A co-owner asking for an application they were not granted gets
+	// nothing rather than someone else's events.
+	if p.OnlyApplicationIDs != nil {
+		args = append(args, p.OnlyApplicationIDs)
+		where += fmt.Sprintf(" AND al.application_id = ANY($%d)", len(args))
 	}
 	if p.Status != "" {
 		args = append(args, p.Status)
