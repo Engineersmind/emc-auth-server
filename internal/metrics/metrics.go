@@ -5,6 +5,7 @@
 //   - emc_auth_http_request_duration_seconds — per-route latency histogram
 //   - emc_auth_http_requests_in_flight       — active request gauge
 //   - emc_auth_operations_total              — named auth operation counter
+//   - emc_auth_app_scope_rejections_total    — tokens refused: wrong application
 //   - emc_auth_rate_limit_hits_total         — rate-limiter rejection counter
 //   - emc_auth_audit_queue_depth             — async audit writer buffer gauge
 //   - emc_auth_audit_events_dropped_total    — audit events lost (by reason)
@@ -63,6 +64,36 @@ var (
 			Help:      "Total number of auth operations by type and outcome.",
 		},
 		[]string{"operation", "outcome"},
+	)
+
+	// AppScopeRejections counts tokens refused because they were not issued for
+	// the application that presented them (issue #96).
+	//
+	// A well-behaved consumer never triggers this: it sends its own tokens with
+	// its own credentials. Any sustained rate therefore means a misconfigured
+	// integration or a caller replaying another application's token — which is
+	// exactly the condition that was previously invisible, because enforcement
+	// lived in each consumer's own middleware and we never saw the outcome.
+	//
+	// Labels:
+	//   client_id — the AUTHENTICATED calling application, or the literal
+	//               "unauthenticated" when the client could not be identified.
+	//               Never an unverified caller-supplied value: Prometheus label
+	//               values are unbounded, so accepting arbitrary input here would
+	//               let anyone inflate the series count at will — a denial of
+	//               service against our own monitoring. Bounded this way,
+	//               cardinality is (applications + 1).
+	//   reason    — app_mismatch | empty_app_id | tenant_mismatch |
+	//               not_a_user_token | client_auth_failed |
+	//               client_credentials_missing | missing_claims |
+	//               appsvc_unconfigured
+	AppScopeRejections = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "app_scope_rejections_total",
+			Help:      "Tokens refused because they were not issued for the calling application.",
+		},
+		[]string{"client_id", "reason"},
 	)
 
 	// RateLimitHits counts requests blocked by rate limiting.

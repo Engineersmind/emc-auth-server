@@ -74,6 +74,15 @@ services:
       # compose interpolation — never hardcode the key in this committed file.
       OAUTH_CLIENT_SECRET_ENCRYPTION_KEY: "${OAUTH_CLIENT_SECRET_ENCRYPTION_KEY:-}"
       OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS: "${OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS:-}"
+      # JWT signing keys (issue #95): same contract as the OAuth key above — the
+      # value comes from .env via interpolation, never hardcoded here. Kept
+      # separate from the OAuth key on purpose: this one protects token-SIGNING
+      # authority, so a social-login secret leak must not also grant the ability
+      # to mint tokens. Unset here means the server falls back to the insecure
+      # zero key, and any signing_keys rows written under a different key then
+      # fail to decrypt (login returns 500).
+      JWT_SIGNING_KEY_ENCRYPTION_KEY: "${JWT_SIGNING_KEY_ENCRYPTION_KEY:-}"
+      JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS: "${JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS:-}"
       SEED_DEMO_DATA: "true"
       SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
       GLOBAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090,https://emc-auth.senie.ai"

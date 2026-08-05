@@ -2186,6 +2186,51 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/apps/me": {
+            "get": {
+                "description": "Same payload as GET /auth/me, but additionally proves the token was issued FOR the calling application. Requires a user Bearer token in Authorization AND the application's credentials in X-Client-Authorization. Rejects app-scoped tokens belonging to a different application in the same tenant, and rejects first-party tokens (empty app_id).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Current user, scoped to the calling application",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Bearer \u003capp-scoped end-user access token\u003e",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "X-Client-Authorization",
+                        "in": "header",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MeResult"
+                        }
+                    },
+                    "401": {
+                        "description": "token_invalid — generic for every rejection reason",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/apps/register": {
             "post": {
                 "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed.",

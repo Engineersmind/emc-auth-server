@@ -2317,6 +2317,565 @@
       ]
     },
     {
+      "name": "10 - App-Scoped /auth/apps/me (#96)",
+      "description": "Issue #96 - the app_id claim enforced as an authorization boundary.\n\nRun in order: the setup requests create two applications in one tenant and a user inside application A. The request that matters is 'CROSS-APPLICATION' - everything else is scaffolding or a fail-closed guard.\n\nRequires folder 01 (admin token) and, for the last check, folder 04 (m2m token).",
+      "item": [
+        {
+          "name": "Setup - create application A",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "applications"
+              ]
+            },
+            "description": "Application A. Two applications in the SAME tenant are what make the cross-application test meaningful: same signing key, same audience, same tenant - only the app_id claim differs.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{uniqueAppName}}-A\",\n  \"description\": \"#96 app-scoping test\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 201', () => pm.expect([200, 201]).to.include(pm.response.code));",
+                  "const b = pm.response.json();",
+                  "pm.environment.set('app_a_client_id', b.client_id);",
+                  "pm.environment.set('app_a_client_secret', b.client_secret);",
+                  "pm.environment.set('app_a_id', String(b.id));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Setup - create application B",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "applications"
+              ]
+            },
+            "description": "Application B. Two applications in the SAME tenant are what make the cross-application test meaningful: same signing key, same audience, same tenant - only the app_id claim differs.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{uniqueAppName}}-B\",\n  \"description\": \"#96 app-scoping test\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 201', () => pm.expect([200, 201]).to.include(pm.response.code));",
+                  "const b = pm.response.json();",
+                  "pm.environment.set('app_b_client_id', b.client_id);",
+                  "pm.environment.set('app_b_client_secret', b.client_secret);",
+                  "pm.environment.set('app_b_id', String(b.id));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Setup - register a user inside application A",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/register",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "register"
+              ]
+            },
+            "description": "App-scoped user. This account lives in application A's own user base and is invisible to POST /auth/login and to application B.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"appscope-{{runId}}@emc.local\",\n  \"password\": \"{{testPassword}}\",\n  \"first_name\": \"App\",\n  \"last_name\": \"Scoped\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{app_a_client_id}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{app_a_client_secret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 201', () => pm.expect([200, 201]).to.include(pm.response.code));",
+                  "pm.environment.set('appscope_email', 'appscope-' + pm.environment.get('runId') + '@emc.local');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Setup - log in through application A",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "login"
+              ]
+            },
+            "description": "Yields an app-scoped end-user token whose app_id claim names application A.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{appscope_email}}\",\n  \"password\": \"{{testPassword}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{app_a_client_id}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{app_a_client_secret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const t = pm.response.json().access_token;",
+                  "pm.environment.set('app_a_user_token', t);",
+                  "const claims = JSON.parse(atob(t.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "pm.test('aud is emc-auth-api (#84)', () =>",
+                  "    pm.expect([].concat(claims.aud)).to.include('emc-auth-api'));",
+                  "pm.test('app_id names application A (#96)', () =>",
+                  "    pm.expect(String(claims.app_id)).to.eql(pm.environment.get('app_a_id')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Matching application - expect 200",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{app_a_user_token}}"
+              },
+              {
+                "key": "X-Client-Authorization",
+                "value": "Basic {{app_a_basic}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "me"
+              ]
+            },
+            "description": "Token's app_id matches the calling application, so the request succeeds and returns the SAME payload shape /auth/me returns - consumers change a URL and a header, not their response handling.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const id = pm.environment.get('app_a_client_id');",
+                  "const sec = pm.environment.get('app_a_client_secret');",
+                  "pm.environment.set('app_a_basic', btoa(id + ':' + sec));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('same shape as /auth/me', () => {",
+                  "    ['user_id','tenant_id','email','role','permissions'].forEach(k =>",
+                  "        pm.expect(b).to.have.property(k));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "CROSS-APPLICATION - app A token + app B credentials (expect 401)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{app_a_user_token}}"
+              },
+              {
+                "key": "X-Client-Authorization",
+                "value": "Basic {{app_b_basic}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "me"
+              ]
+            },
+            "description": "*** THE test for issue #96. ***\n\nApplication B presents application A's user token. Same tenant, same signing key, valid signature, correct audience - everything verifies. Only the app_id claim distinguishes them, and before #96 the server ignored it, so this returned 200 and B could read A's users.\n\nIf this returns 200, app scoping is NOT working.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const id = pm.environment.get('app_b_client_id');",
+                  "const sec = pm.environment.get('app_b_client_secret');",
+                  "pm.environment.set('app_b_basic', btoa(id + ':' + sec));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401 - cross-application access refused (#96)', () =>",
+                  "    pm.response.to.have.status(401));",
+                  "pm.test('generic code, no oracle', () =>",
+                  "    pm.expect(pm.response.json().code).to.eql('token_invalid'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No client credentials (expect 401)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{app_a_user_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "me"
+              ]
+            },
+            "description": "Fails closed. Without X-Client-Authorization the server has nothing to compare app_id against, so it must refuse rather than fall back to /auth/me behaviour.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "First-party admin token (empty app_id) - expect 401",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{access_token}}"
+              },
+              {
+                "key": "X-Client-Authorization",
+                "value": "Basic {{app_a_basic}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "me"
+              ]
+            },
+            "description": "Admin/console tokens carry an empty app_id by design. An empty claim must fail closed here - 'no application' is not 'any application' - even though this same token works fine on /auth/me.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const id = pm.environment.get('app_a_client_id');",
+                  "const sec = pm.environment.get('app_a_client_secret');",
+                  "pm.environment.set('app_a_basic', btoa(id + ':' + sec));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401 - empty app_id fails closed', () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Machine token on the app-scoped route (expect 401)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{m2m_token}}"
+              },
+              {
+                "key": "X-Client-Authorization",
+                "value": "Basic {{app_a_basic}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "me"
+              ]
+            },
+            "description": "Where #84 and #96 compose. This route sits behind JWTRenew, which pins verification to aud=emc-auth-api, so an emc-auth-m2m token is rejected on AUDIENCE before app scoping is even evaluated.\n\nRun folder 04 first so {{m2m_token}} is populated.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const id = pm.environment.get('app_a_client_id');",
+                  "const sec = pm.environment.get('app_a_client_secret');",
+                  "pm.environment.set('app_a_basic', btoa(id + ':' + sec));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401 - machine token refused (#84 + #96)', () =>",
+                  "    pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cleanup - delete application A",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/applications/{{app_a_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "applications",
+                "{{app_a_id}}"
+              ]
+            },
+            "description": "Keeps re-runs idempotent."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 204', () => pm.expect([200, 204]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cleanup - delete application B",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/applications/{{app_b_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "applications",
+                "{{app_b_id}}"
+              ]
+            },
+            "description": "Keeps re-runs idempotent."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 or 204', () => pm.expect([200, 204]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "99 · Negative & Security",
       "description": "Assertions about what must **fail**. These are the tests that catch a regression\nin an authorization boundary — the kind of bug that never shows up in a happy-path\nrun because everything still returns 200.\n\nExpect red here only when something is genuinely wrong.",
       "item": [

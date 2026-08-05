@@ -596,6 +596,39 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Auth routes — protected with transparent renewal (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, jwtRenew, appRateLimit)
+
+	// App-scoped identity (issue #96). Additive — /auth/me above is untouched, so
+	// admin and browser sessions cannot regress.
+	//
+	// Mounted behind the SAME jwtRenew middleware as /auth/me, so it inherits
+	// signature, issuer, expiry, tenant, and audience verification rather than
+	// re-implementing them; the handler adds only the application-boundary check.
+	//
+	// Middleware order matters here, and Echo runs them left-to-right:
+	//
+	//	TokenRateLimiter → appClientRateLimit → Normalize… → jwtRenew → AppMe
+	//
+	// Both limiters sit AHEAD of jwtRenew. Behind it, they would only ever run
+	// for callers who already hold a valid token, so anyone with an expired or
+	// forged one could drive the app lookups underneath at full speed — the
+	// unauthenticated traffic a limiter exists for would be the traffic it never
+	// saw. TokenRateLimiter is first because it is purely in-memory and per IP:
+	// it fences the DB read appClientRateLimit performs to resolve a client_id.
+	// This is the same pairing every other /apps/* route uses.
+	//
+	// appClientRateLimit rather than appRateLimit: this endpoint bears client
+	// credentials, so it is keyed on client_id like every other /apps/* route.
+	// It finds them in X-Client-Authorization (mw.ClientAuthHeader) — this route
+	// cannot put them in Authorization, which carries the user's Bearer token.
+	//
+	// NormalizeAppScopeUnauthorized wraps jwtRenew so its 401s (e.g.
+	// token_expired) come back as the same generic token_invalid AppMe uses —
+	// see that middleware's doc comment. It sits inside the limiters because a
+	// 429 is not a rejection this endpoint's no-oracle contract covers: it
+	// reveals nothing about the token, and disguising it as 401 would strip the
+	// Retry-After signal a well-behaved client needs.
+	authGroup.GET("/apps/me", authHandler.AppMe,
+		mw.TokenRateLimiter(rlCfg), appClientRateLimit, mw.NormalizeAppScopeUnauthorized, jwtRenew)
 	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
 
 	// Self-service email change — authenticated: the user must prove who they are
