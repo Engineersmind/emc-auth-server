@@ -16,7 +16,7 @@ This runbook covers first-time production deployment, environment configuration,
 |----------|----------|---------|-------------|
 | DATABASE_URL | Yes | — | PostgreSQL DSN e.g. `postgres://user:pass@host:5432/db?sslmode=require` |
 | REDIS_URL | Yes | — | Redis URL e.g. `redis://:password@host:6379/0` |
-| JWT_ISSUER | Yes | `https://auth.emc.local` | Base URL of this server placed in the `iss` JWT claim |
+| JWT_ISSUER | Yes | `https://auth.emc.local` | Base URL of this server placed in the `iss` JWT claim. Verified on every token — the server refuses to start if it is empty, and changing it invalidates all tokens already minted |
 | APP_BASE_URL | Yes | `http://localhost:8080` | Same as JWT_ISSUER — prepended to password-reset link URLs in emails |
 | SEED_ADMIN_PASSWORD | Yes | `ChangeMe123!` | First-run super-admin password — **change after first login** |
 | TOTP_ENCRYPTION_KEY | Yes | — | 64-char hex AES-256 key for TOTP secret encryption. Generate: `openssl rand -hex 32` |
@@ -163,6 +163,31 @@ SLA thresholds declared in `scripts/load-test.js`:
 - p99 login latency ≤ 200ms (NFR-02)
 - HTTP error rate < 1% (429s from rate limiter are expected and do not count as failures)
 - Zero HTTP 5xx responses
+
+## Upgrading to Audience-Validated Tokens (One Forced Re-Login)
+
+> **This section applies only to the first restart on a release that includes JWT
+> `aud` validation (issue #84).**
+
+Access tokens minted before this release carry `aud: "emc-auth-server"`, which no
+verification path accepts. There is no dual-accept window on purpose — accepting the
+old value would leave the token-confusion hole open for as long as the window lasted.
+
+What this means operationally:
+
+- Deploy as a **single restart**. This ships as one self-hosted binary, so no staged
+  multi-instance rollout is needed.
+- Users holding an access token at restart get **one forced re-login**. Access tokens
+  live 15 minutes, so the affected window is bounded by that.
+- **Refresh tokens are unaffected** — they are opaque, DB-hashed values, not JWTs. No
+  session data is lost.
+- Machine clients (`client_credentials`) are unaffected on the admin API: M2M and
+  management tokens are still accepted there. They are now refused on user
+  self-service routes (`/auth/me`, `/auth/otp/*`), which is the intended change.
+
+Post-restart, watch `emc_auth_token_audience_rejections_total`. A well-behaved client
+never triggers it, so a sustained non-zero rate after the 15-minute window means a
+caller is presenting the wrong token type on a route — worth alerting on.
 
 ## Upgrading from UUID Schema (Breaking Change)
 

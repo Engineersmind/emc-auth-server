@@ -13,6 +13,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/api/middleware"
+	"github.com/engineersmind/emc-auth-server/internal/auth"
 )
 
 // makeRequest creates a synthetic echo.Context with the given remote address and
@@ -232,5 +233,52 @@ func TestTokenRateLimiter_NoClientIDFallsBackToIPOnly(t *testing.T) {
 	// proves there is no shared "unknown client" bucket.
 	if code := tokenRequest(t, mw, ipB, "", ""); code != http.StatusOK {
 		t.Errorf("ipB request after ipA throttled = %d, want 200", code)
+	}
+}
+
+// runRotation drives one request through the signing-key rotation limiter,
+// carrying the JWT claims the limiter buckets on.
+func runRotation(t *testing.T, mw echo.MiddlewareFunc, tenantID string) int {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/signing-keys/complete", nil)
+	req.RemoteAddr = "192.0.2.7:12345"
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	c.Set("user", &auth.Claims{TenantID: tenantID, Role: "tenant_admin"})
+
+	handler := mw(func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+	_ = handler(c)
+	return rec.Code
+}
+
+// TestSigningKeyRotationRateLimiter_BoundsRotationsPerTenant covers the PR #98
+// review flag: rotation was authorised but unthrottled.
+//
+// The risk is not request volume. Completing a rotation retires the outgoing
+// key, and a retired key leaves the published set once its grace window elapses,
+// so cycling prepare→complete walks a tenant through key generations faster than
+// its issued tokens expire — every token signed by a key pushed past the window
+// stops verifying. The bucket is sized to let one honest two-step rotation
+// through and then hold.
+func TestSigningKeyRotationRateLimiter_BoundsRotationsPerTenant(t *testing.T) {
+	middleware.ResetStoresForTest()
+	mw := middleware.SigningKeyRotationRateLimiter()
+
+	// One honest rotation is prepare + complete, so both must pass.
+	for i := 1; i <= 2; i++ {
+		if code := runRotation(t, mw, "4242"); code != http.StatusOK {
+			t.Fatalf("rotation call %d = %d, want 200 — an honest rotation must not be throttled", i, code)
+		}
+	}
+	if code := runRotation(t, mw, "4242"); code != http.StatusTooManyRequests {
+		t.Errorf("third rotation call = %d, want 429", code)
+	}
+
+	// The bucket is per tenant: one tenant exhausting it must not throttle another.
+	if code := runRotation(t, mw, "9999"); code != http.StatusOK {
+		t.Errorf("other tenant = %d, want 200 — the bucket leaked across tenants", code)
 	}
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // renewalWriter wraps http.ResponseWriter and buffers Set-Cookie headers so
@@ -86,14 +87,33 @@ func JWTRenew(
 				})
 			}
 
-			claims, err := jwtSvc.Verify(c.Request().Context(), tokenString)
+			// The accepted audience is named here rather than inherited from
+			// Verify(): the routes this middleware guards are user self-service
+			// endpoints (/me, /otp/*, /change-email) that assume a real user and a
+			// browser session, so a service (M2M), management, or agent token is
+			// refused here even though it may be perfectly valid on admin routes
+			// (issue #84). Declaring it at the call site keeps this route group
+			// pinned to AudienceAPI even if Verify() ever widens its own set.
+			claims, err := jwtSvc.VerifyForAudience(c.Request().Context(), tokenString, auth.AudienceAPI)
 			if err == nil {
 				c.Set(userContextKey, claims)
 				return next(c)
 			}
 
-			// Any error other than expiry is fatal (tampered signature, wrong issuer, etc.)
+			// Any error other than expiry is fatal (tampered signature, wrong
+			// issuer, wrong audience, etc.) — note a non-user token is never
+			// renewed into a session: it fails closed here rather than falling
+			// through to refresh-token rotation below.
 			if !errors.Is(err, gojwt.ErrTokenExpired) {
+				// These are the routes where a wrong-audience token is the
+				// strongest replay signal: a service, management, or agent token
+				// has no business on a user self-service endpoint, so unlike the
+				// admin group (which legitimately accepts three audiences) any
+				// rejection here is worth counting.
+				if errors.Is(err, auth.ErrUnexpectedAudience) {
+					metrics.TokenAudienceRejections.
+						WithLabelValues(presentedAudience(tokenString), c.Path()).Inc()
+				}
 				return c.JSON(http.StatusUnauthorized, map[string]string{
 					"error": "invalid token",
 					"code":  "token_invalid",

@@ -190,7 +190,10 @@ func newGitHubTestEnv(t *testing.T, sg *stubGitHub) *githubTestEnv {
 		t.Fatalf("seed provider config: %v", err)
 	}
 
-	jwtSvc := NewJWTService(pool, "https://it.test")
+	jwtSvc, err := NewJWTService(pool, "https://it.test")
+	if err != nil {
+		t.Fatalf("NewJWTService: %v", err)
+	}
 	authSvc := NewAuthService(pool, jwtSvc, logger)
 	svc := NewOAuthLoginService(pool, rdb, idpSvc, authSvc, "http://localhost:9090", logger).
 		WithGitHubEndpoints(sg.server.URL+"/login/oauth/authorize", sg.server.URL+"/login/oauth/access_token", sg.server.URL)

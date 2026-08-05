@@ -88,6 +88,38 @@ type Config struct {
 	// the new key on their next admin write. Remove once rotation completes.
 	OAuthClientSecretEncryptionKeyPrevious string
 
+	// JWTSigningKeyEncryptionKey is a 32-byte hex-encoded key used to
+	// AES-256-GCM encrypt JWT signing private keys at rest
+	// (signing_keys.private_key_enc). Generate with: openssl rand -hex 32.
+	// Follows the OAuthClientSecretEncryptionKey precedent — NO zero-key
+	// fallback in production/staging, the server refuses to start (issue #95).
+	//
+	// This key protects token-signing authority: whoever can decrypt these rows
+	// can mint a token for any user in the affected tenant. Treat its loss as
+	// more severe than a database leak of hashed passwords.
+	JWTSigningKeyEncryptionKey string
+
+	// JWTSigningKeyEncryptionKeyPrevious enables zero-downtime rotation of the
+	// key above: set the NEW key as JWT_SIGNING_KEY_ENCRYPTION_KEY and the old
+	// one here. Decryption falls back to it transparently. Note this rotates the
+	// ENCRYPTION key, not the signing keys themselves — signing-key rotation is
+	// a separate operation (see the admin rotate endpoint).
+	JWTSigningKeyEncryptionKeyPrevious string
+
+	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable during the
+	// migration to RS256. Set JWT_ALLOW_LEGACY_HS256=false to perform the Phase 4
+	// cutover (issue #95).
+	//
+	// Defaults to true so upgrading to RS256 signing does not invalidate tokens
+	// minted seconds earlier. Setting it false is what actually removes the forging
+	// risk: while HS256 verifies, any holder of a tenant's jwt_secret can still mint
+	// a token for any user in that tenant.
+	//
+	// Flip it only once emc_auth_legacy_hs256_verifications_total has been flat at
+	// zero — that counter, not a stopwatch, is the evidence. The longest-lived
+	// symmetric token is the 1 h agent token.
+	JWTAllowLegacyHS256 bool
+
 	// CookieDomain sets the Domain attribute on auth cookies.
 	// Leave empty for localhost development (browser scopes to current host).
 	// In production set to the shared parent domain, e.g. ".engineersmind.com",
@@ -168,15 +200,21 @@ func Load() *Config {
 		TOTPEncryptionKey:                      getEnv("TOTP_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKey:         getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKeyPrevious: getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS", ""),
-		CookieDomain:                           getEnv("COOKIE_DOMAIN", ""),
-		GlobalCORSOrigins:                      getEnvList("GLOBAL_CORS_ORIGINS", ""),
-		GeoIPDatabasePath:                      getEnv("GEOIP_DATABASE_PATH", ""),
-		UntrustedIPCIDRs:                       getEnvList("UNTRUSTED_IP_CIDRS", ""),
-		BreachDetectionEnabled:                 getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
-		AuditCaptureResponseBody:               getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
-		AuditRetentionDays:                     mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
-		AuditSIEMWebhookURL:                    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
-		AuditSIEMWebhookSecret:                 getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		JWTSigningKeyEncryptionKey:             getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY", ""),
+		JWTSigningKeyEncryptionKeyPrevious:     getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS", ""),
+		// Fails closed towards COMPATIBILITY, not towards strictness: only the
+		// exact string "false" disables legacy verification, so a typo cannot
+		// accidentally reject every live token.
+		JWTAllowLegacyHS256:      getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
+		CookieDomain:             getEnv("COOKIE_DOMAIN", ""),
+		GlobalCORSOrigins:        getEnvList("GLOBAL_CORS_ORIGINS", ""),
+		GeoIPDatabasePath:        getEnv("GEOIP_DATABASE_PATH", ""),
+		UntrustedIPCIDRs:         getEnvList("UNTRUSTED_IP_CIDRS", ""),
+		BreachDetectionEnabled:   getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
+		AuditCaptureResponseBody: getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
+		AuditRetentionDays:       mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
+		AuditSIEMWebhookURL:      getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
+		AuditSIEMWebhookSecret:   getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
 	}
 }
 

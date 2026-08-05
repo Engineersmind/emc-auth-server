@@ -292,7 +292,10 @@ type Service struct {
 	resetSvc *auth.ResetService
 	invSvc   *auth.InvitationService   // nil when invitations are not configured
 	blockSvc *auth.AccountBlockService // nil when block notifications are not configured
-	logger   zerolog.Logger
+	// signingKeys mints a tenant's asymmetric JWT key pair at creation time
+	// (issue #95). nil is safe — key generation then falls back to lazy.
+	signingKeys *auth.SigningKeyService
+	logger      zerolog.Logger
 }
 
 // New creates a Service.
@@ -311,6 +314,15 @@ func (s *Service) WithInvitations(invSvc *auth.InvitationService) *Service {
 // affected user and an admin unblock clears their lockout counters.
 func (s *Service) WithAccountBlocking(blockSvc *auth.AccountBlockService) *Service {
 	s.blockSvc = blockSvc
+	return s
+}
+
+// WithSigningKeys wires the asymmetric signing-key service so a newly created
+// tenant gets its RSA key pair immediately (issue #95), rather than lazily on its
+// first login. Optional: without it, JWTService's EnsureTenantKey still generates
+// on demand, so tenant creation never depends on this being wired.
+func (s *Service) WithSigningKeys(keys *auth.SigningKeyService) *Service {
+	s.signingKeys = keys
 	return s
 }
 
@@ -496,6 +508,23 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 		Str("tenant_id", strconv.FormatInt(tenantID, 10)).
 		Str("owner_email", ownerEmail).
 		Msg("admin: tenant created with owner")
+
+	// Mint the tenant's asymmetric signing key pair (issue #95) so its JWKS
+	// endpoint is live and its first token is RS256-signed.
+	//
+	// Deliberately AFTER the commit and deliberately non-fatal. RSA generation
+	// takes ~100ms and cannot join the transaction (it goes through the key
+	// service's own pool), and failing tenant creation over it would be the wrong
+	// trade: JWTService.EnsureTenantKey generates on demand, so the worst case is
+	// that the tenant's first login pays the 100ms instead. Logged at error level
+	// because it should not happen and it silently shifts cost to the login path.
+	if s.signingKeys != nil {
+		if _, keyErr := s.signingKeys.EnsureTenantKey(ctx, tenantID); keyErr != nil {
+			s.logger.Error().Err(keyErr).
+				Str("tenant_id", strconv.FormatInt(tenantID, 10)).
+				Msg("admin: tenant created but signing key generation failed — will be generated lazily on first token")
+		}
+	}
 
 	tenant, err := s.getTenantByID(ctx, tenantID)
 	if err != nil {
