@@ -42,7 +42,10 @@ func grace409Fixture(t *testing.T) (*AuthHandler, string) {
 	}
 	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
 
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc, err := auth.NewJWTService(pool, "https://auth.emc.local")
+	if err != nil {
+		t.Fatalf("NewJWTService: %v", err)
+	}
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 
 	reg, err := svc.Register(ctx, auth.RegisterInput{

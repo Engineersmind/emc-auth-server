@@ -188,7 +188,10 @@ func newOAuthTestEnv(t *testing.T, sg *stubGoogle) *oauthTestEnv {
 		t.Fatalf("seed provider config: %v", err)
 	}
 
-	jwtSvc := NewJWTService(pool, "https://it.test")
+	jwtSvc, err := NewJWTService(pool, "https://it.test")
+	if err != nil {
+		t.Fatalf("NewJWTService: %v", err)
+	}
 	authSvc := NewAuthService(pool, jwtSvc, logger)
 	svc := NewOAuthLoginService(pool, rdb, idpSvc, authSvc, "http://localhost:9090", logger).
 		WithIssuer(sg.server.URL)

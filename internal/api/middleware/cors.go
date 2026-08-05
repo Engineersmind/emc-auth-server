@@ -103,6 +103,20 @@ func headerListContains(list, name string) bool {
 	return false
 }
 
+// wellKnownSuffix is the path suffix of the published JWKS document.
+const wellKnownSuffix = "/.well-known/jwks.json"
+
+// isPublicCORSExempt reports whether a path serves public, credential-free
+// material that any origin may read, and so must bypass origin enforcement.
+//
+// Matched on suffix rather than a prefix or exact string because the JWKS path is
+// tenant-scoped (/tenants/{slug}/.well-known/jwks.json) and the slug is arbitrary.
+// Deliberately narrow: only this exact document, so the exemption cannot be
+// widened by a crafted path such as /.well-known/jwks.json/../../admin.
+func isPublicCORSExempt(path string) bool {
+	return strings.HasSuffix(path, wellKnownSuffix)
+}
+
 // TenantCORS returns middleware that applies per-tenant CORS headers.
 //
 // CORS origins are loaded from the tenant's cors_origins DB column (Redis-cached).
@@ -127,6 +141,26 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			req := c.Request()
+
+			// Publicly-fetchable endpoints are exempt (issue #95). This
+			// middleware is mounted via e.Use, so it applies to every route: with
+			// a non-empty GLOBAL_CORS_ORIGINS, a browser sending an Origin that is
+			// not on that list gets a hard 403 "origin not allowed" below. For
+			// /.well-known/jwks.json — whose entire purpose is to be fetched by
+			// arbitrary relying parties we have never heard of — that is exactly
+			// wrong: it would make browser-side token verification impossible for
+			// every tenant not manually added to a server-wide env var.
+			//
+			// Safe because these responses carry no credentials and no
+			// tenant-specific data beyond public key material. The handler sets
+			// Access-Control-Allow-Origin: * itself.
+			//
+			// Server-to-server fetches send no Origin and already passed cleanly;
+			// this exemption is specifically about browsers.
+			if isPublicCORSExempt(req.URL.Path) {
+				return next(c)
+			}
+
 			isPreflight := req.Method == http.MethodOptions
 			slug := req.Header.Get(tenantSlugHeader)
 			requestOrigin := req.Header.Get("Origin")

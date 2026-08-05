@@ -1,8 +1,11 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
@@ -55,6 +58,16 @@ type RoutesConfig struct {
 	// encryption of social-login provider client secrets (issue #64).
 	// Required in production/staging — the server refuses to start without it.
 	OAuthClientSecretEncryptionKey string
+	// JWTSigningKeyEncryptionKey is the 64-char hex key for AES-256-GCM
+	// encryption of asymmetric JWT signing private keys at rest
+	// (signing_keys.private_key_enc). Required in production/staging (issue #95).
+	JWTSigningKeyEncryptionKey string
+	// JWTSigningKeyEncryptionKeyPrevious is the old key accepted for decryption
+	// during rotation of the key above.
+	JWTSigningKeyEncryptionKeyPrevious string
+	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable. False performs
+	// the issue #95 Phase 4 cutover (RS256 only).
+	JWTAllowLegacyHS256 bool
 	// OAuthClientSecretEncryptionKeyPrevious is the old key accepted for
 	// decryption during rotation (empty when no rotation is in progress).
 	OAuthClientSecretEncryptionKeyPrevious string
@@ -173,6 +186,47 @@ func sentryMiddleware() echo.MiddlewareFunc {
 	}
 }
 
+// warnIssuerHostMismatch flags a JWT_ISSUER whose host differs from APP_BASE_URL
+// (issue #95).
+//
+// The two are independent settings that ship with different defaults
+// ("https://auth.emc.local" vs "http://localhost:9090"). That was harmless while
+// we published nothing, but a JWKS endpoint changes it: OIDC convention says a
+// relying party derives the key-set URL from the token's "iss", so a verifier
+// following convention would look for our keys on a host that does not serve them.
+//
+// APP_BASE_URL is authoritative for discovery here — it is where the endpoint
+// actually is — and "iss" is left alone deliberately, because changing it would
+// invalidate every consumer that has pinned the current value. So this warns
+// rather than rewrites: reconciling them is an operator decision with external
+// consequences, not something to do silently at startup.
+//
+// Production is escalated to an error-level log because a mismatch there is a
+// live integration hazard for real relying parties.
+func warnIssuerHostMismatch(issuer, appBaseURL, env string, logger zerolog.Logger) {
+	if issuer == "" || appBaseURL == "" {
+		return
+	}
+	iss, errIss := url.Parse(issuer)
+	base, errBase := url.Parse(appBaseURL)
+	if errIss != nil || errBase != nil || iss.Host == "" || base.Host == "" {
+		return
+	}
+	if strings.EqualFold(iss.Host, base.Host) {
+		return
+	}
+
+	evt := logger.Warn()
+	if env == "production" {
+		evt = logger.Error()
+	}
+	evt.
+		Str("jwt_issuer", issuer).
+		Str("app_base_url", appBaseURL).
+		Str("jwks_url", strings.TrimRight(appBaseURL, "/")+"/tenants/{slug}/.well-known/jwks.json").
+		Msg("JWT_ISSUER host differs from APP_BASE_URL — verifiers deriving the JWKS URL from the iss claim (standard OIDC discovery) will look on the wrong host. JWKS is served from APP_BASE_URL; give consumers that URL explicitly, or set the two to the same host.")
+}
+
 // RegisterRoutes configures all route groups and middleware on the Echo instance.
 func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Middleware stack — order matters:
@@ -217,7 +271,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	})
 
 	// Build shared services
-	jwtSvc := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
+	jwtSvc, jwtErr := auth.NewJWTService(deps.Pool, deps.Config.JWTIssuer)
+	if jwtErr != nil {
+		deps.Logger.Fatal().Err(jwtErr).Msg("JWT service init failed — check JWT_ISSUER")
+	}
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
 
 	// TOTP service — requires encryption key; logs warning in dev if missing.
@@ -376,6 +433,62 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	if err := secretBox.WithPreviousKey(deps.Config.OAuthClientSecretEncryptionKeyPrevious, "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS"); err != nil {
 		deps.Logger.Fatal().Err(err).Msg("social login init failed — check OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS")
 	}
+	// Asymmetric JWT signing keys (issue #95). Separate SecretBox from the OAuth
+	// one: these protect token-SIGNING authority, so a compromise of the social
+	// login secrets must not also hand over the ability to mint tokens, and the two
+	// keys must be rotatable independently. Same fail-closed contract — no
+	// zero-key fallback in production/staging.
+	signingKeyBox, skbErr := auth.NewSecretBox(deps.Config.JWTSigningKeyEncryptionKey, deps.Config.Env, "JWT_SIGNING_KEY_ENCRYPTION_KEY", deps.Logger)
+	if skbErr != nil {
+		deps.Logger.Fatal().Err(skbErr).Msg("JWT signing key init failed — check JWT_SIGNING_KEY_ENCRYPTION_KEY")
+	}
+	if err := signingKeyBox.WithPreviousKey(deps.Config.JWTSigningKeyEncryptionKeyPrevious, "JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS"); err != nil {
+		deps.Logger.Fatal().Err(err).Msg("JWT signing key init failed — check JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS")
+	}
+	signingKeySvc, skErr := auth.NewSigningKeyService(deps.Pool, signingKeyBox, deps.Logger)
+	if skErr != nil {
+		deps.Logger.Fatal().Err(skErr).Msg("JWT signing key service init failed")
+	}
+	// Switch signing to RS256. Verification continues to accept legacy HS256
+	// tokens (no kid) until the Phase 4 cutover, so no live session breaks here.
+	jwtSvc.WithSigningKeys(signingKeySvc).WithLegacyHS256(deps.Config.JWTAllowLegacyHS256)
+	if !deps.Config.JWTAllowLegacyHS256 {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=false — HS256 tokens are REJECTED (issue #95 Phase 4 cutover). Any token minted before RS256 signing went live will fail; tenants.jwt_secret is now unused and can be dropped.")
+	}
+
+	// Backfill keys for tenants that predate this feature so their JWKS endpoint is
+	// live immediately rather than on their next login. Non-fatal: EnsureTenantKey
+	// generates lazily, so a backfill failure costs latency, not availability.
+	startupCtx, cancelStartup := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelStartup()
+	if created, err := signingKeySvc.BackfillAllTenants(startupCtx); err != nil {
+		deps.Logger.Error().Err(err).Msg("signing key backfill failed — keys will be generated lazily")
+	} else if created > 0 {
+		deps.Logger.Info().Int("tenants", created).Msg("backfilled JWT signing keys")
+	}
+
+	// Drop retired keys whose grace window has elapsed. Without this every rotation
+	// leaves a row behind forever and the published JWKS grows without bound.
+	if _, err := signingKeySvc.CollectGarbageAllTenants(startupCtx); err != nil {
+		deps.Logger.Error().Err(err).Msg("retired signing key GC failed")
+	}
+
+	// JWT_ISSUER and APP_BASE_URL are independent settings that default to
+	// different hosts, and OIDC convention derives a JWKS URL from the issuer. Now
+	// that we publish keys, a mismatch means a verifier that follows convention
+	// looks for our keys at the wrong host. APP_BASE_URL is authoritative for
+	// discovery (it is where the endpoint actually is); warn loudly when the issuer
+	// disagrees so an operator reconciles them deliberately.
+	warnIssuerHostMismatch(deps.Config.JWTIssuer, deps.Config.AppBaseURL, deps.Config.Env, deps.Logger)
+
+	// JWKS publication + signing-key rotation handlers (issue #95).
+	jwksHandler := handlers.NewJWKSHandler(deps.Pool, signingKeySvc, deps.Logger)
+	signingKeyHandler := handlers.NewSigningKeyHandler(deps.Pool, signingKeySvc, deps.Config.AppBaseURL, auditLog, deps.Logger)
+
+	// Give newly created tenants their key pair up front rather than lazily on
+	// first login.
+	adminSvc.WithSigningKeys(signingKeySvc)
+
 	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Config.AppBaseURL, deps.Logger)
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
 	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
@@ -511,7 +624,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// app_id is empty. So mounting it here cannot rate-limit an operator out of
 	// the rate-limit CRUD routes below — the limiter only ever engages for
 	// application-scoped traffic, never for the admin console's own calls.
-	adminGroup := apiV1.Group("", mw.JWTRequired(jwtSvc), appRateLimit)
+	//
+	// Accepted token types (issue #84): admin/management routes have three
+	// legitimate kinds of caller, so all three audiences are allowed here and
+	// authorization stays with the RequirePermission guards below —
+	//   - AudienceAPI:        a human operator in the admin SPA
+	//   - AudienceManagement: an API-key integration (POST /auth/management-token)
+	//   - AudienceM2M:        a client_credentials machine client, whose grants
+	//                         come from oauth_clients.scopes
+	// Agent tokens are deliberately absent — nothing verifies them yet.
+	adminGroup := apiV1.Group("", mw.JWTRequired(
+		jwtSvc,
+		auth.AudienceAPI,
+		auth.AudienceManagement,
+		auth.AudienceM2M,
+	), appRateLimit)
 
 	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {
@@ -848,9 +975,43 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/rate-limit", adminHandler.SetAppLimit, tidAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, tidAppsWrite)
 
+	// JWT signing-key management (issue #95) — tenant:manage, because rotating a
+	// signing key is a tenant-wide security operation, not an application-level one.
+	//
+	// Two-step rotation by design: prepare publishes the incoming key so verifier
+	// caches pick it up, complete then activates it. A single-shot rotate endpoint
+	// would reintroduce the window where a token is signed by a key no verifier has
+	// seen yet.
+	//
+	// Both mutating steps are rate limited per tenant. Authorisation alone is not
+	// enough here: completing a rotation retires the outgoing key, so a caller
+	// that already holds tenant:manage can cycle prepare→complete to push keys
+	// past RetiredKeyGrace faster than issued tokens expire, invalidating them.
+	// The limiter turns that from seconds into hours. Listing is read-only and
+	// stays unthrottled.
+	rotationLimit := mw.SigningKeyRotationRateLimiter()
+	tenantMgmt.GET("/signing-keys", signingKeyHandler.ListSigningKeys)
+	tenantMgmt.POST("/signing-keys/prepare", signingKeyHandler.PrepareSigningKeyRotation, rotationLimit)
+	tenantMgmt.POST("/signing-keys/complete", signingKeyHandler.CompleteSigningKeyRotation, rotationLimit)
+
 	// SAML admin config — saml:manage (04-01)
 	adminGroup.GET("/saml-config", samlHandler.GetSAMLConfig, samlManage)
 	adminGroup.PUT("/saml-config", samlHandler.UpsertSAMLConfig, samlManage)
+
+	// Published JWKS — public, unauthenticated, top-level (issue #95, Phase 3).
+	//
+	// Mounted with e.GET like /saml/metadata below: there is no SPA catch-all or
+	// RouteNotFound handler in this server (the only wildcard is the scoped
+	// /api/* 404 at the end of this function), so a top-level path is unshadowed.
+	//
+	// Per-tenant by path because the slug cannot travel in X-Tenant-Slug here — a
+	// JWKS library or browser fetching a URL sends no custom headers.
+	//
+	// The rate limiter is deliberately generous (JWKSPerIPRate) and refunds 304s:
+	// a public route inherits no throttling at all, but throttling this one too
+	// hard breaks every offline verifier we are asking to depend on it.
+	// TenantCORS skips this path entirely — see isPublicCORSExempt.
+	e.GET("/tenants/:slug/.well-known/jwks.json", jwksHandler.GetTenantJWKS, mw.JWKSRateLimiter())
 
 	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
 	e.GET("/saml/metadata", samlHandler.GetMetadata)

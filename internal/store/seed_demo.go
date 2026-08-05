@@ -93,11 +93,18 @@ func RunDemoSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger)
 
 func seedDemoTenant(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger, t demoTenant, pwHash string) error {
 	// Tenant — slug unique constraint (migration 00038).
-	_, err := pool.Exec(ctx, `
+	// crypto/rand secret, not gen_random_uuid()::text — see the note in seed.go
+	// (issue #95). Demo tenants are routinely used for integration testing against
+	// real flows, so a weaker secret here would understate the real thing.
+	secret, err := generateTenantSecret()
+	if err != nil {
+		return fmt.Errorf("tenant: generate jwt_secret: %w", err)
+	}
+	_, err = pool.Exec(ctx, `
 		INSERT INTO tenants (name, slug, jwt_secret, is_active)
-		VALUES ($1, $2, gen_random_uuid()::text, true)
+		VALUES ($1, $2, $3, true)
 		ON CONFLICT (slug) DO NOTHING
-	`, t.name, t.slug)
+	`, t.name, t.slug, secret)
 	if err != nil {
 		return fmt.Errorf("tenant: %w", err)
 	}

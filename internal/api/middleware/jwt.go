@@ -9,6 +9,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // userContextKey is the echo context key under which *auth.Claims is stored.
@@ -24,13 +25,24 @@ const (
 // JWTRequired returns an Echo middleware that:
 //  1. Reads the Authorization header (must be "Bearer <token>"); falls back to
 //     the emc_access_token HttpOnly cookie for browser-session clients.
-//  2. Verifies the JWT signature + expiry using the per-tenant secret (fetched from DB).
+//  2. Verifies the JWT signature, algorithm, issuer, expiry, and audience using
+//     the per-tenant secret (fetched from DB).
 //  3. Stores the validated *auth.Claims in the echo context under key "user".
 //  4. Returns HTTP 401 if no valid token is found in either location.
 //
-// Performance note (NFR-01): Verify() does one DB round-trip to fetch the tenant secret.
-// With pgxpool (MaxConns=25) and the p99 < 2ms DB query target, this adds ≤2ms latency.
-func JWTRequired(jwtSvc *auth.JWTService) echo.MiddlewareFunc {
+// allowedAudiences declares which token types the mounted routes accept
+// (issue #84). It is variadic for call-site readability, but omitting it is a
+// configuration error: auth.VerifyForAudience then fails closed with
+// ErrNoAudienceAllowed rather than accepting every token type.
+//
+// Rejections are deliberately reported as the same generic token_invalid 401 as
+// any other bad token, so a caller cannot use the response to discover that it
+// holds a validly-signed token of the wrong type. Operators see the detail on
+// the emc_auth_token_audience_rejections_total metric instead.
+//
+// Performance note (NFR-01): verification does one DB round-trip to fetch the tenant
+// secret. With pgxpool (MaxConns=25) and the p99 < 2ms DB query target, this adds ≤2ms latency.
+func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			tokenString, found := bearerToken(c)
@@ -49,7 +61,7 @@ func JWTRequired(jwtSvc *auth.JWTService) echo.MiddlewareFunc {
 				})
 			}
 
-			claims, err := jwtSvc.Verify(c.Request().Context(), tokenString)
+			claims, err := jwtSvc.VerifyForAudience(c.Request().Context(), tokenString, allowedAudiences...)
 			if err != nil {
 				// Distinguish expired tokens from invalid ones.
 				// Clients should refresh on token_expired; redirect to login on token_invalid.
@@ -58,6 +70,10 @@ func JWTRequired(jwtSvc *auth.JWTService) echo.MiddlewareFunc {
 						"error": "access token expired",
 						"code":  "token_expired",
 					})
+				}
+				if errors.Is(err, auth.ErrUnexpectedAudience) {
+					metrics.TokenAudienceRejections.
+						WithLabelValues(presentedAudience(tokenString), c.Path()).Inc()
 				}
 				return c.JSON(http.StatusUnauthorized, map[string]string{
 					"error": "invalid token",
@@ -69,6 +85,32 @@ func JWTRequired(jwtSvc *auth.JWTService) echo.MiddlewareFunc {
 			c.Set(userContextKey, claims)
 			return next(c)
 		}
+	}
+}
+
+// presentedAudience reads the "aud" claim for metric labelling only.
+//
+// Safe to parse unverified here: this is called solely after
+// VerifyForAudience has already proven the signature and rejected the token on
+// audience alone, so the claim really was minted by this server.
+//
+// The result is normalized to a known audience (or "other") to keep the metric's
+// label cardinality bounded — Sign() accepts an arbitrary audience string, so an
+// unrecognised value must not become a new time series.
+func presentedAudience(tokenString string) string {
+	parsed, _, err := gojwt.NewParser().ParseUnverified(tokenString, &auth.Claims{})
+	if err != nil {
+		return "other"
+	}
+	claims, ok := parsed.Claims.(*auth.Claims)
+	if !ok || len(claims.Audience) != 1 {
+		return "other"
+	}
+	switch claims.Audience[0] {
+	case auth.AudienceAPI, auth.AudienceM2M, auth.AudienceManagement, auth.AudienceAgent:
+		return claims.Audience[0]
+	default:
+		return "other"
 	}
 }
 

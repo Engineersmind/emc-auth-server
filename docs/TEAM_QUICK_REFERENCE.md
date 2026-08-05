@@ -101,7 +101,7 @@ Format: `emck_...` (shown once, never recoverable — store securely!)
 ## Security
 
 ✅ Passwords hashed with bcrypt (cost 12 — ~100ms per login)  
-✅ Tokens signed with cryptographic key (HS256)  
+✅ Tokens signed with an asymmetric key (RS256) — verifiers get only the public half, so they cannot mint tokens  
 ✅ Refresh tokens atomic (old revoked before new issued)  
 ✅ Rate limiting (5 login attempts/min per IP)  
 ✅ Tenant isolation guaranteed at database level  

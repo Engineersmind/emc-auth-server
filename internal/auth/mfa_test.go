@@ -229,7 +229,7 @@ func newMFAFixture(t *testing.T) *mfaFixture {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
 	appSvc := auth.NewApplicationService(pool, logger)
-	jwtSvc := auth.NewJWTService(pool, "https://auth.emc.local")
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	mail := &captureMailer{}
 	senderSvc := auth.NewEmailSenderService(pool, totpSvc.EncryptionKey(), logger)
 	emailSvc := auth.NewEmailMFAService(pool, rdb, mail, logger).WithSenders(senderSvc)
