@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 )
 
 // ---------------------------------------------------------------------------
@@ -133,9 +134,11 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 	if err != nil {
 		return nil, fmt.Errorf("email must be a valid email address")
 	}
-	// Store the bare address: mail.ParseAddress accepts "Jane <jane@x.com>",
-	// and Login matches users.email as an exact string.
-	email := addr.Address
+	// Store the canonical address: mail.ParseAddress accepts "Jane <jane@x.com>",
+	// and Login matches users.email as an exact string. Normalizing also keeps
+	// the promote-in-place lookup below from missing an existing account that
+	// differs only in casing and creating a second, parallel admin row.
+	email := emailaddr.Normalize(addr.Address)
 
 	switch in.Role {
 	case auth.AdminRoleOwner:

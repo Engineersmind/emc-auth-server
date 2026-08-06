@@ -11,6 +11,7 @@ import (
 
 	"strconv"
 
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -205,6 +206,10 @@ func (s *Service) ParseACSResponse(samlResponse string) (email string, attrs map
 // FindOrCreateUser performs JIT provisioning: looks up a user by tenant+email,
 // creating one if not found. The created user has no usable password (SAML-only login).
 func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) (*User, error) {
+	// IdPs vary in how they case the NameID between assertions; without this an
+	// IdP that changes casing JIT-provisions a second account for one person.
+	email = emailaddr.Normalize(email)
+
 	tenantIDInt, err := strconv.ParseInt(tenantID, 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tenant_id: %w", err)

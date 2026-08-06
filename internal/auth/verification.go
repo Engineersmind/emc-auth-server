@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
@@ -195,6 +196,8 @@ func (s *VerificationService) VerifyEmail(ctx context.Context, rawToken string) 
 // ALWAYS returns nil to prevent email enumeration, mirroring ForgotPassword.
 // Already-verified or unknown emails silently succeed.
 func (s *VerificationService) ResendVerification(ctx context.Context, tenantSlug, email string) error {
+	email = emailaddr.Normalize(email)
+
 	var tenantID int64
 	err := s.pool.QueryRow(ctx,
 		`SELECT id FROM tenants WHERE slug = $1 AND is_active = true`, tenantSlug,

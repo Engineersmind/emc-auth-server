@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -419,6 +420,10 @@ func (s *OAuthLoginService) HandleCallback(ctx context.Context, st *OAuthState, 
 	if ident.Sub == "" || ident.Email == "" {
 		return nil, fmt.Errorf("provider identity missing sub or email")
 	}
+	// Providers differ on whether they preserve the casing the user typed.
+	// Canonicalize once here so auto-link, JIT insert and the stored
+	// provider_email all agree with locally-registered accounts.
+	ident.Email = emailaddr.Normalize(ident.Email)
 
 	userID, outcome, err := s.resolveUser(ctx, st, ident)
 	if isUniqueViolation(err) {
@@ -486,17 +491,16 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 		return 0, "", fmt.Errorf("lookup identity: %w", err)
 	}
 
-	// 2. Auto-link by verified email — app-scoped users only. Case-insensitive:
-	// local registration does not normalize email casing (plain TEXT column,
-	// no lowercasing on insert), so a locally-registered "John.Doe@Example.com"
-	// must still match a provider identity reporting "john.doe@example.com" —
-	// an exact-match comparison here would miss it and JIT-provision a
-	// duplicate account instead of linking to the existing one.
+	// 2. Auto-link by verified email — app-scoped users only. Exact match is
+	// safe (and index-friendly) because every stored address is canonical:
+	// migration 00066 lowercased the table and its CHECK constraint keeps it
+	// that way, and ident.Email was normalized by the caller. A LOWER(email)
+	// comparison here would only defeat idx_users_login_covering.
 	var emailVerified bool
 	err = s.pool.QueryRow(ctx, `
 		SELECT id, email_verified
 		FROM   users
-		WHERE  tenant_id = $1 AND application_id = $2 AND LOWER(email) = LOWER($3)
+		WHERE  tenant_id = $1 AND application_id = $2 AND email = $3
 		  AND  is_active = true AND deleted_at IS NULL
 	`, st.TenantID, st.AppRowID, ident.Email).Scan(&userID, &emailVerified)
 	if err == nil {

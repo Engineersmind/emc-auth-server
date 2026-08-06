@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 )
 
 // Administrative tiers, matching tenant_admins.admin_role. Kept as local
@@ -131,6 +133,9 @@ func isMachineActor(email string) bool {
 // not accepted holds no role and cannot act, so an event attributed to them is
 // not theirs to answer for.
 func (s *EmailSink) actorRole(ctx context.Context, tenantID int64, userID *int64, email string) (string, error) {
+	// Audit events can carry an actor email captured before normalization.
+	email = emailaddr.Normalize(email)
+
 	var role string
 	var err error
 	if userID != nil {

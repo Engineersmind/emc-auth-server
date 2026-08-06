@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"golang.org/x/oauth2"
 )
 
@@ -155,10 +156,9 @@ func (d *githubDriver) fetchIdentity(ctx context.Context, cfg *flowConfig, redir
 	return &providerIdentity{
 		// Numeric ID, never login — usernames are mutable, the ID is stable.
 		Sub: strconv.FormatInt(user.ID, 10),
-		// GitHub preserves user casing on emails; the auto-link lookup in
-		// resolveUser is an exact match, so normalise here or mixed-case
-		// addresses would JIT-provision duplicates instead of linking.
-		Email:     strings.ToLower(email),
+		// GitHub preserves user casing on emails. HandleCallback normalizes
+		// every provider identity, so this is belt-and-braces.
+		Email:     emailaddr.Normalize(email),
 		FirstName: firstName,
 		LastName:  lastName,
 	}, nil
