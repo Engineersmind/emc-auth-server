@@ -73,10 +73,12 @@ func JWTRenew(
 		return func(c echo.Context) error {
 			// ── Step 1: read access token (Bearer header or cookie) ──────────
 			tokenString, found := bearerToken(c)
+			viaCookie := false
 			if !found {
 				if cookie, err := c.Cookie(AccessTokenCookie); err == nil && cookie.Value != "" {
 					tokenString = cookie.Value
 					found = true
+					viaCookie = true
 				}
 			}
 
@@ -96,8 +98,7 @@ func JWTRenew(
 			// pinned to AudienceAPI even if Verify() ever widens its own set.
 			claims, err := jwtSvc.VerifyForAudience(c.Request().Context(), tokenString, auth.AudienceAPI)
 			if err == nil {
-				c.Set(userContextKey, claims)
-				return next(c)
+				return proceedAuthenticated(c, claims, viaCookie, next)
 			}
 
 			// Any error other than expiry is fatal (tampered signature, wrong
@@ -191,9 +192,10 @@ func JWTRenew(
 			// Another concurrent request rotated this family while we were waiting
 			// for the lock. Proceed without issuing new cookies — the browser will
 			// receive the fresh cookies from the other request's response.
+			// Reached only by presenting the refresh cookie, so this is a browser
+			// session regardless of how the (expired) access token arrived.
 			if grace != nil {
-				c.Set(userContextKey, graceToAuthClaims(grace))
-				return next(c)
+				return proceedAuthenticated(c, graceToAuthClaims(grace), true, next)
 			}
 
 			// ── Step 4: wrap response writer — cookies flush before body ──────
@@ -207,7 +209,6 @@ func JWTRenew(
 				logger.Error().Err(verifyErr).Msg("renewal: failed to verify freshly-signed access token")
 				return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
 			}
-			c.Set(userContextKey, newClaims)
 
 			// ── Step 6: audit ─────────────────────────────────────────────────
 			tid, uid, appID := claimsToAuditIDs(newClaims)
@@ -225,7 +226,10 @@ func JWTRenew(
 				Metadata:      map[string]any{"http_route": c.Path()},
 			})
 
-			return next(c)
+			// The rotation itself stands and its fresh cookies still flush, even
+			// if the identity check below refuses the request: the refresh was
+			// legitimate, only the caller's belief about who it is was stale.
+			return proceedAuthenticated(c, newClaims, true, next)
 		}
 	}
 }

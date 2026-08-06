@@ -46,11 +46,13 @@ func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.Middl
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			tokenString, found := bearerToken(c)
+			viaCookie := false
 			if !found {
 				// Fall back to HttpOnly cookie set by /auth/session endpoints.
 				if cookie, err := c.Cookie(AccessTokenCookie); err == nil && cookie.Value != "" {
 					tokenString = cookie.Value
 					found = true
+					viaCookie = true
 				}
 			}
 
@@ -81,9 +83,9 @@ func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.Middl
 				})
 			}
 
-			// Store claims for downstream handlers.
-			c.Set(userContextKey, claims)
-			return next(c)
+			// Publish claims for downstream handlers and apply the
+			// session-identity check before the handler runs.
+			return proceedAuthenticated(c, claims, viaCookie, next)
 		}
 	}
 }
