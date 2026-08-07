@@ -2182,6 +2182,11 @@
         },
         "/api/v1/auth/apps/me": {
             "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
                 "description": "Same payload as GET /auth/me, but additionally proves the token was issued FOR the calling application. Requires a user Bearer token in Authorization AND the application's credentials in X-Client-Authorization. Rejects app-scoped tokens belonging to a different application in the same tenant, and rejects first-party tokens (empty app_id).",
                 "produces": [
                     "application/json"
@@ -4911,6 +4916,117 @@
                 }
             }
         },
+        "/api/v1/signing-keys": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Public metadata for the tenant's signing keys. Never returns private key material.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "List this tenant's JWT signing keys",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SigningKeyListResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/signing-keys/complete": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Activates the prepared key and retires the current one. The retired public key stays published until its grace window elapses, so no live token breaks.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Complete a signing-key rotation",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SigningKeyListResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/signing-keys/prepare": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Generates and publishes the next signing key without activating it. Wait for verifier caches to pick it up (see Cache-Control on the JWKS endpoint), then call the complete endpoint.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "Prepare a signing-key rotation",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SigningKeyListResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/stats": {
             "get": {
                 "security": [
@@ -7196,6 +7312,49 @@
                 }
             }
         },
+        "/oauth/userinfo": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Standard OpenID Connect UserInfo endpoint. Returns claims about the user behind the presented access token. Requires a user access token (aud=emc-auth-api); machine, management, and agent tokens are rejected.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oidc"
+                ],
+                "summary": "OIDC UserInfo",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UserInfoResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/oauth/{provider}/callback": {
             "get": {
                 "description": "Consumes the single-use state, exchanges the code (PKCE), verifies the provider ID token, resolves/links/provisions the user, and redirects back to the application with a one-time login_code.",
@@ -7405,6 +7564,45 @@
                     },
                     "500": {
                         "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/tenants/{slug}/.well-known/jwks.json": {
+            "get": {
+                "description": "Public keys for verifying this tenant's access tokens. Contains the active key, any pre-published next key, and recently retired keys. Never contains private key material.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "system"
+                ],
+                "summary": "Tenant JWKS (public signing keys)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug",
+                        "name": "slug",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -9196,6 +9394,44 @@
                 }
             }
         },
+        "handlers.SigningKeyInfo": {
+            "type": "object",
+            "properties": {
+                "activated_at": {
+                    "type": "string"
+                },
+                "algorithm": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "kid": {
+                    "type": "string"
+                },
+                "retired_at": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SigningKeyListResponse": {
+            "type": "object",
+            "properties": {
+                "jwks_url": {
+                    "description": "JWKSURL is where verifiers should fetch these keys. Returned so an operator\nnever has to construct it by hand or guess the scheme.",
+                    "type": "string"
+                },
+                "keys": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.SigningKeyInfo"
+                    }
+                }
+            }
+        },
         "handlers.SlugCheckResponse": {
             "type": "object",
             "properties": {
@@ -9429,6 +9665,34 @@
                     "items": {
                         "type": "string"
                     }
+                }
+            }
+        },
+        "handlers.UserInfoResponse": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "email_verified": {
+                    "type": "boolean"
+                },
+                "family_name": {
+                    "type": "string"
+                },
+                "given_name": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "sub": {
+                    "description": "Subject is the stable, permanent identifier for the user.\n\nThis is the raw user id, deliberately, and it must stay consistent with the\n\"sub\" already carried in every access token (JWTService.Sign sets\nSubject: c.UserID). OIDC Core requires the token's sub and UserInfo's sub to\nmatch; returning a pairwise (per-client) subject here while tokens carry the\nraw id would violate that and give the same person two identities.\n\nPairwise subjects are the privacy-preserving alternative, keeping two\napplications from correlating the same user. Adding them later means\nchanging BOTH this and the token claim, and is only safe for a client that\nhas never received a subject in the current format — a relying party stores\nsub as its primary key for the user, so changing it orphans every linked\naccount. The natural place is a per-client setting introduced with the\nclient registry in issue #6/#8, applied from that client's first token.",
+                    "type": "string"
+                },
+                "updated_at": {
+                    "description": "UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,\nwhich is what the rest of this API returns for timestamps.",
+                    "type": "integer"
                 }
             }
         },

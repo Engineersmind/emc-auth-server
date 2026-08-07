@@ -475,8 +475,14 @@ func TestJWTService_Verify_RejectsWrongIssuer(t *testing.T) {
 		t.Fatalf("sign wrong-issuer token: %v", err)
 	}
 
-	if _, err := jwtSvc.Verify(ctx, signed); !errors.Is(err, jwt.ErrTokenInvalidIssuer) {
-		t.Errorf("Verify(wrong issuer) error = %v, want ErrTokenInvalidIssuer", err)
+	// ErrUnexpectedIssuer, not jwt.ErrTokenInvalidIssuer: since issue #7 the
+	// expected issuer depends on the token's own tenant, which golang-jwt's
+	// WithIssuer option cannot express (it compares against one string fixed
+	// before parsing). The check moved out of the parser and into issuerAllowed,
+	// which runs after the signature is proven. The rejection is unchanged — only
+	// which sentinel reports it.
+	if _, err := jwtSvc.Verify(ctx, signed); !errors.Is(err, auth.ErrUnexpectedIssuer) {
+		t.Errorf("Verify(wrong issuer) error = %v, want ErrUnexpectedIssuer", err)
 	}
 }
 

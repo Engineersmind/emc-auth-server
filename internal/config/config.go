@@ -120,6 +120,31 @@ type Config struct {
 	// symmetric token is the 1 h agent token.
 	JWTAllowLegacyHS256 bool
 
+	// OIDCIssuerBaseURL is the public origin used to build each tenant's OIDC
+	// issuer, as {base}/tenants/{slug} (issue #7).
+	//
+	// A field of its own rather than reusing AppBaseURL, which is documented as
+	// the base for links inside emails and may legitimately point at a front end
+	// on a different host. The issuer must be the origin a relying party can
+	// actually fetch this server's discovery document and JWKS from — get it wrong
+	// and every external verifier breaks, with the failure surfacing at the
+	// relying party rather than here. It defaults to AppBaseURL because in the
+	// single-binary deployment they are the same host.
+	//
+	// Must be the exact scheme+host+port an external verifier will use, with no
+	// trailing slash — OIDC issuer comparison is an exact string match, so
+	// https://auth.example.com and https://auth.example.com/ are different issuers.
+	OIDCIssuerBaseURL string
+
+	// JWTAllowLegacyIssuer keeps tokens carrying the old global JWT_ISSUER
+	// verifiable during the migration to per-tenant issuers (issue #7).
+	//
+	// Same shape and same discipline as JWTAllowLegacyHS256: defaults to true so
+	// the switch does not invalidate tokens minted seconds earlier, and is flipped
+	// to false only once emc_auth_legacy_issuer_verifications_total has been flat
+	// at zero. The longest-lived affected token is the 1 h agent token.
+	JWTAllowLegacyIssuer bool
+
 	// CookieDomain sets the Domain attribute on auth cookies.
 	// Leave empty for localhost development (browser scopes to current host).
 	// In production set to the shared parent domain, e.g. ".engineersmind.com",
@@ -205,7 +230,13 @@ func Load() *Config {
 		// Fails closed towards COMPATIBILITY, not towards strictness: only the
 		// exact string "false" disables legacy verification, so a typo cannot
 		// accidentally reject every live token.
-		JWTAllowLegacyHS256:      getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
+		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
+		// Same fail-towards-compatibility rule as JWT_ALLOW_LEGACY_HS256 above.
+		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "true") != "false",
+		// Defaults to APP_BASE_URL: in the single-binary deployment the auth server
+		// and the origin used for email links are the same host, so requiring both
+		// to be set would be a config trap with one obviously correct answer.
+		OIDCIssuerBaseURL:        getEnv("OIDC_ISSUER_BASE_URL", getEnv("APP_BASE_URL", "http://localhost:9090")),
 		CookieDomain:             getEnv("COOKIE_DOMAIN", ""),
 		GlobalCORSOrigins:        getEnvList("GLOBAL_CORS_ORIGINS", ""),
 		GeoIPDatabasePath:        getEnv("GEOIP_DATABASE_PATH", ""),

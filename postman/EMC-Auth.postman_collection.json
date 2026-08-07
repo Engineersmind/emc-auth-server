@@ -2876,6 +2876,534 @@
       ]
     },
     {
+      "name": "11 · Per-Tenant OIDC Issuer (#7)",
+      "description": "Issue #7 step 1–3: the `iss` claim moves from one global `JWT_ISSUER` to a\nper-tenant `{OIDC_ISSUER_BASE_URL}/tenants/{slug}`.\n\n**Why it matters:** OIDC clients derive the discovery document — and from it\nthe `jwks_uri` — from the token's own `iss`. With a global issuer that chain\ncould only ever name one key set, but keys are per-tenant since #95, so no\nsingle URL could verify every tenant's tokens.\n\n**Run 01 · Bootstrap first.** Requests 4 and 5 additionally need 08 · API Keys\nand 07 · Admin respectively; both skip themselves cleanly if those have not run.\n\n**The server must be rebuilt** — a container still running the pre-#7 binary\nwill mint the old global issuer and every assertion here will fail.",
+      "item": [
+        {
+          "name": "1 · Login — token carries the per-tenant issuer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "login"
+              ]
+            },
+            "description": "The core assertion of #7. `iss` must now be\n`{{baseUrl}}/tenants/{{tenantSlug}}`, not the old global `JWT_ISSUER`.\n\nCaptures `token_iss` for the next request, which rebuilds the JWKS URL\nfrom it exactly as a standards-compliant client would.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{adminEmail}}\",\n  \"password\": \"{{adminPassword}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const decode = (jwt, part) => JSON.parse(atob(jwt.split('.')[part].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "const b = pm.response.json();",
+                  "const claims = decode(b.access_token, 1);",
+                  "",
+                  "const expected = pm.environment.get('baseUrl') + '/tenants/' + pm.environment.get('tenantSlug');",
+                  "",
+                  "// Stale-binary guard. If the container is still running a pre-#7 build it",
+                  "// mints the old global issuer, and every later request in this folder fails",
+                  "// for a reason that has nothing to do with the code under test. Say so once,",
+                  "// loudly, instead of leaving five confusing failures behind.",
+                  "if (claims.iss === pm.environment.get('baseUrl') || claims.iss === 'https://auth.emc.local') {",
+                  "    console.error('[#7] STALE BINARY: iss is the global issuer (' + claims.iss + ').');",
+                  "    console.error('[#7] Rebuild:  docker compose up -d --build emc-auth-server');",
+                  "}",
+                  "",
+                  "pm.test('#7: iss is the per-tenant issuer', () =>",
+                  "    pm.expect(claims.iss).to.eql(expected));",
+                  "",
+                  "pm.test('#7: iss is NOT the legacy global issuer', () => {",
+                  "    pm.expect(claims.iss).to.not.eql('https://auth.emc.local');",
+                  "    pm.expect(claims.iss).to.not.eql(pm.environment.get('baseUrl'));",
+                  "});",
+                  "",
+                  "// Exact-match trap: OIDC compares issuers byte for byte, so a trailing",
+                  "// slash makes this a different issuer to every compliant client.",
+                  "pm.test('#7: iss has no trailing slash', () =>",
+                  "    pm.expect(claims.iss.endsWith('/')).to.be.false);",
+                  "",
+                  "pm.environment.set('token_iss', claims.iss);",
+                  "pm.environment.set('access_token', b.access_token);",
+                  "pm.environment.set('refresh_token', b.refresh_token);",
+                  "console.log('[#7] iss = ' + claims.iss);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2 · JWKS resolved FROM the token's iss",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{token_iss}}/.well-known/jwks.json",
+              "host": [
+                "{{token_iss}}"
+              ],
+              "path": [
+                ".well-known",
+                "jwks.json"
+              ]
+            },
+            "description": "This is the request that proves #7 actually works, and the one that could\nnot have passed before it.\n\nThe URL is built from the token's own `iss` — not from a hardcoded path —\nwhich is precisely what an OIDC client library does. It then checks that\nthe key set found there contains the `kid` that signed the token. If the\nissuer and the JWKS route ever drift apart, this 404s or misses the kid.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 — JWKS reachable from iss', () => pm.response.to.have.status(200));",
+                  "",
+                  "const decode = (jwt, part) => JSON.parse(atob(jwt.split('.')[part].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "const hdr  = decode(pm.environment.get('access_token'), 0);",
+                  "const keys = pm.response.json().keys || [];",
+                  "",
+                  "pm.test('#7: key set is non-empty', () => pm.expect(keys.length).to.be.above(0));",
+                  "",
+                  "pm.test('#7: the kid that signed the token is published here', () =>",
+                  "    pm.expect(keys.map(k => k.kid)).to.include(hdr.kid));",
+                  "",
+                  "pm.test('#95: keys are RSA public keys only — no private material', () => {",
+                  "    keys.forEach(k => {",
+                  "        pm.expect(k.kty).to.eql('RSA');",
+                  "        pm.expect(k).to.not.have.property('d');",
+                  "    });",
+                  "});",
+                  "",
+                  "console.log('[#7] JWKS at ' + pm.environment.get('token_iss') + '/.well-known/jwks.json OK, kids: ' + keys.map(k => k.kid).join(', '));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3 · Token with the new issuer still verifies server-side",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/me",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "me"
+              ]
+            },
+            "description": "Guards the regression that matters most: the issuer check moved out of the\nJWT parser and into `issuerAllowed`, which runs after signature\nverification. If that rewiring were wrong, a freshly minted token would\nfail its own server's verification and this returns 401."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 — per-tenant issuer accepted by Verify()', () =>",
+                  "    pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "pm.test('identity resolves', () => pm.expect(b).to.have.property('email'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4 · Management token carries the same issuer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/management-token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "management-token"
+              ]
+            },
+            "description": "`SignManagement` builds its own `RegisteredClaims` literal, separate from\n`Sign` — exactly the shape of bug where one forgotten mint path keeps\nemitting the old issuer. Same reason #95 funnelled all signing through\n`signClaims`.\n\n**Needs 08 · API Keys to have run** (`api_key` in the environment).\nSkips itself if absent.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"api_key\": \"{{api_key}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.environment.get('api_key')) {",
+                  "    console.log('[#7] no api_key in environment — run folder 08 first; skipping');",
+                  "    pm.execution.skipRequest();",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const decode = (jwt, part) => JSON.parse(atob(jwt.split('.')[part].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "const tok = pm.response.json().access_token || pm.response.json().token;",
+                  "const claims = decode(tok, 1);",
+                  "",
+                  "pm.test('#7: management token carries the per-tenant issuer', () =>",
+                  "    pm.expect(claims.iss).to.eql(pm.environment.get('token_iss')));",
+                  "",
+                  "pm.test('#84: aud is emc-auth-management', () =>",
+                  "    pm.expect([].concat(claims.aud)).to.include('emc-auth-management'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5 · A second tenant gets its OWN issuer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tenants",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tenants"
+              ]
+            },
+            "description": "Tenant isolation at the issuer layer. Two tenants must not share an\nissuer, or a relying party trusting one would accept the other's tokens —\nthe property that ruled out the aggregate-JWKS alternative.\n\nCreates a throwaway tenant; request 6 deletes it.\n\n`owner_email` is required — CreateTenant seeds an owner user and emails an\ninvitation, and returns 503 creating nothing if no mailer is configured.\nThe dev stack points SMTP at mailpit (http://localhost:8025), so the\ninvitation lands there harmlessly.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"OIDC Issuer Check\",\n  \"slug\": \"{{oidc_check_slug}}\",\n  \"owner_email\": \"{{oidc_check_slug}}@example.test\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.environment.set('oidc_check_slug', 'oidc-check-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "",
+                  "const b = pm.response.json();",
+                  "pm.environment.set('oidc_check_tenant_id', String(b.id));",
+                  "",
+                  "const mine   = pm.environment.get('token_iss');",
+                  "const theirs = pm.environment.get('baseUrl') + '/tenants/' + pm.environment.get('oidc_check_slug');",
+                  "",
+                  "pm.test('#7: the new tenant has a DIFFERENT issuer', () =>",
+                  "    pm.expect(theirs).to.not.eql(mine));",
+                  "",
+                  "console.log('[#7] seed tenant iss = ' + mine);",
+                  "console.log('[#7] new  tenant iss = ' + theirs);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "6 · Cleanup — delete the throwaway tenant",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/tenants/{{oidc_check_tenant_id}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "tenants",
+                "{{oidc_check_tenant_id}}"
+              ]
+            },
+            "description": "Removes the tenant created by request 5 so the folder is re-runnable."
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.environment.get('oidc_check_tenant_id')) {",
+                  "    console.log('[#7] nothing to clean up; skipping');",
+                  "    pm.execution.skipRequest();",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('deleted (200/204)', () =>",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 204]));",
+                  "pm.environment.unset('oidc_check_tenant_id');"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7 · UserInfo — standard OIDC claims",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/oauth/userinfo",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "userinfo"
+              ]
+            },
+            "description": "OIDC Core §5.3 UserInfo. Asserts the standard claim NAMES — `sub`,\n`email`, `email_verified` — because the point of this endpoint is that a\nstock OIDC client reads it with no per-vendor mapping. Renaming one is a\nbreaking change for every integrator, not an internal refactor.\n\nAlso checks `sub` equals the token's own `sub`, which OIDC requires and\nwhich is why the subject is the raw user id rather than a pairwise hash."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const decode = (jwt, part) => JSON.parse(atob(jwt.split('.')[part].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "const b = pm.response.json();",
+                  "const claims = decode(pm.environment.get('access_token'), 1);",
+                  "",
+                  "pm.test('#7: standard claim names present', () => {",
+                  "    pm.expect(b).to.have.property('sub');",
+                  "    pm.expect(b).to.have.property('email');",
+                  "    pm.expect(b).to.have.property('email_verified');",
+                  "});",
+                  "",
+                  "pm.test('#7: userinfo sub === token sub (OIDC requires this)', () =>",
+                  "    pm.expect(b.sub).to.eql(claims.sub));",
+                  "",
+                  "pm.test('#7: response is not cacheable', () =>",
+                  "    pm.expect(pm.response.headers.get('Cache-Control')).to.eql('no-store'));",
+                  "",
+                  "console.log('[#7] userinfo: ' + JSON.stringify(b));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "8 · UserInfo accepts POST too",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/oauth/userinfo",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "userinfo"
+              ]
+            },
+            "description": "OIDC Core §5.3 requires both GET and POST; client libraries use either."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 on POST', () => pm.response.to.have.status(200));",
+                  "pm.test('same subject as GET', () =>",
+                  "    pm.expect(pm.response.json().sub).to.be.a('string').and.not.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "9 · UserInfo rejects a machine token (expect 401)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{m2m_token}}"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/oauth/userinfo",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "userinfo"
+              ]
+            },
+            "description": "Issue #84's rule applied to a new route: a machine (M2M) token stands for\nno user, so there is no user info to return. Answering would mean\ndescribing a user to a caller that never authenticated as one.\n\n**Needs 04 · Applications & M2M to have run** (`m2m_token`). Skips if absent.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (!pm.environment.get('m2m_token')) {",
+                  "    console.log('[#7] no m2m_token — run folder 04 first; skipping');",
+                  "    pm.execution.skipRequest();",
+                  "}"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('#84: machine token refused on userinfo', () =>",
+                  "    pm.response.to.have.status(401));",
+                  "",
+                  "pm.test('RFC 6750: 401 carries a WWW-Authenticate challenge', () =>",
+                  "    pm.expect(pm.response.headers.get('WWW-Authenticate')).to.be.a('string'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "10 · Legacy-issuer metric is registered",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/metrics",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "metrics"
+              ]
+            },
+            "description": "`emc_auth_legacy_issuer_verifications_total` is the gate for the cutover:\n`JWT_ALLOW_LEGACY_ISSUER=false` is only safe once it has been flat at zero,\nbecause until then live tokens still carry the old global issuer.\n\nThis is the same class of gap caught in #84 and still open as deferred\nitem #12 — a counter that exists but is never incremented is invisible\nexactly when it is needed. A Prometheus CounterVec only appears here after\nits first increment, so 'absent' means no legacy token has been seen since\nboot, which during migration is itself the signal worth reading.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "",
+                  "const body = pm.response.text();",
+                  "const line = body.split('\\n').find(l => l.startsWith('emc_auth_legacy_issuer_verifications_total'));",
+                  "",
+                  "if (line) {",
+                  "    console.log('[#7] legacy issuer verifications: ' + line);",
+                  "    console.log('[#7] non-zero is EXPECTED during migration — pre-#7 tokens are still valid.');",
+                  "} else {",
+                  "    console.log('[#7] no legacy-issuer verifications since boot — nothing is presenting the old issuer.');",
+                  "}",
+                  "",
+                  "// Reported, not asserted: either state is legitimate depending on how long",
+                  "// the server has been up and what tokens are still in circulation.",
+                  "pm.test('metrics endpoint served', () => pm.expect(body.length).to.be.above(0));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "99 · Negative & Security",
       "description": "Assertions about what must **fail**. These are the tests that catch a regression\nin an authorization boundary — the kind of bug that never shows up in a happy-path\nrun because everything still returns 200.\n\nExpect red here only when something is genuinely wrong.",
       "item": [

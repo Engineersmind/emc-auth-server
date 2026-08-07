@@ -119,11 +119,36 @@ var ErrNoAudienceAllowed = errors.New("jwt: no allowed audience specified")
 // could never verify its own tokens — fail at construction, not at request time.
 var ErrEmptyIssuer = errors.New("jwt: issuer must not be empty")
 
+// ErrUnexpectedIssuer is returned when a token is well-formed and correctly
+// signed but its "iss" is neither the issuer of the tenant it claims nor the
+// legacy global issuer.
+//
+// A distinct sentinel rather than a generic parse failure because the two mean
+// different things operationally: an expired token is routine, whereas a validly
+// signed token bearing a foreign issuer means either a stale token past the
+// migration window or another deployment sharing our key material. Both are worth
+// counting and logging separately.
+var ErrUnexpectedIssuer = errors.New("jwt: unexpected issuer")
+
 // JWTService signs and verifies JWTs using a per-tenant HS256 secret.
 type JWTService struct {
 	pool *pgxpool.Pool
-	// issuer is the value placed in the "iss" claim.
+	// issuer is the legacy server-wide value for the "iss" claim (JWT_ISSUER).
+	//
+	// Since issue #7 it is no longer what new tokens carry when issuers is set —
+	// see issuerFor. It remains the value accepted on the legacy verification
+	// branch, and the sole issuer for embedders that never wire a resolver.
 	issuer string
+	// issuers resolves the per-tenant OIDC issuer (issue #7). When nil the
+	// service stays on the single global issuer, which is the pre-#7 behaviour
+	// and what tests and any embedder that has not wired it still get.
+	issuers *TenantIssuerResolver
+	// allowLegacyIssuer keeps tokens carrying the global issuer verifiable during
+	// the migration window. Setting it false is the cutover.
+	//
+	// Only meaningful when issuers != nil; without a resolver the global issuer is
+	// the only issuer, and refusing it would leave nothing able to verify anything.
+	allowLegacyIssuer bool
 	// keys supplies per-tenant asymmetric signing keys (issue #95). When nil the
 	// service stays on legacy symmetric HS256; when set, tokens are signed RS256
 	// and verification resolves the key by the token's kid header.
@@ -183,6 +208,106 @@ func (s *JWTService) WithSigningKeys(keys *SigningKeyService) *JWTService {
 func (s *JWTService) WithLegacyHS256(allow bool) *JWTService {
 	s.allowLegacyHS256 = allow
 	return s
+}
+
+// WithTenantIssuers switches the "iss" claim from the single global JWT_ISSUER to
+// a per-tenant OIDC issuer (issue #7). Verification then accepts the tenant's own
+// issuer *and* the legacy global value, so tokens minted before the switch stay
+// valid until they expire.
+//
+// Deliberately mirrors WithSigningKeys: same opt-in shape, same
+// accept-both-during-migration default, same cutover switch. The two migrations
+// are the same problem one step apart — #95 made the key per-tenant, this makes
+// the identifier that names that key per-tenant.
+func (s *JWTService) WithTenantIssuers(issuers *TenantIssuerResolver) *JWTService {
+	s.issuers = issuers
+	// Accept the legacy issuer by default: switching mint behaviour must not
+	// invalidate tokens minted moments earlier. WithLegacyIssuer(false) performs
+	// the cutover once none are left in circulation.
+	s.allowLegacyIssuer = true
+	return s
+}
+
+// WithLegacyIssuer controls whether tokens carrying the old global issuer still
+// verify (issue #7 cutover).
+//
+// Do not flip it until no live token carries the old issuer. The evidence for that
+// is emc_auth_legacy_issuer_verifications_total sitting at zero, not elapsed time.
+func (s *JWTService) WithLegacyIssuer(allow bool) *JWTService {
+	s.allowLegacyIssuer = allow
+	return s
+}
+
+// issuerFor returns the "iss" value to mint for a tenant: the tenant's own OIDC
+// issuer when a resolver is wired, otherwise the legacy global value.
+func (s *JWTService) issuerFor(ctx context.Context, tenantID int64) (string, error) {
+	if s.issuers == nil {
+		return s.issuer, nil
+	}
+	issuer, err := s.issuers.Issuer(ctx, tenantID)
+	if err != nil {
+		// Deliberately fails the mint rather than falling back to the global
+		// issuer. A silent fallback would emit a token whose iss does not match
+		// the discovery document a relying party fetched, which fails at the
+		// relying party — far from the cause, and only for some tenants.
+		return "", err
+	}
+	return issuer, nil
+}
+
+// issuerAllowed checks a verified token's "iss" against the issuer of the tenant
+// it claims, falling back to the legacy global issuer during the migration.
+//
+// It runs after signature verification, alongside the audience check and for the
+// same reason: only then is the tenant_id claim trustworthy enough to decide which
+// issuer the token should have carried. golang-jwt's WithIssuer option cannot
+// express this — it compares against one constant string, decided before the token
+// is parsed, whereas the expected value here depends on the token's own contents.
+//
+// Both checks live at the single choke point every verification passes through, so
+// neither can be skipped by a new caller.
+func (s *JWTService) issuerAllowed(ctx context.Context, claims *Claims) error {
+	if s.issuers == nil {
+		// Pre-#7 behaviour, byte-for-byte: one issuer, exact match. Previously
+		// enforced by jwt.WithIssuer inside the parser.
+		if claims.Issuer != s.issuer {
+			return fmt.Errorf("verify jwt: got %q, want %q: %w",
+				claims.Issuer, s.issuer, ErrUnexpectedIssuer)
+		}
+		return nil
+	}
+
+	// An empty tenant_id cannot name an expected issuer. Fail rather than fall
+	// through to the legacy branch, which would let a token omit the claim to
+	// pick the weaker check.
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("verify jwt: invalid tenant_id %q: %w", claims.TenantID, ErrUnexpectedIssuer)
+	}
+
+	expected, err := s.issuers.Issuer(ctx, tenantID)
+	if err == nil && claims.Issuer == expected {
+		return nil
+	}
+	// A resolver error is not fatal on its own: the token may legitimately be a
+	// pre-#7 one, which the legacy branch below can still accept. It does mean the
+	// per-tenant comparison could not be made, so the token gets no better than
+	// legacy treatment.
+
+	if claims.Issuer == s.issuer {
+		if !s.allowLegacyIssuer {
+			metrics.LegacyIssuerVerifications.WithLabelValues("rejected").Inc()
+			return fmt.Errorf("verify jwt: legacy issuer %q is no longer accepted: %w",
+				claims.Issuer, ErrUnexpectedIssuer)
+		}
+		metrics.LegacyIssuerVerifications.WithLabelValues("accepted").Inc()
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("verify jwt: cannot resolve issuer for tenant %d: %w", tenantID, err)
+	}
+	return fmt.Errorf("verify jwt: got %q, want %q: %w", claims.Issuer, expected, ErrUnexpectedIssuer)
 }
 
 // signingKeyFor returns the tenant's active asymmetric key, or nil when the
@@ -281,10 +406,14 @@ const ManagementTokenTTL = 15 * time.Minute
 
 // Sign creates and signs a JWT for the given claims using the tenant's HS256 secret.
 func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, c *Claims) (string, error) {
+	issuer, err := s.issuerFor(ctx, tenantID)
+	if err != nil {
+		return "", err
+	}
 	now := time.Now().UTC()
 	c.RegisteredClaims = jwt.RegisteredClaims{
 		ID:        uuid.New().String(),
-		Issuer:    s.issuer,
+		Issuer:    issuer,
 		Audience:  jwt.ClaimStrings{audience},
 		Subject:   c.UserID,
 		IssuedAt:  jwt.NewNumericDate(now),
@@ -297,6 +426,10 @@ func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, 
 // The token carries the API key's permissions so it can call /admin/* endpoints
 // for the key's tenant — equivalent to Auth0's client_credentials management token.
 func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentity) (string, error) {
+	issuer, err := s.issuerFor(ctx, identity.TenantID)
+	if err != nil {
+		return "", err
+	}
 	now := time.Now().UTC()
 	claims := &Claims{
 		UserID:   "key:" + strconv.FormatInt(identity.KeyID, 10),
@@ -311,7 +444,7 @@ func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentit
 		Permissions: identity.Permissions,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        uuid.New().String(),
-			Issuer:    s.issuer,
+			Issuer:    issuer,
 			Audience:  jwt.ClaimStrings{AudienceManagement},
 			Subject:   "key:" + strconv.FormatInt(identity.KeyID, 10),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -332,6 +465,10 @@ func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentit
 // against user, management, or M2M routes. Wiring agent-token verification is
 // tracked separately from issue #84.
 func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (string, error) {
+	issuer, err := s.issuerFor(ctx, identity.TenantID)
+	if err != nil {
+		return "", err
+	}
 	now := time.Now().UTC()
 	claims := &AgentClaims{
 		AgentID:      identity.AgentID.String(),
@@ -339,7 +476,7 @@ func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (st
 		AgentType:    identity.AgentType,
 		Capabilities: identity.Capabilities,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    s.issuer,
+			Issuer:    issuer,
 			Audience:  jwt.ClaimStrings{AudienceAgent},
 			Subject:   identity.AgentID.String(),
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -401,10 +538,12 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 	opts := []jwt.ParserOption{
 		jwt.WithExpirationRequired(),
 		jwt.WithValidMethods(methods),
-		// iss is enforced unconditionally: every token we mint carries
-		// iss = s.issuer, and NewJWTService refuses to build a service without
-		// one, so there is no runtime value that can switch this check off.
-		jwt.WithIssuer(s.issuer),
+		// iss is NOT checked here. Since issue #7 the expected issuer depends on
+		// which tenant the token claims, and jwt.WithIssuer can only compare
+		// against one string fixed before parsing. The check moved to
+		// issuerAllowed below, after the signature is proven — see there. It is
+		// still enforced unconditionally and on every path, because it sits at
+		// this same single choke point, next to the audience check.
 	}
 
 	// Key resolution happens inside the keyfunc, which is what closes ME-07.
@@ -435,8 +574,12 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 		return nil, errors.New("jwt is not valid")
 	}
 
-	// Audience check runs last — the signature is proven at this point, so the
-	// token really was minted by us and its aud claim can be trusted.
+	// Issuer and audience checks run last — the signature is proven at this
+	// point, so the token really was minted by us and its claims can be trusted
+	// to decide what it should have carried.
+	if err := s.issuerAllowed(ctx, claims); err != nil {
+		return nil, err
+	}
 	if !audienceAllowed(claims.Audience, allowed) {
 		return nil, fmt.Errorf("verify jwt: got %v, want one of %v: %w",
 			[]string(claims.Audience), allowed, ErrUnexpectedAudience)
