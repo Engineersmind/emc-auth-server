@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
@@ -95,6 +96,8 @@ func (s *ResetService) ForgotPasswordForced(ctx context.Context, tenantID int64,
 }
 
 func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string, honorSuppression bool) error {
+	email = emailaddr.Normalize(email)
+
 	// Suppression: if the reset template is disabled at this scope, don't send —
 	// unless this is an admin-forced reset (honorSuppression=false).
 	if honorSuppression && !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordReset) {

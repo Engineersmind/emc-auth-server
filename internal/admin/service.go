@@ -20,6 +20,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 )
 
 // Sentinel errors returned by service methods.
@@ -374,8 +375,10 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// (e.g. "Jane Doe <jane@example.com>"). Store only the bare address —
 	// otherwise the literal input string ends up in users.email and the owner
 	// can never log in with the address they were actually given, since Login
-	// matches on an exact string.
-	ownerEmailAddr := ownerAddr.Address
+	// matches on an exact string. Normalize for the same reason: an owner
+	// invited as Jane.Doe@example.com must be able to sign in as
+	// jane.doe@example.com.
+	ownerEmailAddr := emailaddr.Normalize(ownerAddr.Address)
 
 	// Refused up front, before a single row is written.
 	//
@@ -1294,6 +1297,8 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 // creating the account and granting it an administrative role in one call is the
 // same bypass, minus a step.
 func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID *int64, email, password, firstName, lastName string, roleID *int64) (*UserResult, error) {
+	email = emailaddr.Normalize(email)
+
 	if roleID != nil {
 		var roleAppID *int64
 		var roleIsSystem bool
@@ -1368,6 +1373,10 @@ func (s *Service) InviteUser(ctx context.Context, tenantID int64, applicationID 
 	if s.invSvc == nil {
 		return nil, ErrInvitationsUnavailable
 	}
+	// Normalized here as well as in CreateUser: the address is also used as the
+	// invitation recipient below, and the invite must be addressed to exactly
+	// the account that was created.
+	email = emailaddr.Normalize(email)
 
 	placeholder, err := generateTempPassword()
 	if err != nil {
@@ -1423,6 +1432,8 @@ func (s *Service) GetUser(ctx context.Context, tenantID int64, applicationID *in
 // UpdateUser updates a user's profile fields, with the same optional
 // application scope filter as GetUser.
 func (s *Service) UpdateUser(ctx context.Context, tenantID int64, applicationID *int64, userID int64, email, firstName, lastName string) (*UserResult, error) {
+	email = emailaddr.Normalize(email)
+
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE users
 		SET email = $1, first_name = $2, last_name = $3, updated_at = NOW()
@@ -1855,6 +1866,9 @@ func (s *Service) getTenantByID(ctx context.Context, tenantID int64) (*TenantRes
 // Unlike ListTenantsPaginated (platform-admin-only, lists every tenant), this
 // is self-scoped: it only ever returns tenants tied to the caller's own email.
 func (s *Service) ListOwnedTenants(ctx context.Context, email string) ([]OwnedTenantResult, error) {
+	// The email arrives from a JWT claim, which may predate normalization.
+	email = emailaddr.Normalize(email)
+
 	rows, err := s.pool.Query(ctx, `
 		SELECT
 			t.id, t.name, t.slug, t.display_name, t.domain, t.region, t.description,

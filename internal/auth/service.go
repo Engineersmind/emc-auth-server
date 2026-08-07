@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -341,6 +342,8 @@ func (s *AuthService) authenticateApp(ctx context.Context, clientID, clientSecre
 // Register creates a new user. The target tenant comes either from an
 // authenticated application (ClientID + ClientSecret) or from TenantSlug.
 func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResult, error) {
+	in.Email = emailaddr.Normalize(in.Email)
+
 	var tenantID int64
 	appID := ""
 	// appRowID is non-nil only for application-authenticated registration —
@@ -489,6 +492,8 @@ type loginCandidate struct {
 // one to find the single tenant it belongs to. With ClientID + ClientSecret
 // the application is authenticated first and the search is pinned to its tenant.
 func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
+	in.Email = emailaddr.Normalize(in.Email)
+
 	// Application-authenticated mode: verify the app before touching any user
 	// data so bad app credentials fail fast and identically regardless of the
 	// submitted email.

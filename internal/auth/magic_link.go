@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
@@ -76,6 +77,8 @@ func (s *AuthService) magicLinkConfig(ctx context.Context, appRowID int64) (enab
 // An unknown email is NOT an error: the caller receives the same success
 // either way, so this endpoint cannot be used to enumerate accounts.
 func (s *AuthService) RequestMagicLink(ctx context.Context, clientID, clientSecret, email string) error {
+	email = emailaddr.Normalize(email)
+
 	if s.emailSvc == nil || s.redisCli == nil {
 		return fmt.Errorf("magic link not configured on this server")
 	}

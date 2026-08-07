@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
@@ -83,7 +84,7 @@ func (s *EmailChangeService) WithAudit(a *audit.Logger) *EmailChangeService {
 // user identity from verified JWT claims — this flow never accepts a user id
 // from the request body.
 func (s *EmailChangeService) Request(ctx context.Context, tenantID, userID int64, newEmail string) error {
-	newEmail = strings.ToLower(strings.TrimSpace(newEmail))
+	newEmail = emailaddr.Normalize(newEmail)
 	if newEmail == "" || !strings.Contains(newEmail, "@") {
 		return fmt.Errorf("a valid email address is required")
 	}
