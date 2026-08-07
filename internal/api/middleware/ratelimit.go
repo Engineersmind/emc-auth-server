@@ -138,6 +138,10 @@ func startCleanup() {
 				oauthClientStore.cleanup(10 * time.Minute)
 				auditMaintStore.cleanup(10 * time.Minute)
 				jwksStore.cleanup(10 * time.Minute)
+				// Safe at 10 min: UserInfo refills 60/min, i.e. one token per
+				// second, so a bucket idle for ten minutes is already full and
+				// evicting it grants nothing that waiting would not.
+				userInfoStore.cleanup(10 * time.Minute)
 				// Evicting a bucket resets it to full burst, so a store may not
 				// be swept faster than its own refill interval or idling becomes
 				// a way to skip the limit. Rotation refills one token every
@@ -546,6 +550,65 @@ var jwksStore = &limiterStore{}
 // material served from an in-memory cache, with an ETag so well-behaved clients
 // mostly get 304s. There is little to protect and much to break.
 const JWKSPerIPRate = 120
+
+// userInfoStore holds the per-user buckets for the OIDC UserInfo endpoint, kept
+// separate from every other store for the same reason jwksStore is: UserInfo and
+// login have different legitimate volumes and must not exhaust each other.
+var userInfoStore = &limiterStore{}
+
+// UserInfoPerSubjectRate is the per-minute allowance for /oauth/userinfo, keyed
+// on the authenticated user.
+//
+// Keyed per user, not per IP, because unlike JWKS this endpoint is authenticated
+// — the caller is known, so the bucket can be charged to the account rather than
+// to a shared NAT address. That avoids the failure mode described for
+// JWKSPerIPRate, where many pods behind one gateway starve each other.
+//
+// 60/min is generous for the intended use: a relying party calls UserInfo once
+// per login to populate a profile, not on every request. It is low enough that a
+// stolen token cannot be used to hammer the user lookup, and high enough that a
+// client refreshing a profile on navigation will never notice it.
+const UserInfoPerSubjectRate = 60
+
+// UserInfoRateLimiter bounds /oauth/userinfo per authenticated subject (issue #7).
+//
+// This server attaches every limiter per route and has no global one, so a new
+// route inherits no throttling whatsoever — the same gap JWKSRateLimiter exists to
+// close, and the reason CLAUDE.md carries deferred item #14.
+//
+// Falls back to the client IP when no verified subject is present. That should be
+// unreachable, since the route sits behind JWTRequired, but a limiter whose key can
+// silently become the empty string collapses every caller into one shared bucket —
+// which is either a global outage or no limit at all, depending on the order of
+// arrival. Failing back to IP keeps it bounded either way.
+func UserInfoRateLimiter() echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			key := ""
+			if claims, ok := c.Get("user").(*auth.Claims); ok && claims != nil && claims.UserID != "" {
+				key = "userinfo:sub:" + claims.TenantID + ":" + claims.UserID
+			} else {
+				ip := c.RealIP()
+				if ip == "" {
+					ip = c.Request().RemoteAddr
+				}
+				key = "userinfo:ip:" + ip
+			}
+
+			if !userInfoStore.getOrCreate(key, UserInfoPerSubjectRate).Allow() {
+				metrics.RateLimitHits.WithLabelValues("userinfo").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many userinfo requests",
+					"retry_after": "60",
+				})
+			}
+			return next(c)
+		}
+	}
+}
 
 // JWKSRateLimiter rate-limits the public JWKS endpoint per client IP (issue #95).
 //

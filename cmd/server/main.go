@@ -242,6 +242,8 @@ func main() {
 			JWTSigningKeyEncryptionKey:             cfg.JWTSigningKeyEncryptionKey,
 			JWTSigningKeyEncryptionKeyPrevious:     cfg.JWTSigningKeyEncryptionKeyPrevious,
 			JWTAllowLegacyHS256:                    cfg.JWTAllowLegacyHS256,
+			OIDCIssuerBaseURL:                      cfg.OIDCIssuerBaseURL,
+			JWTAllowLegacyIssuer:                   cfg.JWTAllowLegacyIssuer,
 			EmailProvider:                          cfg.EmailProvider,
 			SendGridAPIKey:                         cfg.SendGridAPIKey,
 			EmailFromName:                          cfg.EmailFromName,

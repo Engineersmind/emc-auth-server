@@ -137,6 +137,36 @@ var (
 		[]string{"reason"},
 	)
 
+	// LegacyIssuerVerifications counts tokens accepted because their "iss"
+	// matched the old global JWT_ISSUER rather than the token's own per-tenant
+	// issuer (issue #7).
+	//
+	// Same role as LegacyHS256Verifications, for the same kind of migration:
+	// issue #7 moves iss from one server-wide value to {base}/tenants/{slug} so
+	// that OIDC discovery can name a jwks_uri whose keys actually verify the
+	// token. Tokens minted before that change carry the old value and must keep
+	// working until they expire, so the legacy value stays acceptable behind
+	// JWT_ALLOW_LEGACY_ISSUER.
+	//
+	// Watch this flatten to zero before setting JWT_ALLOW_LEGACY_ISSUER=false.
+	// The longest-lived affected token is the 1 h agent token, but a clock is not
+	// evidence — a flat counter is.
+	//
+	// Labels: reason —
+	//   accepted  a pre-#7 token verified against the global issuer; the normal
+	//             case during the migration window
+	//   rejected  refused because JWT_ALLOW_LEGACY_ISSUER=false. A climbing count
+	//             means something is still minting or replaying tokens with the
+	//             old issuer and must be found before this stays off.
+	LegacyIssuerVerifications = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "legacy_issuer_verifications_total",
+			Help:      "Tokens accepted via the legacy global issuer rather than a per-tenant issuer. Must reach zero before JWT_ALLOW_LEGACY_ISSUER=false.",
+		},
+		[]string{"reason"},
+	)
+
 	// ---------------------------------------------------------------------
 	// Audit pipeline — health of the async audit writer (internal/audit).
 	// The pipeline is designed to degrade by dropping events, never by

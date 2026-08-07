@@ -1251,6 +1251,33 @@ definitions:
       is_active:
         type: boolean
     type: object
+  handlers.SigningKeyInfo:
+    properties:
+      activated_at:
+        type: string
+      algorithm:
+        type: string
+      created_at:
+        type: string
+      kid:
+        type: string
+      retired_at:
+        type: string
+      status:
+        type: string
+    type: object
+  handlers.SigningKeyListResponse:
+    properties:
+      jwks_url:
+        description: |-
+          JWKSURL is where verifiers should fetch these keys. Returned so an operator
+          never has to construct it by hand or guess the scheme.
+        type: string
+      keys:
+        items:
+          $ref: '#/definitions/handlers.SigningKeyInfo'
+        type: array
+    type: object
   handlers.SlugCheckResponse:
     properties:
       available:
@@ -1407,6 +1434,42 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  handlers.UserInfoResponse:
+    properties:
+      email:
+        type: string
+      email_verified:
+        type: boolean
+      family_name:
+        type: string
+      given_name:
+        type: string
+      name:
+        type: string
+      sub:
+        description: |-
+          Subject is the stable, permanent identifier for the user.
+
+          This is the raw user id, deliberately, and it must stay consistent with the
+          "sub" already carried in every access token (JWTService.Sign sets
+          Subject: c.UserID). OIDC Core requires the token's sub and UserInfo's sub to
+          match; returning a pairwise (per-client) subject here while tokens carry the
+          raw id would violate that and give the same person two identities.
+
+          Pairwise subjects are the privacy-preserving alternative, keeping two
+          applications from correlating the same user. Adding them later means
+          changing BOTH this and the token claim, and is only safe for a client that
+          has never received a subject in the current format — a relying party stores
+          sub as its primary key for the user, so changing it orphans every linked
+          account. The natural place is a per-client setting introduced with the
+          client registry in issue #6/#8, applied from that client's first token.
+        type: string
+      updated_at:
+        description: |-
+          UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,
+          which is what the rest of this API returns for timestamps.
+        type: integer
     type: object
   saml.SAMLConfig:
     properties:
@@ -2910,6 +2973,8 @@ paths:
             additionalProperties:
               type: string
             type: object
+      security:
+      - BearerAuth: []
       summary: Current user, scoped to the calling application
       tags:
       - AUTH
@@ -4735,6 +4800,80 @@ paths:
       summary: Create or update tenant SAML configuration
       tags:
       - saml
+  /api/v1/signing-keys:
+    get:
+      description: Public metadata for the tenant's signing keys. Never returns private
+        key material.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.SigningKeyListResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List this tenant's JWT signing keys
+      tags:
+      - admin
+  /api/v1/signing-keys/complete:
+    post:
+      description: Activates the prepared key and retires the current one. The retired
+        public key stays published until its grace window elapses, so no live token
+        breaks.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.SigningKeyListResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Complete a signing-key rotation
+      tags:
+      - admin
+  /api/v1/signing-keys/prepare:
+    post:
+      description: Generates and publishes the next signing key without activating
+        it. Wait for verifier caches to pick it up (see Cache-Control on the JWKS
+        endpoint), then call the complete endpoint.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.SigningKeyListResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Prepare a signing-key rotation
+      tags:
+      - admin
   /api/v1/stats:
     get:
       description: Returns audit-log-based activity counts scoped to the caller's
@@ -6345,6 +6484,35 @@ paths:
       summary: Start social login
       tags:
       - oauth
+  /oauth/userinfo:
+    get:
+      description: Standard OpenID Connect UserInfo endpoint. Returns claims about
+        the user behind the presented access token. Requires a user access token (aud=emc-auth-api);
+        machine, management, and agent tokens are rejected.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.UserInfoResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: OIDC UserInfo
+      tags:
+      - oidc
   /saml/acs:
     post:
       consumes:
@@ -6422,6 +6590,34 @@ paths:
       summary: Get SP metadata XML
       tags:
       - saml
+  /tenants/{slug}/.well-known/jwks.json:
+    get:
+      description: Public keys for verifying this tenant's access tokens. Contains
+        the active key, any pre-published next key, and recently retired keys. Never
+        contains private key material.
+      parameters:
+      - description: Tenant slug
+        in: path
+        name: slug
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Tenant JWKS (public signing keys)
+      tags:
+      - system
 securityDefinitions:
   BearerAuth:
     description: 'Enter: Bearer <your_access_token>'

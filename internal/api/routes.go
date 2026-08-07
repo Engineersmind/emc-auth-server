@@ -68,6 +68,12 @@ type RoutesConfig struct {
 	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable. False performs
 	// the issue #95 Phase 4 cutover (RS256 only).
 	JWTAllowLegacyHS256 bool
+	// OIDCIssuerBaseURL is the public origin used to build each tenant's OIDC
+	// issuer as {base}/tenants/{slug} (issue #7).
+	OIDCIssuerBaseURL string
+	// JWTAllowLegacyIssuer keeps tokens carrying the old global JWT_ISSUER
+	// verifiable. False performs the issue #7 issuer cutover.
+	JWTAllowLegacyIssuer bool
 	// OAuthClientSecretEncryptionKeyPrevious is the old key accepted for
 	// decryption during rotation (empty when no rotation is in progress).
 	OAuthClientSecretEncryptionKeyPrevious string
@@ -203,6 +209,14 @@ func sentryMiddleware() echo.MiddlewareFunc {
 //
 // Production is escalated to an error-level log because a mismatch there is a
 // live integration hazard for real relying parties.
+//
+// Issue #7 update: the value compared here is now OIDC_ISSUER_BASE_URL, not
+// JWT_ISSUER. Per-tenant issuers made JWT_ISSUER a legacy value that new tokens
+// no longer carry, so comparing it would warn about a host that appears in no
+// token while staying silent on the one that does — the check would look healthy
+// and cover nothing. What still matters is unchanged and is exactly what #7 makes
+// structural: the origin a token's "iss" is built from must be the origin that
+// serves the matching JWKS.
 func warnIssuerHostMismatch(issuer, appBaseURL, env string, logger zerolog.Logger) {
 	if issuer == "" || appBaseURL == "" {
 		return
@@ -275,6 +289,27 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	if jwtErr != nil {
 		deps.Logger.Fatal().Err(jwtErr).Msg("JWT service init failed — check JWT_ISSUER")
 	}
+
+	// Per-tenant OIDC issuers (issue #7): iss becomes {base}/tenants/{slug} so a
+	// relying party following discovery reaches a jwks_uri whose keys actually
+	// verify the token. Wired here, immediately after construction, so no mint
+	// path can run before it — the failure mode of wiring it later is tokens
+	// issued during startup carrying the wrong issuer.
+	//
+	// Verification keeps accepting the legacy global issuer until the cutover, so
+	// no live session breaks at this point.
+	issuerResolver, issErr := auth.NewTenantIssuerResolver(deps.Pool, deps.Config.OIDCIssuerBaseURL)
+	if issErr != nil {
+		deps.Logger.Fatal().Err(issErr).Msg("tenant issuer resolver init failed — check OIDC_ISSUER_BASE_URL / APP_BASE_URL")
+	}
+	jwtSvc.WithTenantIssuers(issuerResolver).WithLegacyIssuer(deps.Config.JWTAllowLegacyIssuer)
+	if !deps.Config.JWTAllowLegacyIssuer {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_ISSUER=false — tokens carrying the old global JWT_ISSUER are REJECTED (issue #7 cutover). Any token minted before per-tenant issuers went live will fail.")
+	}
+	deps.Logger.Info().
+		Str("issuer_base_url", issuerResolver.BaseURL()).
+		Bool("legacy_issuer_accepted", deps.Config.JWTAllowLegacyIssuer).
+		Msg("per-tenant OIDC issuers enabled (issue #7)")
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
 
 	// TOTP service — requires encryption key; logs warning in dev if missing.
@@ -479,10 +514,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// looks for our keys at the wrong host. APP_BASE_URL is authoritative for
 	// discovery (it is where the endpoint actually is); warn loudly when the issuer
 	// disagrees so an operator reconciles them deliberately.
-	warnIssuerHostMismatch(deps.Config.JWTIssuer, deps.Config.AppBaseURL, deps.Config.Env, deps.Logger)
+	// Compares the per-tenant issuer origin (issue #7), not the legacy JWT_ISSUER
+	// — see warnIssuerHostMismatch for why the operand changed.
+	warnIssuerHostMismatch(deps.Config.OIDCIssuerBaseURL, deps.Config.AppBaseURL, deps.Config.Env, deps.Logger)
 
 	// JWKS publication + signing-key rotation handlers (issue #95).
 	jwksHandler := handlers.NewJWKSHandler(deps.Pool, signingKeySvc, deps.Logger)
+	oidcHandler := handlers.NewOIDCHandler(deps.Pool, deps.Logger)
 	signingKeyHandler := handlers.NewSigningKeyHandler(deps.Pool, signingKeySvc, deps.Config.AppBaseURL, auditLog, deps.Logger)
 
 	// Give newly created tenants their key pair up front rather than lazily on
@@ -1052,6 +1090,24 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// hard breaks every offline verifier we are asking to depend on it.
 	// TenantCORS skips this path entirely — see isPublicCORSExempt.
 	e.GET("/tenants/:slug/.well-known/jwks.json", jwksHandler.GetTenantJWKS, mw.JWKSRateLimiter())
+
+	// OIDC UserInfo (issue #7) — top-level, beside JWKS, because both are standard
+	// OIDC surfaces that external client libraries fetch by absolute URL.
+	//
+	// No /tenants/:slug prefix, unlike JWKS. JWKS is unauthenticated, so the slug
+	// is the only thing that can select a tenant; UserInfo carries a verified
+	// token, and the tenant claim inside it is authoritative. Taking the tenant
+	// from the path here would mean accepting a tenant selector from the caller on
+	// an authenticated route — exactly what the tenant-isolation rule forbids.
+	//
+	// AudienceAPI only, and stated explicitly rather than inherited: machine,
+	// management, and agent tokens stand for no user, so there is no user info to
+	// return for them (issue #84). JWTRequired enforces it before the handler runs.
+	//
+	// GET and POST because OIDC Core §5.3 requires both.
+	userInfoAuth := mw.JWTRequired(jwtSvc, auth.AudienceAPI)
+	e.GET("/oauth/userinfo", oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
+	e.POST("/oauth/userinfo", oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
 
 	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
