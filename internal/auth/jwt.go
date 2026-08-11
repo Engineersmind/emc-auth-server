@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -39,7 +40,43 @@ type Claims struct {
 	// AdminApps lists the application row ids they administer.
 	AdminScope string   `json:"admin_scope,omitempty"`
 	AdminApps  []string `json:"admin_apps,omitempty"`
+
+	// Scope is the space-delimited OAuth scope set granted to this token
+	// (RFC 6749 §3.3), populated only by the authorization code flow (issue #6).
+	//
+	// EMPTY MEANS UNSCOPED, NOT UNAUTHORIZED — and that asymmetry is deliberate,
+	// unlike AdminScope above where the empty string is denied.
+	//
+	// Every token minted before #6, and every first-party token minted today by
+	// password login, registration, refresh rotation, MFA completion, magic
+	// link, social callback and SAML, carries no scope claim. Those flows have
+	// no scope concept: the user authenticated directly to us and the token
+	// stands for the whole of that account. Treating their empty scope as
+	// "grants nothing" would break every existing consumer at once.
+	//
+	// The two claims differ because they answer different questions. AdminScope
+	// bounds how far an administrator's reach extends, so an unset value must
+	// fail closed. Scope records what a third-party client was granted, and only
+	// a flow that can grant scopes ever sets it — so an unset value means the
+	// question was never asked, and the caller is a first-party holder of a full
+	// session.
+	//
+	// Consumers must therefore branch on presence, not on content:
+	// no claim → release everything, as before; claim present → release only
+	// what it lists.
+	Scope string `json:"scope,omitempty"`
+
 	jwt.RegisteredClaims
+}
+
+// ScopeList splits the space-delimited Scope claim. Returns nil when the claim
+// is absent, which callers must distinguish from an empty granted set — see the
+// Scope field comment.
+func (c *Claims) ScopeList() []string {
+	if c.Scope == "" {
+		return nil
+	}
+	return strings.Fields(c.Scope)
 }
 
 // Admin scope values for Claims.AdminScope.

@@ -335,6 +335,41 @@ var (
 		},
 		[]string{"outcome"},
 	)
+
+	// OAuthGrants counts token-endpoint exchanges by grant type and outcome
+	// (issue #6).
+	//
+	// The outcome label is the operationally important half. "replayed" and
+	// "pkce_failed" are attack signals, not noise: a replayed authorization
+	// code means a code was seen by someone who should not have had it, and a
+	// PKCE mismatch means a code was presented by a party that did not
+	// originate the request. Both are invisible without this counter, because
+	// the client is deliberately told the same generic invalid_grant either way.
+	//
+	// grant: authorization_code | refresh_token | client_credentials
+	// outcome: success | invalid | replayed | pkce_failed | user_unavailable |
+	//          invalid_client | error
+	OAuthGrants = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "oauth_grants_total",
+			Help:      "OAuth 2.0 token endpoint exchanges by grant type and outcome.",
+		},
+		[]string{"grant", "outcome"},
+	)
+
+	// OAuthAuthorizeRequests counts /oauth/authorize outcomes (issue #6).
+	//
+	// outcome: code_issued | login_shown | invalid_client | invalid_redirect |
+	//          consent_required | invalid_request | error
+	OAuthAuthorizeRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "oauth_authorize_requests_total",
+			Help:      "OAuth 2.0 authorization endpoint requests by outcome.",
+		},
+		[]string{"outcome"},
+	)
 )
 
 // RecordOp is a convenience wrapper around AuthOperations.WithLabelValues.

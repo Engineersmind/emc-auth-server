@@ -160,19 +160,36 @@ func (h *OIDCHandler) UserInfo(c echo.Context) error {
 		return h.unauthorized(c, "user is not active")
 	}
 
-	resp := UserInfoResponse{
-		Subject:       claims.UserID,
-		Email:         email,
-		EmailVerified: verified,
-		GivenName:     firstName,
-		FamilyName:    lastName,
-		UpdatedAt:     updatedAt.Unix(),
+	// Scope filtering (OIDC Core §5.4), deferred to issue #6 by #7a's decision
+	// log because no flow could grant a scope until the authorization code flow
+	// existed — filtering then would have filtered on a field nothing set.
+	//
+	// Branch on PRESENCE of the claim, not its content. A token with no scope
+	// claim is a first-party session (password login, refresh, MFA, magic link,
+	// social, SAML) that predates or bypasses scopes entirely; it gets the full
+	// claim set exactly as before. A token carrying a scope claim came through
+	// /oauth/authorize, where the client asked for specific scopes and received
+	// only what it was granted — releasing more than that here would hand a
+	// client data it never requested and, once consent exists, was never
+	// approved for. See Claims.Scope for why empty cannot mean "grants nothing".
+	granted := claims.ScopeList()
+	scoped := granted != nil
+
+	resp := UserInfoResponse{Subject: claims.UserID}
+	if !scoped || auth.HasScope(granted, auth.ScopeEmail) {
+		resp.Email = email
+		resp.EmailVerified = verified
 	}
-	// "name" is the full display name. Built from the parts rather than stored,
-	// and omitted entirely when both are empty so a client does not receive a
-	// blank string as though it were a real name.
-	if full := strings.TrimSpace(firstName + " " + lastName); full != "" {
-		resp.Name = full
+	if !scoped || auth.HasScope(granted, auth.ScopeProfile) {
+		resp.GivenName = firstName
+		resp.FamilyName = lastName
+		resp.UpdatedAt = updatedAt.Unix()
+		// "name" is the full display name. Built from the parts rather than
+		// stored, and omitted entirely when both are empty so a client does not
+		// receive a blank string as though it were a real name.
+		if full := strings.TrimSpace(firstName + " " + lastName); full != "" {
+			resp.Name = full
+		}
 	}
 
 	return c.JSON(http.StatusOK, resp)
