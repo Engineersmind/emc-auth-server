@@ -833,6 +833,9 @@ func enforceSessionCap(ctx context.Context, tx pgx.Tx, userID, tenantID int64, m
 // diagnose, and avoiding it costs one XOR.
 func sessionCapLockKey(userID, tenantID int64) (int32, int32) {
 	fold := func(v int64) int32 {
+		// #nosec G115 -- narrowing to 32 bits is the point, not an accident: the
+		// lock key must be an int32 and any bit pattern is a valid one. The XOR
+		// mixes the discarded high bits back in rather than dropping them.
 		return int32(uint32(v) ^ uint32(v>>32))
 	}
 	return fold(userID), fold(tenantID)
