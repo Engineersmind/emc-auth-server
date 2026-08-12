@@ -180,7 +180,8 @@ Errors: 401 bad code/expired token · 403 method not allowed for this app ·
 
 ### 3.5 Token lifecycle (unchanged by MFA)
 ```
-POST /api/v1/auth/refresh   { "refresh_token" }   → 200 new pair (rotation; replay revokes the whole session family)
+POST /api/v1/auth/refresh   { "refresh_token" }   → 200 new pair in the body (rotation; replay revokes the whole session family)
+                                                    409 concurrent_refresh — a sibling request already rotated the family; no pair returned, use its response
 GET  /api/v1/auth/me                                Bearer <user>   → profile from claims (user_id, tenant_id, email, role, permissions)
 POST /api/v1/auth/logout    { "refresh_token" }   → 200
 ```
