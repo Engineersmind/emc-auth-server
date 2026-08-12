@@ -6633,9 +6633,10 @@ paths:
     post:
       consumes:
       - application/x-www-form-urlencoded
-      description: Revokes a refresh token and the entire session family it belongs
-        to. Always returns 200, including for tokens that do not exist, per RFC 7009
-        §2.2.
+      description: Revokes a refresh token. Client authentication is REQUIRED (RFC
+        7009 §2.1) — the same credentials the token endpoint takes. Returns 200 for
+        an unknown or already-revoked token, per RFC 7009 §2.2; a bad or missing client
+        credential is a 401 invalid_client.
       parameters:
       - description: The token to revoke
         in: formData
@@ -6646,11 +6647,24 @@ paths:
         in: formData
         name: token_type_hint
         type: string
+      - description: Required — prefer the Authorization Basic header
+        in: formData
+        name: client_id
+        required: true
+        type: string
+      - description: Confidential clients only
+        in: formData
+        name: client_secret
+        type: string
       produces:
       - application/json
       responses:
         "200":
-          description: Always, regardless of whether the token existed
+          description: Token revoked, or did not exist
+        "401":
+          description: client authentication failed
+          schema:
+            $ref: '#/definitions/handlers.tokenError'
       summary: OAuth 2.0 token revocation
       tags:
       - oauth

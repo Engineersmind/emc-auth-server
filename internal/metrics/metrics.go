@@ -360,8 +360,19 @@ var (
 
 	// OAuthAuthorizeRequests counts /oauth/authorize outcomes (issue #6).
 	//
+	// Incremented exactly once on every terminal path through Authorize,
+	// LoginSubmit and MFASubmit — see countAuthorize and the authzOutcome*
+	// constants in internal/api/handlers/oauth_authorize.go, which are the
+	// authority on these values. Keep the two lists in step.
+	//
 	// outcome: code_issued | login_shown | invalid_client | invalid_redirect |
-	//          consent_required | invalid_request | error
+	//          consent_required | invalid_request | invalid_scope |
+	//          unauthorized_client | mfa_enrollment_required | login_failed |
+	//          request_expired | error
+	//
+	// login_failed is the operationally interesting one: the hosted login is a
+	// password form on the public internet, and a rate of failures far above
+	// code_issued is what credential stuffing looks like from here.
 	OAuthAuthorizeRequests = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "emc_auth",

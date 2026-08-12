@@ -273,6 +273,18 @@ func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int6
 // appID is the string-encoded oauth_clients.id when the token is issued through a
 // registered application; pass "" when no application context is present.
 func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sessionFamilyID *int64, appID string) (*AuthResult, error) {
+	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms, sessionFamilyID, appID, "")
+}
+
+// issueTokenPairWithScope is issueTokenPair with the OAuth `scope` claim.
+//
+// Only the OAuth authorization-code path passes a non-empty scope; every other
+// caller goes through issueTokenPair and gets "". That is not incidental — the
+// claim is `omitempty`, so "" produces an ABSENT claim, and absent is what every
+// first-party flow must keep emitting. An empty-but-present scope claim reads
+// downstream as "granted nothing" and would strip the claims those callers
+// depend on (see Claims.Scope and /oauth/userinfo).
+func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sessionFamilyID *int64, appID, scope string) (*AuthResult, error) {
 	claims := &Claims{
 		UserID:      strconv.FormatInt(userID, 10),
 		TenantID:    strconv.FormatInt(tenantID, 10),
@@ -280,6 +292,7 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 		Email:       email,
 		Role:        role,
 		Permissions: perms,
+		Scope:       scope,
 	}
 
 	// Administrative reach is resolved here rather than at each caller because
@@ -1502,6 +1515,41 @@ func (s *AuthService) Logout(ctx context.Context, rawRefreshToken string) error 
 	return nil
 }
 
+// RevokeRefreshTokenForTenant revokes a refresh token, but only if it belongs to
+// the given tenant. Reports whether a live token was actually revoked.
+//
+// This is Logout with a tenant guard, and it exists for POST /oauth/revoke
+// (RFC 7009). Logout is reached only by a caller already holding that user's own
+// session; the revocation endpoint is reached by any client that can
+// authenticate, so "I hold this string" must not be sufficient authority to
+// invalidate it. Scoping the UPDATE by tenant_id means an authenticated client
+// in one tenant cannot revoke a token issued in another — the same isolation
+// boundary every other query in this codebase enforces.
+//
+// The boolean is the honest answer to "did anything happen", which the caller
+// needs for its audit record. It must NOT be reflected in the HTTP response:
+// RFC 7009 §2.2 requires 200 for an unknown token, because a distinguishable
+// response would make this endpoint an oracle for whether a captured string is
+// a live token.
+//
+// Per-client ownership is NOT checked, and cannot be: refresh_tokens carries
+// user_id and tenant_id but no application_id (see migrations 00009 / 00026), so
+// there is no column to compare a client_id against. Tenant scoping is the
+// tightest guard available without a schema change — tracked as CLAUDE.md
+// deferred item #22.
+func (s *AuthService) RevokeRefreshTokenForTenant(ctx context.Context, rawRefreshToken string, tenantID int64) (bool, error) {
+	hash := HashToken(rawRefreshToken)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE refresh_tokens
+		SET    revoked_at = NOW()
+		WHERE  token_hash = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, hash, tenantID)
+	if err != nil {
+		return false, fmt.Errorf("revoke refresh token: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // LookupUserForApp resolves an authenticated user to their row id and canonical
 // email within one application's isolated user base (issue #6).
 //
@@ -1602,45 +1650,27 @@ func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenan
 	}, nil
 }
 
-// issueScopedTokenPair is issueTokenPair with the OAuth `scope` claim set.
+// issueScopedTokenPair mints the token pair for an OAuth grant, carrying the
+// granted scopes as the `scope` claim.
 //
-// The two are kept separate rather than merged behind an extra parameter
-// because every existing caller must keep minting tokens with NO scope claim.
-// An empty scope claim and an absent one are read differently downstream — see
-// Claims.Scope — and quietly writing `scope: ""` onto password logins would
-// switch every one of them into the scoped branch of /oauth/userinfo and strip
-// the claims those callers already depend on.
+// A thin wrapper on issueTokenPairWithScope: the scope is threaded into the ONE
+// signing call rather than the token being signed twice. An earlier shape signed
+// without the claim and then re-signed with it, which meant a second Sign and a
+// second loadAdminScope — two round trips on the token-exchange path, and a
+// window in which two differently-claimed access tokens existed for one grant.
+//
+// strings.Join of an empty slice is "", so the no-scope case needs no branch:
+// the claim is omitempty and simply does not appear.
 func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, appID string, scopes []string) (*AuthResult, error) {
-	result, err := s.issueTokenPair(ctx, userID, tenantID, email, role, perms, nil, appID)
-	if err != nil {
-		return nil, err
-	}
-	if len(scopes) == 0 {
-		return result, nil
-	}
-	// Re-sign with the scope claim. issueTokenPair already resolved admin scope
-	// and persisted the refresh token; only the access token changes, and the
-	// refresh token it stored stays valid because nothing about it is derived
-	// from the access token.
-	claims := &Claims{
-		UserID:      strconv.FormatInt(userID, 10),
-		TenantID:    strconv.FormatInt(tenantID, 10),
-		AppID:       appID,
-		Email:       email,
-		Role:        role,
-		Permissions: perms,
-		Scope:       strings.Join(scopes, " "),
-	}
-	adminScope, adminApps, err := loadAdminScope(ctx, s.pool, userID, tenantID)
-	if err != nil {
-		return nil, err
-	}
-	claims.AdminScope, claims.AdminApps = adminScope, adminApps
-
-	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, claims)
-	if err != nil {
-		return nil, fmt.Errorf("sign scoped access token: %w", err)
-	}
-	result.AccessToken = accessToken
-	return result, nil
+	// NOTE (CLAUDE.md deferred #19 / #23): the access token minted here carries
+	// the OAuth `scope` claim AND the full internal `permissions` claim. That is
+	// safe only because /oauth/authorize refuses first_party = false, so every
+	// grant reaching this function belongs to a client the tenant owns. When the
+	// consent screen lands and genuinely third-party clients become possible,
+	// this line becomes a data-leakage path — an external client would receive
+	// internal permission strings it was never shown on a consent page. Filter
+	// perms by grant, or drop them for non-first-party clients, as part of that
+	// work. Read #19 before enabling third-party clients.
+	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms, nil, appID,
+		strings.Join(scopes, " "))
 }

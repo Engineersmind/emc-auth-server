@@ -361,7 +361,18 @@ func (s *AuthorizationServer) RedeemAuthorizationCode(ctx context.Context, clien
 	// redirect_uri must match the one the code was issued against (RFC 6749
 	// §4.1.3). Without this, a code intercepted at one registered URI could be
 	// redeemed as though it had been delivered to another.
-	if redirectURI != "" && redirectURI != r.RedirectURI {
+	//
+	// The comparison is UNCONDITIONAL — there is deliberately no "omitted means
+	// skip the check" branch. Every code this server mints carries a resolved,
+	// non-empty redirect_uri (ResolveRedirectURI runs before the code is
+	// issued), so treating an absent parameter as "nothing to compare" would
+	// turn the one binding that ties a code to its delivery address into an
+	// opt-out an attacker controls: a code lifted from one registered URI could
+	// be redeemed by simply not mentioning a URI at all. A client that reaches
+	// this endpoint without redirect_uri gets invalid_grant, which is the
+	// stricter reading of §4.1.3's REQUIRED and is safe here because every code
+	// was issued against a known URI.
+	if redirectURI != r.RedirectURI {
 		return nil, ErrInvalidAuthorizationCode
 	}
 

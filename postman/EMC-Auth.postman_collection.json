@@ -3405,7 +3405,7 @@
     },
     {
       "name": "12 - OAuth 2.0 Authorization Server (#6)",
-      "description": "Issue #6 - EMC as an OAuth 2.0 authorization server: /oauth/authorize, /oauth/token, /oauth/revoke, mandatory PKCE S256, OIDC ID tokens, and a server-rendered hosted login.\n\nRUN IN ORDER. Requests 1-3 set up a client and a user, 4-6 are the happy path, the rest are the security controls.\n\nRequests 8, 10 and 11 are the CRITICAL ones - a PKCE bypass and two open-redirect variants. They log to the Postman console on failure.\n\nPrerequisite: run folder 01 - Bootstrap first, for baseUrl, tenantSlug, adminEmail and adminPassword.",
+      "description": "Issue #6 - EMC as an OAuth 2.0 authorization server: /oauth/authorize, /oauth/token, /oauth/revoke, mandatory PKCE S256, OIDC ID tokens, and a server-rendered hosted login.\n\nRUN IN ORDER. Requests 1-3 set up a client and a user, 4-6 are the happy path, the rest are the security controls.\n\nRequests 8, 10, 11, 24 and 25 are the CRITICAL ones - a PKCE bypass, two open-redirect variants, an unauthenticated revocation, and a bypassable code-to-redirect_uri binding. They log to the Postman console on failure.\n\n24 and 25 were added from the PR #107 review, which found two security blockers:\nunauthenticated token revocation, and an `!= \"\"` escape hatch that let a token\nexchange skip the redirect_uri check by omitting the parameter. Note that\nrequests 10 and 11 send a WRONG redirect_uri and would BOTH have passed with\nthat second hole open - only an ABSENT one exposes it, which is what 25 sends.\n\nPrerequisite: run folder 01 - Bootstrap first, for baseUrl, tenantSlug, adminEmail and adminPassword.",
       "item": [
         {
           "name": "1 - Admin login (setup)",
@@ -3885,6 +3885,11 @@
                   "key": "code_verifier",
                   "value": "{{pkceVerifier}}",
                   "type": "text"
+                },
+                {
+                  "key": "redirect_uri",
+                  "value": "http://localhost:8080/callback",
+                  "type": "text"
                 }
               ]
             },
@@ -4008,6 +4013,11 @@
                 {
                   "key": "code_verifier",
                   "value": "{{wrongVerifier}}",
+                  "type": "text"
+                },
+                {
+                  "key": "redirect_uri",
+                  "value": "http://localhost:8080/callback",
                   "type": "text"
                 }
               ]
@@ -4858,6 +4868,171 @@
                   "pm.test('status 200', () => pm.response.to.have.status(200));",
                   "pm.test('first_party restored', () =>",
                   "    pm.expect(pm.response.json().first_party).to.be.true);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "24 - CRITICAL: revoke without client authentication must be refused",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "RFC 7009 2.1 requires the SAME client authentication at the revocation\nendpoint as at the token endpoint. Revocation is destructive, so possession of\na token must not by itself be authority to destroy it - otherwise anyone who\nintercepts a refresh token can log the user out from the public internet with\nno credential at all.\n\nNote there is no Basic auth on this request and no client_id in the body. That\nis the point. Compare with request 17, which is the same call WITH credentials\nand returns 200.\n\nThis was a blocker on PR #107: the handler used to skip authentication\nentirely when client_id was absent.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/revoke",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "revoke"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "token",
+                  "value": "{{oauthRefreshToken}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('#6: unauthenticated revocation refused', () => {",
+                  "    if (pm.response.code === 200) {",
+                  "        console.error('[#6 BLOCKER] /oauth/revoke acted on a token with NO client ",
+                  "credentials. Anyone holding an intercepted refresh token can revoke it.');",
+                  "    }",
+                  "    pm.expect(pm.response.json().error).to.eql('invalid_client');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "25 - CRITICAL: omitted redirect_uri must not bypass the code binding",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "RFC 6749 4.1.3. Every code this server mints is bound to a resolved,\nnon-empty redirect_uri, so an ABSENT redirect_uri at redemption must be a\nmismatch - not a skipped check.\n\nThis was a blocker on PR #107: the check read\n`if redirectURI != \"\" && redirectURI != r.RedirectURI`, which made the one\nbinding between a code and its delivery address opt-out at the caller's\ndiscretion. Request 10 and 11 send a WRONG redirect_uri and would both still\npass with that hole open, because neither ever sends an absent one.\n\nThe pre-request script mints its own code so this does not depend on any\nearlier request in the folder.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "authorization_code",
+                  "type": "text"
+                },
+                {
+                  "key": "code",
+                  "value": "{{noRedirectCode}}",
+                  "type": "text"
+                },
+                {
+                  "key": "code_verifier",
+                  "value": "{{noRedirectVerifier}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Mint a fresh code with the CORRECT verifier, so the only thing wrong",
+                  "// with the exchange below is the missing redirect_uri.",
+                  "const b64url = w => CryptoJS.enc.Base64.stringify(w)",
+                  "    .replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');",
+                  "const verifier  = b64url(CryptoJS.lib.WordArray.random(48));",
+                  "const challenge = b64url(CryptoJS.SHA256(verifier));",
+                  "pm.environment.set('noRedirectVerifier', verifier);",
+                  "",
+                  "const base = pm.environment.get('baseUrl');",
+                  "pm.sendRequest({method: 'GET', url: base + '/oauth/authorize?client_id=' +",
+                  "    pm.environment.get('oauthClientId') + '&redirect_uri=' +",
+                  "    encodeURIComponent('http://localhost:8080/callback') +",
+                  "    '&response_type=code&scope=openid&state=s25&code_challenge=' + challenge +",
+                  "    '&code_challenge_method=S256'}, (e, r) => {",
+                  "    if (e) { console.error(e); return; }",
+                  "    const m = r.text().match(/name=\"request\" value=\"([a-f0-9]+)\"/);",
+                  "    if (!m) { console.error('[#6] no request handle on the login page'); return; }",
+                  "    pm.sendRequest({url: base + '/oauth/authorize/login', method: 'POST',",
+                  "        header: {'Content-Type': 'application/x-www-form-urlencoded'},",
+                  "        body: {mode: 'urlencoded', urlencoded: [",
+                  "            {key: 'request',  value: m[1]},",
+                  "            {key: 'email',    value: pm.environment.get('oauthUserEmail')},",
+                  "            {key: 'password', value: pm.environment.get('oauthUserPassword')}]}",
+                  "    }, (e2, r2) => {",
+                  "        if (e2) { console.error(e2); return; }",
+                  "        const c = ((r2.headers.get('Location') || '').match(/[?&]code=([^&]+)/) || [])[1];",
+                  "        if (c) pm.environment.set('noRedirectCode', c);",
+                  "    });",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('#6: absent redirect_uri is a mismatch, not a skipped check', () => {",
+                  "    if (pm.response.code === 200) {",
+                  "        console.error('[#6 BLOCKER] a code redeemed with NO redirect_uri. The ",
+                  "binding between a code and its delivery address is bypassable.');",
+                  "    }",
+                  "    pm.expect(pm.response.json().error).to.eql('invalid_grant');",
+                  "});"
                 ]
               }
             }

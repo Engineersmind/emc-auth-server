@@ -366,42 +366,73 @@ func (h *OAuthTokenHandler) clientCredentialsGrant(c echo.Context) error {
 // Revoke handles POST /oauth/revoke — RFC 7009.
 //
 // @Summary      OAuth 2.0 token revocation
-// @Description  Revokes a refresh token and the entire session family it belongs to. Always returns 200, including for tokens that do not exist, per RFC 7009 §2.2.
+// @Description  Revokes a refresh token. Client authentication is REQUIRED (RFC 7009 §2.1) — the same credentials the token endpoint takes. Returns 200 for an unknown or already-revoked token, per RFC 7009 §2.2; a bad or missing client credential is a 401 invalid_client.
 // @Tags         oauth
 // @Accept       x-www-form-urlencoded
 // @Produce      json
 // @Param        token            formData  string  true   "The token to revoke"
 // @Param        token_type_hint  formData  string  false  "refresh_token | access_token"
-// @Success      200  "Always, regardless of whether the token existed"
+// @Param        client_id        formData  string  true   "Required — prefer the Authorization Basic header"
+// @Param        client_secret    formData  string  false  "Confidential clients only"
+// @Success      200  "Token revoked, or did not exist"
+// @Failure      401  {object}  tokenError  "client authentication failed"
 // @Router       /oauth/revoke [post]
 func (h *OAuthTokenHandler) Revoke(c echo.Context) error {
 	c.Response().Header().Set("Cache-Control", "no-store")
 	ctx := c.Request().Context()
 
+	// Client authentication is REQUIRED here, exactly as at the token endpoint
+	// (RFC 7009 §2.1) — and it is checked BEFORE the token parameter is read, so
+	// an unauthenticated request cannot have any effect at all.
+	//
+	// There is deliberately no "client_id omitted, so skip the check" branch.
+	// With one, possession of a refresh token would itself be sufficient
+	// authority to destroy it, and anyone who intercepted one could log the user
+	// out from the public internet without presenting a single credential.
+	// Revocation is a destructive operation; the bar to reach it is the same bar
+	// as the one to mint a token.
 	clientID, clientSecret := clientCredentialsFromRequest(c)
-	if clientID != "" {
-		if _, err := h.authenticateClient(c, clientID, clientSecret); err != nil {
-			return h.failClient(c)
-		}
+	if clientID == "" {
+		return h.failClient(c)
+	}
+	client, err := h.authenticateClient(c, clientID, clientSecret)
+	if err != nil {
+		return h.failClient(c)
 	}
 
 	token := c.FormValue("token")
-	if token != "" {
-		// Logout revokes the refresh token and, through it, the session family.
-		// The error is deliberately discarded: RFC 7009 §2.2 requires 200 for
-		// an invalid or unknown token, because a distinguishable response would
-		// turn this endpoint into an oracle for whether a captured string is a
-		// live token.
-		//
-		// An access token cannot be revoked — it is a self-contained JWT with no
-		// server-side record, and it expires in 15 minutes. Revoking the refresh
-		// token stops the session continuing past that, which is the meaningful
-		// action. token_type_hint is accepted and ignored for the same reason.
-		if err := h.authSvc.Logout(ctx, token); err != nil {
-			h.logger.Debug().Msg("revoke: token not found or already revoked")
-		} else {
-			h.auditRevoke(c, clientID)
-		}
+	if token == "" {
+		// Nothing named, nothing to do. Still a 200 — an empty token parameter is
+		// a malformed request, not a hint about any token's existence.
+		return c.NoContent(http.StatusOK)
+	}
+
+	// Scoped to the authenticated client's tenant. An authenticated client must
+	// not be able to revoke a token minted in someone else's tenant just by
+	// presenting the string.
+	//
+	// An access token cannot be revoked — it is a self-contained JWT with no
+	// server-side record, and it expires in 15 minutes. Revoking the refresh
+	// token stops the session continuing past that, which is the meaningful
+	// action. token_type_hint is accepted and ignored for the same reason.
+	revoked, err := h.authSvc.RevokeRefreshTokenForTenant(ctx, token, client.TenantID)
+	if err != nil {
+		// A storage fault is ours, not the caller's, and still must not change
+		// the response: a 500 here for a token that happens to exist would be
+		// exactly the oracle §2.2 forbids.
+		h.logger.Error().Err(err).Str("client_id", client.ClientID).
+			Msg("revoke: could not revoke refresh token")
+		return c.NoContent(http.StatusOK)
+	}
+
+	if revoked {
+		// Audited only when something was actually revoked, and attributed to the
+		// client that has now been authenticated — an audit row for every probe
+		// of an unknown string would bury the real revocations in noise.
+		h.auditRevoke(c, client)
+	} else {
+		h.logger.Debug().Str("client_id", client.ClientID).
+			Msg("revoke: token not found, already revoked, or belongs to another tenant")
 	}
 
 	return c.NoContent(http.StatusOK)
@@ -453,16 +484,25 @@ func (h *OAuthTokenHandler) auditCode(c echo.Context, action string, client *aut
 	h.audit.Log(c.Request().Context(), ev)
 }
 
-func (h *OAuthTokenHandler) auditRevoke(c echo.Context, clientID string) {
-	if h.audit == nil {
+// auditRevoke records a successful revocation against the client that performed
+// it. The client is fully authenticated by the time this is called, so tenant and
+// application are facts rather than caller-supplied values — which is the whole
+// point of an audit row for a destructive operation.
+func (h *OAuthTokenHandler) auditRevoke(c echo.Context, client *auth.AuthzClient) {
+	if h.audit == nil || client == nil {
 		return
 	}
+	tenantID := client.TenantID
+	appRowID := client.RowID
 	h.audit.Log(c.Request().Context(), audit.Event{
-		Action:       "oauth.token_revoked",
-		ResourceType: "oauth_client",
-		ResourceID:   clientID,
-		Status:       audit.StatusSuccess,
-		IPAddress:    c.RealIP(),
-		UserAgent:    c.Request().UserAgent(),
+		Action:        "oauth.token_revoked",
+		TenantID:      &tenantID,
+		ApplicationID: &appRowID,
+		ResourceType:  "oauth_client",
+		ResourceID:    client.ClientID,
+		Status:        audit.StatusSuccess,
+		AuthMethod:    "client_credentials",
+		IPAddress:     c.RealIP(),
+		UserAgent:     c.Request().UserAgent(),
 	})
 }

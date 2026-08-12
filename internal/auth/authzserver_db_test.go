@@ -12,6 +12,14 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
 
+// authzRedirectURI is the fixture client's single registered redirect_uri.
+//
+// Named rather than inlined because redemption now requires it UNCONDITIONALLY:
+// a test that passes "" is asserting the absent-parameter case, not "I don't
+// care about this argument", and the two must not be confused. See
+// TestAuthorizationCode_RedirectURIIsRequiredAtRedemption.
+const authzRedirectURI = "https://app.test/cb"
+
 // authzFixture is a real database with one tenant, one registered client and
 // one user, ready to issue and redeem authorization codes.
 type authzFixture struct {
@@ -45,7 +53,7 @@ func newAuthzFixture(t *testing.T) *authzFixture {
 	app, err := appSvc.CreateApplicationWithOptions(ctx, tenantID,
 		"authz-fixture-"+strconv.FormatInt(time.Now().UnixNano(), 10), "web",
 		[]string{"openid", "profile", "email"},
-		auth.AppUpdate{RedirectURIs: []string{"https://app.test/cb"}})
+		auth.AppUpdate{RedirectURIs: []string{authzRedirectURI}})
 	if err != nil {
 		t.Fatalf("CreateApplicationWithOptions: %v", err)
 	}
@@ -78,7 +86,7 @@ func (f *authzFixture) issue(t *testing.T) string {
 		TenantID:      f.tenantID,
 		ClientID:      f.clientID,
 		UserID:        f.userID,
-		RedirectURI:   "https://app.test/cb",
+		RedirectURI:   authzRedirectURI,
 		Scopes:        []string{"openid", "email"},
 		CodeChallenge: f.chal,
 		Nonce:         "n-test",
@@ -93,7 +101,7 @@ func TestAuthorizationCode_RoundTrip(t *testing.T) {
 	f := newAuthzFixture(t)
 	code := f.issue(t)
 
-	got, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "https://app.test/cb", f.verifier)
+	got, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, f.verifier)
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -141,10 +149,10 @@ func TestAuthorizationCode_SingleUse(t *testing.T) {
 	f := newAuthzFixture(t)
 	code := f.issue(t)
 
-	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "https://app.test/cb", f.verifier); err != nil {
+	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, f.verifier); err != nil {
 		t.Fatalf("first redemption failed: %v", err)
 	}
-	_, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "https://app.test/cb", f.verifier)
+	_, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, f.verifier)
 	if !errors.Is(err, auth.ErrAuthorizationCodeReplayed) {
 		t.Fatalf("second redemption error = %v, want ErrAuthorizationCodeReplayed", err)
 	}
@@ -159,13 +167,33 @@ func TestAuthorizationCode_WrongVerifierBurnsTheCode(t *testing.T) {
 	code := f.issue(t)
 
 	wrong := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "", wrong); !errors.Is(err, auth.ErrInvalidCodeVerifier) {
+	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, wrong); !errors.Is(err, auth.ErrInvalidCodeVerifier) {
 		t.Fatalf("wrong verifier error = %v, want ErrInvalidCodeVerifier", err)
 	}
 	// Now the CORRECT verifier must also fail — the code is gone.
-	_, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "", f.verifier)
+	_, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, f.verifier)
 	if err == nil {
 		t.Fatal("a code presented with a wrong verifier stayed redeemable — it must be burned")
+	}
+}
+
+func TestAuthorizationCode_RedirectURIIsRequiredAtRedemption(t *testing.T) {
+	// The redirect_uri check must have NO "omitted means skip" escape hatch.
+	//
+	// This is the regression test for the second blocker on PR #107. The check
+	// used to read `if redirectURI != "" && redirectURI != r.RedirectURI`, which
+	// made the one binding between a code and its delivery address opt-out at the
+	// attacker's discretion: a code lifted from one registered URI could be
+	// redeemed by simply not mentioning a URI at all, and
+	// TestAuthorizationCode_BoundToRedirectURI above would still have passed
+	// because it only ever sends a WRONG value, never an absent one.
+	f := newAuthzFixture(t)
+	code := f.issue(t)
+
+	_, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "", f.verifier)
+	if !errors.Is(err, auth.ErrInvalidAuthorizationCode) {
+		t.Fatalf("omitted redirect_uri error = %v, want ErrInvalidAuthorizationCode "+
+			"(an absent redirect_uri must not bypass the binding check)", err)
 	}
 }
 
@@ -180,12 +208,12 @@ func TestAuthorizationCode_BoundToClient(t *testing.T) {
 		t.Fatalf("create second client: %v", err)
 	}
 
-	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, other.ClientID, code, "", f.verifier); err == nil {
+	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, other.ClientID, code, authzRedirectURI, f.verifier); err == nil {
 		t.Fatal("client B redeemed client A's authorization code")
 	}
 	// Still redeemable by its real owner — the rejection above must not have
 	// consumed it.
-	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "", f.verifier); err != nil {
+	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, f.verifier); err != nil {
 		t.Errorf("owner could not redeem after a foreign client's attempt: %v", err)
 	}
 }
@@ -210,7 +238,9 @@ func TestAuthorizationCode_Expired(t *testing.T) {
 		auth.HashToken(code)); err != nil {
 		t.Fatalf("expire code: %v", err)
 	}
-	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "", f.verifier); err == nil {
+	// Real redirect_uri: with "" this would be refused by the redirect-binding
+	// check and would still pass even if expiry stopped being enforced.
+	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, f.verifier); err == nil {
 		t.Fatal("an expired authorization code was redeemed")
 	}
 }
@@ -235,12 +265,17 @@ func TestAuthorizationCode_LoginCodeCannotBeRedeemedHere(t *testing.T) {
 		INSERT INTO oauth_authorization_codes
 		    (tenant_id, client_id, user_id, code_hash, redirect_uri, scopes, grant_kind, expires_at)
 		VALUES ($1, $2, $3, $4, $5, '{}', $6, NOW() + INTERVAL '60 seconds')
-	`, f.tenantID, f.clientID, f.userID, auth.HashToken(raw), "https://app.test/cb",
+	`, f.tenantID, f.clientID, f.userID, auth.HashToken(raw), authzRedirectURI,
 		auth.GrantKindLoginCode); err != nil {
 		t.Fatalf("insert login_code: %v", err)
 	}
 
-	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, raw, "", f.verifier); err == nil {
+	// The real redirect_uri matters here more than anywhere: the login_code row
+	// above was inserted WITH authzRedirectURI, so passing "" would make this
+	// test pass on the redirect-binding check even if the grant_kind filter were
+	// deleted outright — silently disarming the PKCE-bypass trap it exists to
+	// guard. Only grant_kind may be what refuses this.
+	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, raw, authzRedirectURI, f.verifier); err == nil {
 		t.Fatal("SECURITY: /oauth/token redeemed a login_code — the grant_kind filter is missing")
 	}
 
@@ -281,7 +316,10 @@ func TestExchangeLoginCode_CannotRedeemAuthorizationCode(t *testing.T) {
 	}
 
 	// The authorization code must still be redeemable at its own endpoint.
-	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, "", f.verifier); err != nil {
+	// The real redirect_uri is required here — redemption no longer treats an
+	// absent one as "nothing to compare", so passing "" would fail this for a
+	// reason that has nothing to do with what the test is asserting.
+	if _, err := f.svc.RedeemAuthorizationCode(f.ctx, f.clientID, code, authzRedirectURI, f.verifier); err != nil {
 		t.Errorf("authorization code was damaged by the login-code query: %v", err)
 	}
 }
@@ -302,7 +340,7 @@ func TestLookupClient_ReportsConfidentiality(t *testing.T) {
 	if !client.FirstParty {
 		t.Error("first_party must default to true")
 	}
-	if len(client.RedirectURIs) != 1 || client.RedirectURIs[0] != "https://app.test/cb" {
+	if len(client.RedirectURIs) != 1 || client.RedirectURIs[0] != authzRedirectURI {
 		t.Errorf("RedirectURIs = %v, want the registered value", client.RedirectURIs)
 	}
 

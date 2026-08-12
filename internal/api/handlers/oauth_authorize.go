@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"context"
 	"embed"
 	"errors"
 	"html/template"
@@ -14,16 +13,33 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 //go:embed templates/*.html
 var authzTemplateFS embed.FS
 
-// authzTemplates are parsed once at init. A parse failure is a programming
-// error in an embedded asset — it cannot be fixed at runtime and every
-// authorize request would fail, so panicking at startup is the honest outcome
-// rather than discovering it on the first login.
-var authzTemplates = template.Must(template.ParseFS(authzTemplateFS, "templates/*.html"))
+// authzPages holds one fully-composed template per page, built at init.
+//
+// Every page file defines "content", so they cannot share a single template set
+// — the last one parsed would win and every page would render the same body.
+// Each page therefore gets its own set holding layout + that page, composed once
+// at startup. The earlier shape cloned the shared set and re-parsed the page
+// file on every request, which put a parse on the hot login path for a result
+// that never varies.
+//
+// A parse failure is a programming error in an embedded asset: it cannot be
+// fixed at runtime and every authorize request would fail, so panicking at
+// startup is the honest outcome rather than discovering it on the first login.
+var authzPages = func() map[string]*template.Template {
+	pages := []string{"login.html", "mfa.html", "error.html"}
+	out := make(map[string]*template.Template, len(pages))
+	for _, p := range pages {
+		out[p] = template.Must(template.ParseFS(authzTemplateFS,
+			"templates/layout.html", "templates/"+p))
+	}
+	return out
+}()
 
 // OAuth 2.0 error codes, RFC 6749 §4.1.2.1. Returned in the `error` query
 // parameter on the redirect, or rendered when redirecting is unsafe.
@@ -35,6 +51,36 @@ const (
 	errServerError             = "server_error"
 	errConsentRequired         = "consent_required"
 )
+
+// Outcome labels for metrics.OAuthAuthorizeRequests. Named constants rather than
+// inline strings because a typo in a label value does not fail a build or a test
+// — it silently creates a second, near-identical time series that no dashboard
+// is watching.
+const (
+	authzOutcomeCodeIssued         = "code_issued"
+	authzOutcomeLoginShown         = "login_shown"
+	authzOutcomeInvalidClient      = "invalid_client"
+	authzOutcomeInvalidRedirect    = "invalid_redirect"
+	authzOutcomeConsentRequired    = "consent_required"
+	authzOutcomeInvalidRequest     = "invalid_request"
+	authzOutcomeInvalidScope       = "invalid_scope"
+	authzOutcomeUnauthorizedClient = "unauthorized_client"
+	authzOutcomeMFAEnrollment      = "mfa_enrollment_required"
+	authzOutcomeLoginFailed        = "login_failed"
+	authzOutcomeRequestExpired     = "request_expired"
+	authzOutcomeError              = "error"
+)
+
+// countAuthorize records one authorize-endpoint outcome.
+//
+// Every terminal path through Authorize, LoginSubmit and MFASubmit increments
+// exactly once. The counter's value is entirely in the outcome distribution: the
+// client is told the same generic thing on most failures, so without this an
+// operator cannot tell a misconfigured redirect_uri from a credential-stuffing
+// run against the hosted login.
+func countAuthorize(outcome string) {
+	metrics.OAuthAuthorizeRequests.WithLabelValues(outcome).Inc()
+}
 
 // pageData is the view model for every hosted page.
 type pageData struct {
@@ -115,11 +161,13 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	client, err := h.authz.LookupClient(ctx, clientID)
 	if err != nil {
 		if errors.Is(err, auth.ErrClientNotFound) {
+			countAuthorize(authzOutcomeInvalidClient)
 			return h.renderError(c, http.StatusBadRequest, "Unknown application",
 				"This sign-in link refers to an application that does not exist or has been deactivated.",
 				"invalid client_id")
 		}
 		h.logger.Error().Err(err).Msg("authorize: client lookup failed")
+		countAuthorize(authzOutcomeError)
 		return h.renderError(c, http.StatusInternalServerError, "Something went wrong",
 			"We could not start the sign-in process. Please try again.", "")
 	}
@@ -127,6 +175,7 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	redirectURI, err := auth.ResolveRedirectURI(client, requestedRedirect)
 	if err != nil {
 		// Rendered, never redirected — see the comment above and error.html.
+		countAuthorize(authzOutcomeInvalidRedirect)
 		switch {
 		case errors.Is(err, auth.ErrNoRedirectURIsRegistered):
 			return h.renderError(c, http.StatusBadRequest, "Application is not configured",
@@ -143,15 +192,27 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	// as RFC 6749 §4.1.2.1 requires, with state echoed so the client can match
 	// the response to its own request.
 	state := q.Get("state")
+	if state == "" {
+		// Spec-permitted (RFC 6749 §4.1.1 marks state RECOMMENDED, not required),
+		// so this is a warning and not a rejection — refusing would break
+		// conformant clients. But a client that omits state has no way to bind the
+		// callback to the request it started, which is the CSRF defence for the
+		// redirect leg, so the omission is worth a log line an integrator can be
+		// pointed at.
+		h.logger.Warn().Str("client_id", client.ClientID).
+			Msg("authorize: request omitted state — no CSRF binding on the callback")
+	}
 
 	// ---- Phase 2: validate the request itself -------------------------------
 
 	if rt := q.Get("response_type"); rt != "code" {
+		countAuthorize(authzOutcomeInvalidRequest)
 		return h.redirectError(c, redirectURI, state, errUnsupportedResponseType,
 			"only response_type=code is supported")
 	}
 
 	if !auth.AllowsGrant(client, "authorization_code") {
+		countAuthorize(authzOutcomeUnauthorizedClient)
 		return h.redirectError(c, redirectURI, state, errUnauthorizedClient,
 			"this client is not permitted to use the authorization_code grant")
 	}
@@ -162,6 +223,7 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	// application a token for a user who was never told — the exact harm
 	// consent prevents. Failing closed makes the gap impossible to ship past.
 	if !client.FirstParty {
+		countAuthorize(authzOutcomeConsentRequired)
 		return h.redirectError(c, redirectURI, state, errConsentRequired,
 			"user consent is required for third-party clients and is not yet supported")
 	}
@@ -170,6 +232,7 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	method := q.Get("code_challenge_method")
 	if client.RequirePKCE || challenge != "" {
 		if challenge == "" {
+			countAuthorize(authzOutcomeInvalidRequest)
 			return h.redirectError(c, redirectURI, state, errInvalidRequest,
 				"code_challenge is required")
 		}
@@ -177,10 +240,12 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 		// plain, so an omitted method is an error rather than a silent
 		// downgrade to the weaker mode.
 		if method == "" {
+			countAuthorize(authzOutcomeInvalidRequest)
 			return h.redirectError(c, redirectURI, state, errInvalidRequest,
 				"code_challenge_method is required and must be S256")
 		}
 		if err := auth.ValidateCodeChallenge(challenge, method); err != nil {
+			countAuthorize(authzOutcomeInvalidRequest)
 			if errors.Is(err, auth.ErrUnsupportedChallengeMethod) {
 				return h.redirectError(c, redirectURI, state, errInvalidRequest,
 					"code_challenge_method must be S256")
@@ -195,6 +260,7 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	// to mint a token granting nothing, which reads to the client as a server
 	// bug rather than a registration problem.
 	if q.Get("scope") != "" && len(granted) == 0 {
+		countAuthorize(authzOutcomeInvalidScope)
 		return h.redirectError(c, redirectURI, state, errInvalidScope,
 			"none of the requested scopes are registered for this client")
 	}
@@ -208,6 +274,9 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 		State:         state,
 		Nonce:         q.Get("nonce"),
 		CodeChallenge: challenge,
+		// Captured from the LookupClient above so the login and MFA pages never
+		// re-query for a display name.
+		AppName: client.Name,
 	}
 
 	// ---- Phase 3: is the user already signed in here? -----------------------
@@ -224,9 +293,11 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	handle, err := h.sessions.SaveRequest(ctx, req)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("authorize: could not park request")
+		countAuthorize(authzOutcomeError)
 		return h.redirectError(c, redirectURI, state, errServerError, "could not start sign-in")
 	}
-	return h.renderLogin(c, http.StatusOK, client.Name, handle, "", "")
+	countAuthorize(authzOutcomeLoginShown)
+	return h.renderLogin(c, http.StatusOK, appName(req), handle, "", "")
 }
 
 // currentSession resolves the SSO cookie, or nil.
@@ -251,13 +322,14 @@ func (h *OAuthAuthorizeHandler) LoginSubmit(c echo.Context) error {
 	if err != nil {
 		// No redirect target is available: the handle is how we know where the
 		// user was going, and it is gone.
+		countAuthorize(authzOutcomeRequestExpired)
 		return h.renderError(c, http.StatusBadRequest, "Sign-in expired",
 			"This sign-in request has expired. Please start again from the application.", "")
 	}
 
 	email := c.FormValue("email")
 	password := c.FormValue("password")
-	appName := h.appName(ctx, req)
+	displayName := appName(req)
 
 	result, err := h.authSvc.Login(ctx, auth.LoginInput{
 		Email:    email,
@@ -275,15 +347,17 @@ func (h *OAuthAuthorizeHandler) LoginSubmit(c echo.Context) error {
 		// second factor. Not a credential failure — say so specifically rather
 		// than telling the user their correct password was wrong.
 		if errors.Is(err, auth.ErrMFARequiredByPolicy) {
+			countAuthorize(authzOutcomeMFAEnrollment)
 			return h.renderEnrollmentDeadEnd(c)
 		}
 		h.logger.Warn().Str("email", email).Str("client_id", req.ClientID).
 			Msg("authorize: hosted login failed")
+		countAuthorize(authzOutcomeLoginFailed)
 		// One message for every failure mode. Distinguishing "no such account"
 		// from "wrong password" here would make this page an account-existence
 		// oracle for any tenant's user base — the same rule /forgot-password
 		// follows.
-		return h.renderLogin(c, http.StatusUnauthorized, appName, handle, email,
+		return h.renderLogin(c, http.StatusUnauthorized, displayName, handle, email,
 			"Incorrect email or password.")
 	}
 
@@ -293,6 +367,7 @@ func (h *OAuthAuthorizeHandler) LoginSubmit(c echo.Context) error {
 	// this is a genuine dead end. Saying so explicitly beats a generic error the
 	// user cannot act on.
 	if result.MFAEnrollment != nil {
+		countAuthorize(authzOutcomeMFAEnrollment)
 		return h.renderEnrollmentDeadEnd(c)
 	}
 
@@ -305,9 +380,11 @@ func (h *OAuthAuthorizeHandler) LoginSubmit(c echo.Context) error {
 		req.OTPMethods = result.OTPChallenge.Methods
 		if err := h.sessions.UpdateRequest(ctx, handle, req); err != nil {
 			h.logger.Error().Err(err).Msg("authorize: could not attach OTP challenge")
+			countAuthorize(authzOutcomeError)
 			return h.redirectError(c, req.RedirectURI, req.State, errServerError, "sign-in failed")
 		}
-		return h.renderMFA(c, http.StatusOK, appName, handle, "")
+		countAuthorize(authzOutcomeLoginShown)
+		return h.renderMFA(c, http.StatusOK, displayName, handle, "")
 	}
 
 	return h.completeLogin(c, handle, req)
@@ -320,6 +397,7 @@ func (h *OAuthAuthorizeHandler) MFASubmit(c echo.Context) error {
 
 	req, err := h.sessions.GetRequest(ctx, handle)
 	if err != nil {
+		countAuthorize(authzOutcomeRequestExpired)
 		return h.renderError(c, http.StatusBadRequest, "Sign-in expired",
 			"This sign-in request has expired. Please start again from the application.", "")
 	}
@@ -327,7 +405,8 @@ func (h *OAuthAuthorizeHandler) MFASubmit(c echo.Context) error {
 		// Reaching the MFA page without having passed the password step. Send
 		// the user back rather than accepting a code for a login that never
 		// began.
-		return h.renderLogin(c, http.StatusBadRequest, h.appName(ctx, req), handle, "",
+		countAuthorize(authzOutcomeInvalidRequest)
+		return h.renderLogin(c, http.StatusBadRequest, appName(req), handle, "",
 			"Please sign in again.")
 	}
 
@@ -336,7 +415,8 @@ func (h *OAuthAuthorizeHandler) MFASubmit(c echo.Context) error {
 		Code:            c.FormValue("code"),
 	}); err != nil {
 		h.logger.Warn().Str("client_id", req.ClientID).Msg("authorize: OTP verification failed")
-		return h.renderMFA(c, http.StatusUnauthorized, h.appName(ctx, req), handle,
+		countAuthorize(authzOutcomeLoginFailed)
+		return h.renderMFA(c, http.StatusUnauthorized, appName(req), handle,
 			"That code is not valid. Please try again.")
 	}
 
@@ -360,6 +440,7 @@ func (h *OAuthAuthorizeHandler) completeLogin(c echo.Context, handle string, req
 		// The credentials were just accepted, so failing to re-read the user is
 		// a server fault, not a rejection.
 		h.logger.Error().Err(err).Msg("authorize: could not resolve authenticated user")
+		countAuthorize(authzOutcomeError)
 		return h.redirectError(c, req.RedirectURI, req.State, errServerError, "sign-in failed")
 	}
 
@@ -372,6 +453,7 @@ func (h *OAuthAuthorizeHandler) completeLogin(c echo.Context, handle string, req
 	sessHandle, err := h.sessions.CreateSession(ctx, sess)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("authorize: could not create SSO session")
+		countAuthorize(authzOutcomeError)
 		return h.redirectError(c, req.RedirectURI, req.State, errServerError, "sign-in failed")
 	}
 	h.setSessionCookie(c, sessHandle)
@@ -397,6 +479,7 @@ func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle stri
 	})
 	if err != nil {
 		h.logger.Error().Err(err).Msg("authorize: could not issue code")
+		countAuthorize(authzOutcomeError)
 		return h.redirectError(c, req.RedirectURI, req.State, errServerError, "sign-in failed")
 	}
 
@@ -409,6 +492,7 @@ func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle stri
 		// worse than saying so.
 		h.logger.Error().Err(err).Str("redirect_uri", req.RedirectURI).
 			Msg("authorize: registered redirect_uri does not parse")
+		countAuthorize(authzOutcomeError)
 		return h.renderError(c, http.StatusInternalServerError, "Something went wrong",
 			"We could not complete the sign-in.", "")
 	}
@@ -424,6 +508,11 @@ func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle stri
 	if handle != "" {
 		h.sessions.DeleteRequest(ctx, handle)
 	}
+	// Counted here rather than at each caller so both routes to a code — the SSO
+	// short-circuit in Authorize and the completed hosted login — land on the
+	// same series. Placed after the parse so a request that failed to redirect is
+	// counted only as an error, never as both.
+	countAuthorize(authzOutcomeCodeIssued)
 	return c.Redirect(http.StatusFound, target.String())
 }
 
@@ -510,15 +599,12 @@ func (h *OAuthAuthorizeHandler) render(c echo.Context, status int, page string, 
 	c.Response().Header().Set("Pragma", "no-cache")
 	c.Response().Header().Set("Referrer-Policy", "no-referrer")
 
-	// Clone per request: templates are shared and Lookup+Execute on the shared
-	// set is safe, but the two-file (layout + page) composition needs the page's
-	// "content" definition bound alongside "layout" for this render only.
-	t, err := authzTemplates.Clone()
-	if err == nil {
-		_, err = t.ParseFS(authzTemplateFS, "templates/"+page)
-	}
-	if err != nil {
-		h.logger.Error().Err(err).Str("page", page).Msg("authorize: template render failed")
+	// Pre-composed at init; Execute on a parsed template is safe to call
+	// concurrently. An unknown page name is a caller bug, not a runtime
+	// condition, but it is handled rather than allowed to nil-panic the request.
+	t, ok := authzPages[page]
+	if !ok {
+		h.logger.Error().Str("page", page).Msg("authorize: unknown template page")
 		return c.String(http.StatusInternalServerError, "internal error")
 	}
 	c.Response().Header().Set(echo.HeaderContentType, echo.MIMETextHTMLCharsetUTF8)
@@ -526,14 +612,14 @@ func (h *OAuthAuthorizeHandler) render(c echo.Context, status int, page string, 
 	return t.ExecuteTemplate(c.Response().Writer, "layout", data)
 }
 
-// appName resolves a display name for the page, falling back to the client_id.
+// appName is the display name for the page, read from the parked request rather
+// than re-queried. Falls back to the client_id when the client has no name.
 // Cosmetic only — never used for a security decision.
-func (h *OAuthAuthorizeHandler) appName(ctx context.Context, req *auth.AuthzRequest) string {
-	client, err := h.authz.LookupClient(ctx, req.ClientID)
-	if err != nil || client.Name == "" {
+func appName(req *auth.AuthzRequest) string {
+	if req.AppName == "" {
 		return req.ClientID
 	}
-	return client.Name
+	return req.AppName
 }
 
 // auditEvent records an authorize outcome. Fire-and-forget per the house rule:

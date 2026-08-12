@@ -76,6 +76,17 @@ type AuthzRequest struct {
 	Nonce         string   `json:"nonce"`
 	CodeChallenge string   `json:"code_challenge"`
 
+	// AppName is the client's display name, captured from the same LookupClient
+	// call that validated the client at /oauth/authorize.
+	//
+	// Carried here purely so the login and MFA pages do not re-query
+	// oauth_clients on every render — a page can be re-rendered on each failed
+	// password or OTP attempt, which is exactly the path that should not be
+	// doing avoidable DB work. Cosmetic: it is only ever interpolated into a
+	// page title and is never read for a security decision, which is why
+	// carrying it in the parked request is safe.
+	AppName string `json:"app_name,omitempty"`
+
 	// OTPSessionToken is set once a password has been accepted and a second
 	// factor is outstanding, carrying the challenge across to the MFA page.
 	OTPSessionToken string `json:"otp_session_token,omitempty"`
