@@ -94,10 +94,7 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	// would otherwise keep minting access tokens — now carrying admin_scope,
 	// because rotation re-reads the grant it was stolen ahead of. Signing an
 	// incoming administrator out once is a cheap price for that not being true.
-	if _, err = tx.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-	`, userID, tenantID); err != nil {
+	if err = RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
 		return fmt.Errorf("revoke sessions on admin grant activation: %w", err)
 	}
 	return nil

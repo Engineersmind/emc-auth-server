@@ -237,12 +237,8 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 		return fmt.Errorf("update password hash: %w", err)
 	}
 
-	_, err = tx.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-	`, userID, tenantID)
-	if err != nil {
-		return fmt.Errorf("revoke refresh tokens on password reset: %w", err)
+	if err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
+		return fmt.Errorf("revoke sessions on password reset: %w", err)
 	}
 
 	// The breach warning is per-password: clearing the marker means a user who
@@ -255,6 +251,15 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit reset-password tx: %w", err)
 	}
+
+	// Refuse the access tokens already in circulation.
+	//
+	// After the commit, so a Redis entry is never written for a transaction that
+	// rolled back. The refresh-token revocation above only stops RENEWAL, so
+	// without this a password reset left whoever held the old session — including
+	// an attacker the reset was meant to evict — working normally until their
+	// access token expired.
+	DenyAccountSessions(ctx, s.logger, userID, tenantID)
 
 	s.logger.Info().
 		Str("user_id", strconv.FormatInt(userID, 10)).

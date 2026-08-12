@@ -139,7 +139,11 @@ func (s *AccountBlockService) NotifyIfRisky(ctx context.Context, tenantID int64,
 			Int64("user_id", userID).
 			Str("risk", level).
 			Msg("risky sign-in — alerting account owner")
-		s.notify.auditUserEvent(ctx, audit.ActionAuthAccountBlocked, tenantID, appRowID, userID, map[string]any{
+		// An ALERT, not a block: the sign-in succeeded and the account is untouched.
+		// This used to be recorded as auth.account_blocked, which put "account
+		// blocked" in the activity feed one second after "login succeeded" on an
+		// account that was never blocked.
+		s.notify.auditUserEvent(ctx, audit.ActionAuthSuspiciousLogin, tenantID, appRowID, userID, map[string]any{
 			"reason": mailer.BlockReasonSuspiciousLogin,
 			"risk":   signals,
 		})
@@ -210,10 +214,7 @@ func (s *AccountBlockService) blockForFailedAttempts(ctx context.Context, tenant
 		}
 		return false // already blocked, or gone — nothing to notify about
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-	`, userID, tenantID); err != nil {
+	if err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
 		s.logger.Warn().Err(err).Int64("user_id", userID).Msg("lockout: session revocation failed")
 		return false
 	}
@@ -234,6 +235,14 @@ func (s *AccountBlockService) blockForFailedAttempts(ctx context.Context, tenant
 		s.logger.Warn().Err(err).Int64("user_id", userID).Msg("lockout: commit failed")
 		return false
 	}
+
+	// Refuse the outstanding access tokens too, now that the block is committed.
+	// Revoking the refresh rows only stops renewal, so without this a locked-out
+	// account keeps working for the remaining life of the token it already holds —
+	// the opposite of a lockout. After the commit because a Redis entry cannot be
+	// rolled back: denying on a block that failed to commit would sign a user out on
+	// the strength of a write that never landed.
+	DenyAccountSessions(ctx, s.logger, userID, tenantID)
 
 	s.logger.Warn().Int64("user_id", userID).Int64("tenant_id", tenantID).Msg("account blocked after repeated failed sign-ins")
 	s.notify.auditUserEvent(ctx, audit.ActionAuthAccountBlocked, tenantID, appRowID, userID, map[string]any{

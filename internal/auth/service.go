@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
+	"github.com/engineersmind/emc-auth-server/internal/requestctx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -30,13 +32,38 @@ type AuthService struct {
 	verifSvc *VerificationService // nil when email verification is not configured
 	blockSvc *AccountBlockService // nil when brute-force lockout is not configured
 	brchSvc  *BreachService       // nil when breached-password detection is off
-	logger   zerolog.Logger
+	// policySvc resolves per-tenant session lifetime policy. Never nil after
+	// NewAuthService: a nil-safe zero value would mean every deployment that
+	// forgot to wire it silently reverted to unbounded sessions, so the
+	// constructor always installs one.
+	policySvc *SessionPolicyService
+	logger    zerolog.Logger
 }
 
 // NewAuthService creates an AuthService.
 func NewAuthService(pool *pgxpool.Pool, jwtSvc *JWTService, logger zerolog.Logger) *AuthService {
-	return &AuthService{pool: pool, jwtSvc: jwtSvc, logger: logger}
+	return &AuthService{
+		pool:      pool,
+		jwtSvc:    jwtSvc,
+		policySvc: NewSessionPolicyService(pool, logger),
+		logger:    logger,
+	}
 }
+
+// WithSessionPolicy replaces the session policy resolver, so the process can
+// share one cache between the auth service and the admin write path that
+// invalidates it. Optional — NewAuthService already installs a working resolver.
+func (s *AuthService) WithSessionPolicy(policySvc *SessionPolicyService) *AuthService {
+	if policySvc != nil {
+		s.policySvc = policySvc
+	}
+	return s
+}
+
+// SessionPolicy exposes the resolver so callers that must apply the same policy
+// (the reaper's retention window, the admin API's validation) read it from one
+// place instead of re-deriving it.
+func (s *AuthService) SessionPolicy() *SessionPolicyService { return s.policySvc }
 
 // WithTOTP attaches a TOTPService and Redis client so the auth service can enforce
 // TOTP on login. Call this after NewAuthService when TOTP is enabled.
@@ -120,9 +147,32 @@ type LoginInput struct {
 	ClientSecret string
 	Email        string
 	Password     string
+	// Persistent is the user's "remember me" choice. It selects which idle clock
+	// the tenant's session policy applies — the long one for a trusted personal
+	// device, the short one otherwise — and is refused outright when the policy
+	// sets allow_persistent = false.
+	//
+	// Defaults to false, which is the safe direction: an unset flag yields the
+	// shorter session, so a client that has not been updated to send it cannot
+	// accidentally opt its users into month-long sessions on shared machines.
+	Persistent bool
 }
 
-// AuthResult is returned by both Register and Login (when TOTP is not required).
+// RegisterResult describes the account Register created.
+//
+// No tokens: registration does not sign the user in, so there is nothing to hand
+// back but the identity of what was made. See the end of Register for why.
+type RegisterResult struct {
+	UserID   int64  `json:"user_id"`
+	TenantID int64  `json:"tenant_id"`
+	Email    string `json:"email"`
+	Role     string `json:"role,omitempty"`
+	// ApplicationID is set when the account belongs to one application's isolated
+	// user base, nil for a tenant-level account.
+	ApplicationID *int64 `json:"application_id,omitempty"`
+}
+
+// AuthResult is returned by Login (when TOTP is not required) and by token refresh.
 type AuthResult struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
@@ -235,12 +285,44 @@ func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int6
 	return perms, rows.Err()
 }
 
-// issueTokenPair signs a JWT access token and generates a refresh token.
-// sessionFamilyID is nil for new logins (the new token becomes its own family root);
-// for token rotation it carries the existing family id forward.
+// sessionContext describes the session a token pair is being minted into.
+//
+// Grouped into a struct rather than added as parameters because issueTokenPair
+// has eight call sites (password login, registration, MFA completion, magic link,
+// both social callbacks, SAML, and the two refresh paths) and the set of
+// per-session facts keeps growing — persistence, authentication time, methods
+// used, and the family's absolute deadline all arrived together. A struct means
+// the next addition has one zero value to define instead of eight call sites to
+// edit, and a caller that omits a field gets the documented default rather than
+// whatever the parameter order happened to put there.
+type sessionContext struct {
+	// sessionID is nil for a new session (a user_sessions row is created) and set
+	// when rotating a credential within an existing one.
+	sessionID *int64
+	// persistent records whether the user asked to be remembered, selecting which
+	// idle clock the policy applies. False — the safer of the two — is the zero
+	// value.
+	persistent bool
+	// amr lists the authentication methods actually used (OIDC "amr").
+	amr []string
+	// authTime is when the user proved who they were. Zero means "now", correct for
+	// a fresh login. Rotation leaves it alone: it is already on the session row, so
+	// there is nothing to carry forward and nothing to get wrong.
+	authTime time.Time
+}
+
+// issueTokenPair signs a JWT access token and persists a matching refresh token.
+//
 // appID is the string-encoded oauth_clients.id when the token is issued through a
 // registered application; pass "" when no application context is present.
-func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sessionFamilyID *int64, appID string) (*AuthResult, error) {
+//
+// Ordering note: the refresh-token row is inserted BEFORE the JWT is signed, and
+// the signing happens inside the same transaction. Both are deliberate. A new
+// session's family id is the inserted row's own primary key, and that id is the
+// "sid" claim, so the row must exist before the token can be signed — and signing
+// inside the transaction means a signing failure rolls the row back instead of
+// leaving a live refresh token that no access token was ever paired with.
+func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sess sessionContext, appID string) (*AuthResult, error) {
 	claims := &Claims{
 		UserID:      strconv.FormatInt(userID, 10),
 		TenantID:    strconv.FormatInt(tenantID, 10),
@@ -261,60 +343,150 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 	}
 	claims.AdminScope, claims.AdminApps = adminScope, adminApps
 
-	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, claims)
-	if err != nil {
-		return nil, fmt.Errorf("sign access token: %w", err)
-	}
-
 	rawRefresh, err := GenerateRefreshToken()
 	if err != nil {
 		return nil, fmt.Errorf("generate refresh token: %w", err)
 	}
 	refreshHash := HashToken(rawRefresh)
 
-	if sessionFamilyID != nil {
-		// Token rotation: inherit the existing session family.
-		_, err = s.pool.Exec(ctx, `
-			INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, session_family_id)
-			VALUES ($1, $2, $3, $4, $5)
-		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL), *sessionFamilyID)
-	} else {
-		// New login: insert with session_family_id=0, then set it to the row's
-		// own id inside a transaction.
-		//
-		// A single-statement CTE (INSERT ... RETURNING id, then UPDATE ... FROM
-		// that CTE) cannot do this: per Postgres's documented WITH semantics,
-		// the outer UPDATE scans refresh_tokens against the snapshot taken
-		// before the CTE's own write, so it never sees the row the CTE just
-		// inserted into that same table — the join matches zero rows and
-		// session_family_id is silently left at 0 forever (verified directly
-		// against Postgres; this previously affected every fresh login/
-		// registration, not just a transient window). The explicit transaction
-		// here gives the same "no visible family_id=0 window" guarantee the
-		// CTE was meant to provide, without relying on same-statement
-		// visibility that Postgres doesn't offer.
-		var newID int64
-		var tx pgx.Tx
-		tx, err = s.pool.Begin(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("begin refresh token tx: %w", err)
-		}
-		defer tx.Rollback(ctx) //nolint:errcheck
+	// Session lifetime is per-tenant policy, not a global constant: see
+	// migration 00067. Resolution never fails — it degrades to platform defaults —
+	// so a policy-table problem cannot stop anybody signing in.
+	policy := s.policySvc.Resolve(ctx, tenantID, parseAppID(appID))
 
-		err = tx.QueryRow(ctx, `
-			INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, session_family_id)
-			VALUES ($1, $2, $3, $4, 0)
-			RETURNING id
-		`, userID, tenantID, refreshHash, time.Now().UTC().Add(RefreshTokenTTL)).Scan(&newID)
-		if err == nil {
-			_, err = tx.Exec(ctx, `UPDATE refresh_tokens SET session_family_id = $1 WHERE id = $1`, newID)
-		}
-		if err == nil {
-			err = tx.Commit(ctx)
-		}
+	now := time.Now().UTC()
+	authTime := sess.authTime
+	if authTime.IsZero() {
+		authTime = now
 	}
+
+	// The idle deadline is measured from NOW (this rotation is the activity that
+	// resets it), while the absolute deadline is measured from the original
+	// authentication and never moves. Deriving both from authTime would make the
+	// idle clock un-resettable; deriving both from now would make the absolute cap
+	// slide forever, which is the bug the cap exists to prevent.
+	//
+	// On rotation the absolute deadline is not recomputed at all — it is already on
+	// the session row and stays there. Only the idle clock is written.
+	_, absoluteExpiresAt := policy.Deadlines(authTime, sess.persistent)
+	idleExpiresAt := now.Add(policy.IdleTTLFor(sess.persistent))
+	if idleExpiresAt.After(absoluteExpiresAt) {
+		idleExpiresAt = absoluteExpiresAt
+	}
+
+	amr := sess.amr
+	if amr == nil {
+		amr = []string{}
+	}
+	device := requestctx.FromContext(ctx)
+
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return nil, fmt.Errorf("begin session tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var sessionID int64
+	// tokenExpiresAt is the credential's own deadline, distinct from the session's.
+	// Clamped to the session's absolute cap so a token can never outlive the session
+	// that issued it.
+	var tokenExpiresAt time.Time
+	// evicted holds sessions the concurrent-session cap displaced. Denied only after
+	// a successful commit — see the end of this function.
+	var evicted []int64
+
+	if sess.sessionID != nil {
+		// Rotation. The session row already holds the authentication context and the
+		// absolute cap; all that changes is that it has been used again.
+		//
+		// This is the change the parent table buys: nothing is copied forward, so no
+		// rotation path can drop a field and silently alter the session's character.
+		// Re-reading the absolute deadline rather than trusting the caller also means
+		// a policy change cannot retroactively extend a session already in flight.
+		sessionID = *sess.sessionID
+		// revoked_at IS NULL is re-checked here, not just in the caller's lookup.
+		//
+		// The caller read the session a moment ago; a revoke landing in between would
+		// otherwise have this UPDATE touch a revoked session and mint a token against
+		// it. The token would be unusable — every read requires a live session — but
+		// the caller would be handed it as though the refresh had succeeded. Failing
+		// here instead turns the race into the correct answer: the session is gone,
+		// so the refresh is invalid.
+		if err := tx.QueryRow(ctx, `
+			UPDATE user_sessions
+			SET last_seen_at = NOW(),
+			    idle_expires_at = LEAST($2, absolute_expires_at),
+			    updated_at = NOW()
+			WHERE id = $1 AND revoked_at IS NULL
+			RETURNING absolute_expires_at
+		`, sessionID, idleExpiresAt).Scan(&tokenExpiresAt); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, ErrInvalidRefreshToken
+			}
+			return nil, fmt.Errorf("touch session: %w", err)
+		}
+	} else {
+		// New session. Serialise concurrent logins for this user before counting
+		// live sessions: the cap's count-then-insert would otherwise let N
+		// simultaneous logins each see room for one more and each take it,
+		// overshooting by N. The lock is transaction-scoped, so the commit or
+		// rollback below releases it without an explicit unlock.
+		lockA, lockB := sessionCapLockKey(userID, tenantID)
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, lockA, lockB); err != nil {
+			return nil, fmt.Errorf("acquire session cap lock: %w", err)
+		}
+		evicted, err = enforceSessionCap(ctx, tx, userID, tenantID, policy.MaxConcurrentSessions)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO user_sessions
+			    (user_id, tenant_id, application_id, user_agent, device_hint, ip_address,
+			     auth_time, amr, is_persistent, idle_expires_at, absolute_expires_at)
+			VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, '')::INET,
+			        $7, $8, $9, $10, $11)
+			RETURNING id
+		`, userID, tenantID, parseAppID(appID), device.UserAgent, DeviceHint(device.UserAgent),
+			device.IPAddress, authTime, amr, sess.persistent,
+			idleExpiresAt, absoluteExpiresAt).Scan(&sessionID); err != nil {
+			return nil, fmt.Errorf("create session: %w", err)
+		}
+		tokenExpiresAt = absoluteExpiresAt
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO refresh_tokens
+		    (user_id, tenant_id, token_hash, expires_at, session_id, session_family_id, last_used_at)
+		VALUES ($1, $2, $3, $4, $5, $5, NOW())
+	`, userID, tenantID, refreshHash, tokenExpiresAt, sessionID); err != nil {
 		return nil, fmt.Errorf("persist refresh token: %w", err)
+	}
+
+	// "sid" is the OIDC session identifier, and now genuinely identifies a row.
+	// It is what makes a single session revocable on its own: without it the access
+	// token carries no session identity and there is no way to invalidate one.
+	claims.SessionID = strconv.FormatInt(sessionID, 10)
+
+	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, claims)
+	if err != nil {
+		return nil, fmt.Errorf("sign access token: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit refresh token: %w", err)
+	}
+
+	// Only now deny the sessions the cap displaced.
+	//
+	// After the commit, and NOT in a defer: a defer registered at eviction time also
+	// runs when the function returns an error — a failed JWT signing, say — and the
+	// transaction has then rolled back, so the eviction never happened. Denying in
+	// that case would sign users out of sessions that were never actually evicted.
+	// A Redis entry cannot be rolled back, so it must not be written until the
+	// database says the eviction is real.
+	for _, id := range evicted {
+		s.denySession(ctx, id)
 	}
 
 	return &AuthResult{
@@ -322,7 +494,7 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 		RefreshToken: rawRefresh,
 		TokenType:    "Bearer",
 		ExpiresIn:    int(AccessTokenTTL.Seconds()),
-		ExpiresAt:    time.Now().UTC().Add(AccessTokenTTL).Unix(),
+		ExpiresAt:    now.Add(AccessTokenTTL).Unix(),
 	}, nil
 }
 
@@ -341,7 +513,7 @@ func (s *AuthService) authenticateApp(ctx context.Context, clientID, clientSecre
 
 // Register creates a new user. The target tenant comes either from an
 // authenticated application (ClientID + ClientSecret) or from TenantSlug.
-func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResult, error) {
+func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*RegisterResult, error) {
 	in.Email = emailaddr.Normalize(in.Email)
 
 	var tenantID int64
@@ -453,13 +625,25 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*AuthResu
 	// earliest useful moment to tell the user. Detached; never blocks registration.
 	s.brchSvc.Notify(ctx, tenantID, appRowID, userID, in.Email, in.Password)
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
-	if err != nil {
-		s.logger.Warn().Err(err).Msg("register: failed to load permissions, continuing with empty set")
-		perms = []string{}
-	}
-
-	return s.issueTokenPair(ctx, userID, tenantID, in.Email, roleName, perms, nil, appID)
+	// Registration deliberately does NOT sign the user in.
+	//
+	// It used to return a token pair, which meant creating a session — so every new
+	// account began with a session nobody had asked for. A client that registered and
+	// then logged in (the normal shape, and what our own portal does) produced two
+	// sessions seconds apart, and the user's device list opened on a phantom entry
+	// they could not explain.
+	//
+	// Creating an account and starting a session are separate acts, and only the
+	// second is a statement about a device. The portal already worked this way — its
+	// register mutation discards the response and routes to /login — so the tokens
+	// were unused by the one client we control.
+	return &RegisterResult{
+		UserID:        userID,
+		TenantID:      tenantID,
+		ApplicationID: appRowID,
+		Email:         in.Email,
+		Role:          roleName,
+	}, nil
 }
 
 // dummyPasswordHash has no known matching plaintext. Login pads every attempt
@@ -601,7 +785,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		perms = []string{}
 	}
 
-	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms); err != nil {
+	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent); err != nil {
 		return nil, err
 	} else if gate != nil {
 		return gate, nil
@@ -617,7 +801,8 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		appID = strconv.FormatInt(id, 10)
 	}
 
-	tokens, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, nil, appID)
+	tokens, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms,
+		sessionContext{persistent: in.Persistent, amr: []string{AMRPassword}}, appID)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +822,12 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 //     challenge. Fails closed on a policy read error — issuing tokens when we
 //     cannot prove the app does NOT require MFA would turn a transient DB
 //     error into a silent policy bypass.
-func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string) (*LoginResult, error) {
+//
+// persistent carries the caller's "remember me" choice into the challenge state so
+// the finally-issued session honours it. Threaded through rather than re-read at the
+// completion step because the completion request has no access to it: the user
+// ticked the box on the password form, one or more requests ago.
+func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool) (*LoginResult, error) {
 	if s.totpSvc == nil || s.redisCli == nil {
 		return nil, nil
 	}
@@ -687,7 +877,7 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	}
 
 	if len(methods) > 0 {
-		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods)
+		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent)
 		if err != nil {
 			return nil, fmt.Errorf("create OTP session: %w", err)
 		}
@@ -698,7 +888,7 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// (re)enroll a permitted method before finishing login; otherwise the login
 	// proceeds (the app does not enforce MFA).
 	if appRowID != 0 && mode == MFAModeRequired {
-		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods)
+		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent)
 		if err != nil {
 			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
 		}
@@ -773,7 +963,11 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 
 	// session.AppID carries the application context through the challenge so
 	// an app-authenticated login keeps its app_id claim after the OTP step.
-	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms, nil, session.AppID)
+	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
+		sessionContext{
+			persistent: session.Persistent,
+			amr:        []string{AMRPassword, AMROTP, AMRMFA},
+		}, session.AppID)
 }
 
 // EnrollPending generates the TOTP secret for a forced-enrollment login
@@ -898,7 +1092,11 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 
 	s.clearOTPSession(ctx, key)
 
-	tokens, err := s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms, nil, session.AppID)
+	tokens, err := s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
+		sessionContext{
+			persistent: session.Persistent,
+			amr:        []string{AMRPassword, AMROTP, AMRMFA},
+		}, session.AppID)
 	if err != nil {
 		return nil, session, err
 	}
@@ -908,15 +1106,16 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 // createOTPSession stores pre-auth user state in Redis and returns a challenge
 // token. When the user's active methods include email, a one-time code is
 // minted and sent to the account's inbox alongside the challenge.
-func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string) (*OTPChallenge, error) {
+func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool) (*OTPChallenge, error) {
 	sessionToken, err := s.storePreAuthSession(ctx, otpSessionKey, OTPSessionTTL, OTPSession{
-		UserID:   userID,
-		TenantID: tenantID,
-		Email:    email,
-		RoleName: roleName,
-		Perms:    perms,
-		AppID:    appID,
-		Methods:  methods,
+		UserID:     userID,
+		TenantID:   tenantID,
+		Email:      email,
+		RoleName:   roleName,
+		Perms:      perms,
+		AppID:      appID,
+		Methods:    methods,
+		Persistent: persistent,
 	})
 	if err != nil {
 		return nil, err
@@ -976,15 +1175,16 @@ func (s *AuthService) ResendLoginOTP(ctx context.Context, otpSessionToken string
 
 // createMFAEnrollmentSession stores pre-auth state for a forced enrollment and
 // returns the challenge handed back by Login instead of tokens.
-func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, allowedMethods []string) (*MFAEnrollmentChallenge, error) {
+func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, allowedMethods []string, persistent bool) (*MFAEnrollmentChallenge, error) {
 	enrollmentToken, err := s.storePreAuthSession(ctx, mfaEnrollKey, MFAEnrollmentSessionTTL, OTPSession{
-		UserID:   userID,
-		TenantID: tenantID,
-		Email:    email,
-		RoleName: roleName,
-		Perms:    perms,
-		AppID:    appID,
-		Methods:  allowedMethods,
+		UserID:     userID,
+		TenantID:   tenantID,
+		Email:      email,
+		RoleName:   roleName,
+		Perms:      perms,
+		AppID:      appID,
+		Methods:    allowedMethods,
+		Persistent: persistent,
 	})
 	if err != nil {
 		return nil, err
@@ -1129,33 +1329,52 @@ type GraceResult struct {
 	Email       string
 	Role        string
 	Permissions []string
+	// SessionID is the session the grace-path request belongs to.
+	//
+	// Carried because the claims synthesised from this result are what the request
+	// then authenticates with, and claims without a session id are exempt from the
+	// per-session revocation check. Omitting it left a ten-second window — the grace
+	// period — in which a single-session revoke was not enforced.
+	SessionID int64
 }
 
 // Refresh rotates a refresh token pair (AUTH-03).
 func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*AuthResult, error) {
 	hash := HashToken(rawRefreshToken)
 
-	var tokenID, userID, tenantID, sessionFamilyID int64
+	// Joined to the session, and BOTH must be live: the token has its own expiry and
+	// single-use lifetime, while the session carries the idle and absolute clocks and
+	// the revocation flag. Either one being dead means this refresh must fail, and
+	// the join is what makes a session revoke instantly effective on every token it
+	// issued without having to touch those token rows first.
+	var tokenID, userID, tenantID, sessionID int64
+	var carried sessionContext
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, user_id, tenant_id, session_family_id
-		FROM refresh_tokens
-		WHERE token_hash = $1
-		  AND revoked_at IS NULL
-		  AND expires_at > NOW()
-	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionFamilyID)
+		SELECT rt.id, s.user_id, s.tenant_id, s.id,
+		       s.is_persistent, s.auth_time, s.amr
+		FROM refresh_tokens rt
+		JOIN user_sessions s ON s.id = rt.session_id
+		WHERE rt.token_hash = $1
+		  AND `+LiveTokenWhere("rt.")+`
+		  AND `+LiveSessionWhere("s."),
+		hash).Scan(&tokenID, &userID, &tenantID, &sessionID,
+		&carried.persistent, &carried.authTime, &carried.amr)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken
 		}
 		return nil, fmt.Errorf("lookup refresh token: %w", err)
 	}
+	carried.sessionID = &sessionID
 
 	_, err = s.pool.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1
-	`, tokenID)
+		UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = $2, updated_at = NOW()
+		WHERE id = $1
+	`, tokenID, RevokeReasonRotated)
 	if err != nil {
 		return nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
+	metrics.SessionRevocations.WithLabelValues(RevokeReasonRotated).Inc()
 
 	var email, roleName string
 	var roleID, applicationID *int64
@@ -1178,7 +1397,7 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		perms = []string{}
 	}
 
-	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, appIDClaim(applicationID))
+	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, carried, appIDClaim(applicationID))
 }
 
 // appIDClaim renders a nullable users.application_id into the string form used
@@ -1195,32 +1414,32 @@ func appIDClaim(applicationID *int64) string {
 // gracePeriod is the window in which a concurrent rotation is not treated as a replay.
 const gracePeriod = 10 // seconds
 
-// revokeFamily marks every non-revoked token in a session family as revoked.
-// Called on replay detection to terminate all tokens an attacker might hold.
-func (s *AuthService) revokeFamily(ctx context.Context, familyID int64) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE refresh_tokens
-		SET revoked_at = NOW()
-		WHERE session_family_id = $1 AND revoked_at IS NULL
-	`, familyID)
-	return err
-}
-
-// checkGraceWindow looks for a valid token in the given family that was issued
-// within the last gracePeriod seconds. Used when concurrent requests arrive on
-// the same expiring access token — one rotates, the other hits the grace path.
-func (s *AuthService) checkGraceWindow(ctx context.Context, familyID int64) (*GraceResult, error) {
-	var userID, tenantID int64
+// checkGraceWindow looks for a token in the given session that was issued within
+// the last gracePeriod seconds. Used when concurrent requests arrive on the same
+// expiring access token — one rotates, the other hits the grace path.
+//
+// Scoped by user_id and tenant_id as well as session id. The caller already knows
+// both from the presented token, and passing them turns a lookup that USED to be
+// able to return a different account's identity into one that provably cannot: the
+// historical session_family_id = 0 bug (migration 00068, step 3) put many users'
+// tokens in the same family, and this function's result becomes the caller's
+// identity for the rest of the request.
+//
+// The session must still be live, not merely have a recent token: a session revoked
+// during the grace window must not be waved through by a token minted a moment
+// before the revoke.
+func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, sessionID int64) (*GraceResult, error) {
 	err := s.pool.QueryRow(ctx, `
-		SELECT user_id, tenant_id
-		FROM refresh_tokens
-		WHERE session_family_id = $1
-		  AND revoked_at IS NULL
-		  AND expires_at > NOW()
-		  AND created_at > NOW() - make_interval(secs => $2)
-		ORDER BY created_at DESC
+		SELECT 1
+		FROM refresh_tokens rt
+		JOIN user_sessions s ON s.id = rt.session_id
+		WHERE rt.session_id = $1 AND s.user_id = $2 AND s.tenant_id = $3
+		  AND rt.created_at > NOW() - make_interval(secs => $4)
+		  AND `+LiveTokenWhere("rt.")+`
+		  AND `+LiveSessionWhere("s.")+`
+		ORDER BY rt.created_at DESC
 		LIMIT 1
-	`, familyID, gracePeriod).Scan(&userID, &tenantID)
+	`, sessionID, userID, tenantID, gracePeriod).Scan(new(int))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken
@@ -1255,6 +1474,7 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, familyID int64) (*Gr
 		Email:       email,
 		Role:        roleName,
 		Permissions: perms,
+		SessionID:   sessionID,
 	}, nil
 }
 
@@ -1309,23 +1529,47 @@ func (s *AuthService) ResolveTokenOwner(ctx context.Context, rawToken string) (*
 func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redisCli *redis.Client) (*AuthResult, *GraceResult, error) {
 	hash := HashToken(rawToken)
 
-	// Initial read — fetch token row including revoked ones so we can detect replay.
-	var tokenID, userID, tenantID, sessionFamilyID int64
-	var revokedAt *time.Time
+	// Initial read — fetch the token row WITHOUT the liveness predicate, including
+	// revoked and expired rows.
+	//
+	// This must stay unfiltered even though every other read applies the liveness
+	// predicates. Replay detection depends on recognising a token that exists but is
+	// no longer live: filtering here would turn a replayed token into ErrNoRows →
+	// "invalid token", silently downgrading a security event into a routine failure
+	// and never revoking the session the attacker holds. The liveness checks are
+	// applied explicitly further down instead, after the lock.
+	//
+	// The session join is a LEFT JOIN for the same reason the token filter is absent:
+	// a token whose session row is gone (reaped, or cascade-deleted with the user)
+	// must still be recognisable rather than vanishing into "invalid token".
+	var tokenID, userID, tenantID, sessionID int64
+	var revokedAt, sessionRevokedAt *time.Time
 	var expiresAt time.Time
+	var sessionIdleExpires, sessionAbsoluteExpires *time.Time
+	var carried sessionContext
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, user_id, tenant_id, session_family_id, revoked_at, expires_at
-		FROM refresh_tokens
-		WHERE token_hash = $1
-	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionFamilyID, &revokedAt, &expiresAt)
+		SELECT rt.id, rt.user_id, rt.tenant_id,
+		       COALESCE(rt.session_id, rt.session_family_id),
+		       rt.revoked_at, rt.expires_at,
+		       COALESCE(s.is_persistent, false),
+		       COALESCE(s.auth_time, rt.created_at),
+		       COALESCE(s.amr, '{}'),
+		       s.revoked_at, s.idle_expires_at, s.absolute_expires_at
+		FROM refresh_tokens rt
+		LEFT JOIN user_sessions s ON s.id = rt.session_id
+		WHERE rt.token_hash = $1
+	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionID, &revokedAt, &expiresAt,
+		&carried.persistent, &carried.authTime, &carried.amr,
+		&sessionRevokedAt, &sessionIdleExpires, &sessionAbsoluteExpires)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, ErrInvalidRefreshToken
 		}
 		return nil, nil, fmt.Errorf("lookup refresh token: %w", err)
 	}
+	carried.sessionID = &sessionID
 
-	lockKey := fmt.Sprintf("renewal:lock:family:%d", sessionFamilyID)
+	lockKey := fmt.Sprintf("renewal:lock:session:%d", sessionID)
 
 	acquired := false
 	if redisCli != nil {
@@ -1342,10 +1586,10 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	}
 
 	if !acquired {
-		// Another request is currently rotating this family. Wait briefly then
+		// Another request is currently rotating this session. Wait briefly then
 		// check whether a fresh token was issued within the grace window.
 		time.Sleep(300 * time.Millisecond)
-		grace, err := s.checkGraceWindow(ctx, sessionFamilyID)
+		grace, err := s.checkGraceWindow(ctx, userID, tenantID, sessionID)
 		return nil, grace, err
 	}
 
@@ -1365,23 +1609,41 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		return nil, nil, fmt.Errorf("re-read token after lock: %w", err)
 	}
 	if currentRevoked != nil {
-		if err := s.revokeFamily(ctx, sessionFamilyID); err != nil {
-			s.logger.Error().Err(err).Int64("family_id", sessionFamilyID).Msg("renewal: family revocation failed")
+		if _, err := s.revokeSession(ctx, userID, tenantID, sessionID, RevokeReasonReplay); err != nil {
+			s.logger.Error().Err(err).Int64("session_id", sessionID).Msg("renewal: session revocation failed")
 		}
 		return nil, nil, ErrTokenReplay
 	}
 
-	if expiresAt.Before(time.Now().UTC()) {
+	// Lifetime checks, applied here rather than in the lookup query so that a
+	// replayed token still reaches the session revoke above.
+	//
+	// An expired or revoked SESSION is ErrInvalidRefreshToken, NOT a replay: the user
+	// did nothing wrong — they were away too long, or an operator ended the session —
+	// and reporting it as a replay would flood the audit trail with false positives
+	// and alarm every operator watching that metric.
+	//
+	// The session-side nils are the mid-rolling-deploy case: a token inserted by the
+	// previous binary has no session_id, so the LEFT JOIN found no parent. Treated as
+	// "no session-level limit" rather than as expired, because failing those closed
+	// would sign out every user still on the old binary.
+	nowUTC := time.Now().UTC()
+	if expiresAt.Before(nowUTC) ||
+		sessionRevokedAt != nil ||
+		(sessionAbsoluteExpires != nil && sessionAbsoluteExpires.Before(nowUTC)) ||
+		(sessionIdleExpires != nil && sessionIdleExpires.Before(nowUTC)) {
 		return nil, nil, ErrInvalidRefreshToken
 	}
 
 	// Revoke the presented token.
 	_, err = s.pool.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = $1
-	`, tokenID)
+		UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = $2, updated_at = NOW()
+		WHERE id = $1
+	`, tokenID, RevokeReasonRotated)
 	if err != nil {
 		return nil, nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
+	metrics.SessionRevocations.WithLabelValues(RevokeReasonRotated).Inc()
 
 	// Fresh user load from DB — catches suspensions, role changes, or email bans
 	// that occurred during the access token's lifetime (key security gate).
@@ -1406,7 +1668,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		perms = []string{}
 	}
 
-	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, &sessionFamilyID, appIDClaim(applicationID))
+	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, carried, appIDClaim(applicationID))
 	return result, nil, err
 }
 
@@ -1449,16 +1711,5 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 	return token, int(AccessTokenTTL.Seconds()), nil
 }
 
-// Logout revokes a refresh token (AUTH-04).
-func (s *AuthService) Logout(ctx context.Context, rawRefreshToken string) error {
-	hash := HashToken(rawRefreshToken)
-	_, err := s.pool.Exec(ctx, `
-		UPDATE refresh_tokens
-		SET revoked_at = NOW()
-		WHERE token_hash = $1 AND revoked_at IS NULL
-	`, hash)
-	if err != nil {
-		return fmt.Errorf("revoke refresh token on logout: %w", err)
-	}
-	return nil
-}
+// Logout (AUTH-04) now lives in session.go, where it revokes the whole session
+// family rather than the single presented token. See LogoutSession for why.

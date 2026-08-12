@@ -1628,7 +1628,9 @@ func (h *AdminHandler) ListUserSessions(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
 
-	sessions, err := h.svc.ListUserSessions(c.Request().Context(), tenantID, appScope, userID)
+	// No current-session marker: an administrator is looking at somebody else's
+	// sessions, so none of them can be the one they are calling from.
+	sessions, err := h.svc.ListUserSessions(c.Request().Context(), tenantID, appScope, userID, "")
 	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
@@ -1669,7 +1671,7 @@ func (h *AdminHandler) RevokeUserSession(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid session id"})
 	}
 
-	if err := h.svc.RevokeUserSession(c.Request().Context(), tenantID, appScope, userID, familyID); err != nil {
+	if err := h.svc.RevokeUserSession(c.Request().Context(), tenantID, appScope, userID, familyID, auth.RevokeReasonAdmin); err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "user or session not found"})
 		}

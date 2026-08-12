@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
-	"sort"
 	"strconv"
 	"time"
 
@@ -275,12 +274,40 @@ type UserDetail struct {
 
 // UserSession is one active refresh-token session family for a user.
 type UserSession struct {
-	SessionFamilyID string     `json:"session_family_id"`
-	IPAddress       *string    `json:"ip_address,omitempty"`
-	UserAgent       string     `json:"user_agent"`
-	CreatedAt       time.Time  `json:"created_at"`
-	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
-	ExpiresAt       time.Time  `json:"expires_at"`
+	SessionFamilyID string  `json:"session_family_id"`
+	IPAddress       *string `json:"ip_address,omitempty"`
+	UserAgent       string  `json:"user_agent"`
+	// DeviceHint is the server-parsed "Chrome on Windows" form of UserAgent.
+	//
+	// Both are returned: the hint so a consumer does not need its own User-Agent
+	// parser to show a user which device they are looking at, the raw header because
+	// it is the evidence and a parser that guesses wrong must not destroy it.
+	DeviceHint *string    `json:"device_hint,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	ExpiresAt  time.Time  `json:"expires_at"`
+	// IdleExpiresAt is when the session dies if it is not used again, and
+	// AbsoluteExpiresAt is the hard deadline it cannot outlive whatever it does.
+	// Both are surfaced because "expires_at" alone cannot answer the question an
+	// operator actually has — is this session about to go away on its own, or does
+	// it need revoking? Nullable for rows written before migration 00068.
+	IdleExpiresAt     *time.Time `json:"idle_expires_at,omitempty"`
+	AbsoluteExpiresAt *time.Time `json:"absolute_expires_at,omitempty"`
+	// IsPersistent records whether the user asked to be remembered on this device.
+	IsPersistent bool `json:"is_persistent"`
+	// AuthTime is when the user actually authenticated, as opposed to when the
+	// current token in the family was minted.
+	AuthTime *time.Time `json:"auth_time,omitempty"`
+	// AMR lists the authentication methods used to establish the session.
+	AMR []string `json:"amr"`
+	// IsCurrent marks the session the caller is making this request from.
+	//
+	// Only ever true on the end-user (/me/sessions) view, where the caller and the
+	// subject are the same person: it prevents somebody from revoking the session
+	// they are sitting in and wondering why the page broke. On the admin view the
+	// caller is a different person from the subject, so no session in the list can
+	// be theirs and the field stays false throughout.
+	IsCurrent bool `json:"is_current"`
 }
 
 // ---------------------------------------------------------------------------
@@ -296,12 +323,30 @@ type Service struct {
 	// signingKeys mints a tenant's asymmetric JWT key pair at creation time
 	// (issue #95). nil is safe — key generation then falls back to lazy.
 	signingKeys *auth.SigningKeyService
-	logger      zerolog.Logger
+	// authSvc owns session revocation. Admin revocation goes through it rather
+	// than issuing its own UPDATE so that revoking from the admin API and revoking
+	// from a logout take exactly the same code path — including the revoked-session
+	// denylist, without which an admin revoke would leave the session's access
+	// token working for up to 15 more minutes while the API reported success.
+	//
+	// nil is tolerated: session revocation then falls back to a direct database
+	// write, which is what this package did before. Tests that construct a bare
+	// Service therefore keep working, at the cost of the immediate-revocation
+	// accelerator they do not exercise.
+	authSvc *auth.AuthService
+	logger  zerolog.Logger
 }
 
 // New creates a Service.
 func New(pool *pgxpool.Pool, resetSvc *auth.ResetService, logger zerolog.Logger) *Service {
 	return &Service{pool: pool, resetSvc: resetSvc, logger: logger}
+}
+
+// WithAuthService wires the auth service so session revocation shares one
+// implementation with logout — see the authSvc field for why that matters.
+func (s *Service) WithAuthService(authSvc *auth.AuthService) *Service {
+	s.authSvc = authSvc
+	return s
 }
 
 // WithInvitations wires the invitation service so admin-created accounts can be
@@ -1607,13 +1652,17 @@ func (s *Service) GetUserDetail(ctx context.Context, tenantID int64, application
 		return nil, fmt.Errorf("user detail: email mfa: %w", err)
 	}
 
-	// Active-session count (LastLoginAt already comes with the base row and
-	// covers revoked/expired sessions too).
+	// Active-session count. LastLoginAt comes with the base row and deliberately
+	// does NOT use this predicate — it must survive the sessions it was derived
+	// from being revoked, expired, and eventually reaped (see
+	// userEnrichmentColumns).
+	// COUNT(*) over one row per session, rather than COUNT(DISTINCT …) over a
+	// rotation log.
 	if err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT session_family_id)
-		FROM refresh_tokens
-		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL AND deleted_at IS NULL AND expires_at > NOW()
-	`, userID, tenantID).Scan(&d.ActiveSessions); err != nil {
+		SELECT COUNT(*)
+		FROM user_sessions
+		WHERE user_id = $1 AND tenant_id = $2 AND `+auth.LiveSessionWhere(""),
+		userID, tenantID).Scan(&d.ActiveSessions); err != nil {
 		return nil, fmt.Errorf("user detail: sessions: %w", err)
 	}
 
@@ -1691,6 +1740,15 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 		return nil, fmt.Errorf("commit set-active: %w", err)
 	}
 
+	// Blocking has to end the sessions the account already holds, not just stop it
+	// renewing them. The refresh revocation above is not enough on its own: an
+	// operator who blocks a compromised account and watches it keep making requests
+	// for another fifteen minutes has been given a control that does not do what its
+	// name says. After the commit so nothing is denied on a rolled-back block.
+	if !active && s.authSvc != nil {
+		s.authSvc.DenyUserSessions(ctx, userID, tenantID)
+	}
+
 	result, err := s.getUserByID(ctx, tenantID, applicationID, userID)
 	if err != nil {
 		return nil, err
@@ -1709,21 +1767,51 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 	return result, nil
 }
 
-// ListUserSessions returns the user's active (non-revoked, unexpired) sessions,
-// one row per session family, most-recently-active first.
-func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64) ([]UserSession, error) {
+// MaxSessionsListed bounds one page of session results.
+//
+// The endpoint used to return every live session in one response. That was
+// tolerable only because nothing expired: with a 30-day absolute lifetime, no
+// idle clock, and a logout that revoked one token instead of the session, a
+// single active dev account accumulated over four hundred live families and the
+// response returned all of them. The lifecycle work makes that number small
+// again, but an unbounded query over a table with one row per token rotation is
+// a latent problem regardless of how tidy the data currently is.
+//
+// Set above the default concurrent-session cap (20) so a user at the cap still
+// sees every session they have, and truncation only happens where the cap itself
+// has been raised.
+const MaxSessionsListed = 100
+
+// ListUserSessions returns the user's live sessions, one row per session family,
+// most-recently-active first.
+//
+// currentFamilyID marks the caller's own session in the result; pass "" from the
+// admin path, where the caller is by definition somebody else.
+func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64, currentFamilyID string) ([]UserSession, error) {
 	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
 		return nil, err
 	}
 
+	// One row per session, straight from user_sessions — no DISTINCT ON over a
+	// rotation log. Liveness comes from auth.LiveSessionWhere rather than a
+	// hand-written clause so this list and the refresh path can never disagree about
+	// which sessions still work; that drift presents to an operator as "I revoked
+	// that session and it is still listed as active".
+	//
+	// ORDER BY is most-recently-active, so the LIMIT keeps the sessions that matter.
+	// The previous version ordered by session id because DISTINCT ON required it,
+	// which meant the limit silently kept the OLDEST hundred and hid everything
+	// recent — the Go-side sort then reordered those, making the output look correct.
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (session_family_id)
-		       session_family_id, host(ip_address), user_agent, created_at, last_used_at, expires_at
-		FROM refresh_tokens
+		SELECT id, host(ip_address), user_agent, device_hint, created_at, last_seen_at,
+		       absolute_expires_at, idle_expires_at, absolute_expires_at,
+		       is_persistent, auth_time, amr
+		FROM user_sessions
 		WHERE user_id = $1 AND tenant_id = $2
-		  AND revoked_at IS NULL AND deleted_at IS NULL AND expires_at > NOW()
-		ORDER BY session_family_id, last_used_at DESC NULLS LAST, created_at DESC
-	`, userID, tenantID)
+		  AND `+auth.LiveSessionWhere("")+`
+		ORDER BY last_seen_at DESC
+		LIMIT $3
+	`, userID, tenantID, MaxSessionsListed)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
@@ -1732,62 +1820,109 @@ func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicat
 	sessions := []UserSession{}
 	for rows.Next() {
 		var sess UserSession
-		var familyID int64
-		var ip *string
-		if err := rows.Scan(&familyID, &ip, &sess.UserAgent, &sess.CreatedAt, &sess.LastUsedAt, &sess.ExpiresAt); err != nil {
+		var sessionID int64
+		var ip, deviceHint *string
+		var lastSeenAt time.Time
+		if err := rows.Scan(&sessionID, &ip, &sess.UserAgent, &deviceHint,
+			&sess.CreatedAt, &lastSeenAt,
+			&sess.ExpiresAt, &sess.IdleExpiresAt, &sess.AbsoluteExpiresAt,
+			&sess.IsPersistent, &sess.AuthTime, &sess.AMR); err != nil {
 			return nil, fmt.Errorf("scan session: %w", err)
 		}
-		sess.SessionFamilyID = strconv.FormatInt(familyID, 10)
+		sess.SessionFamilyID = strconv.FormatInt(sessionID, 10)
 		sess.IPAddress = ip
+		sess.DeviceHint = deviceHint
+		// last_seen_at is NOT NULL on the session row, so the pointer field the API
+		// exposes is always populated now — the nullability was an artefact of
+		// last_used_at being unset on a token that had never been rotated.
+		sess.LastUsedAt = &lastSeenAt
+		sess.IsCurrent = currentFamilyID != "" && sess.SessionFamilyID == currentFamilyID
+		if sess.AMR == nil {
+			sess.AMR = []string{}
+		}
 		sessions = append(sessions, sess)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	// Sort most-recently-active first (DISTINCT ON forced a family-id order).
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessionActivity(sessions[i]).After(sessionActivity(sessions[j]))
-	})
+	// No Go-side sort: the query orders by last_seen_at, which is also what the LIMIT
+	// now applies to. Sorting here previously masked the fact that the limit was
+	// keeping the wrong rows.
 	return sessions, nil
-}
-
-func sessionActivity(s UserSession) time.Time {
-	if s.LastUsedAt != nil {
-		return *s.LastUsedAt
-	}
-	return s.CreatedAt
 }
 
 // RevokeUserSession revokes a single session family belonging to the user.
 // Returns ErrNotFound if no live token in that family belongs to the user.
 //
-// Unlike RevokeAllUserSessions / SetUserActive, this does NOT
-// bump token_version: that counter is global to the user, so bumping it would
-// invalidate the access tokens of every OTHER session too — the opposite of a
-// single-session revoke. The access token is not session-scoped (the JWT
-// carries no family id), so it cannot be selectively invalidated; revoking the
-// refresh-token family stops the session from being renewed, and the already
-// issued access token dies at its short natural expiry. Use RevokeAllUserSessions
-// for immediate, account-wide invalidation.
-func (s *Service) RevokeUserSession(ctx context.Context, tenantID int64, applicationID *int64, userID, familyID int64) error {
+// Unlike RevokeAllUserSessions / SetUserActive, this does NOT bump token_version:
+// that counter is global to the user, so bumping it would invalidate the access
+// tokens of every OTHER session too — the opposite of a single-session revoke.
+//
+// The access token IS session-scoped now (the "sid" claim), so revocation takes
+// effect immediately rather than waiting out the token's remaining lifetime: the
+// session is added to a short-lived denylist that the authenticating middleware
+// checks. That denylist is a Redis accelerator, not the guarantee — if it is
+// unavailable, revoking the refresh-token family still stops the session being
+// renewed and the already-issued access token dies at its 15-minute expiry, which
+// is the behaviour this endpoint had before. Use RevokeAllUserSessions when
+// immediate account-wide invalidation must not depend on Redis at all.
+//
+// reason is recorded on the revoked rows so the cause survives in the data, not
+// only in the audit trail.
+func (s *Service) RevokeUserSession(ctx context.Context, tenantID int64, applicationID *int64, userID, familyID int64, reason string) error {
 	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
 		return err
 	}
-	ct, err := s.pool.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE session_family_id = $1 AND user_id = $2 AND tenant_id = $3 AND revoked_at IS NULL
-	`, familyID, userID, tenantID)
+	n, err := s.revokeSession(ctx, userID, tenantID, familyID, reason)
 	if err != nil {
 		return fmt.Errorf("revoke session: %w", err)
 	}
-	if ct.RowsAffected() == 0 {
+	if n == 0 {
 		return ErrNotFound
 	}
 	return nil
 }
 
-// RevokeAllUserSessions revokes every live refresh token for the user and bumps
-// token_version, signing them out everywhere. Returns the number of tokens revoked.
+// revokeSession routes session revocation through the auth service when it is
+// wired, and falls back to a direct write when it is not.
+//
+// The fallback exists for tests that construct a bare Service. It is deliberately
+// identical in its database effect and different only in that it cannot populate
+// the revoked-session denylist — so a deployment that forgets WithAuthService
+// degrades to the pre-denylist behaviour (revocation effective within 15 minutes)
+// rather than failing, but says so in the log, because silently losing immediate
+// revocation is exactly the kind of regression nobody notices until an incident.
+func (s *Service) revokeSession(ctx context.Context, userID, tenantID, sessionID int64, reason string) (int64, error) {
+	if s.authSvc != nil {
+		return s.authSvc.RevokeSession(ctx, userID, tenantID, sessionID, reason)
+	}
+	s.logger.Warn().Msg("admin: auth service not wired; session revoke will not deny outstanding access tokens")
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE user_sessions
+		SET revoked_at = NOW(), revoked_reason = $4, updated_at = NOW()
+		WHERE id = $1 AND user_id = $2 AND tenant_id = $3 AND revoked_at IS NULL
+	`, sessionID, userID, tenantID, reason)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// RevokeAllUserSessions revokes every live refresh token for the user, signing
+// them out everywhere. Returns the number of tokens revoked.
+//
+// The account-wide denylist entry written after the commit is what actually ends
+// the sessions. Without it this method reported success while the user stayed
+// signed in for up to another fifteen minutes: it revoked the refresh tokens
+// (which only stops RENEWAL) and bumped users.token_version — a counter that,
+// despite its name and every comment that referred to it, is verified nowhere in
+// this codebase and has never affected token validity.
+//
+// Written after the commit rather than inside the transaction, and deliberately:
+// a Redis entry cannot be rolled back, so denying sessions the transaction then
+// failed to revoke would sign a user out on the strength of a write that never
+// landed. This ordering leaves a sub-millisecond window in which the rows are
+// revoked and the tokens still pass, which the next request closes.
 func (s *Service) RevokeAllUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (int64, error) {
 	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
 		return 0, err
@@ -1798,10 +1933,17 @@ func (s *Service) RevokeAllUserSessions(ctx context.Context, tenantID int64, app
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	ct, err := tx.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-	`, userID, tenantID)
+	// Counted before the revoke: the return value is "how many sessions did this
+	// end", and after the UPDATE there are none left to count.
+	var revoked int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM user_sessions
+		WHERE user_id = $1 AND tenant_id = $2 AND `+auth.LiveSessionWhere(""),
+		userID, tenantID).Scan(&revoked); err != nil {
+		return 0, fmt.Errorf("count sessions to revoke: %w", err)
+	}
+
+	err = auth.RevokeAllSessionsTx(ctx, tx, userID, tenantID, auth.RevokeReasonAdminAll)
 	if err != nil {
 		return 0, fmt.Errorf("revoke all sessions: %w", err)
 	}
@@ -1814,7 +1956,16 @@ func (s *Service) RevokeAllUserSessions(ctx context.Context, tenantID int64, app
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit revoke-all: %w", err)
 	}
-	return ct.RowsAffected(), nil
+
+	if s.authSvc != nil {
+		s.authSvc.DenyUserSessions(ctx, userID, tenantID)
+	} else {
+		s.logger.Warn().Int64("user_id", userID).
+			Msg("admin: auth service not wired; revoke-all will not sign the user out until their access token expires")
+	}
+
+	// The metric is emitted by RevokeAllSessionsTx, so it is not repeated here.
+	return revoked, nil
 }
 
 // GetUserMFA returns just the user's MFA enrollment status.
@@ -1933,10 +2084,36 @@ func scanTenantRow(row pgxScanner) (TenantResult, error) {
 // userEnrichmentColumns are the Auth0-style per-user stats selected alongside
 // the base row: latest login, successful-login count, and sign-in connections.
 // Requires the users table aliased as u.
+//
+// last_login_at is the GREATEST of two sources, and needs both.
+//
+// refresh_tokens gives the finer answer — MAX(last_used_at, created_at) is the
+// last time the account actually did something, including silent token rotations
+// that produce no login event. But that table is no longer permanent: the session
+// reaper deletes rows once they are dead and past their retention margin, so on
+// its own it would report NULL for any user whose last session died more than a
+// week ago, and the console would show a long-dormant account as having never
+// signed in. That is worse than imprecise; it is confidently wrong about the one
+// field an operator uses to decide whether an account is abandoned.
+//
+// audit_logs is the durable half: login events are retained under the audit
+// retention policy and are never reaped by session cleanup. It is coarser (it
+// records logins, not subsequent activity), which is why it does not simply
+// replace the other.
+//
+// Taking the greatest keeps the previous behaviour exactly while a session is
+// live, and degrades to the audited login time afterwards instead of to NULL.
 const userEnrichmentColumns = `
-	       (SELECT MAX(COALESCE(rt.last_used_at, rt.created_at))
-	        FROM refresh_tokens rt
-	        WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id) AS last_login_at,
+	       GREATEST(
+	           (SELECT MAX(COALESCE(rt.last_used_at, rt.created_at))
+	            FROM refresh_tokens rt
+	            WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id),
+	           (SELECT MAX(al.created_at) FROM audit_logs al
+	            WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
+	              AND al.action IN (
+	                  'auth.login', 'auth.google_login', 'auth.github_login',
+	                  'auth.magic_link_requested', 'auth.register'))
+	       ) AS last_login_at,
 	       (SELECT COUNT(*) FROM audit_logs al
 	        WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
 	          AND al.action = 'auth.login') AS logins_count,

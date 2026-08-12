@@ -217,13 +217,20 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 	}
 
 	appID := strconv.FormatInt(appRowID, 10)
-	if gate, err := s.mfaGate(ctx, sess.UserID, tenantID, appRowID, appID, email, roleName, perms); err != nil {
+	// Never persistent — see the issueTokenPair call below for why a magic link
+	// does not grant a remembered device.
+	if gate, err := s.mfaGate(ctx, sess.UserID, tenantID, appRowID, appID, email, roleName, perms, false); err != nil {
 		return nil, err
 	} else if gate != nil {
 		return gate, nil
 	}
 
-	tokens, err := s.issueTokenPair(ctx, sess.UserID, tenantID, email, roleName, perms, nil, appID)
+	// Non-persistent: a magic link is a single-use credential delivered to an
+	// inbox, often opened on whatever device is to hand, so the short idle clock
+	// is the right default. There is no "remember me" to honour — the flow has no
+	// step at which the user could have asked for one.
+	tokens, err := s.issueTokenPair(ctx, sess.UserID, tenantID, email, roleName, perms,
+		sessionContext{amr: []string{AMRMagicLink}}, appID)
 	if err != nil {
 		return nil, err
 	}

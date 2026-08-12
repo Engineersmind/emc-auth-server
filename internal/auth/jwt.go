@@ -39,6 +39,29 @@ type Claims struct {
 	// AdminApps lists the application row ids they administer.
 	AdminScope string   `json:"admin_scope,omitempty"`
 	AdminApps  []string `json:"admin_apps,omitempty"`
+	// SessionID is the OIDC "sid" claim: the session (refresh-token family) this
+	// access token was minted into.
+	//
+	// It is what makes one session revocable on its own: the middleware checks this
+	// value against a short-lived denylist and refuses exactly the revoked session.
+	//
+	// Without it there is no way to invalidate a live access token at all. The
+	// users.token_version column reads like the account-wide equivalent, and several
+	// revocation paths bump it, but nothing in this codebase verifies that counter —
+	// it has never affected token validity. The denylist is the only mechanism.
+	//
+	// Named "sid" on the wire because that is the OIDC-registered claim name
+	// (OIDC Core, and required by back-channel logout), so a standards-aware
+	// relying party already knows how to read it.
+	//
+	// Empty on tokens minted before this claim existed and on tokens that have no
+	// session at all — client-credentials and agent tokens. Absence therefore
+	// means "not session-scoped" and must never be treated as a wildcard: the
+	// denylist check skips an empty sid rather than blocking on it, which is safe
+	// because such tokens cannot be revoked per-session anyway. A user token with
+	// no sid is still covered account-wide, since the denylist check also consults
+	// a per-account key derived from the user and tenant claims.
+	SessionID string `json:"sid,omitempty"`
 	jwt.RegisteredClaims
 }
 

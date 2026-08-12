@@ -707,5 +707,6 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 	}
 
 	// Same choke point as password/OTP login — no parallel token minting.
-	return s.authSvc.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, nil, strconv.FormatInt(appRowID, 10))
+	return s.authSvc.issueTokenPair(ctx, userID, tenantID, email, roleName, perms,
+		sessionContext{amr: []string{AMRFederated}}, strconv.FormatInt(appRowID, 10))
 }
