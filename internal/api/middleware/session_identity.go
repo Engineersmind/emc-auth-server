@@ -73,6 +73,16 @@ var sessionRevocation SessionRevocationChecker
 
 // SetSessionRevocationChecker installs the revocation checker. Called once during
 // route registration, before the server accepts traffic.
+//
+// Test contract: because the variable is process-wide, a test that installs a
+// checker MUST restore it, or it leaks into every later test in the package and
+// makes ordering significant:
+//
+//	middleware.SetSessionRevocationChecker(fake)
+//	t.Cleanup(func() { middleware.SetSessionRevocationChecker(nil) })
+//
+// nil is the correct zero to restore to, not the previously-installed value: no
+// test should be depending on one having been installed by another.
 func SetSessionRevocationChecker(checker SessionRevocationChecker) {
 	sessionRevocation = checker
 }

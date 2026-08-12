@@ -1745,8 +1745,17 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 	// operator who blocks a compromised account and watches it keep making requests
 	// for another fifteen minutes has been given a control that does not do what its
 	// name says. After the commit so nothing is denied on a rolled-back block.
-	if !active && s.authSvc != nil {
-		s.authSvc.DenyUserSessions(ctx, userID, tenantID)
+	if !active {
+		if s.authSvc == nil {
+			// Say so rather than failing quietly. The block itself stands, but without
+			// the denylist the account's already-issued access tokens keep working for
+			// up to AccessTokenTTL, and an operator handling a compromise needs to know
+			// that the control was partial rather than assume it took effect at once.
+			s.logger.Warn().Int64("user_id", userID).Int64("tenant_id", tenantID).
+				Msg("admin: no auth service wired; blocked user's access tokens remain valid until they expire")
+		} else {
+			s.authSvc.DenyUserSessions(ctx, userID, tenantID)
+		}
 	}
 
 	result, err := s.getUserByID(ctx, tenantID, applicationID, userID)
@@ -1804,7 +1813,8 @@ func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicat
 	// recent — the Go-side sort then reordered those, making the output look correct.
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, host(ip_address), user_agent, device_hint, created_at, last_seen_at,
-		       absolute_expires_at, idle_expires_at, absolute_expires_at,
+		       LEAST(idle_expires_at, absolute_expires_at),
+		       idle_expires_at, absolute_expires_at,
 		       is_persistent, auth_time, amr
 		FROM user_sessions
 		WHERE user_id = $1 AND tenant_id = $2

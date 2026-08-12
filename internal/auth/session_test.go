@@ -61,12 +61,19 @@ func newSessionEnv(t *testing.T) sessionEnv {
 		t.Fatalf("user id: %v", err)
 	}
 
-	// Register auto-logs the new user in, so it leaves a live session behind.
-	// Clear it: every test here counts sessions, and starting from one instead of
-	// zero would make each assertion carry an unexplained +1 that reads as an
-	// off-by-one bug in the code under test rather than a fixture artefact.
-	if _, err := svc.RevokeOtherSessions(ctx, userID, tenantID, ""); err != nil {
-		t.Fatalf("clear registration session: %v", err)
+	// Register does not issue tokens, so it must leave no session behind. Every test
+	// here counts sessions from a baseline of zero; asserting that baseline rather
+	// than assuming it means a regression that starts auth-ing the user at
+	// registration fails here, instead of adding an unexplained +1 to every
+	// assertion downstream that reads as an off-by-one in the code under test.
+	var baseline int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM user_sessions WHERE user_id = $1 AND revoked_at IS NULL
+	`, userID).Scan(&baseline); err != nil {
+		t.Fatalf("count sessions after registration: %v", err)
+	}
+	if baseline != 0 {
+		t.Fatalf("live sessions after Register = %d, want 0", baseline)
 	}
 
 	return sessionEnv{pool: pool, svc: svc, ctx: ctx, tenantID: tenantID, userID: userID, email: email}

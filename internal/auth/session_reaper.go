@@ -191,13 +191,33 @@ func (r *SessionReaper) RunOnce(ctx context.Context) error {
 	// migration 00069, plus anything orphaned by a partial backfill. Swept by their
 	// own expiry so they cannot accumulate forever, and separately from the loop
 	// above because they have no parent to delete.
-	if _, err := conn.Exec(ctx, `
-		DELETE FROM refresh_tokens
-		WHERE session_id IS NULL
-		  AND ((revoked_at IS NOT NULL AND revoked_at < $1) OR expires_at < $1)
-	`, cutoff); err != nil {
-		metrics.SessionReaperRuns.WithLabelValues("failure").Inc()
-		return fmt.Errorf("reaper: delete orphaned tokens: %w", err)
+	//
+	// Batched on the same boundary as the loop above: on a deployment that predates
+	// 00069 this predicate can match the entire legacy table, and one unbounded
+	// statement would hold row locks on all of it for the length of the delete.
+	for {
+		if err := ctx.Err(); err != nil {
+			r.logger.Info().Int64("deleted", total).Msg("session reaper: interrupted, will resume next run")
+			metrics.SessionReaperRuns.WithLabelValues("success").Inc()
+			return nil
+		}
+
+		ct, err := conn.Exec(ctx, `
+			DELETE FROM refresh_tokens
+			WHERE id IN (
+				SELECT id FROM refresh_tokens
+				WHERE session_id IS NULL
+				  AND ((revoked_at IS NOT NULL AND revoked_at < $1) OR expires_at < $1)
+				LIMIT $2
+			)
+		`, cutoff, r.batchSize)
+		if err != nil {
+			metrics.SessionReaperRuns.WithLabelValues("failure").Inc()
+			return fmt.Errorf("reaper: delete orphaned tokens: %w", err)
+		}
+		if ct.RowsAffected() < int64(r.batchSize) {
+			break
+		}
 	}
 
 	metrics.SessionReaperRuns.WithLabelValues("success").Inc()

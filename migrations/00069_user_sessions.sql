@@ -143,6 +143,17 @@ BEGIN
                    (ARRAY_AGG(rt.revoked_reason ORDER BY rt.id DESC))[1] AS revoked_reason
             FROM refresh_tokens rt
             WHERE rt.session_id IS NULL
+              -- Family 0 is not a family: it is the zero value left by rows written
+              -- before session_family_id was populated, so grouping by it would fold
+              -- unrelated tokens from different users into one bogus session.
+              --
+              -- DELIBERATELY REDUNDANT — do not remove as dead code. Step 3 of 00068
+              -- already repairs family-0 rows, so this matches nothing on a database
+              -- that ran both migrations in order. It is kept because the cost of
+              -- being wrong is asymmetric: the predicate costs nothing, and if 00068's
+              -- repair is ever skipped, partially applied, or a rollback reintroduces
+              -- such rows, without it this backfill silently creates a cross-user
+              -- session — the worst possible failure for a revocation feature.
               AND rt.session_family_id <> 0
               AND EXISTS (SELECT 1 FROM users u WHERE u.id = rt.user_id)
               AND EXISTS (SELECT 1 FROM tenants t WHERE t.id = rt.tenant_id)

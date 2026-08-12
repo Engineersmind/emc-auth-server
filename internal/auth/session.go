@@ -209,13 +209,16 @@ func (s *AuthService) RevokeSession(ctx context.Context, userID, tenantID, sessi
 // sessions: the bump is account-global and would invalidate the caller's own access
 // token along with the rest, which is exactly what this function exists to avoid.
 // The revoked sessions' access tokens are handled by the denylist instead.
+// keepNoSession is the "spare nothing" sentinel for RevokeOtherSessions.
+//
+// -1, not 0: session ids are positive, so `id <> -1` matches every row. 0 was
+// wrong because it spared any legacy row whose family id was 0 — the exact
+// opposite of the documented behaviour, and silently so. Named rather than
+// written inline so a copy-paste carries the reasoning with it.
+const keepNoSession = int64(-1)
+
 func (s *AuthService) RevokeOtherSessions(ctx context.Context, userID, tenantID int64, keepFamilyID string) (int64, error) {
-	// -1, not 0, as the "keep nothing" sentinel.
-	//
-	// Session ids are positive, so `id <> -1` matches every row. 0 was wrong: it
-	// spared any legacy row whose family id was 0 — the exact opposite of the
-	// documented behaviour, and silently so.
-	keep := int64(-1)
+	keep := keepNoSession
 	if keepFamilyID != "" {
 		if parsed, err := strconv.ParseInt(keepFamilyID, 10, 64); err == nil {
 			keep = parsed
