@@ -51,7 +51,7 @@ func newUserInfoFixture(t *testing.T) *userInfoFixture {
 	}
 
 	f := &userInfoFixture{
-		handler: NewOIDCHandler(pool, logger),
+		handler: NewOIDCHandler(pool, nil, logger),
 		pool:    pool,
 		ctx:     ctx,
 		email:   "admin@emc.local",

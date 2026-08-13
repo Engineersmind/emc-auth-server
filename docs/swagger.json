@@ -7826,6 +7826,56 @@
                     }
                 }
             }
+        },
+        "/tenants/{slug}/.well-known/openid-configuration": {
+            "get": {
+                "description": "OpenID Provider Metadata for one tenant (OIDC Discovery 1.0 §3). Public and unauthenticated. Point an OIDC client at {base}/tenants/{slug} as its issuer and it will fetch this and configure itself. Cacheable — supports ETag / If-None-Match.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oidc"
+                ],
+                "summary": "OIDC discovery document",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant slug",
+                        "name": "slug",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OIDCDiscoveryDocument"
+                        }
+                    },
+                    "304": {
+                        "description": "Not Modified — document unchanged since the supplied ETag"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
@@ -9504,6 +9554,96 @@
                     "type": "string"
                 },
                 "login_code": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.OIDCDiscoveryDocument": {
+            "type": "object",
+            "properties": {
+                "authorization_endpoint": {
+                    "type": "string"
+                },
+                "claims_parameter_supported": {
+                    "description": "The three *_supported booleans below are stated explicitly as false rather\nthan omitted. Omission means \"use the default\", and a client reading a\ndocument with no opinion may probe the feature anyway; an explicit false\nstops the request being made at all.",
+                    "type": "boolean"
+                },
+                "claims_supported": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "code_challenge_methods_supported": {
+                    "description": "CodeChallengeMethodsSupported advertises S256 and nothing else. This is a\nsecurity statement, not an omission: pkce.go refuses \"plain\" outright, and\na document offering it would invite a client to negotiate down to a method\nthat provides no protection against the attacker PKCE exists to stop.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "grant_types_supported": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "id_token_signing_alg_values_supported": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "issuer": {
+                    "description": "Issuer must be byte-identical to the \"iss\" claim of every token this\ntenant issues. This is the one field a conformant client hard-fails on:\ngo-oidc, openid-client, MSAL and Spring Security all compare the string\nthey fetched discovery from against this value and refuse a mismatch.",
+                    "type": "string"
+                },
+                "jwks_uri": {
+                    "type": "string"
+                },
+                "request_parameter_supported": {
+                    "type": "boolean"
+                },
+                "request_uri_parameter_supported": {
+                    "type": "boolean"
+                },
+                "response_modes_supported": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "response_types_supported": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "revocation_endpoint": {
+                    "type": "string"
+                },
+                "scopes_supported": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "subject_types_supported": {
+                    "description": "SubjectTypesSupported is [\"public\"] because \"sub\" is the raw user id, the\nsame value for every client (see UserInfoResponse.Subject). Advertising\n\"pairwise\" would be a false claim about a privacy property we do not have.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "token_endpoint": {
+                    "type": "string"
+                },
+                "token_endpoint_auth_methods_supported": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "userinfo_endpoint": {
                     "type": "string"
                 }
             }

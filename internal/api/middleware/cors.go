@@ -106,15 +106,22 @@ func headerListContains(list, name string) bool {
 // wellKnownSuffix is the path suffix of the published JWKS document.
 const wellKnownSuffix = "/.well-known/jwks.json"
 
+// discoverySuffix is the path suffix of the published OIDC discovery document
+// (issue #7b). Exempt for the same reason as JWKS and in the same breath: a
+// browser-side client fetches discovery first and follows its jwks_uri second,
+// so exempting only the second half would break the flow at step one.
+const discoverySuffix = "/.well-known/openid-configuration"
+
 // isPublicCORSExempt reports whether a path serves public, credential-free
 // material that any origin may read, and so must bypass origin enforcement.
 //
-// Matched on suffix rather than a prefix or exact string because the JWKS path is
-// tenant-scoped (/tenants/{slug}/.well-known/jwks.json) and the slug is arbitrary.
-// Deliberately narrow: only this exact document, so the exemption cannot be
+// Matched on suffix rather than a prefix or exact string because both paths are
+// tenant-scoped (/tenants/{slug}/.well-known/...) and the slug is arbitrary.
+// Deliberately narrow: only these exact documents, so the exemption cannot be
 // widened by a crafted path such as /.well-known/jwks.json/../../admin.
 func isPublicCORSExempt(path string) bool {
-	return strings.HasSuffix(path, wellKnownSuffix)
+	return strings.HasSuffix(path, wellKnownSuffix) ||
+		strings.HasSuffix(path, discoverySuffix)
 }
 
 // TenantCORS returns middleware that applies per-tenant CORS headers.

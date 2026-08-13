@@ -16,21 +16,29 @@ import (
 )
 
 // OIDCHandler serves the OpenID Connect endpoints that sit on top of the token
-// layer (issue #7).
+// layer: UserInfo (issue #7a, below) and the per-tenant discovery document
+// (issue #7b, oidc_discovery.go).
 //
-// Today that is UserInfo alone. The discovery document belongs with issue #6:
-// OIDC requires a discovery response to carry authorization_endpoint and
-// token_endpoint, and publishing one that names routes returning 404 is worse
-// than publishing none — a relying party that reads it will configure itself
-// against endpoints that do not exist and fail later, further from the cause.
+// Discovery waited for issue #6 rather than shipping with UserInfo, because a
+// discovery response must carry authorization_endpoint and token_endpoint, and
+// publishing one that names routes returning 404 is worse than publishing none
+// — a relying party that reads it configures itself against endpoints that do
+// not exist and fails later, further from the cause. Both now exist.
 type OIDCHandler struct {
-	pool   *pgxpool.Pool
+	pool *pgxpool.Pool
+
+	// issuers supplies the public origin every URL in the discovery document is
+	// built from, and is the same resolver that stamps "iss" at mint time — so
+	// the document's issuer and the tokens' issuer cannot be derived from two
+	// different values. UserInfo does not use it.
+	issuers *auth.TenantIssuerResolver
+
 	logger zerolog.Logger
 }
 
 // NewOIDCHandler builds the handler.
-func NewOIDCHandler(pool *pgxpool.Pool, logger zerolog.Logger) *OIDCHandler {
-	return &OIDCHandler{pool: pool, logger: logger}
+func NewOIDCHandler(pool *pgxpool.Pool, issuers *auth.TenantIssuerResolver, logger zerolog.Logger) *OIDCHandler {
+	return &OIDCHandler{pool: pool, issuers: issuers, logger: logger}
 }
 
 // UserInfoResponse is the OIDC UserInfo claim set (OIDC Core 1.0 §5.3).

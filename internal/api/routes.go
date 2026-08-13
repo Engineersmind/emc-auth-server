@@ -520,7 +520,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// JWKS publication + signing-key rotation handlers (issue #95).
 	jwksHandler := handlers.NewJWKSHandler(deps.Pool, signingKeySvc, deps.Logger)
-	oidcHandler := handlers.NewOIDCHandler(deps.Pool, deps.Logger)
+	oidcHandler := handlers.NewOIDCHandler(deps.Pool, issuerResolver, deps.Logger)
 	signingKeyHandler := handlers.NewSigningKeyHandler(deps.Pool, signingKeySvc, deps.Config.AppBaseURL, auditLog, deps.Logger)
 
 	// Give newly created tenants their key pair up front rather than lazily on
@@ -1099,7 +1099,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// a public route inherits no throttling at all, but throttling this one too
 	// hard breaks every offline verifier we are asking to depend on it.
 	// TenantCORS skips this path entirely — see isPublicCORSExempt.
-	e.GET("/tenants/:slug/.well-known/jwks.json", jwksHandler.GetTenantJWKS, mw.JWKSRateLimiter())
+	e.GET(handlers.PathTenantJWKS, jwksHandler.GetTenantJWKS, mw.JWKSRateLimiter())
+
+	// OIDC discovery document (issue #7b) — the sibling of JWKS, and per-tenant
+	// for the same reason: it names an issuer, and since #7a the issuer is
+	// per-tenant. Sitting at {iss}/.well-known/openid-configuration is what lets
+	// a relying party be handed nothing but the issuer URL and configure itself.
+	//
+	// JWKSRateLimiter rather than a new limiter: the caller shape is identical —
+	// unauthenticated, machine-fetched, cached, and fetched by the same clients
+	// in the same breath, since discovery is what tells them the JWKS URL.
+	//
+	// Every path in the served document comes from the handlers.Path* constants
+	// used to register the routes below, so the document cannot advertise a
+	// route this file does not mount.
+	e.GET(handlers.PathTenantDiscovery, oidcHandler.Discovery, mw.JWKSRateLimiter())
 
 	// OIDC UserInfo (issue #7) — top-level, beside JWKS, because both are standard
 	// OIDC surfaces that external client libraries fetch by absolute URL.
@@ -1116,8 +1130,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	//
 	// GET and POST because OIDC Core §5.3 requires both.
 	userInfoAuth := mw.JWTRequired(jwtSvc, auth.AudienceAPI)
-	e.GET("/oauth/userinfo", oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
-	e.POST("/oauth/userinfo", oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
+	e.GET(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
+	e.POST(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
 
 	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
@@ -1145,17 +1159,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// instead from the server-side request handle: a forged form cannot supply
 	// one, and the handle names the only redirect target a code can be sent to.
 	authorizeLimit := mw.AuthorizeRateLimiter()
-	e.GET("/oauth/authorize", authorizeHandler.Authorize, authorizeLimit)
-	e.POST("/oauth/authorize/login", authorizeHandler.LoginSubmit, authorizeLimit)
-	e.POST("/oauth/authorize/mfa", authorizeHandler.MFASubmit, authorizeLimit)
+	e.GET(handlers.PathOAuthAuthorize, authorizeHandler.Authorize, authorizeLimit)
+	e.POST(handlers.PathOAuthAuthorize+"/login", authorizeHandler.LoginSubmit, authorizeLimit)
+	e.POST(handlers.PathOAuthAuthorize+"/mfa", authorizeHandler.MFASubmit, authorizeLimit)
 
 	// Token endpoint — form-encoded (RFC 6749 §4.1.3), unlike the JSON
 	// POST /auth/token which keeps working as a documented-deprecated alias.
-	e.POST("/oauth/token", oauthTokenHandler.Token, mw.OAuthTokenRateLimiter())
+	e.POST(handlers.PathOAuthToken, oauthTokenHandler.Token, mw.OAuthTokenRateLimiter())
 
 	// Revocation (RFC 7009). Always 200, so the limiter is what stops it being
 	// used to probe token validity at volume.
-	e.POST("/oauth/revoke", oauthTokenHandler.Revoke, mw.RevokeRateLimiter())
+	e.POST(handlers.PathOAuthRevoke, oauthTokenHandler.Revoke, mw.RevokeRateLimiter())
 
 	// Social login browser endpoints — public, top-level like SAML, but with
 	// the dedicated rate limiting SAML's routes lack (issue #64).
