@@ -7312,6 +7312,220 @@
                 }
             }
         },
+        "/oauth/authorize": {
+            "get": {
+                "description": "Starts the Authorization Code flow with PKCE. Validates the client and redirect_uri, authenticates the user through a server-rendered login page, and redirects back to redirect_uri with a single-use code. Browser endpoint — returns HTML or a 302, never JSON.",
+                "produces": [
+                    "text/html"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "OAuth 2.0 authorization endpoint",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Registered client_id",
+                        "name": "client_id",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must exactly match a registered redirect_uri. Optional only when exactly one is registered.",
+                        "name": "redirect_uri",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must be 'code'",
+                        "name": "response_type",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Space-delimited. Unregistered scopes are dropped, not rejected.",
+                        "name": "scope",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Opaque value echoed back on the redirect",
+                        "name": "state",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "OIDC nonce, echoed into the ID token",
+                        "name": "nonce",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "base64url(SHA256(code_verifier))",
+                        "name": "code_challenge",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must be 'S256'",
+                        "name": "code_challenge_method",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "302": {
+                        "description": "Redirect to redirect_uri with code and state"
+                    },
+                    "400": {
+                        "description": "HTML error page — client_id or redirect_uri invalid"
+                    }
+                }
+            }
+        },
+        "/oauth/revoke": {
+            "post": {
+                "description": "Revokes a refresh token. Client authentication is REQUIRED (RFC 7009 §2.1) — the same credentials the token endpoint takes. Returns 200 for an unknown or already-revoked token, per RFC 7009 §2.2; a bad or missing client credential is a 401 invalid_client.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "OAuth 2.0 token revocation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The token to revoke",
+                        "name": "token",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "refresh_token | access_token",
+                        "name": "token_type_hint",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required — prefer the Authorization Basic header",
+                        "name": "client_id",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Confidential clients only",
+                        "name": "client_secret",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Token revoked, or did not exist"
+                    },
+                    "401": {
+                        "description": "client authentication failed",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    }
+                }
+            }
+        },
+        "/oauth/token": {
+            "post": {
+                "description": "Exchanges credentials for tokens. Supports authorization_code (with mandatory PKCE), refresh_token, and client_credentials. Form-encoded per RFC 6749 — not JSON. Client authentication via Authorization Basic or client_secret_post; public clients authenticate with PKCE alone.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "OAuth 2.0 token endpoint",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "authorization_code | refresh_token | client_credentials",
+                        "name": "grant_type",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for authorization_code",
+                        "name": "code",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for authorization_code",
+                        "name": "code_verifier",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must match the value the code was issued against",
+                        "name": "redirect_uri",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for refresh_token",
+                        "name": "refresh_token",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for public clients",
+                        "name": "client_id",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Confidential clients — prefer the Authorization Basic header",
+                        "name": "client_secret",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "client_credentials only",
+                        "name": "scope",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.TokenResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    }
+                }
+            }
+        },
         "/oauth/userinfo": {
             "get": {
                 "security": [
@@ -8466,6 +8680,10 @@
                 "created_at": {
                     "type": "string"
                 },
+                "first_party": {
+                    "description": "FirstParty false means a consent screen is required before a code may be\nissued. No consent screen exists yet, so /oauth/authorize refuses such a\nclient outright rather than skipping consent silently.",
+                    "type": "boolean"
+                },
                 "id": {
                     "type": "string"
                 },
@@ -8474,6 +8692,17 @@
                 },
                 "name": {
                     "type": "string"
+                },
+                "redirect_uris": {
+                    "description": "RedirectURIs is the exact-match allow-list for GET /oauth/authorize\n(issue #6). Empty means the application cannot use the authorization\ncode flow at all — which is the correct default for the m2m app_type.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "description": "RequirePKCE defaults true for every client type, confidential included.",
+                    "type": "boolean"
                 },
                 "scopes": {
                     "type": "array",
@@ -8527,11 +8756,23 @@
                 "created_at": {
                     "type": "string"
                 },
+                "first_party": {
+                    "type": "boolean"
+                },
                 "id": {
                     "type": "string"
                 },
                 "name": {
                     "type": "string"
+                },
+                "redirect_uris": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "type": "boolean"
                 },
                 "scopes": {
                     "type": "array",
@@ -9012,11 +9253,26 @@
                     "description": "web | spa | m2m | native; defaults to web",
                     "type": "string"
                 },
+                "first_party": {
+                    "description": "FirstParty defaults to true when omitted. Setting it false marks the\nclient as third-party, which currently causes /oauth/authorize to refuse\nit with consent_required — the consent screen is not built yet.",
+                    "type": "boolean"
+                },
                 "name": {
                     "type": "string"
                 },
+                "redirect_uris": {
+                    "description": "RedirectURIs is the exact-match allow-list for GET /oauth/authorize\n(issue #6). Without at least one entry the application cannot use the\nauthorization code flow at all — which is the right default for m2m.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "description": "RequirePKCE defaults to true when omitted. Pointer so \"omitted\" is\ndistinguishable from an explicit false.",
+                    "type": "boolean"
+                },
                 "scopes": {
-                    "description": "resource:action strings; optional",
+                    "description": "Scopes accepts resource:action permission strings and the reserved OIDC\nscopes (openid, profile, email, offline_access). Optional.",
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -9483,6 +9739,32 @@
                 }
             }
         },
+        "handlers.TokenResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string"
+                },
+                "expires_in": {
+                    "type": "integer"
+                },
+                "id_token": {
+                    "description": "IDToken appears only when the granted scopes include `openid`. Its\npresence is what makes this an OIDC response rather than a plain OAuth 2.0 one.",
+                    "type": "string"
+                },
+                "refresh_token": {
+                    "description": "RefreshToken is omitted for client_credentials: RFC 6749 §4.4.3 says a\nrefresh token SHOULD NOT be issued, because a client that can present its\nown credentials can simply ask for another token.",
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "Scope is the GRANTED set, which may be narrower than what was requested\n(RFC 6749 §3.3). Echoed so a client can see what it actually received\nrather than assuming its request was honoured in full.",
+                    "type": "string"
+                },
+                "token_type": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.UpdateApplicationMFARequest": {
             "type": "object",
             "properties": {
@@ -9509,8 +9791,22 @@
                 "app_type": {
                     "type": "string"
                 },
+                "first_party": {
+                    "type": "boolean"
+                },
                 "name": {
                     "type": "string"
+                },
+                "redirect_uris": {
+                    "description": "RedirectURIs omitted = unchanged; [] clears — same convention as Scopes.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "description": "Nil leaves the flag unchanged.",
+                    "type": "boolean"
                 },
                 "scopes": {
                     "type": "array",
@@ -9693,6 +9989,17 @@
                 "updated_at": {
                     "description": "UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,\nwhich is what the rest of this API returns for timestamps.",
                     "type": "integer"
+                }
+            }
+        },
+        "handlers.tokenError": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "error_description": {
+                    "type": "string"
                 }
             }
         },

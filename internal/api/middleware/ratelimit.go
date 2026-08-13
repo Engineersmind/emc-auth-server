@@ -142,6 +142,12 @@ func startCleanup() {
 				// second, so a bucket idle for ten minutes is already full and
 				// evicting it grants nothing that waiting would not.
 				userInfoStore.cleanup(10 * time.Minute)
+				// Same reasoning as UserInfo: all three refill at least once
+				// per two seconds, so a bucket idle for ten minutes is full and
+				// evicting it grants nothing that waiting would not.
+				authorizeStore.cleanup(10 * time.Minute)
+				oauthTokenStore.cleanup(10 * time.Minute)
+				revokeStore.cleanup(10 * time.Minute)
 				// Evicting a bucket resets it to full burst, so a store may not
 				// be swept faster than its own refill interval or idling becomes
 				// a way to skip the limit. Rotation refills one token every
@@ -163,6 +169,10 @@ func ResetStoresForTest() {
 	auditMaintStore.store.Range(func(k, _ any) bool { auditMaintStore.store.Delete(k); return true })
 	jwksStore.store.Range(func(k, _ any) bool { jwksStore.store.Delete(k); return true })
 	signingKeyRotationStore.store.Range(func(k, _ any) bool { signingKeyRotationStore.store.Delete(k); return true })
+	userInfoStore.store.Range(func(k, _ any) bool { userInfoStore.store.Delete(k); return true })
+	authorizeStore.store.Range(func(k, _ any) bool { authorizeStore.store.Delete(k); return true })
+	oauthTokenStore.store.Range(func(k, _ any) bool { oauthTokenStore.store.Delete(k); return true })
+	revokeStore.store.Range(func(k, _ any) bool { revokeStore.store.Delete(k); return true })
 }
 
 // defaultAuditMaintRate is the per-tenant per-minute cap on the expensive audit
@@ -714,6 +724,134 @@ func SigningKeyRotationRateLimiter() echo.MiddlewareFunc {
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many signing-key rotations for this tenant — rotation is rate limited to protect outstanding tokens",
 					"retry_after": "600",
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OAuth 2.0 authorization server limiters (issue #6)
+// ---------------------------------------------------------------------------
+
+var (
+	authorizeStore  = &limiterStore{}
+	oauthTokenStore = &limiterStore{}
+	revokeStore     = &limiterStore{}
+)
+
+const (
+	// AuthorizePerIPRate bounds GET /oauth/authorize and the two hosted login
+	// pages behind it, per client IP.
+	//
+	// Keyed on IP rather than client_id because the login form is where
+	// passwords are submitted, and an attacker spraying credentials controls
+	// the client_id in the URL but not their own address. It is deliberately
+	// higher than the login limiter's per-IP rate: one human sign-in costs
+	// three requests here (GET the page, POST the password, POST the code),
+	// and a shared office NAT multiplies that across everyone behind it.
+	//
+	// This does NOT replace the account-level protections. LoginRateLimiter is
+	// keyed per account email and account lockout still applies, both reached
+	// through AuthService.Login underneath — the limit here is the outer,
+	// coarser bound on the endpoint itself.
+	AuthorizePerIPRate = 30
+
+	// OAuthTokenPerClientRate bounds POST /oauth/token per client_id.
+	//
+	// Per client rather than per IP: the token endpoint is called
+	// server-to-server, so every request from one integrator arrives from the
+	// same small set of addresses and an IP-keyed limit would make a busy
+	// tenant throttle itself. A code brute-force is bounded far more tightly by
+	// the 60-second single-use code and the PKCE verifier than by any rate here.
+	OAuthTokenPerClientRate = 120
+
+	// RevokePerIPRate bounds POST /oauth/revoke.
+	RevokePerIPRate = 60
+)
+
+// AuthorizeRateLimiter bounds the authorization endpoint and its login pages.
+//
+// Returns HTML, not JSON: these are browser routes, and a user who hits the
+// limit is looking at a page, not parsing a response body.
+func AuthorizeRateLimiter() echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+			if !authorizeStore.getOrCreate("authorize:ip:"+ip, AuthorizePerIPRate).Allow() {
+				metrics.RateLimitHits.WithLabelValues("authorize").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.HTML(http.StatusTooManyRequests,
+					"<h1>Too many sign-in attempts</h1><p>Please wait a minute and try again.</p>")
+			}
+			return next(c)
+		}
+	}
+}
+
+// OAuthTokenRateLimiter bounds the token endpoint per client_id.
+//
+// The client_id is read from the Basic header when present and the form body
+// otherwise, matching how the handler itself resolves it — a limiter keyed on a
+// different value than the handler authenticates would bucket two requests from
+// the same client separately.
+//
+// Falls back to IP when no client_id is present at all, so an unauthenticated
+// flood cannot collapse into one shared empty-string bucket.
+func OAuthTokenRateLimiter() echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			key := ""
+			if id, _, ok := c.Request().BasicAuth(); ok && id != "" {
+				key = "oauth_token:client:" + id
+			} else if id := c.FormValue("client_id"); id != "" {
+				key = "oauth_token:client:" + id
+			} else {
+				ip := c.RealIP()
+				if ip == "" {
+					ip = c.Request().RemoteAddr
+				}
+				key = "oauth_token:ip:" + ip
+			}
+
+			if !oauthTokenStore.getOrCreate(key, OAuthTokenPerClientRate).Allow() {
+				metrics.RateLimitHits.WithLabelValues("oauth_token").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				// RFC 6749 §5.2 shape, so a client library parses this the same
+				// way it parses every other token-endpoint failure.
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":             "slow_down",
+					"error_description": "too many token requests",
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
+// RevokeRateLimiter bounds the revocation endpoint per client IP.
+func RevokeRateLimiter() echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+			if !revokeStore.getOrCreate("revoke:ip:"+ip, RevokePerIPRate).Allow() {
+				metrics.RateLimitHits.WithLabelValues("revoke").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error": "slow_down",
 				})
 			}
 			return next(c)

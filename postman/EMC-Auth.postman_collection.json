@@ -3404,6 +3404,1643 @@
       ]
     },
     {
+      "name": "12 - OAuth 2.0 Authorization Server (#6)",
+      "description": "Issue #6 - EMC as an OAuth 2.0 authorization server: /oauth/authorize, /oauth/token, /oauth/revoke, mandatory PKCE S256, OIDC ID tokens, and a server-rendered hosted login.\n\nRUN IN ORDER. Requests 1-3 set up a client and a user, 4-6 are the happy path, the rest are the security controls.\n\nRequests 8, 10, 11, 24 and 25 are the CRITICAL ones - a PKCE bypass, two open-redirect variants, an unauthenticated revocation, and a bypassable code-to-redirect_uri binding. They log to the Postman console on failure.\n\n24 and 25 were added from the PR #107 review, which found two security blockers:\nunauthenticated token revocation, and an `!= \"\"` escape hatch that let a token\nexchange skip the redirect_uri check by omitting the parameter. Note that\nrequests 10 and 11 send a WRONG redirect_uri and would BOTH have passed with\nthat second hole open - only an ABSENT one exposes it, which is what 25 sends.\n\nPrerequisite: run folder 01 - Bootstrap first, for baseUrl, tenantSlug, adminEmail and adminPassword.",
+      "item": [
+        {
+          "name": "1 - Admin login (setup)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Gets the admin token used to register the test client. Not part of #6 itself.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{adminEmail}}\",\n  \"password\": \"{{adminPassword}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.environment.set('adminToken', pm.response.json().access_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2 - Register an OAuth client with redirect_uris",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Registers a confidential client for the authorization code flow.\n\nTwo things here were impossible before #6:\n  * redirect_uris is written at all. The column has existed since\n    migration 00032 and was never read or written by any code path.\n  * scopes accepts openid/profile/email. validateScopes required\n    resource:action, so it rejected the very values 00032 sets as the\n    column DEFAULT.\n\nAlso returns the new require_pkce and first_party flags.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/applications",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "applications"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"pkce-demo-{{$timestamp}}\",\n  \"app_type\": \"web\",\n  \"scopes\": [\"openid\", \"profile\", \"email\"],\n  \"redirect_uris\": [\"http://localhost:8080/callback\"]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const b = pm.response.json();",
+                  "pm.environment.set('oauthClientId', b.client_id);",
+                  "pm.environment.set('oauthClientSecret', b.client_secret);",
+                  "pm.environment.set('oauthAppRowId', b.id);",
+                  "",
+                  "pm.test('#6: redirect_uris persisted (dead column since 00032)', () =>",
+                  "    pm.expect(b.redirect_uris).to.eql(['http://localhost:8080/callback']));",
+                  "pm.test('#6: OIDC scopes accepted (validateScopes used to reject these)', () =>",
+                  "    pm.expect(b.scopes).to.include.members(['openid','profile','email']));",
+                  "pm.test('#6: require_pkce defaults true', () => pm.expect(b.require_pkce).to.be.true);",
+                  "pm.test('#6: first_party defaults true', () => pm.expect(b.first_party).to.be.true);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3 - Register a user in that client's user base",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "App-scoped registration. The authorization code flow searches this\napplication's isolated user base, not the tenant-level one.\n\n409 on a re-run is fine - the account already exists.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/apps/register",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "apps",
+                "register"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{oauthUserEmail}}\",\n  \"password\": \"{{oauthUserPassword}}\",\n  \"first_name\": \"Priya\",\n  \"last_name\": \"Sharma\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Pinned once per client so requests 4-15 all use the same account.",
+                  "pm.environment.set('oauthUserEmail',",
+                  "    'priya-' + pm.environment.get('oauthClientId').slice(-8) + '@acme.test');",
+                  "pm.environment.set('oauthUserPassword', 'Str0ngPass!23');"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('registered (201) or already exists (409)', () =>",
+                  "    pm.expect([201, 409]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "4 - GET /oauth/authorize - hosted login page",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "THE request that did not exist before #6. Generates a PKCE S256 pair in\nthe pre-request script, then loads the server-rendered login page.\n\nThe page is served by the Go binary from an embedded html/template. The\nReact frontend is an admin console and cannot serve this: no return-URL\nparameter, not tenant- or application-aware, and MFA hard-fails there.\n\nCaptures the server-side request handle out of the form. Note what the\nform does NOT carry: no client_id, no redirect_uri, no scope, no state.\nAll of that was validated here and is held server-side under the handle,\nso a forged copy of the form cannot redirect a code anywhere new.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/authorize?client_id={{oauthClientId}}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback&response_type=code&scope=openid+profile+email&state={{oauthState}}&nonce={{oauthNonce}}&code_challenge={{pkceChallenge}}&code_challenge_method=S256",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "authorize"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// PKCE S256 per RFC 7636. CryptoJS ships with Postman.",
+                  "const b64url = w => CryptoJS.enc.Base64.stringify(w)",
+                  "    .replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');",
+                  "",
+                  "const verifier = b64url(CryptoJS.lib.WordArray.random(48));",
+                  "pm.environment.set('pkceVerifier', verifier);",
+                  "pm.environment.set('pkceChallenge', b64url(CryptoJS.SHA256(verifier)));",
+                  "pm.environment.set('oauthState', 'st-' + Date.now());",
+                  "pm.environment.set('oauthNonce', 'n-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200 - login page rendered', () => pm.response.to.have.status(200));",
+                  "pm.test('is HTML, not JSON', () =>",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/html'));",
+                  "",
+                  "// The page carries a live request handle and a password field. A cached",
+                  "// copy is a replayable login; a Referer leak hands the handle to a third party.",
+                  "pm.test('#6: Cache-Control no-store', () =>",
+                  "    pm.expect(pm.response.headers.get('Cache-Control')).to.include('no-store'));",
+                  "pm.test('#6: Referrer-Policy no-referrer', () =>",
+                  "    pm.expect(pm.response.headers.get('Referrer-Policy')).to.eql('no-referrer'));",
+                  "",
+                  "const html = pm.response.text();",
+                  "const m = html.match(/name=\"request\" value=\"([a-f0-9]+)\"/);",
+                  "pm.test('request handle present in the form', () => pm.expect(m).to.not.be.null);",
+                  "if (m) pm.environment.set('authzRequest', m[1]);",
+                  "",
+                  "pm.test('#6: form does not echo security parameters back', () => {",
+                  "    pm.expect(html).to.not.include('name=\"redirect_uri\"');",
+                  "    pm.expect(html).to.not.include('name=\"client_id\"');",
+                  "    pm.expect(html).to.not.include('name=\"scope\"');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "5 - POST the password -> 302 with the authorization code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "Submits the hosted login form. On success the browser is redirected to\nthe REGISTERED redirect_uri with a single-use code and the original state.\n\nRedirect following is disabled so the Location header can be asserted; a\nreal browser would follow it back to the client application.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/authorize/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "authorize",
+                "login"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "request",
+                  "value": "{{authzRequest}}",
+                  "type": "text"
+                },
+                {
+                  "key": "email",
+                  "value": "{{oauthUserEmail}}",
+                  "type": "text"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthUserPassword}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 302', () => pm.response.to.have.status(302));",
+                  "const loc = pm.response.headers.get('Location') || '';",
+                  "pm.test('redirects to the REGISTERED uri', () =>",
+                  "    pm.expect(loc).to.include('http://localhost:8080/callback'));",
+                  "",
+                  "const code  = (loc.match(/[?&]code=([^&]+)/)  || [])[1];",
+                  "const state = (loc.match(/[?&]state=([^&]+)/) || [])[1];",
+                  "pm.test('authorization code returned', () => pm.expect(code).to.be.a('string'));",
+                  "pm.test('#6: state echoed unmodified (CSRF binding)', () =>",
+                  "    pm.expect(state).to.eql(pm.environment.get('oauthState')));",
+                  "if (code) pm.environment.set('authzCode', code);",
+                  "",
+                  "pm.test('#6: SSO cookie is emc_authz_session, NOT emc_access_token', () => {",
+                  "    const sc = pm.response.headers.get('Set-Cookie') || '';",
+                  "    pm.expect(sc).to.include('emc_authz_session');",
+                  "    // #101 forbids cookie sessions for app-scoped logins, and the portal",
+                  "    // cookie would let a tenant admin be silently SSO'd into any app.",
+                  "    pm.expect(sc).to.not.include('emc_access_token');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "6 - POST /oauth/token - code + verifier -> tokens + ID token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "The exchange. Form-encoded per RFC 6749 4.1.3, NOT JSON - that is the\ndifference from the pre-existing POST /auth/token, which keeps working.\n\nAsserts this is a real OIDC ID token: aud is the client_id (not our\ntoken-type audience), iss is the per-tenant issuer from #7a, the nonce is\nechoed, and at_hash is the LEFT HALF of SHA-256 (22 chars, not 43).",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "authorization_code",
+                  "type": "text"
+                },
+                {
+                  "key": "code",
+                  "value": "{{authzCode}}",
+                  "type": "text"
+                },
+                {
+                  "key": "code_verifier",
+                  "value": "{{pkceVerifier}}",
+                  "type": "text"
+                },
+                {
+                  "key": "redirect_uri",
+                  "value": "http://localhost:8080/callback",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('RFC 6749 5.1: Cache-Control no-store', () =>",
+                  "    pm.expect(pm.response.headers.get('Cache-Control')).to.include('no-store'));",
+                  "",
+                  "const b = pm.response.json();",
+                  "pm.environment.set('oauthAccessToken', b.access_token);",
+                  "pm.environment.set('oauthRefreshToken', b.refresh_token);",
+                  "",
+                  "pm.test('access + refresh + id_token returned', () => {",
+                  "    pm.expect(b.access_token).to.be.a('string');",
+                  "    pm.expect(b.refresh_token).to.be.a('string');",
+                  "    pm.expect(b.id_token).to.be.a('string');",
+                  "    pm.expect(b.token_type).to.eql('Bearer');",
+                  "});",
+                  "pm.test('granted scope echoed', () => pm.expect(b.scope).to.eql('openid profile email'));",
+                  "",
+                  "const dec = (j, i) => JSON.parse(atob(j.split('.')[i].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "const id = dec(b.id_token, 1);",
+                  "",
+                  "pm.test('#6: ID token aud is the client_id, not a token-type audience', () => {",
+                  "    const aud = Array.isArray(id.aud) ? id.aud[0] : id.aud;",
+                  "    pm.expect(aud).to.eql(pm.environment.get('oauthClientId'));",
+                  "    pm.expect(aud).to.not.eql('emc-auth-api');",
+                  "});",
+                  "pm.test('#7a: ID token iss is the per-tenant issuer', () =>",
+                  "    pm.expect(id.iss).to.eql(pm.environment.get('baseUrl') + '/tenants/' +",
+                  "        pm.environment.get('tenantSlug')));",
+                  "pm.test('FED-3: nonce echoed into the ID token', () =>",
+                  "    pm.expect(id.nonce).to.eql(pm.environment.get('oauthNonce')));",
+                  "pm.test('OIDC 3.1.3.6: at_hash is the left half of SHA-256 (22 chars)', () =>",
+                  "    pm.expect(id.at_hash).to.have.lengthOf(22));",
+                  "pm.test('auth_time present', () => pm.expect(id.auth_time).to.be.a('number'));",
+                  "pm.test('sub matches between ID token and access token', () =>",
+                  "    pm.expect(id.sub).to.eql(dec(b.access_token, 1).sub));",
+                  "pm.test('#6: access token carries the granted scope claim', () =>",
+                  "    pm.expect(dec(b.access_token, 1).scope).to.eql('openid profile email'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "7 - Replay the same code -> invalid_grant",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "Single-use is enforced by an atomic UPDATE ... WHERE used_at IS NULL\nRETURNING, so two concurrent exchanges cannot both succeed.\n\nThe client is told the same generic invalid_grant as for an unknown code:\ndistinguishing them would confirm to an attacker that a guessed code was\nreal. The replay is logged and counted separately server-side as\nemc_auth_oauth_grants_total{outcome=\"replayed\"}.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "authorization_code",
+                  "type": "text"
+                },
+                {
+                  "key": "code",
+                  "value": "{{authzCode}}",
+                  "type": "text"
+                },
+                {
+                  "key": "code_verifier",
+                  "value": "{{pkceVerifier}}",
+                  "type": "text"
+                },
+                {
+                  "key": "redirect_uri",
+                  "value": "http://localhost:8080/callback",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('#6: replayed code refused with invalid_grant', () =>",
+                  "    pm.expect(pm.response.json().error).to.eql('invalid_grant'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "8 - CRITICAL: login-code endpoint must refuse an authorization code",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "THE trap that migration 00067 exists to close.\n\noauth_authorization_codes holds two different credentials. A login_code\n(the social-login hand-back) is redeemable at /auth/oauth/exchange with\nthe PUBLIC client_id alone - that endpoint checks no code_challenge at all.\n\nWithout the grant_kind discriminator, this request would exchange a\nPKCE-protected authorization code for a full token pair without ever\npresenting the verifier. PKCE would be bypassed completely and silently.\n\nA 200 here is a CRITICAL failure.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/oauth/exchange",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "oauth",
+                "exchange"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"client_id\": \"{{oauthClientId}}\",\n  \"login_code\": \"{{authzCode}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('#6 CRITICAL: authorization code NOT redeemable as a login_code', () => {",
+                  "    if (pm.response.code === 200) {",
+                  "        console.error('[#6] PKCE BYPASS: /auth/oauth/exchange accepted an authorization_code.');",
+                  "        console.error('[#6] The grant_kind filter in ExchangeLoginCode is missing or broken.');",
+                  "    }",
+                  "    pm.expect(pm.response.code).to.not.eql(200);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "9 - Wrong code_verifier -> invalid_grant",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "Runs a fresh authorize round in the pre-request script, then presents the\ncode with a different verifier of the same shape.\n\nThis is the attack PKCE exists to stop: someone who intercepted the code\nin the redirect but never saw the verifier.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "authorization_code",
+                  "type": "text"
+                },
+                {
+                  "key": "code",
+                  "value": "{{freshCode}}",
+                  "type": "text"
+                },
+                {
+                  "key": "code_verifier",
+                  "value": "{{wrongVerifier}}",
+                  "type": "text"
+                },
+                {
+                  "key": "redirect_uri",
+                  "value": "http://localhost:8080/callback",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Mint a fresh code so this does not depend on request 7 having",
+                  "// already burned the previous one.",
+                  "const b64url = w => CryptoJS.enc.Base64.stringify(w)",
+                  "    .replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');",
+                  "const verifier  = b64url(CryptoJS.lib.WordArray.random(48));",
+                  "const challenge = b64url(CryptoJS.SHA256(verifier));",
+                  "// Same length and alphabet, different value.",
+                  "pm.environment.set('wrongVerifier', b64url(CryptoJS.lib.WordArray.random(48)));",
+                  "",
+                  "const base = pm.environment.get('baseUrl');",
+                  "pm.sendRequest({method: 'GET', url: base + '/oauth/authorize?client_id=' +",
+                  "    pm.environment.get('oauthClientId') + '&redirect_uri=' +",
+                  "    encodeURIComponent('http://localhost:8080/callback') +",
+                  "    '&response_type=code&scope=openid&state=s9&code_challenge=' + challenge +",
+                  "    '&code_challenge_method=S256'}, (e, r) => {",
+                  "    if (e) { console.error(e); return; }",
+                  "    const m = r.text().match(/name=\"request\" value=\"([a-f0-9]+)\"/);",
+                  "    if (!m) { console.error('[#6] no request handle on the login page'); return; }",
+                  "    pm.sendRequest({url: base + '/oauth/authorize/login', method: 'POST',",
+                  "        header: {'Content-Type': 'application/x-www-form-urlencoded'},",
+                  "        body: {mode: 'urlencoded', urlencoded: [",
+                  "            {key: 'request',  value: m[1]},",
+                  "            {key: 'email',    value: pm.environment.get('oauthUserEmail')},",
+                  "            {key: 'password', value: pm.environment.get('oauthUserPassword')}]}",
+                  "    }, (e2, r2) => {",
+                  "        if (e2) { console.error(e2); return; }",
+                  "        const c = ((r2.headers.get('Location') || '').match(/[?&]code=([^&]+)/) || [])[1];",
+                  "        if (c) pm.environment.set('freshCode', c);",
+                  "    });",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "const b = pm.response.json();",
+                  "pm.test('#6: wrong verifier rejected', () => pm.expect(b.error).to.eql('invalid_grant'));",
+                  "pm.test('the reason names PKCE', () =>",
+                  "    pm.expect(b.error_description || '').to.include('code_verifier'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "10 - CRITICAL: unregistered redirect_uri must NOT redirect",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "RFC 6749 4.1.2.1. An unregistered redirect_uri must be reported by\nRENDERING an error, never by redirecting to the requested address -\notherwise the authorize endpoint is an open redirector that forwards an\nattacker-chosen destination.\n\nA 302 here is a CRITICAL failure.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/authorize?client_id={{oauthClientId}}&redirect_uri=https%3A%2F%2Fevil.test%2Fsteal&response_type=code&code_challenge={{pkceChallenge}}&code_challenge_method=S256",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "authorize"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('#6 CRITICAL: does not redirect to an unregistered uri', () => {",
+                  "    if (pm.response.code === 302) {",
+                  "        console.error('[#6] OPEN REDIRECT: ' + pm.response.headers.get('Location'));",
+                  "    }",
+                  "    pm.expect(pm.response.code).to.eql(400);",
+                  "});",
+                  "pm.test('error is rendered as HTML', () =>",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/html'));"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "11 - CRITICAL: suffix-extension redirect must be refused",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "http://localhost:8080/callback.evil.test starts with the registered URI.\nA server doing prefix matching instead of exact matching would accept it\nand deliver the code to the attacker.\n\nThis is the single most common redirect_uri bypass.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/authorize?client_id={{oauthClientId}}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback.evil.test&response_type=code&code_challenge={{pkceChallenge}}&code_challenge_method=S256",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "authorize"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('#6: exact match only - suffix extension refused', () =>",
+                  "    pm.expect(pm.response.code).to.eql(400));"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "12 - code_challenge_method=plain must be refused",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Migration 00032's CHECK constraint still permits plain, where the\nchallenge IS the verifier - no protection at all against an attacker who\ncan read the authorization request. Refused at the application layer.\n\nRedirects with error=invalid_request because by this point the\nredirect_uri has been validated, so reporting to the client is safe.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/authorize?client_id={{oauthClientId}}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback&response_type=code&code_challenge={{pkceChallenge}}&code_challenge_method=plain&state=s12",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "authorize"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 302 - safe to report to a validated redirect', () =>",
+                  "    pm.response.to.have.status(302));",
+                  "const loc = pm.response.headers.get('Location') || '';",
+                  "pm.test('#6: plain refused with invalid_request', () =>",
+                  "    pm.expect(loc).to.include('error=invalid_request'));",
+                  "pm.test('state echoed on the error', () => pm.expect(loc).to.include('state=s12'));"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "13 - Missing code_challenge must be refused",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "PKCE is mandatory for every client type, confidential included\n(OAuth 2.1). A confidential client that leaks a code still loses it\nunless a verifier is required.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/authorize?client_id={{oauthClientId}}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback&response_type=code&state=s13",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "authorize"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const loc = pm.response.headers.get('Location') || '';",
+                  "pm.test('#6: PKCE mandatory even for a confidential client', () =>",
+                  "    pm.expect(loc).to.include('error=invalid_request'));"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "14 - UserInfo releases the granted scopes",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "#7a deferred scope filtering to #6 because no flow could grant a scope\nyet. This token was granted openid profile email, so every claim is\nreleased. Request 15 proves the negative.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/userinfo",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "userinfo"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{oauthAccessToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('email released (scope: email)', () => pm.expect(b.email).to.be.a('string'));",
+                  "pm.test('name released (scope: profile)', () => pm.expect(b.name).to.be.a('string'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "15 - UserInfo withholds claims outside the grant",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Runs a full authorize + token round for openid email only, then calls\nUserInfo. name, given_name and family_name must be ABSENT - the client\nnever asked for profile.\n\nThe handler branches on PRESENCE of the scope claim, not its content: a\nfirst-party token from password login carries no scope claim at all and\nstill receives the full claim set, exactly as before #6.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/userinfo",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "userinfo"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{narrowToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b64url = w => CryptoJS.enc.Base64.stringify(w)",
+                  "    .replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');",
+                  "const verifier  = b64url(CryptoJS.lib.WordArray.random(48));",
+                  "const challenge = b64url(CryptoJS.SHA256(verifier));",
+                  "const base = pm.environment.get('baseUrl');",
+                  "",
+                  "pm.sendRequest({method: 'GET', url: base + '/oauth/authorize?client_id=' +",
+                  "    pm.environment.get('oauthClientId') + '&redirect_uri=' +",
+                  "    encodeURIComponent('http://localhost:8080/callback') +",
+                  "    '&response_type=code&scope=openid+email&state=s15&code_challenge=' +",
+                  "    challenge + '&code_challenge_method=S256'}, (e, r) => {",
+                  "    if (e) { console.error(e); return; }",
+                  "    const m = r.text().match(/name=\"request\" value=\"([a-f0-9]+)\"/);",
+                  "    if (!m) return;",
+                  "    pm.sendRequest({url: base + '/oauth/authorize/login', method: 'POST',",
+                  "        header: {'Content-Type': 'application/x-www-form-urlencoded'},",
+                  "        body: {mode: 'urlencoded', urlencoded: [",
+                  "            {key: 'request',  value: m[1]},",
+                  "            {key: 'email',    value: pm.environment.get('oauthUserEmail')},",
+                  "            {key: 'password', value: pm.environment.get('oauthUserPassword')}]}",
+                  "    }, (e2, r2) => {",
+                  "        if (e2) { console.error(e2); return; }",
+                  "        const c = ((r2.headers.get('Location') || '').match(/[?&]code=([^&]+)/) || [])[1];",
+                  "        if (!c) return;",
+                  "        pm.sendRequest({url: base + '/oauth/token', method: 'POST',",
+                  "            header: {'Content-Type': 'application/x-www-form-urlencoded',",
+                  "                     'Authorization': 'Basic ' + btoa(",
+                  "                         pm.environment.get('oauthClientId') + ':' +",
+                  "                         pm.environment.get('oauthClientSecret'))},",
+                  "            body: {mode: 'urlencoded', urlencoded: [",
+                  "                {key: 'grant_type',    value: 'authorization_code'},",
+                  "                {key: 'code',          value: c},",
+                  "                {key: 'code_verifier', value: verifier}]}",
+                  "        }, (e3, r3) => {",
+                  "            if (e3) { console.error(e3); return; }",
+                  "            pm.environment.set('narrowToken', r3.json().access_token);",
+                  "        });",
+                  "    });",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('email released (scope: email)', () => pm.expect(b.email).to.be.a('string'));",
+                  "pm.test('#6: name WITHHELD - profile was not granted', () =>",
+                  "    pm.expect(b.name).to.be.undefined);",
+                  "pm.test('#6: given_name withheld', () => pm.expect(b.given_name).to.be.undefined);",
+                  "pm.test('#6: family_name withheld', () => pm.expect(b.family_name).to.be.undefined);",
+                  "pm.test('sub always present', () => pm.expect(b.sub).to.be.a('string'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "16 - refresh_token grant at /oauth/token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "The same rotation logic as /auth/refresh, so replay detection and\nsession-family revocation behave identically at either endpoint.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "refresh_token",
+                  "type": "text"
+                },
+                {
+                  "key": "refresh_token",
+                  "value": "{{oauthRefreshToken}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('rotated pair returned', () => {",
+                  "    pm.expect(b.access_token).to.be.a('string');",
+                  "    pm.expect(b.refresh_token).to.be.a('string');",
+                  "});",
+                  "pm.test('refresh token rotated, not reused', () =>",
+                  "    pm.expect(b.refresh_token).to.not.eql(pm.environment.get('oauthRefreshToken')));",
+                  "pm.environment.set('oauthRefreshToken', b.refresh_token);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "17 - POST /oauth/revoke (RFC 7009)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "Revokes the refresh token and the whole session family behind it.\n\nAn access token cannot be revoked - it is a self-contained JWT with no\nserver-side record and expires in 15 minutes. Stopping the refresh is the\nmeaningful action, which is also why token_type_hint is accepted and\nignored.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/revoke",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "revoke"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "token",
+                  "value": "{{oauthRefreshToken}}",
+                  "type": "text"
+                },
+                {
+                  "key": "token_type_hint",
+                  "value": "refresh_token",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "18 - Revoke returns 200 for an unknown token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "RFC 7009 2.2. A distinguishable response would turn this endpoint into an\noracle for whether a captured string is a live token - the same\nenumeration-prevention rule /forgot-password follows.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/revoke",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "revoke"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "token",
+                  "value": "deadbeefdeadbeefdeadbeef",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('#6: unknown token still returns 200 (no oracle)', () =>",
+                  "    pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "19 - The revoked refresh token no longer works",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "Proves request 17 actually revoked rather than returning a cosmetic 200.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "refresh_token",
+                  "type": "text"
+                },
+                {
+                  "key": "refresh_token",
+                  "value": "{{oauthRefreshToken}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('#6: revoked refresh token refused', () =>",
+                  "    pm.expect(pm.response.json().error).to.eql('invalid_grant'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "20 - grant_types is now enforced",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "The column has existed since migration 00032 with the default\n{authorization_code,refresh_token} and was never read by any code path.\n#6 starts enforcing it, so this client - which never registered\nclient_credentials - is refused that grant.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "client_credentials",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('#6: unregistered grant_type refused', () =>",
+                  "    pm.expect(pm.response.json().error).to.eql('unauthorized_client'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "21 - Wrong client_secret -> 401 invalid_client",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "RFC 6749 5.2, with the WWW-Authenticate challenge client libraries expect.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "authorization_code",
+                  "type": "text"
+                },
+                {
+                  "key": "code",
+                  "value": "irrelevant",
+                  "type": "text"
+                },
+                {
+                  "key": "code_verifier",
+                  "value": "{{pkceVerifier}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "definitely-not-the-secret"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('invalid_client', () =>",
+                  "    pm.expect(pm.response.json().error).to.eql('invalid_client'));",
+                  "pm.test('WWW-Authenticate challenge present', () =>",
+                  "    pm.expect(pm.response.headers.get('WWW-Authenticate')).to.include('Basic'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "22 - first_party=false -> consent_required (fails closed)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "description": "Flips the client to third-party in the pre-request script, then tries to\nauthorize.\n\nThe consent screen is deliberately NOT built in #6. A third-party client\nis therefore REFUSED rather than silently skipping consent - skipping it\nwould hand a stranger's application a token for a user who was never\ntold, which is the exact harm consent prevents.\n\nRequest 23 flips it back so this folder is re-runnable.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/authorize?client_id={{oauthClientId}}&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback&response_type=code&code_challenge={{pkceChallenge}}&code_challenge_method=S256&state=s22",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "authorize"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.sendRequest({method: 'PUT',",
+                  "    url: pm.environment.get('baseUrl') + '/api/v1/applications/' +",
+                  "         pm.environment.get('oauthAppRowId'),",
+                  "    header: {'Authorization': 'Bearer ' + pm.environment.get('adminToken'),",
+                  "             'Content-Type': 'application/json'},",
+                  "    body: {mode: 'raw', raw: JSON.stringify({first_party: false})}",
+                  "}, e => { if (e) console.error(e); });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 302', () => pm.response.to.have.status(302));",
+                  "const loc = pm.response.headers.get('Location') || '';",
+                  "pm.test('#6: third-party client refused with consent_required', () =>",
+                  "    pm.expect(loc).to.include('error=consent_required'));",
+                  "pm.test('#6: no authorization code was issued', () =>",
+                  "    pm.expect(loc).to.not.include('code='));"
+                ]
+              }
+            }
+          ],
+          "protocolProfileBehavior": {
+            "followRedirects": false
+          }
+        },
+        {
+          "name": "23 - Restore first_party=true (cleanup)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "description": "Leaves the client re-runnable for the next pass through this folder.",
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/applications/{{oauthAppRowId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "applications",
+                "{{oauthAppRowId}}"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"first_party\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{adminToken}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('first_party restored', () =>",
+                  "    pm.expect(pm.response.json().first_party).to.be.true);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "24 - CRITICAL: revoke without client authentication must be refused",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "RFC 7009 2.1 requires the SAME client authentication at the revocation\nendpoint as at the token endpoint. Revocation is destructive, so possession of\na token must not by itself be authority to destroy it - otherwise anyone who\nintercepts a refresh token can log the user out from the public internet with\nno credential at all.\n\nNote there is no Basic auth on this request and no client_id in the body. That\nis the point. Compare with request 17, which is the same call WITH credentials\nand returns 200.\n\nThis was a blocker on PR #107: the handler used to skip authentication\nentirely when client_id was absent.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/revoke",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "revoke"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "token",
+                  "value": "{{oauthRefreshToken}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('#6: unauthenticated revocation refused', () => {",
+                  "    if (pm.response.code === 200) {",
+                  "        console.error('[#6 BLOCKER] /oauth/revoke acted on a token with NO client ",
+                  "credentials. Anyone holding an intercepted refresh token can revoke it.');",
+                  "    }",
+                  "    pm.expect(pm.response.json().error).to.eql('invalid_client');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "25 - CRITICAL: omitted redirect_uri must not bypass the code binding",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/x-www-form-urlencoded"
+              }
+            ],
+            "description": "RFC 6749 4.1.3. Every code this server mints is bound to a resolved,\nnon-empty redirect_uri, so an ABSENT redirect_uri at redemption must be a\nmismatch - not a skipped check.\n\nThis was a blocker on PR #107: the check read\n`if redirectURI != \"\" && redirectURI != r.RedirectURI`, which made the one\nbinding between a code and its delivery address opt-out at the caller's\ndiscretion. Request 10 and 11 send a WRONG redirect_uri and would both still\npass with that hole open, because neither ever sends an absent one.\n\nThe pre-request script mints its own code so this does not depend on any\nearlier request in the folder.",
+            "url": {
+              "raw": "{{baseUrl}}/oauth/token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "oauth",
+                "token"
+              ]
+            },
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                {
+                  "key": "grant_type",
+                  "value": "authorization_code",
+                  "type": "text"
+                },
+                {
+                  "key": "code",
+                  "value": "{{noRedirectCode}}",
+                  "type": "text"
+                },
+                {
+                  "key": "code_verifier",
+                  "value": "{{noRedirectVerifier}}",
+                  "type": "text"
+                }
+              ]
+            },
+            "auth": {
+              "type": "basic",
+              "basic": [
+                {
+                  "key": "username",
+                  "value": "{{oauthClientId}}"
+                },
+                {
+                  "key": "password",
+                  "value": "{{oauthClientSecret}}"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Mint a fresh code with the CORRECT verifier, so the only thing wrong",
+                  "// with the exchange below is the missing redirect_uri.",
+                  "const b64url = w => CryptoJS.enc.Base64.stringify(w)",
+                  "    .replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');",
+                  "const verifier  = b64url(CryptoJS.lib.WordArray.random(48));",
+                  "const challenge = b64url(CryptoJS.SHA256(verifier));",
+                  "pm.environment.set('noRedirectVerifier', verifier);",
+                  "",
+                  "const base = pm.environment.get('baseUrl');",
+                  "pm.sendRequest({method: 'GET', url: base + '/oauth/authorize?client_id=' +",
+                  "    pm.environment.get('oauthClientId') + '&redirect_uri=' +",
+                  "    encodeURIComponent('http://localhost:8080/callback') +",
+                  "    '&response_type=code&scope=openid&state=s25&code_challenge=' + challenge +",
+                  "    '&code_challenge_method=S256'}, (e, r) => {",
+                  "    if (e) { console.error(e); return; }",
+                  "    const m = r.text().match(/name=\"request\" value=\"([a-f0-9]+)\"/);",
+                  "    if (!m) { console.error('[#6] no request handle on the login page'); return; }",
+                  "    pm.sendRequest({url: base + '/oauth/authorize/login', method: 'POST',",
+                  "        header: {'Content-Type': 'application/x-www-form-urlencoded'},",
+                  "        body: {mode: 'urlencoded', urlencoded: [",
+                  "            {key: 'request',  value: m[1]},",
+                  "            {key: 'email',    value: pm.environment.get('oauthUserEmail')},",
+                  "            {key: 'password', value: pm.environment.get('oauthUserPassword')}]}",
+                  "    }, (e2, r2) => {",
+                  "        if (e2) { console.error(e2); return; }",
+                  "        const c = ((r2.headers.get('Location') || '').match(/[?&]code=([^&]+)/) || [])[1];",
+                  "        if (c) pm.environment.set('noRedirectCode', c);",
+                  "    });",
+                  "});"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 400', () => pm.response.to.have.status(400));",
+                  "pm.test('#6: absent redirect_uri is a mismatch, not a skipped check', () => {",
+                  "    if (pm.response.code === 200) {",
+                  "        console.error('[#6 BLOCKER] a code redeemed with NO redirect_uri. The ",
+                  "binding between a code and its delivery address is bypassable.');",
+                  "    }",
+                  "    pm.expect(pm.response.json().error).to.eql('invalid_grant');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "99 · Negative & Security",
       "description": "Assertions about what must **fail**. These are the tests that catch a regression\nin an authorization boundary — the kind of bug that never shows up in a happy-path\nrun because everything still returns 200.\n\nExpect red here only when something is genuinely wrong.",
       "item": [
