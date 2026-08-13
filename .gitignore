@@ -57,3 +57,6 @@ FRONTEND_M2M_PLAN.md
 FRONTEND_RBAC_NEXT_STEP.md
 docs/SPRINT_*.md
 EMC_M2M_Postman_Collection.json
+
+# Postman collection, environment and its verifier — local tooling, not shipped.
+postman/
