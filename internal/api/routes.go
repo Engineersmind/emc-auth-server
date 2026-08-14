@@ -384,10 +384,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
+	// One lockout-policy resolver shared by the login path, the account-block
+	// service, and the admin write path that invalidates it — so an operator's
+	// change is seen by every reader at once rather than by each one's own cache
+	// whenever it happens to expire.
+	lockoutPolicySvc := authSvc.LockoutPolicy()
+
 	blockSvc := auth.NewAccountBlockService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc).
-		WithRiskAssessor(risk.New(deps.Pool, deps.Config.UntrustedIPCIDRs, deps.Logger))
+		WithRiskAssessor(risk.New(deps.Pool, deps.Config.UntrustedIPCIDRs, deps.Logger)).
+		// Redis carries the soft-lock tier, the once-per-window warning marker and
+		// the spike counter. Nil is tolerated: the hard tier is pure Postgres and
+		// keeps working, which is the degradation this design deliberately chose.
+		WithRedis(deps.Redis).
+		WithLockoutPolicy(lockoutPolicySvc).
+		WithDashboardURL(deps.Config.DashboardBaseURL)
 	// A disabled checker yields a service whose Notify is a no-op.
 	breachSvc := auth.NewBreachService(deps.Pool,
 		breach.New(deps.Config.BreachDetectionEnabled, deps.Logger),
@@ -636,7 +648,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// SessionCSRF guards against cross-site form-POST attacks when SameSite=None is
 	// active (staging/production); it is a no-op in development (SameSite=Lax).
 	sessionCSRF := mw.SessionCSRF(cookieCfg)
-	authGroup.POST("/session", authHandler.SessionLogin, sessionCSRF)
+	// LoginRateLimiter for the same reason /login carries it: this is a
+	// password-verifying endpoint, and the per-account lockout counter is
+	// documented as the BACKSTOP behind a per-IP limiter (see
+	// auth.MaxFailedLogins). Without it this path had no first line of defence,
+	// which mattered doubly because the admin console signs in here.
+	authGroup.POST("/session", authHandler.SessionLogin, mw.LoginRateLimiter(rlCfg), sessionCSRF)
 	authGroup.POST("/session/refresh", authHandler.SessionRefresh, sessionCSRF)
 	authGroup.POST("/session/logout", authHandler.SessionLogout, sessionCSRF)
 
@@ -876,6 +893,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/session-policy", adminHandler.UpdateSessionPolicy, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/session-policy", adminHandler.DeleteSessionPolicy, appAppsWrite)
 
+	// Account-lockout policy (issue #72). Guarded with users:* rather than apps:*
+	// like the session policy above: these thresholds govern whether USERS can sign
+	// in, so the permission that gates blocking and unblocking a user is the one
+	// that should gate the policy deciding it automatically.
+	adminGroup.GET("/tenants/:tid/lockout-policy", adminHandler.GetLockoutPolicy, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/lockout-policy", adminHandler.UpdateLockoutPolicy, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/lockout-policy", adminHandler.DeleteLockoutPolicy, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.GetLockoutPolicy, appUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.UpdateLockoutPolicy, appUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.DeleteLockoutPolicy, appUsersWrite)
+
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
 	adminGroup.PUT("/tenants/:tid/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
@@ -894,6 +922,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/tenants/:tid/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
 	adminGroup.GET("/tenants/:tid/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
 	adminGroup.PUT("/tenants/:tid/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
+	// Unlock is separate from the status toggle above (issue #72): it also clears
+	// the failure counter and the temporary soft lock, and unlike a status change
+	// it is permitted on your own account — see UnlockUser for why.
+	adminGroup.POST("/tenants/:tid/users/:uid/unlock", adminHandler.UnlockUser, tidUsersWrite)
 	adminGroup.GET("/tenants/:tid/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
 	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
@@ -969,6 +1001,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, appUsersWrite)
 	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, appUsersRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/unlock", adminHandler.UnlockUser, appUsersWrite)
 	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, appUsersRead)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, appUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, appUsersWrite)
@@ -1032,6 +1065,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
 	adminGroup.GET("/users/:id/detail", adminHandler.GetAdminUserDetail, usersRead)
 	adminGroup.PUT("/users/:id/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.POST("/users/:id/unlock", adminHandler.UnlockUser, usersWrite)
 	adminGroup.GET("/users/:id/sessions", adminHandler.ListUserSessions, usersRead)
 	adminGroup.DELETE("/users/:id/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
 	adminGroup.DELETE("/users/:id/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)
@@ -1123,6 +1157,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, usersWrite)
 	adminGroup.GET("/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, usersRead)
 	adminGroup.PUT("/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.POST("/applications/:appID/users/:uid/unlock", adminHandler.UnlockUser, usersWrite)
 	// Slug-less session-policy variants — the caller's own tenant, resolved from
 	// their token. Same handlers; tenantFromClaimsOrPath supplies the tenant.
 	adminGroup.GET("/session-policy", adminHandler.GetSessionPolicy, appsRead)
@@ -1131,6 +1166,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications/:appID/session-policy", adminHandler.GetSessionPolicy, appsRead)
 	adminGroup.PUT("/applications/:appID/session-policy", adminHandler.UpdateSessionPolicy, appsWrite)
 	adminGroup.DELETE("/applications/:appID/session-policy", adminHandler.DeleteSessionPolicy, appsWrite)
+
+	// Slug-less lockout-policy variants — the caller's own tenant, from their token.
+	adminGroup.GET("/lockout-policy", adminHandler.GetLockoutPolicy, usersRead)
+	adminGroup.PUT("/lockout-policy", adminHandler.UpdateLockoutPolicy, usersWrite)
+	adminGroup.DELETE("/lockout-policy", adminHandler.DeleteLockoutPolicy, usersWrite)
+	adminGroup.GET("/applications/:appID/lockout-policy", adminHandler.GetLockoutPolicy, usersRead)
+	adminGroup.PUT("/applications/:appID/lockout-policy", adminHandler.UpdateLockoutPolicy, usersWrite)
+	adminGroup.DELETE("/applications/:appID/lockout-policy", adminHandler.DeleteLockoutPolicy, usersWrite)
 
 	adminGroup.GET("/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, usersRead)
 	adminGroup.DELETE("/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, usersWrite)

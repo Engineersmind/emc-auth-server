@@ -107,12 +107,20 @@ services:
         condition: service_healthy
       mailpit:
         condition: service_started
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      start_period: 30s
-      retries: 3
+    # No healthcheck. The previous one (CMD-SHELL + wget) could never run: the
+    # runtime image is distroless, so there is no /bin/sh, no wget and no curl, and
+    # Docker reported the container unhealthy forever with
+    # `exec: "/bin/sh": no such file or directory` while it served traffic normally.
+    #
+    # Removed rather than replaced. Nothing in this compose file waits on this
+    # service being healthy — it is the last service to start — so the check bought
+    # no ordering guarantee, and polling /health every 10s wrote a request log line
+    # every 10s for the life of the container, burying real traffic.
+    #
+    # The binary still supports `emc-auth-server -healthcheck` (see runHealthcheck
+    # in cmd/server/main.go) for orchestrators that do need a probe — Kubernetes
+    # liveness/readiness, ECS, or a compose file that adds a dependency on this
+    # service. Re-add a `healthcheck:` block here if that day comes.
 
 volumes:
   postgres_data:

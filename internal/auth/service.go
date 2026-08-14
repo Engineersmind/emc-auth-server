@@ -38,18 +38,38 @@ type AuthService struct {
 	// forgot to wire it silently reverted to unbounded sessions, so the
 	// constructor always installs one.
 	policySvc *SessionPolicyService
-	logger    zerolog.Logger
+	// lockoutSvc resolves per-tenant lockout policy. Never nil after
+	// NewAuthService, for the same reason as policySvc: a nil here would mean the
+	// login path silently used a zero HardLockDuration, which reads as "no
+	// expiry" and would quietly reinstate permanent lockouts.
+	lockoutSvc *LockoutPolicyService
+	logger     zerolog.Logger
 }
 
 // NewAuthService creates an AuthService.
 func NewAuthService(pool *pgxpool.Pool, jwtSvc *JWTService, logger zerolog.Logger) *AuthService {
 	return &AuthService{
-		pool:      pool,
-		jwtSvc:    jwtSvc,
-		policySvc: NewSessionPolicyService(pool, logger),
-		logger:    logger,
+		pool:       pool,
+		jwtSvc:     jwtSvc,
+		policySvc:  NewSessionPolicyService(pool, logger),
+		lockoutSvc: NewLockoutPolicyService(pool, logger),
+		logger:     logger,
 	}
 }
+
+// WithLockoutPolicy replaces the lockout policy resolver so the process can share
+// one cache between the login path, the account-block service, and the admin write
+// path that invalidates it. Optional — NewAuthService installs a working resolver.
+func (s *AuthService) WithLockoutPolicy(svc *LockoutPolicyService) *AuthService {
+	if svc != nil {
+		s.lockoutSvc = svc
+	}
+	return s
+}
+
+// LockoutPolicy exposes the resolver so the admin API validates against the same
+// thresholds the login path enforces, rather than a second copy of them.
+func (s *AuthService) LockoutPolicy() *LockoutPolicyService { return s.lockoutSvc }
 
 // WithSessionPolicy replaces the session policy resolver, so the process can
 // share one cache between the auth service and the admin write path that
@@ -712,6 +732,11 @@ type loginCandidate struct {
 	email        string
 	passwordHash string
 	roleName     string
+	// isActive is false for an account admitted by the auto-expiry predicate: the
+	// lock has elapsed but the row still says disabled. Carried through so the
+	// match path can lift the lock properly instead of issuing tokens against an
+	// account the database still considers blocked.
+	isActive bool
 }
 
 // Login authenticates a user by email and password. Without application
@@ -747,17 +772,75 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// User-base isolation: app-authenticated logins only see that application's
 	// own users; generic logins only see tenant-level users (application_id IS
 	// NULL) — an app-scoped account can never authenticate outside its app.
+	// The is_active test admits one extra class of account: one that an AUTOMATIC
+	// lockout disabled and whose lock has since expired (issue #72). Without this,
+	// hard_lock_duration_seconds could not work at all — an expired account would
+	// stay invisible to login and the lock would be permanent in practice however
+	// the policy was configured.
+	//
+	// Deliberately narrow. block_reason = 'failed_attempts' means an
+	// administrator's block (block_reason = 'admin') is never lifted by the clock,
+	// and the interval is computed in SQL from the policy so a locked account
+	// becomes visible at exactly the moment it should. Accounts admitted this way
+	// are re-checked below and unlocked properly before any token is issued —
+	// matching a candidate here is not the same as authenticating it.
+	// Resolved at the app's scope when one authenticated, and at platform scope
+	// otherwise. In generic mode the tenant is genuinely not known yet — that is
+	// what the candidate query is about to determine — so a tenant-scoped
+	// hard_lock_duration cannot be applied here. It is re-resolved against the real
+	// tenant below, before anything is unlocked, so the tenant's own setting still
+	// governs the decision that matters; this predicate only widens what the query
+	// is allowed to see.
+	var lockoutScope *int64
+	if appRowID != 0 {
+		lockoutScope = &appRowID
+	}
+	lockoutPolicy := s.lockoutSvc.Resolve(ctx, appTenantID, lockoutScope)
+
+	// The window used to ADMIT a locked row for re-checking.
+	//
+	// In generic mode the policy above is the PLATFORM default, because which
+	// tenant this email belongs to is exactly what the candidate query is about to
+	// determine. A tenant that configured a SHORTER expiry than the platform would
+	// then never have its accounts admitted — they would stay locked past their own
+	// deadline, silently ignoring the tenant's setting.
+	//
+	// So admit on the SMALLEST expiry any scope could plausibly set, which is the
+	// floor the CHECK constraint in migration 00070 allows. Being admitted here
+	// grants nothing: the row is still marked disabled, and ExpireHardLock
+	// re-validates the elapsed time in SQL against the tenant's real policy before
+	// anything is unlocked. Widening this predicate cannot let an account in early;
+	// it only lets the authoritative check run.
+	autoExpirySecs := minHardLockDurationSeconds
+	if lockoutPolicy.HardLockDuration > 0 {
+		if d := int(lockoutPolicy.HardLockDuration.Seconds()); d < autoExpirySecs {
+			autoExpirySecs = d
+		}
+	}
+
 	candidateQuery := `
-		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, '')
+		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, ''),
+		       u.is_active
 		FROM users u
 		JOIN user_credentials uc ON uc.user_id = u.id
 		JOIN tenants t ON t.id = u.tenant_id
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.email = $1 AND u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
+		WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
+		  AND (
+		        u.is_active = true
+		    OR (
+		        $2::INTEGER > 0
+		        AND u.block_reason = 'failed_attempts'
+		        AND u.blocked_at IS NOT NULL
+		        AND u.blocked_at < NOW() - make_interval(secs => $2::INTEGER)
+		    )
+		  )
 	`
-	args := []any{in.Email}
+	// $2 is bound unconditionally so the app-scoped branch can keep appending
+	// from $3 without the two placeholder sets colliding.
+	args := []any{in.Email, autoExpirySecs}
 	if appRowID != 0 {
-		candidateQuery += ` AND u.tenant_id = $2 AND u.application_id = $3`
+		candidateQuery += ` AND u.tenant_id = $3 AND u.application_id = $4`
 		args = append(args, appTenantID, appRowID)
 	} else {
 		candidateQuery += ` AND u.application_id IS NULL`
@@ -770,7 +853,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	var candidates []loginCandidate
 	for rows.Next() {
 		var c loginCandidate
-		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName); err != nil {
+		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName, &c.isActive); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan login candidate: %w", err)
 		}
@@ -809,6 +892,20 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		for i := range candidates {
 			s.blockSvc.RecordFailedLogin(ctx, candidates[i].tenantID, candidates[i].userID)
 		}
+		// Report the soft lock so the caller can send Retry-After, telling a
+		// legitimate user when to come back. Only ever consulted after the attempt
+		// has already failed, so it discloses nothing about whether the account
+		// exists that the attempt itself did not: every branch here returns the
+		// same "invalid credentials" body.
+		//
+		// Single candidate only. With several accounts sharing this email across
+		// tenants, whose retry window would it even be? — and answering that would
+		// leak that the address has accounts in more than one tenant.
+		if len(candidates) == 1 {
+			if retryAfter, locked := s.blockSvc.SoftLockedFor(ctx, candidates[0].tenantID, candidates[0].userID); locked {
+				return nil, &SoftLockError{RetryAfter: retryAfter}
+			}
+		}
 		return nil, fmt.Errorf("invalid credentials")
 	}
 	if matchCount > 1 {
@@ -822,6 +919,46 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	}
 
 	userID, tenantID, email, roleName := matched.userID, matched.tenantID, matched.email, matched.roleName
+
+	// Now that the tenant is known, re-resolve: in generic mode the policy read
+	// before the candidate query was the PLATFORM default, because which tenant
+	// this email belongs to is exactly what that query just answered. This is the
+	// authoritative reading, and it is the one the unlock decision below uses.
+	if appRowID == 0 {
+		lockoutPolicy = s.lockoutSvc.Resolve(ctx, tenantID, nil)
+	}
+
+	// An account admitted by the auto-expiry predicate is still marked disabled.
+	// Lift the lock properly now — inside its own guarded UPDATE, which re-checks
+	// the elapsed interval in SQL against the policy resolved just above — before
+	// anything issues a token. If the lift does not take (a concurrent admin block,
+	// a tenant policy longer than the admit-window floor, a policy tightened between
+	// the two queries), refuse: a correct password must not be enough to
+	// authenticate an account the database still considers blocked.
+	if !matched.isActive {
+		if !s.blockSvc.ExpireHardLock(ctx, tenantID, userID, lockoutPolicy.HardLockDuration) {
+			s.logger.Warn().Int64("user_id", userID).
+				Msg("login: lock expiry did not apply; refusing")
+			return nil, fmt.Errorf("invalid credentials")
+		}
+	}
+
+	// Soft lock is checked HERE — after the bcrypt comparisons, and on the path
+	// where the password was CORRECT.
+	//
+	// After bcrypt so a soft-locked account takes the same time to refuse as a
+	// wrong password; checking first would make the lock detectable by timing.
+	//
+	// On the success path because a soft lock that a correct password lifts is not
+	// a lock at all: an attacker who guesses right on the attempt after the
+	// threshold would walk straight in, and the tier would exist only to
+	// inconvenience the legitimate owner. This is the check that makes the soft
+	// tier a real control.
+	if retryAfter, locked := s.blockSvc.SoftLockedFor(ctx, tenantID, userID); locked {
+		s.logger.Info().Int64("user_id", userID).Dur("retry_after", retryAfter).
+			Msg("login refused: account soft-locked")
+		return nil, &SoftLockError{RetryAfter: retryAfter}
+	}
 
 	// The password is now proven correct, so the lockout counter is cleared here
 	// rather than after the MFA gate: a user who holds the right password should

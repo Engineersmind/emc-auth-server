@@ -670,8 +670,8 @@ func TestLockout_BlocksAfterThresholdAndUnblocks(t *testing.T) {
 			t.Fatalf("blocked after %d attempts, want only at %d", i+1, auth.MaxFailedLogins)
 		}
 	}
-	if len(e.mail.blocks) != 0 {
-		t.Fatalf("blocked-account emails = %d before the threshold, want 0", len(e.mail.blocks))
+	if got := e.mail.Blocks(); len(got) != 0 {
+		t.Fatalf("blocked-account emails = %d before the threshold, want 0", len(got))
 	}
 
 	if blocked := blockSvc.RecordFailedLogin(e.ctx, e.tenantID, userID); !blocked {
@@ -689,11 +689,12 @@ func TestLockout_BlocksAfterThresholdAndUnblocks(t *testing.T) {
 	if reason == nil || *reason != mailer.BlockReasonFailedAttempts {
 		t.Errorf("block_reason = %v, want %q", reason, mailer.BlockReasonFailedAttempts)
 	}
-	if len(e.mail.blocks) != 1 || e.mail.blocks[0].Reason != mailer.BlockReasonFailedAttempts {
-		t.Fatalf("blocked-account emails = %+v, want 1 with the failed-attempts reason", e.mail.blocks)
+	blocks := e.mail.awaitBlocks(t, 1)
+	if len(blocks) != 1 || blocks[0].Reason != mailer.BlockReasonFailedAttempts {
+		t.Fatalf("blocked-account emails = %+v, want 1 with the failed-attempts reason", blocks)
 	}
 
-	raw := tokenFromLink(t, e.mail.blocks[0].Link)
+	raw := tokenFromLink(t, blocks[0].Link)
 	if err := blockSvc.Unblock(e.ctx, raw); err != nil {
 		t.Fatalf("Unblock: %v", err)
 	}
@@ -728,8 +729,8 @@ func TestLockout_ResetClearsCounter(t *testing.T) {
 	if blocked := blockSvc.RecordFailedLogin(e.ctx, e.tenantID, userID); blocked {
 		t.Error("blocked immediately after a successful sign-in reset the counter")
 	}
-	if len(e.mail.blocks) != 0 {
-		t.Errorf("blocked-account emails = %d, want 0", len(e.mail.blocks))
+	if got := e.mail.Blocks(); len(got) != 0 {
+		t.Errorf("blocked-account emails = %d, want 0", len(got))
 	}
 }
 
@@ -763,8 +764,8 @@ func TestLockout_AttemptsAgeOutOfWindow(t *testing.T) {
 	if attempts != 1 {
 		t.Errorf("failed_login_attempts = %d after the window lapsed, want the counter restarted at 1", attempts)
 	}
-	if len(e.mail.blocks) != 0 {
-		t.Errorf("blocked-account emails = %d, want 0", len(e.mail.blocks))
+	if got := e.mail.Blocks(); len(got) != 0 {
+		t.Errorf("blocked-account emails = %d, want 0", len(got))
 	}
 }
 
@@ -780,7 +781,7 @@ func TestUnblock_RejectsAdminBlockedAccount(t *testing.T) {
 	for i := 0; i < auth.MaxFailedLogins; i++ {
 		blockSvc.RecordFailedLogin(e.ctx, e.tenantID, userID)
 	}
-	raw := tokenFromLink(t, e.mail.blocks[0].Link)
+	raw := tokenFromLink(t, e.mail.awaitBlocks(t, 1)[0].Link)
 
 	// An admin now blocks the same account, overriding the automatic reason.
 	blockSvc.NotifyAdminBlock(e.ctx, e.tenantID, nil, userID, email)
@@ -795,8 +796,9 @@ func TestUnblock_RejectsAdminBlockedAccount(t *testing.T) {
 	if active {
 		t.Error("is_active = true, want the admin block to stand")
 	}
-	if len(e.mail.blocks) != 2 || e.mail.blocks[1].Reason != mailer.BlockReasonAdmin {
-		t.Errorf("second email = %+v, want the admin-block variant", e.mail.blocks)
+	blocks := e.mail.awaitBlocks(t, 2)
+	if len(blocks) != 2 || blocks[1].Reason != mailer.BlockReasonAdmin {
+		t.Errorf("second email = %+v, want the admin-block variant", blocks)
 	}
 }
 

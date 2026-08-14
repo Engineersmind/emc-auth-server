@@ -221,6 +221,23 @@ type UserResult struct {
 	// credentials row exists, plus every linked federated provider (Auth0's
 	// "Connection" column).
 	Connections []string `json:"connections"`
+
+	// Lockout state (issue #72), for the console's locked badge and its unlock
+	// action. BlockedAt and BlockReason are nil on an account nothing has locked.
+	//
+	// BlockReason distinguishes the two cases an operator must respond to
+	// differently: "failed_attempts" is automatic and usually expires on its own,
+	// while "admin" is somebody's deliberate decision and only an operator lifts
+	// it. A badge that showed only "locked" would flatten that distinction.
+	BlockedAt   *time.Time `json:"blocked_at"`
+	BlockReason *string    `json:"block_reason"`
+	// FailedLoginAttempts is the live counter, so the console can show how close
+	// an account is to locking rather than only that it already has.
+	FailedLoginAttempts int `json:"failed_login_attempts"`
+	// LockExpiresAt is when an automatic lock lifts by itself. Nil when the
+	// account is not automatically locked, or when the tenant opted into a
+	// permanent lock — in which case only an operator can restore access.
+	LockExpiresAt *time.Time `json:"lock_expires_at"`
 }
 
 // UsersPage wraps a paginated user list.
@@ -1299,7 +1316,8 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		var providers []string
 		if err := rows.Scan(&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 			&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
-			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers); err != nil {
+			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
+			&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		u.ID = strconv.FormatInt(id, 10)
@@ -1776,6 +1794,86 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 	return result, nil
 }
 
+// UnlockUser clears every lockout tier on an account (issue #72): the failure
+// counter, the automatic block, and the ephemeral soft lock.
+//
+// Distinct from SetUserActive(..., true) even though both re-enable an account,
+// because they answer different questions. SetUserActive is a status toggle — an
+// operator deciding whether this account should exist — and it is refused on your
+// own account. Unlock is incident response: "this user is locked out and should
+// not be", which an operator may legitimately need to do for themselves after
+// being brute-forced, and which must also clear the Redis soft lock that
+// SetUserActive knows nothing about.
+//
+// Idempotent. Unlocking an account that is not locked is a successful no-op
+// rather than an error: an operator clicking Unlock on a badge that has since
+// expired should see success, not a confusing failure about state they cannot
+// observe.
+func (s *Service) UnlockUser(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserResult, error) {
+	// Resolved first so the soft-lock clear below can run even when the row needed
+	// no database change — the two states are independent, and an account can hold
+	// a live soft lock while is_active is still true.
+	var wasBlocked bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT (u.blocked_at IS NOT NULL OR NOT u.is_active OR u.failed_login_attempts > 0)
+		FROM users u
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
+	`, userID, tenantID, applicationID).Scan(&wasBlocked)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("look up user for unlock: %w", err)
+	}
+
+	// Deliberately does NOT bump token_version, unlike the blocking path: nothing
+	// is being taken away, so there is no reason to sign the user out of sessions
+	// they may already hold.
+	//
+	// Only automatic locks are cleared here without further thought; an admin block
+	// is cleared too, because an operator explicitly asking to unlock an account is
+	// entitled to override another operator's block — but it is logged distinctly
+	// by the caller's audit event, which records block_reason.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE users
+		SET is_active = true, blocked_at = NULL, block_reason = NULL,
+		    failed_login_attempts = 0, last_failed_login_at = NULL,
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+	`, userID, tenantID, applicationID); err != nil {
+		return nil, fmt.Errorf("unlock user: %w", err)
+	}
+
+	// Retire any outstanding self-service unblock token. The account is already
+	// unlocked, so the link has nothing left to do — and leaving it live means an
+	// old email could re-enable an account that a later block has disabled again.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE account_unblock_tokens SET used_at = NOW()
+		WHERE user_id = $1 AND tenant_id = $2 AND used_at IS NULL
+	`, userID, tenantID); err != nil {
+		s.logger.Warn().Err(err).Int64("user_id", userID).
+			Msg("admin: could not retire unblock tokens on unlock")
+	}
+
+	// The Redis half. Without this an operator's unlock is silently undone by a
+	// soft-lock key nobody can see: the account is active in the database and the
+	// user is still refused, which is the worst possible outcome for a control
+	// whose whole purpose is restoring access.
+	if s.blockSvc == nil {
+		s.logger.Warn().Int64("user_id", userID).
+			Msg("admin: no account-block service wired; a live soft lock may still refuse this user")
+	} else {
+		s.blockSvc.ClearSoftLock(ctx, tenantID, userID)
+	}
+
+	s.logger.Info().Int64("user_id", userID).Int64("tenant_id", tenantID).
+		Bool("was_locked", wasBlocked).Msg("admin: account lockout cleared")
+
+	return s.getUserByID(ctx, tenantID, applicationID, userID)
+}
+
 // MaxSessionsListed bounds one page of session results.
 //
 // The endpoint used to return every live session in one response. That was
@@ -2130,7 +2228,24 @@ const userEnrichmentColumns = `
 	       EXISTS (SELECT 1 FROM user_credentials uc
 	               WHERE uc.user_id = u.id AND uc.tenant_id = u.tenant_id AND uc.deleted_at IS NULL) AS has_password,
 	       (SELECT COALESCE(array_agg(ui.provider ORDER BY ui.provider), '{}')
-	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers`
+	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers,
+	       u.blocked_at, u.block_reason, u.failed_login_attempts,
+	       -- When an automatic lock lifts, resolved against the policy in force for
+	       -- this user's scope. Computed in SQL rather than in Go so a list of
+	       -- fifty users does not become fifty policy lookups, and NULL whenever
+	       -- there is nothing to expire: not locked, an admin block (which no clock
+	       -- lifts), or a tenant that chose a permanent lock.
+	       CASE
+	           WHEN u.block_reason = 'failed_attempts' AND u.blocked_at IS NOT NULL THEN (
+	               SELECT u.blocked_at + make_interval(secs => lp.hard_lock_duration_seconds)
+	               FROM lockout_policies lp
+	               WHERE (lp.application_id = u.application_id AND lp.tenant_id = u.tenant_id)
+	                  OR (lp.application_id IS NULL AND lp.tenant_id = u.tenant_id)
+	                  OR (lp.application_id IS NULL AND lp.tenant_id IS NULL)
+	               ORDER BY lp.application_id NULLS LAST, lp.tenant_id NULLS LAST
+	               LIMIT 1
+	           )
+	       END AS lock_expires_at`
 
 // buildConnections merges the password credential and federated providers
 // into the public Connections list ("password", "google", ...).
@@ -2160,6 +2275,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 		&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 		&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
+		&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

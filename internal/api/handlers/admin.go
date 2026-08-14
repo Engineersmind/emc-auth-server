@@ -1603,6 +1603,48 @@ func (h *AdminHandler) SetUserStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, result)
 }
 
+// UnlockUser handles POST .../users/:id/unlock.
+//
+// @Summary      Unlock a locked-out user
+// @Description  Clears every account-lockout tier: the failed-attempt counter, an automatic or administrative block, and the temporary (soft) lock. Idempotent — unlocking an account that is not locked succeeds. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  admin.UserResult
+// @Failure      403  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/unlock [post]
+func (h *AdminHandler) UnlockUser(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	// Note the absence of SetUserStatus's self-action guard. That guard exists so
+	// an operator cannot disable themselves; unlocking yourself takes nothing away,
+	// and an administrator who has just been brute-forced into a lockout is exactly
+	// the person who most needs to be able to clear it.
+	result, err := h.svc.UnlockUser(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: unlock user failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to unlock user"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminAccountUnlocked, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, result)
+}
+
 // ListUserSessions handles GET .../users/:id/sessions.
 //
 // @Summary      List a user's active sessions

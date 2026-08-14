@@ -318,6 +318,43 @@ func (h *AuthHandler) Register(c echo.Context) error {
 	return c.JSON(http.StatusCreated, result)
 }
 
+// invalidCredentials renders the one response every credential failure gets, and
+// attaches Retry-After when the failure was a soft lock (issue #72).
+//
+// One helper for all three password-login handlers so the three cannot drift: the
+// body must be byte-identical whether the account does not exist, the password was
+// wrong, the account is soft-locked, or it is hard-locked. Anything that varies
+// between those cases is an account-enumeration oracle.
+//
+// The header is the single intentional exception, and it leaks nothing new: a soft
+// lock is only ever reachable by an attempt that already failed, so an attacker
+// who sees Retry-After has learnt nothing the refusal did not already tell them —
+// while a legitimate user learns when to come back instead of guessing.
+func invalidCredentials(c echo.Context, err error) error {
+	var soft *auth.SoftLockError
+	if errors.As(err, &soft) {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(soft.RetryAfterSeconds()))
+	}
+	return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+}
+
+// softLockMeta tags a login-failure audit event that was refused by a soft lock,
+// so the feed distinguishes "wrong password" from "correct password, but locked"
+// without the RESPONSE distinguishing them. Returns nil when the error is not a
+// soft lock, which leaves existing metadata untouched.
+func softLockMeta(err error, base map[string]any) map[string]any {
+	var soft *auth.SoftLockError
+	if !errors.As(err, &soft) {
+		return base
+	}
+	if base == nil {
+		base = map[string]any{}
+	}
+	base["soft_locked"] = true
+	base["retry_after_seconds"] = soft.RetryAfterSeconds()
+	return base
+}
+
 // Login handles POST /api/v1/auth/login.
 //
 // @Summary      Login
@@ -354,9 +391,10 @@ func (h *AuthHandler) Login(c echo.Context) error {
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
+			Metadata:     softLockMeta(err, nil),
 		}, err)
 		if containsMsg(err, "invalid credentials") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return invalidCredentials(c, err)
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
@@ -539,6 +577,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
+			Metadata:     softLockMeta(err, nil),
 		}
 		attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
 		h.auditFailure(c, ev, err)
@@ -546,7 +585,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 		}
 		if containsMsg(err, "invalid credentials") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return invalidCredentials(c, err)
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
@@ -2341,10 +2380,10 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
-			Metadata:     map[string]any{"flow": "session"},
+			Metadata:     softLockMeta(err, map[string]any{"flow": "session"}),
 		}, err)
 		if containsMsg(err, "invalid credentials") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return invalidCredentials(c, err)
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
