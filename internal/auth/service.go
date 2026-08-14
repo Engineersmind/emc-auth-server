@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
@@ -156,6 +157,37 @@ type LoginInput struct {
 	// shorter session, so a client that has not been updated to send it cannot
 	// accidentally opt its users into month-long sessions on shared machines.
 	Persistent bool
+
+	// VerifiedApp carries an application context that the CALLER has already
+	// established from the database, bypassing the client_secret check below.
+	//
+	// It exists for GET /oauth/authorize (issue #6), where the application is
+	// identified by client_id alone. A public client — SPA or native — holds no
+	// secret by definition, so the ClientSecret != "" test above would classify
+	// its login as generic and search only tenant-level users
+	// (application_id IS NULL), never the application's own user base. The user
+	// would be told their password was wrong for an account that exists.
+	//
+	// This is safe there because the authorize endpoint resolves the client
+	// with AuthorizationServer.LookupClient before any user data is touched, so
+	// the tenant and application row id come from an oauth_clients row, not
+	// from the request.
+	//
+	// SECURITY: this field must never be populated from anything a caller sent.
+	// It is not a credential and proves nothing on its own — it ASSERTS that
+	// verification already happened. Every handler builds LoginInput field by
+	// field from a separate bound request struct (see handlers/auth.go), and
+	// LoginInput is never itself bound from JSON; keep it that way. Setting
+	// this from a request body would let any caller name any application and
+	// authenticate against its isolated user base.
+	VerifiedApp *VerifiedApp
+}
+
+// VerifiedApp is an application identity the caller has already resolved from
+// oauth_clients. See LoginInput.VerifiedApp for the security contract.
+type VerifiedApp struct {
+	TenantID int64
+	AppRowID int64
 }
 
 // RegisterResult describes the account Register created.
@@ -323,6 +355,18 @@ type sessionContext struct {
 // inside the transaction means a signing failure rolls the row back instead of
 // leaving a live refresh token that no access token was ever paired with.
 func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sess sessionContext, appID string) (*AuthResult, error) {
+	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms, sess, appID, "")
+}
+
+// issueTokenPairWithScope is issueTokenPair with the OAuth `scope` claim.
+//
+// Only the OAuth authorization-code path passes a non-empty scope; every other
+// caller goes through issueTokenPair and gets "". That is not incidental — the
+// claim is `omitempty`, so "" produces an ABSENT claim, and absent is what every
+// first-party flow must keep emitting. An empty-but-present scope claim reads
+// downstream as "granted nothing" and would strip the claims those callers
+// depend on (see Claims.Scope and /oauth/userinfo).
+func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sess sessionContext, appID, scope string) (*AuthResult, error) {
 	claims := &Claims{
 		UserID:      strconv.FormatInt(userID, 10),
 		TenantID:    strconv.FormatInt(tenantID, 10),
@@ -330,6 +374,7 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 		Email:       email,
 		Role:        role,
 		Permissions: perms,
+		Scope:       scope,
 	}
 
 	// Administrative reach is resolved here rather than at each caller because
@@ -683,7 +728,14 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// submitted email.
 	appID := ""
 	var appTenantID, appRowID int64
-	if in.ClientSecret != "" {
+	switch {
+	case in.VerifiedApp != nil:
+		// Caller already resolved this application from oauth_clients — see the
+		// LoginInput.VerifiedApp contract. Checked first so a caller that
+		// supplies both does not silently get the secret path instead.
+		appTenantID, appRowID = in.VerifiedApp.TenantID, in.VerifiedApp.AppRowID
+		appID = strconv.FormatInt(appRowID, 10)
+	case in.ClientSecret != "":
 		tid, aid, err := s.authenticateApp(ctx, in.ClientID, in.ClientSecret)
 		if err != nil {
 			return nil, err
@@ -1713,3 +1765,164 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 
 // Logout (AUTH-04) now lives in session.go, where it revokes the whole session
 // family rather than the single presented token. See LogoutSession for why.
+
+// RevokeRefreshTokenForTenant revokes a refresh token, but only if it belongs to
+// the given tenant. Reports whether a live token was actually revoked.
+//
+// This is Logout with a tenant guard, and it exists for POST /oauth/revoke
+// (RFC 7009). Logout is reached only by a caller already holding that user's own
+// session; the revocation endpoint is reached by any client that can
+// authenticate, so "I hold this string" must not be sufficient authority to
+// invalidate it. Scoping the UPDATE by tenant_id means an authenticated client
+// in one tenant cannot revoke a token issued in another — the same isolation
+// boundary every other query in this codebase enforces.
+//
+// The boolean is the honest answer to "did anything happen", which the caller
+// needs for its audit record. It must NOT be reflected in the HTTP response:
+// RFC 7009 §2.2 requires 200 for an unknown token, because a distinguishable
+// response would make this endpoint an oracle for whether a captured string is
+// a live token.
+//
+// Per-client ownership is NOT checked, and cannot be: refresh_tokens carries
+// user_id and tenant_id but no application_id (see migrations 00009 / 00026), so
+// there is no column to compare a client_id against. Tenant scoping is the
+// tightest guard available without a schema change — tracked as CLAUDE.md
+// deferred item #22.
+func (s *AuthService) RevokeRefreshTokenForTenant(ctx context.Context, rawRefreshToken string, tenantID int64) (bool, error) {
+	hash := HashToken(rawRefreshToken)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE refresh_tokens
+		SET    revoked_at = NOW()
+		WHERE  token_hash = $1 AND tenant_id = $2 AND revoked_at IS NULL
+	`, hash, tenantID)
+	if err != nil {
+		return false, fmt.Errorf("revoke refresh token: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// LookupUserForApp resolves an authenticated user to their row id and canonical
+// email within one application's isolated user base (issue #6).
+//
+// Called only AFTER credentials have been verified, by the hosted login at
+// /oauth/authorize, which needs the user id to bind an authorization code to.
+// It performs no authentication of its own and must never be reachable from an
+// unauthenticated path — an email address is not a credential.
+//
+// Scoped by application_id as well as tenant_id, matching Login's own candidate
+// query: an app-authenticated login only ever sees that application's users, so
+// resolving the same address against the tenant-level user base here would
+// return a different person than the one who just authenticated.
+//
+// The email is normalized on the way in (issue #104) so a caller that kept the
+// user's original casing still matches the stored row.
+func (s *AuthService) LookupUserForApp(ctx context.Context, tenantID, appRowID int64, email string) (userID int64, canonicalEmail string, err error) {
+	normalized := emailaddr.Normalize(email)
+	err = s.pool.QueryRow(ctx, `
+		SELECT u.id, u.email
+		FROM   users u
+		JOIN   tenants t ON t.id = u.tenant_id
+		WHERE  u.email = $1 AND u.tenant_id = $2 AND u.application_id = $3
+		  AND  u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
+	`, normalized, tenantID, appRowID).Scan(&userID, &canonicalEmail)
+	if err != nil {
+		return 0, "", fmt.Errorf("lookup user for application: %w", err)
+	}
+	return userID, canonicalEmail, nil
+}
+
+// AuthorizedUser is everything the token endpoint needs about the user behind a
+// redeemed authorization code: the tokens to hand back, and the profile facts
+// the ID token may describe.
+type AuthorizedUser struct {
+	Tokens  *AuthResult
+	Subject IDTokenSubject
+}
+
+// IssueTokensForAuthorizationCode mints the token pair for a redeemed
+// authorization code (issue #6) and returns the profile facts alongside it.
+//
+// The user is re-read here rather than trusted from the code. A code lives 60
+// seconds, which is long enough for an account to be deactivated or deleted
+// between the authorize redirect and the token exchange; issuing a 15-minute
+// access token for an account that no longer exists would outlive the
+// revocation by the full token lifetime.
+//
+// Scoped by application_id as well as tenant_id, matching Login and
+// LookupUserForApp — the code was issued inside one application's user base and
+// must be redeemed against the same one.
+func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenantID, userID, appRowID int64, grantedScopes []string) (*AuthorizedUser, error) {
+	var (
+		email, firstName, lastName, roleName string
+		emailVerified                        bool
+		updatedAt                            time.Time
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT u.email, u.first_name, u.last_name, u.email_verified, u.updated_at,
+		       COALESCE(r.name, '')
+		FROM   users u
+		JOIN   tenants t ON t.id = u.tenant_id
+		LEFT   JOIN roles r ON r.id = u.role_id
+		WHERE  u.id = $1 AND u.tenant_id = $2 AND u.application_id = $3
+		  AND  u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
+	`, userID, tenantID, appRowID).Scan(&email, &firstName, &lastName, &emailVerified, &updatedAt, &roleName)
+	if err != nil {
+		return nil, fmt.Errorf("load user for authorization code: %w", err)
+	}
+
+	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	if err != nil {
+		// Matches the stance ExchangeLoginCode already takes: a permission-load
+		// failure degrades to an empty grant set rather than failing the login,
+		// because the alternative is a user who authenticated correctly being
+		// unable to sign in at all.
+		s.logger.Warn().Err(err).Msg("authorization code: failed to load permissions, continuing with empty set")
+		perms = []string{}
+	}
+
+	appID := strconv.FormatInt(appRowID, 10)
+	tokens, err := s.issueScopedTokenPair(ctx, userID, tenantID, email, roleName, perms, appID, grantedScopes)
+	if err != nil {
+		return nil, err
+	}
+
+	name := strings.TrimSpace(firstName + " " + lastName)
+	return &AuthorizedUser{
+		Tokens: tokens,
+		Subject: IDTokenSubject{
+			UserID:        strconv.FormatInt(userID, 10),
+			Email:         email,
+			EmailVerified: emailVerified,
+			Name:          name,
+			GivenName:     firstName,
+			FamilyName:    lastName,
+			UpdatedAt:     updatedAt,
+		},
+	}, nil
+}
+
+// issueScopedTokenPair mints the token pair for an OAuth grant, carrying the
+// granted scopes as the `scope` claim.
+//
+// A thin wrapper on issueTokenPairWithScope: the scope is threaded into the ONE
+// signing call rather than the token being signed twice. An earlier shape signed
+// without the claim and then re-signed with it, which meant a second Sign and a
+// second loadAdminScope — two round trips on the token-exchange path, and a
+// window in which two differently-claimed access tokens existed for one grant.
+//
+// strings.Join of an empty slice is "", so the no-scope case needs no branch:
+// the claim is omitempty and simply does not appear.
+func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, appID string, scopes []string) (*AuthResult, error) {
+	// NOTE (CLAUDE.md deferred #19 / #23): the access token minted here carries
+	// the OAuth `scope` claim AND the full internal `permissions` claim. That is
+	// safe only because /oauth/authorize refuses first_party = false, so every
+	// grant reaching this function belongs to a client the tenant owns. When the
+	// consent screen lands and genuinely third-party clients become possible,
+	// this line becomes a data-leakage path — an external client would receive
+	// internal permission strings it was never shown on a consent page. Filter
+	// perms by grant, or drop them for non-first-party clients, as part of that
+	// work. Read #19 before enabling third-party clients.
+	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms,
+		sessionContext{amr: []string{AMRPassword}}, appID,
+		strings.Join(scopes, " "))
+}

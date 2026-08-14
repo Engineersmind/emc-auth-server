@@ -556,6 +556,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
 	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
 
+	// OAuth 2.0 authorization server (issue #6) — EMC issuing its own
+	// authorization codes, as opposed to oauthSvc above which consumes
+	// Google's and GitHub's.
+	authzSvc := auth.NewAuthorizationServer(deps.Pool, deps.Logger)
+	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
+	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
+		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure)
+	oauthTokenHandler := handlers.NewOAuthTokenHandler(
+		authzSvc, authSvc, jwtSvc, appSvc, auditLog, deps.Logger)
+
 	// AppRateLimiter middleware — enforces per-app token-bucket limits keyed on
 	// the JWT app_id (oauth_clients.id) + tenant_id claims. It MUST run after a
 	// JWT middleware has populated claims, so it is applied per authenticated
@@ -1202,6 +1212,39 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
 	e.GET("/saml/login", samlHandler.InitiateLogin)
 	e.POST("/saml/acs", samlHandler.HandleACS)
+
+	// ---- OAuth 2.0 authorization server (issue #6) -------------------------
+	//
+	// Top-level, beside JWKS and UserInfo, because these are the standard OAuth
+	// surfaces an external client library reaches by absolute URL, and #7b's
+	// discovery document will publish exactly these paths as
+	// authorization_endpoint, token_endpoint and revocation_endpoint.
+	//
+	// No Echo conflict with the social-login routes registered below: these are
+	// two-segment paths (/oauth/authorize) while those are three
+	// (/oauth/:provider/login). This is the same coexistence /oauth/userinfo
+	// already relies on.
+	//
+	// /oauth/authorize and its two login pages are BROWSER routes: they render
+	// HTML, accept form posts, and carry the SSO session cookie. They are
+	// deliberately outside apiV1 — that group applies CookieCSRF, which is
+	// built for the portal's cookie session and would reject a top-level
+	// cross-site navigation arriving from a tenant's application, which is
+	// exactly how every authorize request begins. CSRF protection here comes
+	// instead from the server-side request handle: a forged form cannot supply
+	// one, and the handle names the only redirect target a code can be sent to.
+	authorizeLimit := mw.AuthorizeRateLimiter()
+	e.GET("/oauth/authorize", authorizeHandler.Authorize, authorizeLimit)
+	e.POST("/oauth/authorize/login", authorizeHandler.LoginSubmit, authorizeLimit)
+	e.POST("/oauth/authorize/mfa", authorizeHandler.MFASubmit, authorizeLimit)
+
+	// Token endpoint — form-encoded (RFC 6749 §4.1.3), unlike the JSON
+	// POST /auth/token which keeps working as a documented-deprecated alias.
+	e.POST("/oauth/token", oauthTokenHandler.Token, mw.OAuthTokenRateLimiter())
+
+	// Revocation (RFC 7009). Always 200, so the limiter is what stops it being
+	// used to probe token validity at volume.
+	e.POST("/oauth/revoke", oauthTokenHandler.Revoke, mw.RevokeRateLimiter())
 
 	// Social login browser endpoints — public, top-level like SAML, but with
 	// the dedicated rate limiting SAML's routes lack (issue #64).

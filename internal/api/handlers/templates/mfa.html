@@ -1,0 +1,27 @@
+{{define "content"}}
+<h1>Two-factor authentication</h1>
+<p class="sub">Enter the code for <span class="app">{{.AppName}}</span></p>
+
+{{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+
+<form method="POST" action="/oauth/authorize/mfa" autocomplete="off">
+  <input type="hidden" name="request" value="{{.RequestHandle}}">
+  <div class="field">
+    <label for="code">Authentication code</label>
+    <!--
+      inputmode=numeric with a text type, not type=number: a number input
+      strips leading zeros, and TOTP codes routinely begin with one.
+      autocomplete=one-time-code lets iOS and Android offer the code from the
+      authenticator or SMS directly.
+    -->
+    <input id="code" name="code" type="text" class="code-input"
+           inputmode="numeric" autocomplete="one-time-code"
+           maxlength="10" required autofocus
+           aria-describedby="code-help">
+  </div>
+  <p class="sub" id="code-help" style="margin:-8px 0 16px;font-size:13px">
+    Open your authenticator app, or use a backup code.
+  </p>
+  <button type="submit">Verify</button>
+</form>
+{{end}}

@@ -688,12 +688,30 @@ definitions:
         type: string
       created_at:
         type: string
+      first_party:
+        description: |-
+          FirstParty false means a consent screen is required before a code may be
+          issued. No consent screen exists yet, so /oauth/authorize refuses such a
+          client outright rather than skipping consent silently.
+        type: boolean
       id:
         type: string
       is_active:
         type: boolean
       name:
         type: string
+      redirect_uris:
+        description: |-
+          RedirectURIs is the exact-match allow-list for GET /oauth/authorize
+          (issue #6). Empty means the application cannot use the authorization
+          code flow at all — which is the correct default for the m2m app_type.
+        items:
+          type: string
+        type: array
+      require_pkce:
+        description: RequirePKCE defaults true for every client type, confidential
+          included.
+        type: boolean
       scopes:
         items:
           type: string
@@ -728,10 +746,18 @@ definitions:
         type: string
       created_at:
         type: string
+      first_party:
+        type: boolean
       id:
         type: string
       name:
         type: string
+      redirect_uris:
+        items:
+          type: string
+        type: array
+      require_pkce:
+        type: boolean
       scopes:
         items:
           type: string
@@ -1085,10 +1111,31 @@ definitions:
       app_type:
         description: web | spa | m2m | native; defaults to web
         type: string
+      first_party:
+        description: |-
+          FirstParty defaults to true when omitted. Setting it false marks the
+          client as third-party, which currently causes /oauth/authorize to refuse
+          it with consent_required — the consent screen is not built yet.
+        type: boolean
       name:
         type: string
+      redirect_uris:
+        description: |-
+          RedirectURIs is the exact-match allow-list for GET /oauth/authorize
+          (issue #6). Without at least one entry the application cannot use the
+          authorization code flow at all — which is the right default for m2m.
+        items:
+          type: string
+        type: array
+      require_pkce:
+        description: |-
+          RequirePKCE defaults to true when omitted. Pointer so "omitted" is
+          distinguishable from an explicit false.
+        type: boolean
       scopes:
-        description: resource:action strings; optional
+        description: |-
+          Scopes accepts resource:action permission strings and the reserved OIDC
+          scopes (openid, profile, email, offline_access). Optional.
         items:
           type: string
         type: array
@@ -1431,6 +1478,32 @@ definitions:
       grant_type:
         type: string
     type: object
+  handlers.TokenResponse:
+    properties:
+      access_token:
+        type: string
+      expires_in:
+        type: integer
+      id_token:
+        description: |-
+          IDToken appears only when the granted scopes include `openid`. Its
+          presence is what makes this an OIDC response rather than a plain OAuth 2.0 one.
+        type: string
+      refresh_token:
+        description: |-
+          RefreshToken is omitted for client_credentials: RFC 6749 §4.4.3 says a
+          refresh token SHOULD NOT be issued, because a client that can present its
+          own credentials can simply ask for another token.
+        type: string
+      scope:
+        description: |-
+          Scope is the GRANTED set, which may be narrower than what was requested
+          (RFC 6749 §3.3). Echoed so a client can see what it actually received
+          rather than assuming its request was honoured in full.
+        type: string
+      token_type:
+        type: string
+    type: object
   handlers.UpdateApplicationMFARequest:
     properties:
       allowed_methods:
@@ -1448,8 +1521,19 @@ definitions:
     properties:
       app_type:
         type: string
+      first_party:
+        type: boolean
       name:
         type: string
+      redirect_uris:
+        description: RedirectURIs omitted = unchanged; [] clears — same convention
+          as Scopes.
+        items:
+          type: string
+        type: array
+      require_pkce:
+        description: Nil leaves the flag unchanged.
+        type: boolean
       scopes:
         items:
           type: string
@@ -1591,6 +1675,13 @@ definitions:
           UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,
           which is what the rest of this API returns for timestamps.
         type: integer
+    type: object
+  handlers.tokenError:
+    properties:
+      error:
+        type: string
+      error_description:
+        type: string
     type: object
   saml.SAMLConfig:
     properties:
@@ -6743,6 +6834,159 @@ paths:
               type: string
             type: object
       summary: Start social login
+      tags:
+      - oauth
+  /oauth/authorize:
+    get:
+      description: Starts the Authorization Code flow with PKCE. Validates the client
+        and redirect_uri, authenticates the user through a server-rendered login page,
+        and redirects back to redirect_uri with a single-use code. Browser endpoint
+        — returns HTML or a 302, never JSON.
+      parameters:
+      - description: Registered client_id
+        in: query
+        name: client_id
+        required: true
+        type: string
+      - description: Must exactly match a registered redirect_uri. Optional only when
+          exactly one is registered.
+        in: query
+        name: redirect_uri
+        type: string
+      - description: Must be 'code'
+        in: query
+        name: response_type
+        required: true
+        type: string
+      - description: Space-delimited. Unregistered scopes are dropped, not rejected.
+        in: query
+        name: scope
+        type: string
+      - description: Opaque value echoed back on the redirect
+        in: query
+        name: state
+        type: string
+      - description: OIDC nonce, echoed into the ID token
+        in: query
+        name: nonce
+        type: string
+      - description: base64url(SHA256(code_verifier))
+        in: query
+        name: code_challenge
+        required: true
+        type: string
+      - description: Must be 'S256'
+        in: query
+        name: code_challenge_method
+        required: true
+        type: string
+      produces:
+      - text/html
+      responses:
+        "302":
+          description: Redirect to redirect_uri with code and state
+        "400":
+          description: HTML error page — client_id or redirect_uri invalid
+      summary: OAuth 2.0 authorization endpoint
+      tags:
+      - oauth
+  /oauth/revoke:
+    post:
+      consumes:
+      - application/x-www-form-urlencoded
+      description: Revokes a refresh token. Client authentication is REQUIRED (RFC
+        7009 §2.1) — the same credentials the token endpoint takes. Returns 200 for
+        an unknown or already-revoked token, per RFC 7009 §2.2; a bad or missing client
+        credential is a 401 invalid_client.
+      parameters:
+      - description: The token to revoke
+        in: formData
+        name: token
+        required: true
+        type: string
+      - description: refresh_token | access_token
+        in: formData
+        name: token_type_hint
+        type: string
+      - description: Required — prefer the Authorization Basic header
+        in: formData
+        name: client_id
+        required: true
+        type: string
+      - description: Confidential clients only
+        in: formData
+        name: client_secret
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Token revoked, or did not exist
+        "401":
+          description: client authentication failed
+          schema:
+            $ref: '#/definitions/handlers.tokenError'
+      summary: OAuth 2.0 token revocation
+      tags:
+      - oauth
+  /oauth/token:
+    post:
+      consumes:
+      - application/x-www-form-urlencoded
+      description: Exchanges credentials for tokens. Supports authorization_code (with
+        mandatory PKCE), refresh_token, and client_credentials. Form-encoded per RFC
+        6749 — not JSON. Client authentication via Authorization Basic or client_secret_post;
+        public clients authenticate with PKCE alone.
+      parameters:
+      - description: authorization_code | refresh_token | client_credentials
+        in: formData
+        name: grant_type
+        required: true
+        type: string
+      - description: Required for authorization_code
+        in: formData
+        name: code
+        type: string
+      - description: Required for authorization_code
+        in: formData
+        name: code_verifier
+        type: string
+      - description: Must match the value the code was issued against
+        in: formData
+        name: redirect_uri
+        type: string
+      - description: Required for refresh_token
+        in: formData
+        name: refresh_token
+        type: string
+      - description: Required for public clients
+        in: formData
+        name: client_id
+        type: string
+      - description: Confidential clients — prefer the Authorization Basic header
+        in: formData
+        name: client_secret
+        type: string
+      - description: client_credentials only
+        in: formData
+        name: scope
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.TokenResponse'
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/handlers.tokenError'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.tokenError'
+      summary: OAuth 2.0 token endpoint
       tags:
       - oauth
   /oauth/userinfo:
