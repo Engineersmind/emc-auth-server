@@ -9,6 +9,23 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`POST /api/v1/auth/refresh` returned no tokens to application-scoped clients** (#108)
+  — the rotated pair was delivered only through `setAuthCookies`, which deliberately
+  writes nothing for an identity carrying an `app_id` claim ("cookies are for the portal,
+  headers are for applications"), and the JSON body carried no tokens either. The client
+  received a `200` with nothing usable, retried with the old refresh token, and that
+  forced retry was correctly classified as a **replay** — revoking the whole token family
+  and ending every session for the user. App-scoped callers now receive the full pair in
+  the body (`access_token`, `refresh_token`, `token_type`, `expires_in`, `expires_at`),
+  the same shape `POST /api/v1/auth/apps/login` already returns, and still no cookies.
+  - **First-party callers are unchanged**: cookies plus a body of
+    `{message, expires_in, expires_at}`. A refresh token is deliberately never placed
+    where portal JavaScript can read it, and `/auth/session/refresh` still returns none.
+  - Purely additive for app-scoped clients; no migration, no config, no service-layer
+    change. Replay detection and the `409 concurrent_refresh` grace path are untouched.
+  - Reported by the EMC Insurance Platform integrator, 2026-08-11.
+
 ### In Progress
 - Phase 7: Full unit test suite (≥80% coverage gate)
 - Phase 7: Security test suite (auth bypass, injection, privilege escalation)

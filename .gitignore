@@ -57,3 +57,10 @@ FRONTEND_M2M_PLAN.md
 FRONTEND_RBAC_NEXT_STEP.md
 docs/SPRINT_*.md
 EMC_M2M_Postman_Collection.json
+
+# Local verification / demo scratch — dated run-throughs and throwaway drivers.
+# Named individually rather than as docs/*: docs/ holds real deliverables
+# (DEPLOYMENT.md, swagger.json) that must stay in the remote.
+docs/*_VERIFICATION_*.md
+scripts/demo-*.sh
+postman/verify-collection.ps1

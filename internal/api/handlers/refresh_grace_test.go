@@ -28,6 +28,17 @@ import (
 // happy path (200) and the replay path (401) were covered, but not the
 // concurrent-rotation 409 that the explicit refresh endpoints now return.
 func grace409Fixture(t *testing.T) (*AuthHandler, string) {
+	return grace409FixtureScoped(t, false)
+}
+
+// grace409FixtureScoped builds the grace-window fixture for either identity
+// shape. appScoped=true registers the user through an application's
+// client_id/client_secret so the resulting tokens carry an app_id claim — the
+// identity that, since issue #108, takes a different 200 branch in Refresh. A
+// grace hit must still be a 409 with no token pair for it, because the new
+// branch sits strictly after the grace return. This states that as a fact
+// rather than leaving it as an assumption.
+func grace409FixtureScoped(t *testing.T, appScoped bool) (*AuthHandler, string) {
 	t.Helper()
 
 	pool := testhelper.NewTestDB(t)
@@ -46,22 +57,48 @@ func grace409Fixture(t *testing.T) (*AuthHandler, string) {
 	if err != nil {
 		t.Fatalf("NewJWTService: %v", err)
 	}
-	svc := auth.NewAuthService(pool, jwtSvc, logger)
+	appSvc := auth.NewApplicationService(pool, logger)
+	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
 
 	email := fmt.Sprintf("grace-409-%d@test.example.com", time.Now().UnixNano())
-	if _, err := svc.Register(ctx, auth.RegisterInput{
+	in := auth.RegisterInput{
 		TenantSlug: "emc",
 		Email:      email,
 		Password:   "Password123!",
 		FirstName:  "Grace",
 		LastName:   "Hit",
-	}); err != nil {
+	}
+	if appScoped {
+		var tenantID int64
+		if err := pool.QueryRow(ctx,
+			`SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`,
+		).Scan(&tenantID); err != nil {
+			t.Fatalf("fetch seed tenant id: %v", err)
+		}
+		app, err := appSvc.CreateApplication(ctx, tenantID, fmt.Sprintf("grace-409-app-%d", time.Now().UnixNano()), "web", nil)
+		if err != nil {
+			t.Fatalf("CreateApplication() error = %v", err)
+		}
+		in.TenantSlug = ""
+		in.ClientID = app.ClientID
+		in.ClientSecret = app.ClientSecret
+	}
+
+	if _, err := svc.Register(ctx, in); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
 
 	// A separate sign-in, because registration no longer issues tokens — creating an
-	// account and starting a session are separate acts now.
-	res, err := svc.Login(ctx, auth.LoginInput{Email: email, Password: "Password123!"})
+	// account and starting a session are separate acts now. The application
+	// credentials have to be repeated here: it is the LOGIN that mints the token,
+	// so without them the session would come back first-party and the app_id
+	// branch under test would never be reached.
+	loginIn := auth.LoginInput{Email: email, Password: "Password123!"}
+	if appScoped {
+		loginIn.ClientID = in.ClientID
+		loginIn.ClientSecret = in.ClientSecret
+	}
+	res, err := svc.Login(ctx, loginIn)
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
@@ -126,6 +163,27 @@ func assertConcurrentRefresh409(t *testing.T, rec *httptest.ResponseRecorder) {
 // carries the fresh tokens).
 func TestRefresh_ConcurrentRotationReturns409(t *testing.T) {
 	h, refreshToken := grace409Fixture(t)
+
+	e := echo.New()
+	body := fmt.Sprintf(`{"refresh_token":%q}`, refreshToken)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+
+	if err := h.Refresh(c); err != nil {
+		t.Fatalf("Refresh() returned error: %v", err)
+	}
+	assertConcurrentRefresh409(t, rec)
+}
+
+// TestRefresh_AppScopedConcurrentRotationReturns409 is the same grace hit for an
+// application-scoped identity. Since issue #108 those callers get the token pair
+// in the 200 body; a grace hit must not become a token response, because there
+// is no fresh pair to hand back — the sibling request holds it. The new branch
+// is placed after the grace return, and this pins it there.
+func TestRefresh_AppScopedConcurrentRotationReturns409(t *testing.T) {
+	h, refreshToken := grace409FixtureScoped(t, true)
 
 	e := echo.New()
 	body := fmt.Sprintf(`{"refresh_token":%q}`, refreshToken)

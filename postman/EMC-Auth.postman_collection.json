@@ -2543,6 +2543,176 @@
           ]
         },
         {
+          "name": "Refresh (app-scoped) - pair arrives in the body (#108)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "refresh"
+              ]
+            },
+            "description": "Issue #108. An application-scoped identity gets no cookies by design, so the JSON body is its only delivery path. Before the fix this returned 200 with only {message, expires_in, expires_at}: the client had nothing to rotate with, retried the old token, and that forced retry was classified as a replay - revoking the whole family. Runs against the app-scoped refresh token captured by the preceding 'Setup - log in through application A'.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('access_token is in the body (#108)', () =>",
+                  "    pm.expect(b.access_token, 'app-scoped callers have no other delivery path').to.be.a('string').and.not.empty);",
+                  "pm.test('refresh_token is in the body (#108)', () =>",
+                  "    pm.expect(b.refresh_token, 'without this the client replays the old token and loses the family').to.be.a('string').and.not.empty);",
+                  "pm.test('token_type is Bearer', () => pm.expect(b.token_type).to.eql('Bearer'));",
+                  "pm.test('expires_in is present', () => pm.expect(b.expires_in).to.be.above(0));",
+                  "// The cookie invariant must survive the fix: applications stay header-only.",
+                  "pm.test('no Set-Cookie for an application identity', () =>",
+                  "    pm.expect(pm.response.headers.get('Set-Cookie'), 'applications authenticate with Authorization: Bearer').to.be.undefined);",
+                  "const claims = JSON.parse(atob(b.access_token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));",
+                  "pm.test('rotation preserved app_id (#82)', () =>",
+                  "    pm.expect(String(claims.app_id)).to.eql(pm.environment.get('app_a_id')));",
+                  "// Scoped setter, not a CAPTURE_MAP entry: the next request must replay THIS",
+                  "// superseded token deliberately, so it needs its own name.",
+                  "pm.environment.set('app_a_superseded_refresh', pm.environment.get('refresh_token'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refresh again with the body-delivered token (#108)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "refresh"
+              ]
+            },
+            "description": "The assertion that actually proves #108 is dead: rotate a second time using the token that arrived in the previous response body. Success means the destructive retry loop is broken, because the client finally has something to send.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{refresh_token}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('rotation loop works end to end (#108)', () =>",
+                  "    pm.expect(b.refresh_token).to.be.a('string').and.not.empty);",
+                  "pm.test('token was rotated, not reissued', () =>",
+                  "    pm.expect(b.refresh_token).to.not.eql(pm.environment.get('app_a_superseded_refresh')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Replay the superseded app-scoped token (expect 401)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/auth/refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "auth",
+                "refresh"
+              ]
+            },
+            "description": "Replay detection must survive the #108 fix. The token superseded two requests ago is dead; presenting it terminates the family. Without this check the fix could appear to pass by weakening the control it broke.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refresh_token\": \"{{app_a_superseded_refresh}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('status 401', () => pm.response.to.have.status(401));",
+                  "pm.test('no token pair leaked on the replay path', () => {",
+                  "    const b = pm.response.json();",
+                  "    pm.expect(b.access_token).to.be.undefined;",
+                  "    pm.expect(b.refresh_token).to.be.undefined;",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
           "name": "Matching application - expect 200",
           "request": {
             "method": "GET",

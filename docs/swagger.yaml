@@ -4120,6 +4120,9 @@ paths:
       - application/json
       description: |-
         Issues a new access + refresh token pair and immediately invalidates the old refresh token.
+        Delivery depends on the identity behind the presented refresh token:
+        application-scoped sessions (those established through /auth/apps/login, /auth/apps/register or magic-link verify — their access token carries an `app_id` claim) receive the full pair in the JSON body (`access_token`, `refresh_token`, `token_type`, `expires_in`, `expires_at`) and no cookies, matching the shape /auth/apps/login already returns;
+        first-party sessions receive the pair as HttpOnly cookies and a body of `{message, expires_in, expires_at}` only — a refresh token is deliberately never placed where browser JavaScript can read it.
         Body-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:
         409 (`concurrent_refresh`) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.
         503 means the session store (Redis) is temporarily unavailable — the client should retry.

@@ -1146,6 +1146,9 @@ type LogoutRequest struct {
 //
 // @Summary      Refresh token rotation
 // @Description  Issues a new access + refresh token pair and immediately invalidates the old refresh token.
+// @Description  Delivery depends on the identity behind the presented refresh token:
+// @Description  application-scoped sessions (those established through /auth/apps/login, /auth/apps/register or magic-link verify — their access token carries an `app_id` claim) receive the full pair in the JSON body (`access_token`, `refresh_token`, `token_type`, `expires_in`, `expires_at`) and no cookies, matching the shape /auth/apps/login already returns;
+// @Description  first-party sessions receive the pair as HttpOnly cookies and a body of `{message, expires_in, expires_at}` only — a refresh token is deliberately never placed where browser JavaScript can read it.
 // @Description  Body-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:
 // @Description  409 (`concurrent_refresh`) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.
 // @Description  503 means the session store (Redis) is temporarily unavailable — the client should retry.
@@ -1224,6 +1227,25 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		IPAddress:     c.RealIP(),
 		UserAgent:     c.Request().UserAgent(),
 	})
+
+	// DO NOT collapse this branch into the response below. It is the only thing
+	// that delivers tokens to an application-scoped caller, because
+	// setAuthCookies returns early for any access token carrying an app_id claim
+	// (see its first statement) — "cookies are for the portal, headers are for
+	// applications". So the cookie path writes nothing for these callers and the
+	// body below carries no tokens: removing this return reproduces issue #108,
+	// where the caller got a 200 with nothing usable in it, retried with the old
+	// refresh token, and that forced retry was correctly classified as a replay,
+	// revoking the whole family and ending every session for the user.
+	//
+	// The shape is byte-identical to POST /api/v1/auth/apps/login, which is what
+	// these callers already parse. Conversely, the first-party response below
+	// must keep withholding the pair: returning result unconditionally would put
+	// a refresh token where portal JavaScript can read it. Both directions are
+	// pinned by tests in refresh_app_scope_test.go.
+	if appID != nil {
+		return c.JSON(http.StatusOK, result)
+	}
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
 	return c.JSON(http.StatusOK, map[string]interface{}{
