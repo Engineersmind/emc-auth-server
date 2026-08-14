@@ -100,10 +100,10 @@ func newRefreshScopeFixture(t *testing.T) *refreshScopeFixture {
 }
 
 // appScopedLogin registers and logs a user in through the fixture's
-// application, returning the app-scoped refresh token. Register already returns
-// a token pair, but going through Login as well mirrors the issue's repro steps
-// (step 2 then step 3) and proves the token under test came from the same path
-// the integrator uses.
+// application, returning the app-scoped token pair. Registration no longer
+// issues tokens, so the Login call is not optional here — it is what mints the
+// app-scoped session, and it mirrors the issue's repro steps (step 2 then
+// step 3) so the token under test comes from the path the integrator uses.
 func (f *refreshScopeFixture) appScopedLogin(t *testing.T) *auth.AuthResult {
 	t.Helper()
 
@@ -150,18 +150,26 @@ func (f *refreshScopeFixture) appScopedLogin(t *testing.T) *auth.AuthResult {
 func (f *refreshScopeFixture) firstPartyLogin(t *testing.T) *auth.AuthResult {
 	t.Helper()
 
-	reg, err := f.svc.Register(f.ctx, auth.RegisterInput{
+	email := fmt.Sprintf("portal-refresh-%d@test.example.com", time.Now().UnixNano())
+	if _, err := f.svc.Register(f.ctx, auth.RegisterInput{
 		TenantSlug: "emc",
-		Email:      fmt.Sprintf("portal-refresh-%d@test.example.com", time.Now().UnixNano()),
+		Email:      email,
 		Password:   "Password123!",
 		FirstName:  "First",
 		LastName:   "Party",
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Register(tenant slug) error = %v", err)
 	}
 
-	claims, err := f.jwtSvc.Verify(f.ctx, reg.AccessToken)
+	login, err := f.svc.Login(f.ctx, auth.LoginInput{Email: email, Password: "Password123!"})
+	if err != nil {
+		t.Fatalf("Login(tenant slug) error = %v", err)
+	}
+	if login.Token == nil {
+		t.Fatalf("Login(tenant slug) returned no token pair (challenge = %+v)", login.OTPChallenge)
+	}
+
+	claims, err := f.jwtSvc.Verify(f.ctx, login.Token.AccessToken)
 	if err != nil {
 		t.Fatalf("Verify(first-party access token) error = %v", err)
 	}
@@ -169,7 +177,7 @@ func (f *refreshScopeFixture) firstPartyLogin(t *testing.T) *auth.AuthResult {
 		t.Fatalf("first-party token unexpectedly carries AppID %q — fixture is wrong", claims.AppID)
 	}
 
-	return reg
+	return login.Token
 }
 
 // callRefresh invokes the body-based POST /api/v1/auth/refresh handler.

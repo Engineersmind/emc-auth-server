@@ -1,0 +1,31 @@
+{{define "content"}}
+<h1>Sign in</h1>
+<p class="sub">to continue to <span class="app">{{.AppName}}</span></p>
+
+{{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+
+<!--
+  The form carries ONE hidden field: the request handle. No client_id, no
+  redirect_uri, no scope, no state.
+
+  Everything about the authorization request was validated at /oauth/authorize
+  and stored server-side under this handle. Re-submitting those values through
+  the form would mean reading security-relevant input from a page anyone can
+  render a copy of — the same class of mistake as trusting a callback query
+  parameter, which oauthflow.go's OAuthState exists to avoid.
+-->
+<form method="POST" action="/oauth/authorize/login" autocomplete="on">
+  <input type="hidden" name="request" value="{{.RequestHandle}}">
+  <div class="field">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="username"
+           required autofocus value="{{.Email}}">
+  </div>
+  <div class="field">
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required>
+  </div>
+  <button type="submit">Sign in</button>
+</form>
+{{end}}

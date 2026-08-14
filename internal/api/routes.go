@@ -257,6 +257,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.Use(httpsRedirect(deps.Config.Env))
 	e.Use(mw.RequestLogger(deps.Logger))
 	e.Use(mw.PrometheusMetrics())
+	// RequestInfo: carries client IP + User-Agent into the request context so
+	// session rows can record the device that created them. Mounted before any
+	// route so every token-minting flow inherits it.
+	e.Use(mw.RequestInfo())
 	e.Use(echoMiddleware.Recover())
 
 	// Health check — no auth required
@@ -435,7 +439,28 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger).
 		WithInvitations(invSvc).
-		WithAccountBlocking(blockSvc)
+		WithAccountBlocking(blockSvc).
+		// Session revocation goes through the auth service so an admin revoke and a
+		// user logout share one implementation — including the revoked-session
+		// denylist, without which an admin revoke would report success while the
+		// session's access token kept working for up to another 15 minutes.
+		WithAuthService(authSvc)
+
+	// The end-user session routes (/me/sessions) reuse the admin service's session
+	// queries with the caller's own ids. Wired here rather than in the builder chain
+	// above because adminSvc does not exist yet at that point.
+	authHandler.WithSessionLister(adminSvc)
+
+	// Revoked-session enforcement for the authenticating middleware. Installed once,
+	// before the server accepts traffic; unset, revocation still takes effect at the
+	// next refresh rather than immediately.
+	mw.SetSessionRevocationChecker(authSvc)
+
+	// The account-wide half of the same denylist, for the revocation paths spread
+	// across the auth package's other services (block, password reset, email change,
+	// invitation acceptance). See auth.RegisterSessionDenier for why it is
+	// process-wide rather than injected into each one.
+	auth.RegisterSessionDenier(deps.Redis)
 
 	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
 	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
@@ -530,6 +555,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Config.AppBaseURL, deps.Logger)
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
 	oauthHandler := handlers.NewOAuthHandler(oauthSvc, idpSvc, auditLog, deps.Logger)
+
+	// OAuth 2.0 authorization server (issue #6) — EMC issuing its own
+	// authorization codes, as opposed to oauthSvc above which consumes
+	// Google's and GitHub's.
+	authzSvc := auth.NewAuthorizationServer(deps.Pool, deps.Logger)
+	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
+	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
+		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure)
+	oauthTokenHandler := handlers.NewOAuthTokenHandler(
+		authzSvc, authSvc, jwtSvc, appSvc, auditLog, deps.Logger)
 
 	// AppRateLimiter middleware — enforces per-app token-bucket limits keyed on
 	// the JWT app_id (oauth_clients.id) + tenant_id claims. It MUST run after a
@@ -669,6 +704,43 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		mw.TokenRateLimiter(rlCfg), appClientRateLimit, mw.NormalizeAppScopeUnauthorized, jwtRenew)
 	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
 
+	// Self-service session management — "these are your signed-in devices; sign the
+	// ones you do not recognise out". Every mainstream IdP offers this, and SOC 2
+	// user-access-control evidence expects it; without it a user who suspects a
+	// compromise has to ask an operator to look for them.
+	//
+	// Mounted under /auth so the routes sit behind the same jwtRenew the rest of the
+	// self-service endpoints use, and so the refresh cookie's path scope
+	// (RefreshCookiePath = /api/v1/auth) reaches them — the DELETE handlers need to
+	// know which session is the caller's own.
+	//
+	// The mutating routes additionally get sessionCSRF: they are cookie-authenticated
+	// state changes, which is exactly the shape SameSite=None leaves exposed to a
+	// cross-site form POST. They inherit the stale-identity guard automatically, since
+	// every authenticating path funnels through proceedAuthenticated.
+	mySessions := authGroup.Group("/me/sessions", jwtRenew, appRateLimit)
+	mySessions.GET("", authHandler.ListMySessions)
+	mySessions.DELETE("", authHandler.RevokeMyOtherSessions, sessionCSRF)
+	mySessions.DELETE("/:familyID", authHandler.RevokeMySession, sessionCSRF)
+
+	// The same three handlers under the path issue #70 specifies.
+	//
+	// Both prefixes are served rather than one being chosen, because the choice is not
+	// really ours to make unilaterally: the account portal (#13) is being built against
+	// the path in the issue, and a rename discovered at integration time is a wasted
+	// round trip for whoever is on the other end. Serving both costs three route
+	// registrations and no logic — the handlers are identical.
+	//
+	// /account is deliberately NOT under /api/v1/auth: the refresh cookie is scoped to
+	// that prefix (RefreshCookiePath), so these routes never receive it. They do not
+	// need it — the subject and the current session both come from the access token's
+	// claims — and keeping a 30-day credential off a path that does not consume it is
+	// the same reasoning that scoped it narrowly in the first place.
+	accountSessions := apiV1.Group("/account/sessions", jwtRenew, appRateLimit)
+	accountSessions.GET("", authHandler.ListMySessions)
+	accountSessions.DELETE("", authHandler.RevokeMyOtherSessions, sessionCSRF)
+	accountSessions.DELETE("/:familyID", authHandler.RevokeMySession, sessionCSRF)
+
 	// Self-service email change — authenticated: the user must prove who they are
 	// to start it, and prove control of the new inbox to finish it (the GET
 	// confirm route above). Rate-limited so the confirmation mail cannot be used
@@ -785,6 +857,24 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	appAppsWrite := mw.RequireAppScope("appID", "apps:write")
 	appIDAppsRead := mw.RequireAppScope("id", "apps:read")
 	appIDAppsWrite := mw.RequireAppScope("id", "apps:write")
+
+	// Session lifetime policy — idle/absolute timeouts, the concurrent-session cap,
+	// and whether "remember me" is offered.
+	//
+	// Guarded by apps:write rather than a new permission: this is application/tenant
+	// configuration of the same kind as the MFA policy and the CORS origin list,
+	// which sit behind the same grant, and inventing a permission for it would mean
+	// every existing owner and co-owner silently lost the ability to manage it until
+	// somebody granted the new one.
+	//
+	// Registered at all three scopes so the resolution chain is actually reachable:
+	// application, tenant, and the caller's own tenant via the slug-less form.
+	adminGroup.GET("/tenants/:tid/session-policy", adminHandler.GetSessionPolicy, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/session-policy", adminHandler.UpdateSessionPolicy, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/session-policy", adminHandler.DeleteSessionPolicy, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/session-policy", adminHandler.GetSessionPolicy, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/session-policy", adminHandler.UpdateSessionPolicy, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/session-policy", adminHandler.DeleteSessionPolicy, appAppsWrite)
 
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
@@ -1033,6 +1123,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, usersWrite)
 	adminGroup.GET("/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, usersRead)
 	adminGroup.PUT("/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, usersWrite)
+	// Slug-less session-policy variants — the caller's own tenant, resolved from
+	// their token. Same handlers; tenantFromClaimsOrPath supplies the tenant.
+	adminGroup.GET("/session-policy", adminHandler.GetSessionPolicy, appsRead)
+	adminGroup.PUT("/session-policy", adminHandler.UpdateSessionPolicy, appsWrite)
+	adminGroup.DELETE("/session-policy", adminHandler.DeleteSessionPolicy, appsWrite)
+	adminGroup.GET("/applications/:appID/session-policy", adminHandler.GetSessionPolicy, appsRead)
+	adminGroup.PUT("/applications/:appID/session-policy", adminHandler.UpdateSessionPolicy, appsWrite)
+	adminGroup.DELETE("/applications/:appID/session-policy", adminHandler.DeleteSessionPolicy, appsWrite)
+
 	adminGroup.GET("/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, usersRead)
 	adminGroup.DELETE("/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
 	adminGroup.DELETE("/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)
@@ -1113,6 +1212,39 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
 	e.GET("/saml/login", samlHandler.InitiateLogin)
 	e.POST("/saml/acs", samlHandler.HandleACS)
+
+	// ---- OAuth 2.0 authorization server (issue #6) -------------------------
+	//
+	// Top-level, beside JWKS and UserInfo, because these are the standard OAuth
+	// surfaces an external client library reaches by absolute URL, and #7b's
+	// discovery document will publish exactly these paths as
+	// authorization_endpoint, token_endpoint and revocation_endpoint.
+	//
+	// No Echo conflict with the social-login routes registered below: these are
+	// two-segment paths (/oauth/authorize) while those are three
+	// (/oauth/:provider/login). This is the same coexistence /oauth/userinfo
+	// already relies on.
+	//
+	// /oauth/authorize and its two login pages are BROWSER routes: they render
+	// HTML, accept form posts, and carry the SSO session cookie. They are
+	// deliberately outside apiV1 — that group applies CookieCSRF, which is
+	// built for the portal's cookie session and would reject a top-level
+	// cross-site navigation arriving from a tenant's application, which is
+	// exactly how every authorize request begins. CSRF protection here comes
+	// instead from the server-side request handle: a forged form cannot supply
+	// one, and the handle names the only redirect target a code can be sent to.
+	authorizeLimit := mw.AuthorizeRateLimiter()
+	e.GET("/oauth/authorize", authorizeHandler.Authorize, authorizeLimit)
+	e.POST("/oauth/authorize/login", authorizeHandler.LoginSubmit, authorizeLimit)
+	e.POST("/oauth/authorize/mfa", authorizeHandler.MFASubmit, authorizeLimit)
+
+	// Token endpoint — form-encoded (RFC 6749 §4.1.3), unlike the JSON
+	// POST /auth/token which keeps working as a documented-deprecated alias.
+	e.POST("/oauth/token", oauthTokenHandler.Token, mw.OAuthTokenRateLimiter())
+
+	// Revocation (RFC 7009). Always 200, so the limiter is what stops it being
+	// used to probe token validity at volume.
+	e.POST("/oauth/revoke", oauthTokenHandler.Revoke, mw.RevokeRateLimiter())
 
 	// Social login browser endpoints — public, top-level like SAML, but with
 	// the dedicated rate limiting SAML's routes lack (issue #64).

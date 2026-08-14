@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -35,9 +36,9 @@ var ErrAppNotFound = errors.New("application not found")
 // ErrInvalidAppType is returned when an unknown application type is supplied.
 var ErrInvalidAppType = errors.New("invalid app_type — must be one of: web, spa, m2m, native")
 
-// ErrInvalidScope is returned when a scope string does not follow the
-// resource:action convention or the scope list exceeds limits.
-var ErrInvalidScope = errors.New("invalid scope — scopes must be non-empty resource:action strings (max 50 scopes, 100 chars each)")
+// ErrInvalidScope is returned when a scope string is neither a reserved OIDC
+// scope nor a resource:action permission scope, or the list exceeds limits.
+var ErrInvalidScope = errors.New("invalid scope — each scope must be a reserved OIDC scope (openid, profile, email, offline_access) or a resource:action string (max 50 scopes, 100 chars each)")
 
 // validAppTypes mirrors the CHECK constraint on oauth_clients.app_type.
 var validAppTypes = map[string]bool{"web": true, "spa": true, "m2m": true, "native": true}
@@ -47,9 +48,53 @@ const (
 	maxScopeLen     = 100
 )
 
-// validateScopes enforces the resource:action shape used by the permission
-// system so scopes flow into the token's permissions claim in the same format
-// permission guards expect. A nil/empty slice is valid (no scopes).
+// OIDC scope names (OIDC Core §5.4). These have no colon and therefore cannot
+// satisfy the resource:action rule below — which is why, before issue #6,
+// validateScopes rejected the very values migration 00032 sets as the DEFAULT
+// for oauth_clients.scopes. The column's own default was unwritable through the
+// API. Two namespaces share this column and both are legal:
+//
+//	OIDC scopes        openid, profile, email, offline_access
+//	                   → decide which claims appear in the ID token and userinfo
+//	Permission scopes  users:read, apps:write
+//	                   → become the permissions claim on a client_credentials token
+//
+// Kept in one column rather than split: service.go's client_credentials path
+// already reads `scopes` for permissions, and forking the storage would mean
+// forking that read too. The token minter routes each namespace to the right
+// claim instead.
+const (
+	// ScopeOpenID is the marker that turns an OAuth request into an OIDC one.
+	// Its presence is what makes an ID token appear in the token response.
+	ScopeOpenID = "openid"
+	// ScopeProfile releases name, given_name, family_name and updated_at.
+	ScopeProfile = "profile"
+	// ScopeEmail releases email and email_verified.
+	ScopeEmail = "email"
+	// ScopeOfflineAccess requests a refresh token. Recorded and echoed back, but
+	// refresh-token issuance is currently governed by the client's grant_types
+	// rather than by this scope — see the #6 plan, §9.
+	ScopeOfflineAccess = "offline_access"
+)
+
+// reservedOIDCScopes is the allow-list checked before the resource:action rule.
+// Closed on purpose: an open "anything without a colon is an OIDC scope" rule
+// would silently accept typos like "prof1le" and then never release the claims
+// the caller expected, failing as missing data rather than as an error.
+var reservedOIDCScopes = map[string]bool{
+	ScopeOpenID:        true,
+	ScopeProfile:       true,
+	ScopeEmail:         true,
+	ScopeOfflineAccess: true,
+}
+
+// IsOIDCScope reports whether a scope belongs to the reserved OIDC namespace.
+func IsOIDCScope(scope string) bool { return reservedOIDCScopes[scope] }
+
+// validateScopes accepts a reserved OIDC scope, or a resource:action string in
+// the shape the permission system expects so scopes flow into the permissions
+// claim in the format permission guards already read. A nil/empty slice is
+// valid (no scopes).
 func validateScopes(scopes []string) error {
 	if len(scopes) > maxScopesPerApp {
 		return ErrInvalidScope
@@ -58,9 +103,60 @@ func validateScopes(scopes []string) error {
 		if sc == "" || len(sc) > maxScopeLen {
 			return ErrInvalidScope
 		}
+		if reservedOIDCScopes[sc] {
+			continue
+		}
 		resource, action, found := strings.Cut(sc, ":")
 		if !found || resource == "" || action == "" {
 			return ErrInvalidScope
+		}
+	}
+	return nil
+}
+
+// maxRedirectURIs bounds the allow-list so a misbehaving admin cannot turn the
+// exact-match scan at /oauth/authorize into an unbounded loop. Matches the
+// limit identityprovider.go already applies to redirect_allow.
+const maxRedirectURIs = 20
+
+// ErrInvalidClientRedirectURI is returned when an entry in a client's
+// registered redirect_uris is not an absolute http(s) URL, carries a fragment,
+// or the list exceeds maxRedirectURIs.
+//
+// Named apart from identityprovider.go's ErrInvalidRedirectURI because the two
+// govern different columns: this one oauth_clients.redirect_uris (the
+// authorization code flow), that one identity_provider_configs.redirect_allow
+// (where a social login hands back a login_code).
+var ErrInvalidClientRedirectURI = errors.New("invalid redirect_uri — each entry must be an absolute http(s) URL without a fragment (max 20 entries)")
+
+// validateRedirectURIs checks the values stored in oauth_clients.redirect_uris,
+// the exact-match allow-list for GET /oauth/authorize.
+//
+// The column has existed since migration 00032 and was never written or read
+// until issue #6. It is NOT identity_provider_configs.redirect_allow, which is
+// per social provider and governs where a login_code is handed back.
+//
+// Fragments are rejected because RFC 6749 §3.1.2 forbids them in a registered
+// redirection endpoint, and because a fragment never reaches the server — an
+// entry carrying one could never be matched, so accepting it would register a
+// URI that silently fails every comparison.
+func validateRedirectURIs(uris []string) error {
+	if len(uris) > maxRedirectURIs {
+		return ErrInvalidClientRedirectURI
+	}
+	for _, raw := range uris {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return ErrInvalidClientRedirectURI
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return ErrInvalidClientRedirectURI
+		}
+		if u.Host == "" {
+			return ErrInvalidClientRedirectURI
+		}
+		if u.Fragment != "" || strings.Contains(raw, "#") {
+			return ErrInvalidClientRedirectURI
 		}
 	}
 	return nil
@@ -100,6 +196,9 @@ type AppResult struct {
 	ClientID     string    `json:"client_id"`
 	ClientSecret string    `json:"client_secret"`
 	Scopes       []string  `json:"scopes"`
+	RedirectURIs []string  `json:"redirect_uris"`
+	RequirePKCE  bool      `json:"require_pkce"`
+	FirstParty   bool      `json:"first_party"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
@@ -114,14 +213,24 @@ type AppSummary struct {
 
 // AppDetail is the full public representation of one application — no secret.
 type AppDetail struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	AppType   string    `json:"app_type"`
-	ClientID  string    `json:"client_id"`
-	Scopes    []string  `json:"scopes"`
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	AppType  string   `json:"app_type"`
+	ClientID string   `json:"client_id"`
+	Scopes   []string `json:"scopes"`
+	// RedirectURIs is the exact-match allow-list for GET /oauth/authorize
+	// (issue #6). Empty means the application cannot use the authorization
+	// code flow at all — which is the correct default for the m2m app_type.
+	RedirectURIs []string `json:"redirect_uris"`
+	// RequirePKCE defaults true for every client type, confidential included.
+	RequirePKCE bool `json:"require_pkce"`
+	// FirstParty false means a consent screen is required before a code may be
+	// issued. No consent screen exists yet, so /oauth/authorize refuses such a
+	// client outright rather than skipping consent silently.
+	FirstParty bool      `json:"first_party"`
+	IsActive   bool      `json:"is_active"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // AppFilter holds optional filter and pagination params for ListApplicationsPaginated.
@@ -170,6 +279,13 @@ func generateClientCredentials() (clientID, rawSecret string, err error) {
 // Scopes become the permissions claim of client_credentials tokens; nil/empty
 // means the app's tokens carry no grants until scopes are set via update.
 func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int64, name, appType string, scopes []string) (*AppResult, error) {
+	return s.CreateApplicationWithOptions(ctx, tenantID, name, appType, scopes, AppUpdate{})
+}
+
+// CreateApplicationWithOptions is CreateApplication plus the OAuth
+// authorization-server fields added in issue #6. A nil AppUpdate field takes
+// the column default: no redirect URIs, PKCE required, first-party.
+func (s *ApplicationService) CreateApplicationWithOptions(ctx context.Context, tenantID int64, name, appType string, scopes []string, opts AppUpdate) (*AppResult, error) {
 	if name == "" {
 		return nil, fmt.Errorf("application name is required")
 	}
@@ -180,8 +296,25 @@ func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int
 	if err := validateScopes(scopes); err != nil {
 		return nil, err
 	}
+	if err := validateRedirectURIs(opts.RedirectURIs); err != nil {
+		return nil, err
+	}
 	if scopes == nil {
 		scopes = []string{}
+	}
+	redirectURIs := opts.RedirectURIs
+	if redirectURIs == nil {
+		redirectURIs = []string{}
+	}
+	// Defaults mirror the column defaults in migration 00067 rather than being
+	// re-derived here, so there is one answer to "what does a new client get".
+	requirePKCE := true
+	if opts.RequirePKCE != nil {
+		requirePKCE = *opts.RequirePKCE
+	}
+	firstParty := true
+	if opts.FirstParty != nil {
+		firstParty = *opts.FirstParty
 	}
 
 	clientID, rawSecret, err := generateClientCredentials()
@@ -194,10 +327,12 @@ func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int
 	var createdAt time.Time
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO oauth_clients
-		    (tenant_id, name, app_type, client_id, client_secret_hash, scopes, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
+		    (tenant_id, name, app_type, client_id, client_secret_hash, scopes,
+		     redirect_uris, require_pkce, first_party, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
 		RETURNING id, created_at
-	`, tenantID, name, normType, clientID, secretHash, scopes).Scan(&rowID, &createdAt)
+	`, tenantID, name, normType, clientID, secretHash, scopes,
+		redirectURIs, requirePKCE, firstParty).Scan(&rowID, &createdAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert application: %w", err)
 	}
@@ -209,6 +344,9 @@ func (s *ApplicationService) CreateApplication(ctx context.Context, tenantID int
 		ClientID:     clientID,
 		ClientSecret: rawSecret,
 		Scopes:       scopes,
+		RedirectURIs: redirectURIs,
+		RequirePKCE:  requirePKCE,
+		FirstParty:   firstParty,
 		CreatedAt:    createdAt,
 	}, nil
 }
@@ -334,10 +472,12 @@ func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID
 	var a AppDetail
 	var id int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, name, app_type, client_id, scopes, (deleted_at IS NULL) AS is_active, created_at, updated_at
+		SELECT id, name, app_type, client_id, scopes, redirect_uris, require_pkce, first_party,
+		       (deleted_at IS NULL) AS is_active, created_at, updated_at
 		FROM   oauth_clients
 		WHERE  id = $1 AND tenant_id = $2
-	`, appID, tenantID).Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.Scopes, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	`, appID, tenantID).Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.Scopes,
+		&a.RedirectURIs, &a.RequirePKCE, &a.FirstParty, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAppNotFound
@@ -346,6 +486,9 @@ func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID
 	}
 	if a.Scopes == nil {
 		a.Scopes = []string{}
+	}
+	if a.RedirectURIs == nil {
+		a.RedirectURIs = []string{}
 	}
 	a.ID = strconv.FormatInt(id, 10)
 	return &a, nil
@@ -356,9 +499,33 @@ func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID
 // scopes unchanged, while an empty non-nil slice clears them. Returns the
 // updated application. Scope changes affect tokens issued from then on —
 // already-issued tokens keep their permissions until they expire (≤15 min).
+// AppUpdate carries the optional fields of UpdateApplication that were added
+// after its original signature. A struct rather than more positional
+// parameters: RequirePKCE and FirstParty are booleans whose "leave unchanged"
+// state is distinct from both true and false, which positional bools cannot
+// express.
+type AppUpdate struct {
+	// RedirectURIs nil leaves the list unchanged; an empty non-nil slice clears
+	// it, matching how scopes already behaves.
+	RedirectURIs []string
+	// RequirePKCE / FirstParty nil leaves the flag unchanged.
+	RequirePKCE *bool
+	FirstParty  *bool
+}
+
+// UpdateApplication updates name, app_type and/or scopes only. Retained with
+// its original signature so the many existing callers are untouched; new
+// fields go through UpdateApplicationWithOptions.
 func (s *ApplicationService) UpdateApplication(ctx context.Context, tenantID, appID int64, name, appType string, scopes []string) (*AppDetail, error) {
-	if name == "" && appType == "" && scopes == nil {
-		return nil, fmt.Errorf("nothing to update — provide name, app_type, and/or scopes")
+	return s.UpdateApplicationWithOptions(ctx, tenantID, appID, name, appType, scopes, AppUpdate{})
+}
+
+// UpdateApplicationWithOptions is UpdateApplication plus the OAuth
+// authorization-server fields added in issue #6.
+func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, tenantID, appID int64, name, appType string, scopes []string, upd AppUpdate) (*AppDetail, error) {
+	if name == "" && appType == "" && scopes == nil &&
+		upd.RedirectURIs == nil && upd.RequirePKCE == nil && upd.FirstParty == nil {
+		return nil, fmt.Errorf("nothing to update — provide name, app_type, scopes, redirect_uris, require_pkce, and/or first_party")
 	}
 	if appType != "" {
 		if _, err := normalizeAppType(appType); err != nil {
@@ -368,15 +535,21 @@ func (s *ApplicationService) UpdateApplication(ctx context.Context, tenantID, ap
 	if err := validateScopes(scopes); err != nil {
 		return nil, err
 	}
+	if err := validateRedirectURIs(upd.RedirectURIs); err != nil {
+		return nil, err
+	}
 
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oauth_clients
-		SET    name       = COALESCE(NULLIF($1, ''), name),
-		       app_type   = COALESCE(NULLIF($2, ''), app_type),
-		       scopes     = COALESCE($3, scopes),
-		       updated_at = NOW()
+		SET    name          = COALESCE(NULLIF($1, ''), name),
+		       app_type      = COALESCE(NULLIF($2, ''), app_type),
+		       scopes        = COALESCE($3, scopes),
+		       redirect_uris = COALESCE($6, redirect_uris),
+		       require_pkce  = COALESCE($7, require_pkce),
+		       first_party   = COALESCE($8, first_party),
+		       updated_at    = NOW()
 		WHERE  id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-	`, name, appType, scopes, appID, tenantID)
+	`, name, appType, scopes, appID, tenantID, upd.RedirectURIs, upd.RequirePKCE, upd.FirstParty)
 	if err != nil {
 		return nil, fmt.Errorf("update application: %w", err)
 	}
@@ -399,17 +572,30 @@ func (s *ApplicationService) RotateSecret(ctx context.Context, tenantID, appID i
 
 	var result AppResult
 	var id int64
+	// redirect_uris / require_pkce / first_party are returned too: AppResult
+	// carries them since issue #6, and scanning only the original columns would
+	// report require_pkce=false and first_party=false for every rotation —
+	// a response body that contradicts the row it just wrote.
 	err := s.pool.QueryRow(ctx, `
 		UPDATE oauth_clients
 		SET    client_secret_hash = $1, updated_at = NOW()
 		WHERE  id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-		RETURNING id, name, app_type, client_id, created_at
-	`, HashToken(rawSecret), appID, tenantID).Scan(&id, &result.Name, &result.AppType, &result.ClientID, &result.CreatedAt)
+		RETURNING id, name, app_type, client_id, scopes, redirect_uris,
+		          require_pkce, first_party, created_at
+	`, HashToken(rawSecret), appID, tenantID).Scan(&id, &result.Name, &result.AppType,
+		&result.ClientID, &result.Scopes, &result.RedirectURIs,
+		&result.RequirePKCE, &result.FirstParty, &result.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAppNotFound
 		}
 		return nil, fmt.Errorf("rotate client_secret: %w", err)
+	}
+	if result.Scopes == nil {
+		result.Scopes = []string{}
+	}
+	if result.RedirectURIs == nil {
+		result.RedirectURIs = []string{}
 	}
 	result.ID = strconv.FormatInt(id, 10)
 	result.ClientSecret = rawSecret

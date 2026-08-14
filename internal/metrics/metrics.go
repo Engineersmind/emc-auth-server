@@ -335,6 +335,110 @@ var (
 		},
 		[]string{"outcome"},
 	)
+
+	// SessionRevocations counts refresh-token rows revoked, by cause.
+	//
+	// reason: rotated | logout | user_revoked | admin_revoked |
+	//         admin_revoked_all | replay_detected | cap_evicted |
+	//         credential_change | idle_expired
+	//
+	// Counts ROWS, not sessions: one session revoke touches every live token in
+	// the family, which is normally one. The ratio is not meaningful; the rate per
+	// reason is. Watch replay_detected especially — a sustained non-zero rate is
+	// either stolen tokens or a client that retries refreshes incorrectly, and the
+	// two need opposite responses.
+	SessionRevocations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "session_revocations_total",
+			Help:      "Refresh tokens revoked, by cause.",
+		},
+		[]string{"reason"},
+	)
+
+	// SessionDenylistErrors counts Redis failures on the revoked-session
+	// denylist. op: read | write.
+	//
+	// Worth alerting on rather than merely graphing: the denylist fails OPEN, so
+	// errors here mean revoked sessions keep working until their access tokens
+	// expire. Nothing else surfaces that — the revocation itself reports success.
+	SessionDenylistErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "session_denylist_errors_total",
+			Help:      "Redis errors on the revoked-session denylist, by operation.",
+		},
+		[]string{"op"},
+	)
+
+	// SessionsReaped counts refresh-token rows deleted by the retention reaper.
+	SessionsReaped = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "sessions_reaped_total",
+			Help:      "Expired refresh-token rows deleted by the retention reaper.",
+		},
+	)
+
+	// SessionReaperRuns counts reaper executions by outcome.
+	// outcome: success | failure | skipped_locked
+	//
+	// skipped_locked is normal and expected, not a fault: every replica runs the
+	// reaper on its own timer and the advisory lock lets exactly one win.
+	SessionReaperRuns = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "session_reaper_runs_total",
+			Help:      "Session retention reaper executions by outcome.",
+		},
+		[]string{"outcome"},
+	)
+
+	// OAuthGrants counts token-endpoint exchanges by grant type and outcome
+	// (issue #6).
+	//
+	// The outcome label is the operationally important half. "replayed" and
+	// "pkce_failed" are attack signals, not noise: a replayed authorization
+	// code means a code was seen by someone who should not have had it, and a
+	// PKCE mismatch means a code was presented by a party that did not
+	// originate the request. Both are invisible without this counter, because
+	// the client is deliberately told the same generic invalid_grant either way.
+	//
+	// grant: authorization_code | refresh_token | client_credentials
+	// outcome: success | invalid | replayed | pkce_failed | user_unavailable |
+	//          invalid_client | error
+	OAuthGrants = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "oauth_grants_total",
+			Help:      "OAuth 2.0 token endpoint exchanges by grant type and outcome.",
+		},
+		[]string{"grant", "outcome"},
+	)
+
+	// OAuthAuthorizeRequests counts /oauth/authorize outcomes (issue #6).
+	//
+	// Incremented exactly once on every terminal path through Authorize,
+	// LoginSubmit and MFASubmit — see countAuthorize and the authzOutcome*
+	// constants in internal/api/handlers/oauth_authorize.go, which are the
+	// authority on these values. Keep the two lists in step.
+	//
+	// outcome: code_issued | login_shown | invalid_client | invalid_redirect |
+	//          consent_required | invalid_request | invalid_scope |
+	//          unauthorized_client | mfa_enrollment_required | login_failed |
+	//          request_expired | error
+	//
+	// login_failed is the operationally interesting one: the hosted login is a
+	// password form on the public internet, and a rate of failures far above
+	// code_issued is what credential stuffing looks like from here.
+	OAuthAuthorizeRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "oauth_authorize_requests_total",
+			Help:      "OAuth 2.0 authorization endpoint requests by outcome.",
+		},
+		[]string{"outcome"},
+	)
 )
 
 // RecordOp is a convenience wrapper around AuthOperations.WithLabelValues.

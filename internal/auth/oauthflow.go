@@ -619,11 +619,16 @@ func (s *OAuthLoginService) createLoginCode(ctx context.Context, st *OAuthState,
 	if err != nil {
 		return "", fmt.Errorf("generate login code: %w", err)
 	}
+	// grant_kind is written explicitly rather than relying on the column
+	// default. The default exists to backfill pre-#6 rows; a new insert that
+	// leaves the discriminator implicit would silently change meaning if that
+	// default were ever altered.
 	_, err = s.pool.Exec(ctx, `
 		INSERT INTO oauth_authorization_codes
-		    (tenant_id, client_id, user_id, code_hash, redirect_uri, scopes, expires_at)
-		VALUES ($1, $2, $3, $4, $5, '{}', $6)
-	`, st.TenantID, st.ClientID, userID, HashToken(raw), st.Redirect, time.Now().UTC().Add(loginCodeTTL))
+		    (tenant_id, client_id, user_id, code_hash, redirect_uri, scopes, grant_kind, expires_at)
+		VALUES ($1, $2, $3, $4, $5, '{}', $6, $7)
+	`, st.TenantID, st.ClientID, userID, HashToken(raw), st.Redirect,
+		GrantKindLoginCode, time.Now().UTC().Add(loginCodeTTL))
 	if err != nil {
 		return "", fmt.Errorf("persist login code: %w", err)
 	}
@@ -666,14 +671,31 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 		return nil, ErrInvalidLoginCode
 	}
 
+	// grant_kind = 'login_code' is NOT optional (migration 00067).
+	//
+	// oauth_authorization_codes now holds two different credentials. A login
+	// code is redeemable here with the public client_id alone — no secret, no
+	// PKCE verifier. An authorization code (issue #6) is redeemable only at
+	// /oauth/token, and only by presenting the code_verifier matching the
+	// challenge it was bound to.
+	//
+	// Without this predicate, this endpoint would happily consume an
+	// authorization code: same table, same code_hash column, matching
+	// client_id. Anyone who captured a code in a redirect could exchange it
+	// here for a full token pair and never be asked for the verifier. PKCE
+	// would be bypassed completely and silently.
+	//
+	// The matching filter lives in RedeemAuthorizationCode. Both are required;
+	// either one alone leaves the other endpoint as the open path.
 	var tenantID, userID int64
 	err := s.pool.QueryRow(ctx, `
 		UPDATE oauth_authorization_codes
 		SET    used_at = NOW()
 		WHERE  code_hash = $1 AND client_id = $2
+		  AND  grant_kind = $3
 		  AND  used_at IS NULL AND expires_at > NOW()
 		RETURNING tenant_id, user_id
-	`, HashToken(rawCode), clientID).Scan(&tenantID, &userID)
+	`, HashToken(rawCode), clientID, GrantKindLoginCode).Scan(&tenantID, &userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidLoginCode
@@ -707,5 +729,6 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 	}
 
 	// Same choke point as password/OTP login — no parallel token minting.
-	return s.authSvc.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, nil, strconv.FormatInt(appRowID, 10))
+	return s.authSvc.issueTokenPair(ctx, userID, tenantID, email, roleName, perms,
+		sessionContext{amr: []string{AMRFederated}}, strconv.FormatInt(appRowID, 10))
 }

@@ -238,10 +238,15 @@ func JWTRenew(
 // into the *auth.Claims shape that downstream handlers expect via c.Get("user").
 func graceToAuthClaims(g *auth.GraceResult) *auth.Claims {
 	return &auth.Claims{
-		UserID:      strconv.FormatInt(g.UserID, 10),
-		TenantID:    strconv.FormatInt(g.TenantID, 10),
-		Email:       g.Email,
-		Role:        g.Role,
+		UserID:   strconv.FormatInt(g.UserID, 10),
+		TenantID: strconv.FormatInt(g.TenantID, 10),
+		Email:    g.Email,
+		Role:     g.Role,
+		// Carried so the request stays subject to per-session revocation. Claims with
+		// no session id are exempt from that check — correctly, since machine tokens
+		// have no session — so omitting it here left the ten-second grace window as a
+		// hole in which a single-session revoke was not enforced.
+		SessionID:   strconv.FormatInt(g.SessionID, 10),
 		Permissions: g.Permissions,
 	}
 }

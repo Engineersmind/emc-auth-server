@@ -2232,7 +2232,7 @@
         },
         "/api/v1/auth/apps/register": {
             "post": {
-                "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed.",
+                "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed. Does NOT sign the user in — no session is created and no tokens are returned; call /auth/apps/login afterwards.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2265,7 +2265,7 @@
                     "201": {
                         "description": "Created",
                         "schema": {
-                            "$ref": "#/definitions/auth.AuthResult"
+                            "$ref": "#/definitions/auth.RegisterResult"
                         }
                     },
                     "400": {
@@ -3655,7 +3655,7 @@
         },
         "/api/v1/auth/register": {
             "post": {
-                "description": "Creates a user account in the specified tenant and returns a token pair.",
+                "description": "Creates a user account in the specified tenant. Does NOT sign the user in — no session is created and no tokens are returned; call /auth/session or /auth/login afterwards.",
                 "consumes": [
                     "application/json"
                 ],
@@ -3688,7 +3688,7 @@
                     "201": {
                         "description": "Created",
                         "schema": {
-                            "$ref": "#/definitions/auth.AuthResult"
+                            "$ref": "#/definitions/auth.RegisterResult"
                         }
                     },
                     "400": {
@@ -4440,6 +4440,111 @@
                 }
             }
         },
+        "/api/v1/me/sessions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the caller's active sessions with device, IP, and last-activity, marking the session the request came from.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "account"
+                ],
+                "summary": "List your own active sessions",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends every session except the one this request came from.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "account"
+                ],
+                "summary": "Sign out your other sessions",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/me/sessions/{familyID}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends a single session belonging to the caller. Use the logout endpoint to end the current session.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "account"
+                ],
+                "summary": "Sign out one of your own sessions",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Session ID",
+                        "name": "familyID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/permissions": {
             "get": {
                 "security": [
@@ -4906,6 +5011,112 @@
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/session-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the session policy in force for the tenant or application, and whether it is inherited. Requires apps:write (apps:read to view).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-sessions"
+                ],
+                "summary": "Get the session lifetime policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.SessionPolicyView"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets idle/absolute session lifetimes, the concurrent-session cap, and whether \"remember me\" is allowed. Omitted fields are left unchanged. Requires apps:write (apps:read to view).",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-sessions"
+                ],
+                "summary": "Update the session lifetime policy",
+                "parameters": [
+                    {
+                        "description": "Policy fields to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.SessionPolicyInput"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.SessionPolicyView"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes this scope's policy override so it inherits from the tenant or platform default. Requires apps:write (apps:read to view).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-sessions"
+                ],
+                "summary": "Reset the session lifetime policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -7312,6 +7523,220 @@
                 }
             }
         },
+        "/oauth/authorize": {
+            "get": {
+                "description": "Starts the Authorization Code flow with PKCE. Validates the client and redirect_uri, authenticates the user through a server-rendered login page, and redirects back to redirect_uri with a single-use code. Browser endpoint — returns HTML or a 302, never JSON.",
+                "produces": [
+                    "text/html"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "OAuth 2.0 authorization endpoint",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Registered client_id",
+                        "name": "client_id",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must exactly match a registered redirect_uri. Optional only when exactly one is registered.",
+                        "name": "redirect_uri",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must be 'code'",
+                        "name": "response_type",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Space-delimited. Unregistered scopes are dropped, not rejected.",
+                        "name": "scope",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Opaque value echoed back on the redirect",
+                        "name": "state",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "OIDC nonce, echoed into the ID token",
+                        "name": "nonce",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "base64url(SHA256(code_verifier))",
+                        "name": "code_challenge",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must be 'S256'",
+                        "name": "code_challenge_method",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "302": {
+                        "description": "Redirect to redirect_uri with code and state"
+                    },
+                    "400": {
+                        "description": "HTML error page — client_id or redirect_uri invalid"
+                    }
+                }
+            }
+        },
+        "/oauth/revoke": {
+            "post": {
+                "description": "Revokes a refresh token. Client authentication is REQUIRED (RFC 7009 §2.1) — the same credentials the token endpoint takes. Returns 200 for an unknown or already-revoked token, per RFC 7009 §2.2; a bad or missing client credential is a 401 invalid_client.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "OAuth 2.0 token revocation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The token to revoke",
+                        "name": "token",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "refresh_token | access_token",
+                        "name": "token_type_hint",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required — prefer the Authorization Basic header",
+                        "name": "client_id",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Confidential clients only",
+                        "name": "client_secret",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Token revoked, or did not exist"
+                    },
+                    "401": {
+                        "description": "client authentication failed",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    }
+                }
+            }
+        },
+        "/oauth/token": {
+            "post": {
+                "description": "Exchanges credentials for tokens. Supports authorization_code (with mandatory PKCE), refresh_token, and client_credentials. Form-encoded per RFC 6749 — not JSON. Client authentication via Authorization Basic or client_secret_post; public clients authenticate with PKCE alone.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "OAuth 2.0 token endpoint",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "authorization_code | refresh_token | client_credentials",
+                        "name": "grant_type",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for authorization_code",
+                        "name": "code",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for authorization_code",
+                        "name": "code_verifier",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must match the value the code was issued against",
+                        "name": "redirect_uri",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for refresh_token",
+                        "name": "refresh_token",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Required for public clients",
+                        "name": "client_id",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Confidential clients — prefer the Authorization Basic header",
+                        "name": "client_secret",
+                        "in": "formData"
+                    },
+                    {
+                        "type": "string",
+                        "description": "client_credentials only",
+                        "name": "scope",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.TokenResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    }
+                }
+            }
+        },
         "/oauth/userinfo": {
             "get": {
                 "security": [
@@ -7828,6 +8253,54 @@
                 }
             }
         },
+        "admin.SessionPolicyInput": {
+            "type": "object",
+            "properties": {
+                "absolute_ttl_seconds": {
+                    "type": "integer"
+                },
+                "allow_persistent": {
+                    "type": "boolean"
+                },
+                "idle_ttl_seconds": {
+                    "type": "integer"
+                },
+                "max_concurrent_sessions": {
+                    "type": "integer"
+                },
+                "non_persistent_idle_ttl_seconds": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admin.SessionPolicyView": {
+            "type": "object",
+            "properties": {
+                "absolute_ttl_seconds": {
+                    "type": "integer"
+                },
+                "allow_persistent": {
+                    "type": "boolean"
+                },
+                "idle_ttl_seconds": {
+                    "type": "integer"
+                },
+                "inherited": {
+                    "description": "Inherited is true when no row exists at the requested scope and these\nvalues came from a broader one.",
+                    "type": "boolean"
+                },
+                "max_concurrent_sessions": {
+                    "type": "integer"
+                },
+                "non_persistent_idle_ttl_seconds": {
+                    "type": "integer"
+                },
+                "scope": {
+                    "description": "Scope is \"platform\", \"tenant\", or \"application\" — which row actually\nanswered the request. Without it a caller cannot tell a policy they have set\nfrom an inherited default, and would have no way to know that editing it\ncreates a new row rather than changing an existing one.",
+                    "type": "string"
+                }
+            }
+        },
         "admin.TenantAdminResult": {
             "type": "object",
             "properties": {
@@ -8131,14 +8604,44 @@
         "admin.UserSession": {
             "type": "object",
             "properties": {
+                "absolute_expires_at": {
+                    "type": "string"
+                },
+                "amr": {
+                    "description": "AMR lists the authentication methods used to establish the session.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "auth_time": {
+                    "description": "AuthTime is when the user actually authenticated, as opposed to when the\ncurrent token in the family was minted.",
+                    "type": "string"
+                },
                 "created_at": {
+                    "type": "string"
+                },
+                "device_hint": {
+                    "description": "DeviceHint is the server-parsed \"Chrome on Windows\" form of UserAgent.\n\nBoth are returned: the hint so a consumer does not need its own User-Agent\nparser to show a user which device they are looking at, the raw header because\nit is the evidence and a parser that guesses wrong must not destroy it.",
                     "type": "string"
                 },
                 "expires_at": {
                     "type": "string"
                 },
+                "idle_expires_at": {
+                    "description": "IdleExpiresAt is when the session dies if it is not used again, and\nAbsoluteExpiresAt is the hard deadline it cannot outlive whatever it does.\nBoth are surfaced because \"expires_at\" alone cannot answer the question an\noperator actually has — is this session about to go away on its own, or does\nit need revoking? Nullable for rows written before migration 00068.",
+                    "type": "string"
+                },
                 "ip_address": {
                     "type": "string"
+                },
+                "is_current": {
+                    "description": "IsCurrent marks the session the caller is making this request from.\n\nOnly ever true on the end-user (/me/sessions) view, where the caller and the\nsubject are the same person: it prevents somebody from revoking the session\nthey are sitting in and wondering why the page broke. On the admin view the\ncaller is a different person from the subject, so no session in the list can\nbe theirs and the field stays false throughout.",
+                    "type": "boolean"
+                },
+                "is_persistent": {
+                    "description": "IsPersistent records whether the user asked to be remembered on this device.",
+                    "type": "boolean"
                 },
                 "last_used_at": {
                     "type": "string"
@@ -8466,6 +8969,10 @@
                 "created_at": {
                     "type": "string"
                 },
+                "first_party": {
+                    "description": "FirstParty false means a consent screen is required before a code may be\nissued. No consent screen exists yet, so /oauth/authorize refuses such a\nclient outright rather than skipping consent silently.",
+                    "type": "boolean"
+                },
                 "id": {
                     "type": "string"
                 },
@@ -8474,6 +8981,17 @@
                 },
                 "name": {
                     "type": "string"
+                },
+                "redirect_uris": {
+                    "description": "RedirectURIs is the exact-match allow-list for GET /oauth/authorize\n(issue #6). Empty means the application cannot use the authorization\ncode flow at all — which is the correct default for the m2m app_type.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "description": "RequirePKCE defaults true for every client type, confidential included.",
+                    "type": "boolean"
                 },
                 "scopes": {
                     "type": "array",
@@ -8527,11 +9045,23 @@
                 "created_at": {
                     "type": "string"
                 },
+                "first_party": {
+                    "type": "boolean"
+                },
                 "id": {
                     "type": "string"
                 },
                 "name": {
                     "type": "string"
+                },
+                "redirect_uris": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "type": "boolean"
                 },
                 "scopes": {
                     "type": "array",
@@ -8857,6 +9387,27 @@
                 }
             }
         },
+        "auth.RegisterResult": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "description": "ApplicationID is set when the account belongs to one application's isolated\nuser base, nil for a tenant-level account.",
+                    "type": "integer"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "role": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "integer"
+                },
+                "user_id": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.TOTPStatus": {
             "type": "object",
             "properties": {
@@ -8936,6 +9487,10 @@
                 },
                 "password": {
                     "type": "string"
+                },
+                "remember_me": {
+                    "description": "RememberMe asks for a persistent session. See LoginRequest.RememberMe.",
+                    "type": "boolean"
                 }
             }
         },
@@ -9012,11 +9567,26 @@
                     "description": "web | spa | m2m | native; defaults to web",
                     "type": "string"
                 },
+                "first_party": {
+                    "description": "FirstParty defaults to true when omitted. Setting it false marks the\nclient as third-party, which currently causes /oauth/authorize to refuse\nit with consent_required — the consent screen is not built yet.",
+                    "type": "boolean"
+                },
                 "name": {
                     "type": "string"
                 },
+                "redirect_uris": {
+                    "description": "RedirectURIs is the exact-match allow-list for GET /oauth/authorize\n(issue #6). Without at least one entry the application cannot use the\nauthorization code flow at all — which is the right default for m2m.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "description": "RequirePKCE defaults to true when omitted. Pointer so \"omitted\" is\ndistinguishable from an explicit false.",
+                    "type": "boolean"
+                },
                 "scopes": {
-                    "description": "resource:action strings; optional",
+                    "description": "Scopes accepts resource:action permission strings and the reserved OIDC\nscopes (openid, profile, email, offline_access). Optional.",
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -9187,6 +9757,10 @@
                 },
                 "password": {
                     "type": "string"
+                },
+                "remember_me": {
+                    "description": "RememberMe asks for a persistent session — the tenant's longer idle timeout\ninstead of the short one meant for shared machines. Honoured only when the\ntenant's session policy allows persistent sessions.\n\nAbsent means false, so a client that has not been updated keeps getting the\nshorter session. That is the right default for an omitted security-relevant\nflag: the failure mode is a user signing in more often than they need to,\nnot a month-long session on a library computer.",
+                    "type": "boolean"
                 }
             }
         },
@@ -9372,6 +9946,10 @@
                 },
                 "password": {
                     "type": "string"
+                },
+                "remember_me": {
+                    "description": "RememberMe asks for a persistent session — the tenant's longer idle timeout\ninstead of the short one meant for shared machines. Honoured only when the\ntenant's session policy allows persistent sessions.\n\nAbsent means false, so a client that has not been updated keeps getting the\nshorter session. That is the right default for an omitted security-relevant\nflag: the failure mode is a user signing in more often than they need to,\nnot a month-long session on a library computer.",
+                    "type": "boolean"
                 }
             }
         },
@@ -9483,6 +10061,32 @@
                 }
             }
         },
+        "handlers.TokenResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string"
+                },
+                "expires_in": {
+                    "type": "integer"
+                },
+                "id_token": {
+                    "description": "IDToken appears only when the granted scopes include `openid`. Its\npresence is what makes this an OIDC response rather than a plain OAuth 2.0 one.",
+                    "type": "string"
+                },
+                "refresh_token": {
+                    "description": "RefreshToken is omitted for client_credentials: RFC 6749 §4.4.3 says a\nrefresh token SHOULD NOT be issued, because a client that can present its\nown credentials can simply ask for another token.",
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "Scope is the GRANTED set, which may be narrower than what was requested\n(RFC 6749 §3.3). Echoed so a client can see what it actually received\nrather than assuming its request was honoured in full.",
+                    "type": "string"
+                },
+                "token_type": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.UpdateApplicationMFARequest": {
             "type": "object",
             "properties": {
@@ -9509,8 +10113,22 @@
                 "app_type": {
                     "type": "string"
                 },
+                "first_party": {
+                    "type": "boolean"
+                },
                 "name": {
                     "type": "string"
+                },
+                "redirect_uris": {
+                    "description": "RedirectURIs omitted = unchanged; [] clears — same convention as Scopes.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_pkce": {
+                    "description": "Nil leaves the flag unchanged.",
+                    "type": "boolean"
                 },
                 "scopes": {
                     "type": "array",
@@ -9693,6 +10311,17 @@
                 "updated_at": {
                     "description": "UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,\nwhich is what the rest of this API returns for timestamps.",
                     "type": "integer"
+                }
+            }
+        },
+        "handlers.tokenError": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "error_description": {
+                    "type": "string"
                 }
             }
         },

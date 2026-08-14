@@ -1,0 +1,19 @@
+{{define "content"}}
+<h1>{{.Title}}</h1>
+<!--
+  Rendered instead of redirecting, and reached in exactly two situations:
+
+   1. The authorization request is invalid in a way that makes the redirect
+      target untrustworthy — unknown client_id, or a redirect_uri that is not
+      registered. RFC 6749 §4.1.2.1 requires this: redirecting to an
+      unvalidated URI to report the error would turn this endpoint into an open
+      redirector that forwards an attacker-chosen destination.
+
+   2. The login cannot be completed here at all — an application whose MFA
+      policy is 'required' for a user who has never enrolled. The dead end is
+      real; saying so plainly is better than a generic failure the user cannot
+      act on.
+-->
+<p class="sub">{{.Message}}</p>
+{{if .Detail}}<p class="error" role="alert">{{.Detail}}</p>{{end}}
+{{end}}

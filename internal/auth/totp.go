@@ -396,6 +396,12 @@ type OTPSession struct {
 	// challenge, the user's ACTIVE methods; for a forced-enrollment session,
 	// the application's ALLOWED methods.
 	Methods []string
+	// Persistent carries the "remember me" choice from the password step through
+	// the MFA challenge. Without it the choice would be lost between the two
+	// requests and every MFA-protected login would silently fall back to the
+	// short non-persistent idle clock — the users most likely to want a
+	// remembered device being exactly the ones who enabled a second factor.
+	Persistent bool
 }
 
 // OTPSessionTTL is how long the intermediate TOTP challenge state lives.

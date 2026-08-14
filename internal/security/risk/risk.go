@@ -138,12 +138,14 @@ func (a *Assessor) isNewDevice(ctx context.Context, in audit.RiskInput) bool {
 		return false
 	}
 	defer rows.Close()
+	seen := 0
 	for rows.Next() {
 		var ua string
 		if err := rows.Scan(&ua); err != nil {
 			a.logger.Debug().Err(err).Msg("risk: new-device scan failed")
 			return false
 		}
+		seen++
 		b, o := deviceFamily(ua)
 		if b == curBrowser && o == curOS {
 			return false // same device family seen before — not new
@@ -151,6 +153,22 @@ func (a *Assessor) isNewDevice(ctx context.Context, in audit.RiskInput) bool {
 	}
 	if err := rows.Err(); err != nil {
 		a.logger.Debug().Err(err).Msg("risk: new-device iteration failed")
+		return false
+	}
+
+	// No prior successful login at all: there is no baseline, so nothing can deviate
+	// from it. "New device" is a comparison, and with an empty history the comparison
+	// has no meaning.
+	//
+	// Without this the signal fired on every account's FIRST login — necessarily,
+	// since a first login is always from an unseen device — which alerted the owner
+	// that their own sign-up was suspicious and recorded a risk event on every new
+	// account. A signal that fires 100% of the time carries no information and
+	// teaches operators to ignore the ones that matter.
+	//
+	// The first login is what establishes the baseline; the second onwards can
+	// deviate from it.
+	if seen == 0 {
 		return false
 	}
 	return true

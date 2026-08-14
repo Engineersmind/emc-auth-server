@@ -1628,7 +1628,9 @@ func (h *AdminHandler) ListUserSessions(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
 	}
 
-	sessions, err := h.svc.ListUserSessions(c.Request().Context(), tenantID, appScope, userID)
+	// No current-session marker: an administrator is looking at somebody else's
+	// sessions, so none of them can be the one they are calling from.
+	sessions, err := h.svc.ListUserSessions(c.Request().Context(), tenantID, appScope, userID, "")
 	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
@@ -1669,7 +1671,7 @@ func (h *AdminHandler) RevokeUserSession(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid session id"})
 	}
 
-	if err := h.svc.RevokeUserSession(c.Request().Context(), tenantID, appScope, userID, familyID); err != nil {
+	if err := h.svc.RevokeUserSession(c.Request().Context(), tenantID, appScope, userID, familyID, auth.RevokeReasonAdmin); err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "user or session not found"})
 		}
@@ -2563,7 +2565,20 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 type CreateApplicationRequest struct {
 	Name    string   `json:"name"`
 	AppType string   `json:"app_type"` // web | spa | m2m | native; defaults to web
-	Scopes  []string `json:"scopes"`   // resource:action strings; optional
+	// Scopes accepts resource:action permission strings and the reserved OIDC
+	// scopes (openid, profile, email, offline_access). Optional.
+	Scopes []string `json:"scopes"`
+	// RedirectURIs is the exact-match allow-list for GET /oauth/authorize
+	// (issue #6). Without at least one entry the application cannot use the
+	// authorization code flow at all — which is the right default for m2m.
+	RedirectURIs []string `json:"redirect_uris"`
+	// RequirePKCE defaults to true when omitted. Pointer so "omitted" is
+	// distinguishable from an explicit false.
+	RequirePKCE *bool `json:"require_pkce"`
+	// FirstParty defaults to true when omitted. Setting it false marks the
+	// client as third-party, which currently causes /oauth/authorize to refuse
+	// it with consent_required — the consent screen is not built yet.
+	FirstParty *bool `json:"first_party"`
 }
 
 // UpdateApplicationRequest is the body for PUT /api/v1/applications/:id.
@@ -2572,6 +2587,11 @@ type UpdateApplicationRequest struct {
 	Name    string   `json:"name"`
 	AppType string   `json:"app_type"`
 	Scopes  []string `json:"scopes"`
+	// RedirectURIs omitted = unchanged; [] clears — same convention as Scopes.
+	RedirectURIs []string `json:"redirect_uris"`
+	// Nil leaves the flag unchanged.
+	RequirePKCE *bool `json:"require_pkce"`
+	FirstParty  *bool `json:"first_party"`
 }
 
 // tenantFromClaimsOrPath resolves the target tenant for application handlers.
@@ -2669,9 +2689,15 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "name is required"})
 	}
 
-	result, err := h.appSvc.CreateApplication(c.Request().Context(), tenantID, req.Name, req.AppType, req.Scopes)
+	result, err := h.appSvc.CreateApplicationWithOptions(c.Request().Context(), tenantID,
+		req.Name, req.AppType, req.Scopes, auth.AppUpdate{
+			RedirectURIs: req.RedirectURIs,
+			RequirePKCE:  req.RequirePKCE,
+			FirstParty:   req.FirstParty,
+		})
 	if err != nil {
-		if errors.Is(err, auth.ErrInvalidAppType) || errors.Is(err, auth.ErrInvalidScope) {
+		if errors.Is(err, auth.ErrInvalidAppType) || errors.Is(err, auth.ErrInvalidScope) ||
+			errors.Is(err, auth.ErrInvalidClientRedirectURI) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		}
 		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
@@ -2795,12 +2821,18 @@ func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	app, err := h.appSvc.UpdateApplication(c.Request().Context(), tenantID, appID, req.Name, req.AppType, req.Scopes)
+	app, err := h.appSvc.UpdateApplicationWithOptions(c.Request().Context(), tenantID, appID,
+		req.Name, req.AppType, req.Scopes, auth.AppUpdate{
+			RedirectURIs: req.RedirectURIs,
+			RequirePKCE:  req.RequirePKCE,
+			FirstParty:   req.FirstParty,
+		})
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrAppNotFound):
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
-		case errors.Is(err, auth.ErrInvalidAppType), errors.Is(err, auth.ErrInvalidScope), containsMsg(err, "nothing to update"):
+		case errors.Is(err, auth.ErrInvalidAppType), errors.Is(err, auth.ErrInvalidScope),
+			errors.Is(err, auth.ErrInvalidClientRedirectURI), containsMsg(err, "nothing to update"):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case containsMsg(err, "duplicate"), containsMsg(err, "unique"):
 			return c.JSON(http.StatusConflict, map[string]string{"error": "an application with this name already exists"})
