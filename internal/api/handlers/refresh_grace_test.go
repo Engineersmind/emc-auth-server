@@ -48,30 +48,43 @@ func grace409Fixture(t *testing.T) (*AuthHandler, string) {
 	}
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 
-	reg, err := svc.Register(ctx, auth.RegisterInput{
+	email := fmt.Sprintf("grace-409-%d@test.example.com", time.Now().UnixNano())
+	if _, err := svc.Register(ctx, auth.RegisterInput{
 		TenantSlug: "emc",
-		Email:      fmt.Sprintf("grace-409-%d@test.example.com", time.Now().UnixNano()),
+		Email:      email,
 		Password:   "Password123!",
 		FirstName:  "Grace",
 		LastName:   "Hit",
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
 
-	// Look up the session family so we can pre-hold its rotation lock.
-	var familyID int64
+	// A separate sign-in, because registration no longer issues tokens — creating an
+	// account and starting a session are separate acts now.
+	res, err := svc.Login(ctx, auth.LoginInput{Email: email, Password: "Password123!"})
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	reg := res.Token
+
+	// Look up the session so we can pre-hold its rotation lock.
+	var sessionID int64
 	if err := pool.QueryRow(ctx,
-		`SELECT session_family_id FROM refresh_tokens WHERE token_hash = $1`,
+		`SELECT session_id FROM refresh_tokens WHERE token_hash = $1`,
 		auth.HashToken(reg.RefreshToken),
-	).Scan(&familyID); err != nil {
-		t.Fatalf("lookup session family: %v", err)
+	).Scan(&sessionID); err != nil {
+		t.Fatalf("lookup session: %v", err)
 	}
 
-	// Simulate a concurrent request that already holds the family lock. The
-	// handler's SetNX will fail, sending it into the grace-window branch where
+	// Simulate a concurrent request that already holds the session's rotation lock.
+	// The handler's SetNX will fail, sending it into the grace-window branch where
 	// the still-valid token issued moments ago yields a GraceResult → 409.
-	lockKey := fmt.Sprintf("renewal:lock:family:%d", familyID)
+	//
+	// The key must match the one RefreshWithLock builds. If it drifts, this test does
+	// not fail cleanly: the lock is simply not held, the handler rotates normally, and
+	// the 409 assertion fails somewhere further along — which is exactly what happened
+	// when the key was renamed from "family" to "session".
+	lockKey := fmt.Sprintf("renewal:lock:session:%d", sessionID)
 	ok, err := rdb.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
 	if err != nil {
 		t.Fatalf("pre-hold rotation lock: %v", err)

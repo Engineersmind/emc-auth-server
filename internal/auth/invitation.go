@@ -328,10 +328,7 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 		// activatePendingAdminGrant. The distinction is what changed: a
 		// confirmation that raises nothing leaves sessions alone, one that raises
 		// authority does not.
-		if _, err := tx.Exec(ctx, `
-			UPDATE refresh_tokens SET revoked_at = NOW()
-			WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-		`, t.UserID, t.TenantID); err != nil {
+		if err := RevokeAllSessionsTx(ctx, tx, t.UserID, t.TenantID, RevokeReasonCredentialChange); err != nil {
 			return nil, fmt.Errorf("revoke sessions on invitation accept: %w", err)
 		}
 	}
@@ -359,6 +356,20 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit accept-invitation: %w", err)
 	}
+
+	// Refuse the access tokens issued before this acceptance.
+	//
+	// Both writes above revoke the refresh rows, which stops renewal but leaves
+	// tokens already in circulation valid. That matters most on exactly the path
+	// this covers: accepting an administrative grant RAISES the account's
+	// authority, and a token captured beforehand would otherwise keep working for
+	// its remaining lifetime — and be re-minted with admin_scope on its next
+	// rotation, because rotation re-reads the grant.
+	//
+	// Placed here rather than in activatePendingAdminGrant because that helper runs
+	// inside this transaction and cannot know whether it commits; a Redis entry
+	// cannot be rolled back.
+	DenyAccountSessions(ctx, s.logger, t.UserID, t.TenantID)
 
 	s.logger.Info().Int64("user_id", t.UserID).Msg("invitation accepted")
 	return &t, nil

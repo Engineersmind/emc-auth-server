@@ -170,5 +170,32 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 	}
 	logger.Info().Msg("seed role_permissions ensured")
 
+	// 7. Re-seed the platform-default session policy (idempotent).
+	//
+	// Migration 00067 inserts this row, but a migration runs once and the row does
+	// not survive: session_policies has a foreign key to tenants, and
+	// `TRUNCATE tenants CASCADE` — which the test helper runs, and which truncates
+	// every REFERENCING TABLE rather than just the matching rows — empties it
+	// completely. A developer who ran the test suite was then left with a database
+	// whose policy table was empty, so every login logged
+	// "no session policy row matched (platform default missing?)" and silently fell
+	// back to compiled-in defaults.
+	//
+	// Seeding is the right home for it: unlike a migration, seed runs on every
+	// start, so the row is restored rather than gone until someone re-migrates from
+	// scratch. Values match auth.DefaultSessionPolicy and migration 00067.
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO session_policies
+		    (tenant_id, application_id, idle_ttl_seconds, non_persistent_idle_ttl_seconds,
+		     absolute_ttl_seconds, max_concurrent_sessions, allow_persistent)
+		SELECT NULL, NULL, 604800, 86400, 2592000, 20, true
+		WHERE NOT EXISTS (
+			SELECT 1 FROM session_policies WHERE tenant_id IS NULL AND application_id IS NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("seed platform session policy: %w", err)
+	}
+	logger.Info().Msg("seed session policy ensured")
+
 	return nil
 }
