@@ -117,10 +117,22 @@ jobs:
       - name: Run tests with coverage
         # [CI-05] -p 1: serialize packages to prevent DB race between test packages
         #         that share the same PostgreSQL instance (FK violation in jwt_test.go)
-        # -timeout is per-package: internal/auth runs full migrations + bcrypt per
-        # test and legitimately needs >2m, so give the DB suites headroom.
+        #
+        # -timeout is PER-PACKAGE and internal/auth legitimately needs ~205s: it runs
+        # full migrations and bcrypt at cost 12 throughout. At 300s that left ~95s of
+        # headroom, which a slow runner eats — PR #111 saw the same commit pass at
+        # 205.231s on one runner and time out at 300.017s on another, with the
+        # goroutine dump naming whichever test happened to be in flight rather than a
+        # real hang.
+        #
+        # Raised to 900s. This is a deadlock backstop, not a performance budget: a
+        # ceiling close enough to the real runtime to fire on runner variance reports
+        # a hang that did not happen, and costs more in re-runs and misdirected
+        # investigation than it ever catches. A genuine deadlock still fails, 10
+        # minutes later. If the honest runtime is what needs attention, that is the
+        # per-package split in CLAUDE.md deferred #8, not this number.
         run: |
-          go test -p 1 ./... -coverprofile=coverage.out -covermode=atomic -timeout 300s
+          go test -p 1 ./... -coverprofile=coverage.out -covermode=atomic -timeout 900s
           go tool cover -func=coverage.out
 
       - name: Enforce ≥80% coverage on auth core

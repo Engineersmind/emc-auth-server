@@ -21,6 +21,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/admin"
 	"github.com/engineersmind/emc-auth-server/internal/api/handlers"
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
+	"github.com/engineersmind/emc-auth-server/internal/api/paths"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
@@ -237,7 +238,9 @@ func warnIssuerHostMismatch(issuer, appBaseURL, env string, logger zerolog.Logge
 	evt.
 		Str("jwt_issuer", issuer).
 		Str("app_base_url", appBaseURL).
-		Str("jwks_url", strings.TrimRight(appBaseURL, "/")+"/tenants/{slug}/.well-known/jwks.json").
+		// Same route constant as the registration and the discovery document, with
+		// the placeholder rendered in {braces} for a human reading the log.
+		Str("jwks_url", strings.TrimRight(appBaseURL, "/")+paths.TenantPath(paths.TenantJWKS, "{slug}")).
 		Msg("JWT_ISSUER host differs from APP_BASE_URL — verifiers deriving the JWKS URL from the iss claim (standard OIDC discovery) will look on the wrong host. JWKS is served from APP_BASE_URL; give consumers that URL explicitly, or set the two to the same host.")
 }
 

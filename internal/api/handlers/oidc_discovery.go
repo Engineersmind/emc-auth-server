@@ -12,43 +12,43 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/labstack/echo/v4"
 
+	"github.com/engineersmind/emc-auth-server/internal/api/paths"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // Endpoint paths advertised by the discovery document.
 //
-// These constants are the SINGLE definition of each path: routes.go registers
-// the route from the same constant that this document publishes. That is not
-// tidiness — it is the correctness property of the whole ticket. A discovery
-// document is authoritative to a relying party: an OIDC client library trusts
-// what it reads here over anything in its own configuration, so a document that
-// disagrees with the router is worse than no document at all, because the
-// failure surfaces inside someone else's SDK long after the path was moved.
+// The values now live in internal/api/paths, which is the single definition of
+// each path for every layer that needs one — the router here, and the CORS
+// middleware that must exempt the two public documents. Middleware cannot import
+// this package (handlers already imports middleware), so it kept private copies
+// of the well-known suffixes and nothing but a reviewer's memory tied them to
+// these values.
 //
-// The two tenant-scoped paths carry Echo's ":slug" placeholder so the router and
-// the document cannot diverge on the prefix either; tenantPath substitutes it.
+// Why it matters that there is exactly one definition: a discovery document is
+// authoritative to a relying party — an OIDC client library trusts what it reads
+// here over anything in its own configuration — so a document that disagrees with
+// the router is worse than no document at all, because the failure surfaces
+// inside someone else's SDK long after the path was moved.
+//
+// These names are retained as aliases rather than replaced at every call site:
+// routes.go and the tests already reference them, and the point of the change is
+// to remove a duplicate definition, not to rename what is already correct.
 const (
-	// PathOAuthAuthorize is the OAuth 2.0 authorization endpoint (issue #6).
-	PathOAuthAuthorize = "/oauth/authorize"
-	// PathOAuthToken is the RFC 6749 token endpoint (issue #6). Not
-	// /auth/token, which survives only as a documented-deprecated JSON alias.
-	PathOAuthToken = "/oauth/token"
-	// PathOAuthUserInfo is the OIDC UserInfo endpoint (issue #7a).
-	PathOAuthUserInfo = "/oauth/userinfo"
-	// PathOAuthRevoke is the RFC 7009 revocation endpoint (issue #6).
-	PathOAuthRevoke = "/oauth/revoke"
-	// PathTenantJWKS is the per-tenant JWKS endpoint (issue #95).
-	PathTenantJWKS = "/tenants/:slug/.well-known/jwks.json"
-	// PathTenantDiscovery is this document's own location (issue #7b).
-	PathTenantDiscovery = "/tenants/:slug/.well-known/openid-configuration"
+	PathOAuthAuthorize  = paths.OAuthAuthorize
+	PathOAuthToken      = paths.OAuthToken
+	PathOAuthUserInfo   = paths.OAuthUserInfo
+	PathOAuthRevoke     = paths.OAuthRevoke
+	PathTenantJWKS      = paths.TenantJWKS
+	PathTenantDiscovery = paths.TenantDiscovery
 )
 
 // tenantPath substitutes a concrete slug into one of the ":slug" route
 // templates above, so an absolute URL in the document is derived from the exact
 // string the router was registered with.
 func tenantPath(template, slug string) string {
-	return strings.Replace(template, ":slug", slug, 1)
+	return paths.TenantPath(template, slug)
 }
 
 // discoveryCacheMaxAge is the Cache-Control max-age for the discovery document,
@@ -296,7 +296,7 @@ func (h *OIDCHandler) Discovery(c echo.Context) error {
 	// Every OIDC client fetches discovery at process start, so a fleet restart
 	// is a synchronised burst. A 304 answers it without touching the tenants
 	// table again on the client's side of the cache.
-	if match := c.Request().Header.Get("If-None-Match"); match != "" && match == etag {
+	if ifNoneMatch(c.Request().Header.Get("If-None-Match"), etag) {
 		metrics.OIDCDiscoveryRequests.WithLabelValues(discoveryOutcomeNotModified).Inc()
 		return c.NoContent(http.StatusNotModified)
 	}
@@ -310,6 +310,52 @@ func (h *OIDCHandler) Discovery(c echo.Context) error {
 func discoveryETag(body []byte) string {
 	sum := sha256.Sum256(body)
 	return `"` + base64.RawURLEncoding.EncodeToString(sum[:16]) + `"`
+}
+
+// ifNoneMatch evaluates an If-None-Match header against the current validator
+// per RFC 9110 §13.1.2, rather than comparing the raw header to it.
+//
+// Three things the exact-string comparison this replaces got wrong. None of them
+// can serve stale or wrong data — the only consequence is a 200 with the full
+// body where a 304 would have done — but all three are conformance failures on
+// the one endpoint whose caching behaviour this ticket deliberately designed, and
+// every OIDC client in existence revalidates it on process start:
+//
+//   - "*" matches any existing representation. The document exists whenever this
+//     runs, so "*" is always a match.
+//   - The field is a LIST: `If-None-Match: "a", "b"`. Intermediaries and some
+//     client stacks send more than one candidate, and a whole-header comparison
+//     matches none of them.
+//   - Comparison is the WEAK function, so a validator a cache has weakened to
+//     `W/"a"` still matches our strong `"a"`. Our own ETags are always strong;
+//     it is what arrives that may not be.
+//
+// Deliberately not tolerant of a missing quote pair. An entity-tag is quoted by
+// grammar, so an unquoted value is a malformed request rather than a validator
+// worth guessing at, and treating `abc` as `"abc"` would mean a 304 for a
+// candidate the client never actually sent.
+func ifNoneMatch(header, etag string) bool {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return false
+	}
+	if header == "*" {
+		return true
+	}
+	for _, candidate := range strings.Split(header, ",") {
+		if weakETagEqual(candidate, etag) {
+			return true
+		}
+	}
+	return false
+}
+
+// weakETagEqual compares one candidate entity-tag against ours using RFC 9110
+// §8.8.3.2 weak comparison: strip any "W/" prefix from either side, then require
+// the opaque quoted forms to be byte-identical.
+func weakETagEqual(candidate, etag string) bool {
+	return strings.TrimPrefix(strings.TrimSpace(candidate), "W/") ==
+		strings.TrimPrefix(etag, "W/")
 }
 
 // setDiscoveryHeaders applies the caching and CORS headers a public discovery

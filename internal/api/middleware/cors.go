@@ -11,6 +11,8 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/api/paths"
 )
 
 const (
@@ -103,25 +105,28 @@ func headerListContains(list, name string) bool {
 	return false
 }
 
-// wellKnownSuffix is the path suffix of the published JWKS document.
-const wellKnownSuffix = "/.well-known/jwks.json"
-
-// discoverySuffix is the path suffix of the published OIDC discovery document
-// (issue #7b). Exempt for the same reason as JWKS and in the same breath: a
-// browser-side client fetches discovery first and follows its jwks_uri second,
-// so exempting only the second half would break the flow at step one.
-const discoverySuffix = "/.well-known/openid-configuration"
-
 // isPublicCORSExempt reports whether a path serves public, credential-free
 // material that any origin may read, and so must bypass origin enforcement.
+//
+// The two suffixes come from internal/api/paths, derived there from the same
+// route templates the router registers and the OIDC discovery document
+// publishes. They used to be spelled out here as local constants, which meant
+// moving an endpoint could silently drop its CORS exemption with no compile-time
+// signal — a browser-side client would then get a 403 at step one and never
+// reach the jwks_uri the exemption exists for. This package cannot import
+// handlers (handlers imports this one), which is why the shared package exists.
+//
+// Discovery is exempt for the same reason as JWKS and in the same breath: a
+// browser-side client fetches discovery first and follows its jwks_uri second,
+// so exempting only the second half would break the flow at step one.
 //
 // Matched on suffix rather than a prefix or exact string because both paths are
 // tenant-scoped (/tenants/{slug}/.well-known/...) and the slug is arbitrary.
 // Deliberately narrow: only these exact documents, so the exemption cannot be
 // widened by a crafted path such as /.well-known/jwks.json/../../admin.
 func isPublicCORSExempt(path string) bool {
-	return strings.HasSuffix(path, wellKnownSuffix) ||
-		strings.HasSuffix(path, discoverySuffix)
+	return strings.HasSuffix(path, paths.JWKSSuffix) ||
+		strings.HasSuffix(path, paths.DiscoverySuffix)
 }
 
 // TenantCORS returns middleware that applies per-tenant CORS headers.
