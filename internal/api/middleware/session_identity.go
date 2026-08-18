@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/labstack/echo/v4"
@@ -40,10 +41,90 @@ func proceedAuthenticated(c echo.Context, claims *auth.Claims, viaCookie bool, n
 		c.Set(authSourceKey, authSourceBearer)
 	}
 
+	if rejection, blocked := checkSessionRevoked(c, claims); blocked {
+		return rejection
+	}
 	if rejection, blocked := checkSessionIdentity(c, claims, viaCookie); blocked {
 		return rejection
 	}
 	return next(c)
+}
+
+// SessionRevocationChecker reports whether a session has been revoked recently
+// enough that its outstanding access tokens must be refused. Implemented by
+// *auth.AuthService.
+type SessionRevocationChecker interface {
+	SessionDenied(ctx context.Context, sessionID, userID, tenantID string, issuedAt int64) bool
+}
+
+// sessionRevocation is the process-wide revocation checker.
+//
+// A package-level dependency rather than a middleware parameter because the check
+// belongs in proceedAuthenticated, which is reached from three separate places
+// inside JWTRenew alone (verified token, grace path, post-rotation) and from
+// JWTRequired besides. Threading a service through all of them would mean every
+// future authenticating path has to remember to pass it, and one that forgot would
+// silently stop honouring revocations — a failure with no symptom until somebody
+// tries to revoke a session during an incident.
+//
+// nil disables the check, which is the correct default: unset, revocation still
+// takes effect at the next refresh, exactly as it did before this existed.
+var sessionRevocation SessionRevocationChecker
+
+// SetSessionRevocationChecker installs the revocation checker. Called once during
+// route registration, before the server accepts traffic.
+//
+// Test contract: because the variable is process-wide, a test that installs a
+// checker MUST restore it, or it leaks into every later test in the package and
+// makes ordering significant:
+//
+//	middleware.SetSessionRevocationChecker(fake)
+//	t.Cleanup(func() { middleware.SetSessionRevocationChecker(nil) })
+//
+// nil is the correct zero to restore to, not the previously-installed value: no
+// test should be depending on one having been installed by another.
+func SetSessionRevocationChecker(checker SessionRevocationChecker) {
+	sessionRevocation = checker
+}
+
+// checkSessionRevoked refuses a request whose session has been revoked.
+//
+// Returns 401 with code "session_revoked" rather than the generic token_invalid:
+// the credential is genuinely well-formed and correctly signed, and the client's
+// correct response is to stop and re-authenticate rather than to attempt a refresh
+// that will also fail. Naming the case lets the client skip a pointless round trip
+// and lets an operator tell revocations apart from malformed tokens in the logs.
+//
+// Both a single-session revoke and an account-wide one are caught, which is why
+// the user and tenant claims are passed alongside the session id: an account-wide
+// revocation (revoke-all, an operator block, a password reset) does not know which
+// sessions exist, so it is recorded against the account instead. Checking only the
+// session id — the first version of this — left every account-wide revocation with
+// no effect at all on tokens already issued.
+//
+// A token with neither a "sid" nor a parseable user/tenant is allowed through:
+// those are client-credentials and agent tokens, which have no session and no
+// account to revoke, plus any access token minted before the sid claim existed.
+// Blocking on their absence would refuse every machine client in the deployment.
+func checkSessionRevoked(c echo.Context, claims *auth.Claims) (rejection error, blocked bool) {
+	if sessionRevocation == nil {
+		return nil, false
+	}
+	// The token's issue time distinguishes "in circulation when the account was
+	// revoked" from "minted afterwards". Without it an account-wide revocation would
+	// also refuse the tokens the user receives when they sign back in, locking them
+	// out for the denylist entry's whole lifetime.
+	var issuedAt int64
+	if claims.IssuedAt != nil {
+		issuedAt = claims.IssuedAt.Unix()
+	}
+	if !sessionRevocation.SessionDenied(c.Request().Context(), claims.SessionID, claims.UserID, claims.TenantID, issuedAt) {
+		return nil, false
+	}
+	return c.JSON(http.StatusUnauthorized, map[string]string{
+		"error": "this session has been signed out",
+		"code":  "session_revoked",
+	}), true
 }
 
 // checkSessionIdentity refuses a mutating request whose caller believes it is

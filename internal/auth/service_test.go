@@ -43,6 +43,34 @@ func uniqueEmail(prefix string) string {
 	return fmt.Sprintf("%s-%d@test.example.com", prefix, time.Now().UnixNano())
 }
 
+// registerAndLogin creates an account and signs it in, returning the token pair.
+//
+// Exists because registration deliberately no longer issues tokens: creating an
+// account and starting a session are separate acts. Most tests here only ever wanted
+// "give me a signed-in user", and this keeps that one line at the call site rather
+// than two calls and an error check repeated a dozen times.
+func registerAndLogin(t *testing.T, svc *auth.AuthService, email, password string) *auth.AuthResult {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := svc.Register(ctx, auth.RegisterInput{
+		TenantSlug: "emc",
+		Email:      email,
+		Password:   password,
+		FirstName:  "Test",
+		LastName:   "User",
+	}); err != nil {
+		t.Fatalf("Register(%s): %v", email, err)
+	}
+	res, err := svc.Login(ctx, auth.LoginInput{Email: email, Password: password})
+	if err != nil {
+		t.Fatalf("Login(%s): %v", email, err)
+	}
+	if res.Token == nil {
+		t.Fatalf("Login(%s) returned no token pair", email)
+	}
+	return res.Token
+}
+
 func TestRegister_Success(t *testing.T) {
 	svc, cleanup := newServiceForTest(t)
 	defer cleanup()
@@ -63,17 +91,73 @@ func TestRegister_Success(t *testing.T) {
 	if result == nil {
 		t.Fatal("Register() result is nil")
 	}
-	if result.AccessToken == "" {
-		t.Error("Register() AccessToken is empty")
+	if result.UserID == 0 {
+		t.Error("Register() UserID is zero")
 	}
-	if result.RefreshToken == "" {
-		t.Error("Register() RefreshToken is empty")
+	if result.Email != email {
+		t.Errorf("Register() Email = %q, want %q", result.Email, email)
 	}
-	if result.TokenType != "Bearer" {
-		t.Errorf("Register() TokenType = %q, want %q", result.TokenType, "Bearer")
+	if result.TenantID == 0 {
+		t.Error("Register() TenantID is zero")
 	}
-	if result.ExpiresIn != 900 { // AccessTokenTTL = 15 min = 900s
-		t.Errorf("Register() ExpiresIn = %d, want 900", result.ExpiresIn)
+	if result.ApplicationID != nil {
+		t.Errorf("Register() ApplicationID = %v, want nil for a tenant-level account", *result.ApplicationID)
+	}
+}
+
+// Registration creates an account and nothing else.
+//
+// It used to return a token pair, which meant a session: every new account started
+// with one nobody asked for, and a client that registered then logged in — the
+// normal shape — ended up with two sessions seconds apart and a device list opening
+// on an entry the user could not account for.
+func TestRegister_DoesNotCreateASession(t *testing.T) {
+	svc, cleanup := newServiceForTest(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	email := uniqueEmail("register-no-session")
+
+	reg, err := svc.Register(ctx, auth.RegisterInput{
+		TenantSlug: "emc",
+		Email:      email,
+		Password:   "Password123!",
+		FirstName:  "No",
+		LastName:   "Session",
+	})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// Its own pool against the same DATABASE_URL: newServiceForTest does not expose
+	// one, and a second handle to the same database is cheaper than reshaping the
+	// fixture every other test in this file relies on.
+	pool := testhelper.NewTestDB(t)
+
+	var sessions, tokens int
+	if err := pool.QueryRow(ctx,
+		`SELECT (SELECT COUNT(*) FROM user_sessions WHERE user_id = $1),
+		        (SELECT COUNT(*) FROM refresh_tokens WHERE user_id = $1)`,
+		reg.UserID).Scan(&sessions, &tokens); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessions != 0 {
+		t.Errorf("sessions after register = %d, want 0", sessions)
+	}
+	if tokens != 0 {
+		t.Errorf("refresh tokens after register = %d, want 0", tokens)
+	}
+
+	// And signing in afterwards produces exactly one.
+	if _, err := svc.Login(ctx, auth.LoginInput{Email: email, Password: "Password123!"}); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM user_sessions WHERE user_id = $1`, reg.UserID).Scan(&sessions); err != nil {
+		t.Fatalf("recount sessions: %v", err)
+	}
+	if sessions != 1 {
+		t.Errorf("sessions after register+login = %d, want 1", sessions)
 	}
 }
 
@@ -197,16 +281,7 @@ func TestRefresh_RotatesToken(t *testing.T) {
 	email := uniqueEmail("refresh-rotate")
 	password := "Password123!"
 
-	regResult, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   password,
-		FirstName:  "Refresh",
-		LastName:   "Rotate",
-	})
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
+	regResult := registerAndLogin(t, svc, email, password)
 	originalRefresh := regResult.RefreshToken
 
 	newResult, err := svc.Refresh(ctx, originalRefresh)
@@ -235,20 +310,11 @@ func TestRefresh_ReplayAttack(t *testing.T) {
 	email := uniqueEmail("refresh-replay")
 	password := "Password123!"
 
-	regResult, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   password,
-		FirstName:  "Replay",
-		LastName:   "Attack",
-	})
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
+	regResult := registerAndLogin(t, svc, email, password)
 	oldRefreshToken := regResult.RefreshToken
 
 	// First Refresh succeeds — consumes old token, issues new one.
-	_, err = svc.Refresh(ctx, oldRefreshToken)
+	_, err := svc.Refresh(ctx, oldRefreshToken)
 	if err != nil {
 		t.Fatalf("first Refresh() error = %v", err)
 	}
@@ -271,16 +337,7 @@ func TestLogout_RevokesToken(t *testing.T) {
 	email := uniqueEmail("logout-revokes")
 	password := "Password123!"
 
-	regResult, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   password,
-		FirstName:  "Logout",
-		LastName:   "Revokes",
-	})
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
+	regResult := registerAndLogin(t, svc, email, password)
 	refreshToken := regResult.RefreshToken
 
 	// Logout should succeed.
@@ -289,7 +346,7 @@ func TestLogout_RevokesToken(t *testing.T) {
 	}
 
 	// Refresh after logout must fail.
-	_, err = svc.Refresh(ctx, refreshToken)
+	_, err := svc.Refresh(ctx, refreshToken)
 	if err == nil {
 		t.Fatal("Refresh() after Logout() expected error, got nil")
 	}
@@ -520,10 +577,10 @@ func newAppAuthFixture(t *testing.T) (*auth.AuthService, *auth.AppResult, int64,
 }
 
 // TestRegister_WithAppCredentials verifies that client_id + client_secret
-// authenticate the application, derive the tenant (no slug needed), and stamp
-// app_id into the issued JWT.
+// authenticate the application, derive the tenant (no slug needed), and own the
+// created account.
 func TestRegister_WithAppCredentials(t *testing.T) {
-	svc, app, _, ctx := newAppAuthFixture(t)
+	svc, app, tenantID, ctx := newAppAuthFixture(t)
 
 	result, err := svc.Register(ctx, auth.RegisterInput{
 		ClientID:     app.ClientID,
@@ -536,8 +593,17 @@ func TestRegister_WithAppCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register(app credentials, no slug) error = %v", err)
 	}
-	if result.AccessToken == "" {
-		t.Fatal("Register() AccessToken is empty")
+	if result.UserID == 0 {
+		t.Fatal("Register() UserID is zero")
+	}
+	// The tenant was derived from the authenticated application, not from a slug.
+	if result.TenantID != tenantID {
+		t.Errorf("Register() TenantID = %d, want %d derived from the application", result.TenantID, tenantID)
+	}
+	// The account belongs to that application's isolated user base — previously
+	// asserted via the app_id claim in the token registration used to return.
+	if result.ApplicationID == nil {
+		t.Error("Register() ApplicationID is nil, want the authenticated application")
 	}
 
 	// Wrong secret must be rejected with the sentinel, before any user write.
@@ -628,15 +694,31 @@ func TestRegister_AssignsApplicationDefaultRole(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 
-	claims, err := jwtSvc.Verify(ctx, result.AccessToken)
+	// Read off the result rather than out of a token: registration no longer issues
+	// one. The role is what matters here, and it is now returned directly.
+	if result.Role != "viewer" {
+		t.Errorf("Register() assigned role = %q, want %q", result.Role, "viewer")
+	}
+	// The permissions the role carries are still worth asserting, so they are read
+	// from the session the user gets when they sign in.
+	login, err := svc.Login(ctx, auth.LoginInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        result.Email,
+		Password:     "Password123!",
+	})
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	claims, err := jwtSvc.Verify(ctx, login.Token.AccessToken)
 	if err != nil {
 		t.Fatalf("Verify() error = %v", err)
 	}
 	if claims.Role != "viewer" {
-		t.Errorf("Register() assigned role = %q, want %q", claims.Role, "viewer")
+		t.Errorf("token role = %q, want %q", claims.Role, "viewer")
 	}
 	if len(claims.Permissions) != 1 || claims.Permissions[0] != "widgets:read" {
-		t.Errorf("Register() permissions = %v, want [widgets:read]", claims.Permissions)
+		t.Errorf("token permissions = %v, want [widgets:read]", claims.Permissions)
 	}
 
 	// A second application with no default role configured must register the
@@ -654,12 +736,8 @@ func TestRegister_AssignsApplicationDefaultRole(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register(appB) error = %v", err)
 	}
-	claimsB, err := jwtSvc.Verify(ctx, resultB.AccessToken)
-	if err != nil {
-		t.Fatalf("Verify(appB) error = %v", err)
-	}
-	if claimsB.Role != "" {
-		t.Errorf("Register(appB, no default role) assigned role = %q, want empty", claimsB.Role)
+	if resultB.Role != "" {
+		t.Errorf("Register(appB, no default role) assigned role = %q, want empty", resultB.Role)
 	}
 }
 
@@ -689,12 +767,8 @@ func TestRegister_LegacyDoesNotInheritSystemRole(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 
-	claims, err := jwtSvc.Verify(ctx, result.AccessToken)
-	if err != nil {
-		t.Fatalf("Verify() error = %v", err)
-	}
-	if claims.Role == "owner" || claims.Role == "super_admin" {
-		t.Errorf("Register() legacy registration got system role %q, want no system role", claims.Role)
+	if result.Role == "owner" || result.Role == "super_admin" {
+		t.Errorf("Register() legacy registration got system role %q, want no system role", result.Role)
 	}
 }
 
@@ -829,15 +903,27 @@ func newAppRefreshFixture(t *testing.T) (*auth.AuthService, *auth.JWTService, *a
 func TestRefreshWithLock_PreservesAppID(t *testing.T) {
 	svc, jwtSvc, app, ctx := newAppRefreshFixture(t)
 
-	reg, err := svc.Register(ctx, auth.RegisterInput{
+	// Register then sign in: registration creates the account without starting a
+	// session, so the token pair comes from the login.
+	email := uniqueEmail("refresh-appid")
+	if _, err := svc.Register(ctx, auth.RegisterInput{
 		ClientID:     app.ClientID,
 		ClientSecret: app.ClientSecret,
-		Email:        uniqueEmail("refresh-appid"),
+		Email:        email,
+		Password:     "Password123!",
+	}); err != nil {
+		t.Fatalf("Register(app credentials) error = %v", err)
+	}
+	loginRes, err := svc.Login(ctx, auth.LoginInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        email,
 		Password:     "Password123!",
 	})
 	if err != nil {
-		t.Fatalf("Register(app credentials) error = %v", err)
+		t.Fatalf("Login(app credentials) error = %v", err)
 	}
+	reg := loginRes.Token
 
 	// Sanity: the original access token carries the application id.
 	origClaims, err := jwtSvc.Verify(ctx, reg.AccessToken)
@@ -875,15 +961,27 @@ func TestRefreshWithLock_ReplayRevokesFamily(t *testing.T) {
 	svc, _, app, ctx := newAppRefreshFixture(t)
 	rdb := testhelper.NewTestRedis(t)
 
-	reg, err := svc.Register(ctx, auth.RegisterInput{
+	// Register then sign in: registration creates the account without starting a
+	// session, so the token pair comes from the login.
+	email := uniqueEmail("refresh-replay-lock")
+	if _, err := svc.Register(ctx, auth.RegisterInput{
 		ClientID:     app.ClientID,
 		ClientSecret: app.ClientSecret,
-		Email:        uniqueEmail("refresh-replay-lock"),
+		Email:        email,
+		Password:     "Password123!",
+	}); err != nil {
+		t.Fatalf("Register(app credentials) error = %v", err)
+	}
+	loginRes, err := svc.Login(ctx, auth.LoginInput{
+		ClientID:     app.ClientID,
+		ClientSecret: app.ClientSecret,
+		Email:        email,
 		Password:     "Password123!",
 	})
 	if err != nil {
-		t.Fatalf("Register(app credentials) error = %v", err)
+		t.Fatalf("Login(app credentials) error = %v", err)
 	}
+	reg := loginRes.Token
 
 	// First rotation consumes the original token and issues a fresh pair.
 	rotated, grace, err := svc.RefreshWithLock(ctx, reg.RefreshToken, rdb)

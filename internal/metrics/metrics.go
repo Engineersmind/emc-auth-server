@@ -336,6 +336,64 @@ var (
 		[]string{"outcome"},
 	)
 
+	// SessionRevocations counts refresh-token rows revoked, by cause.
+	//
+	// reason: rotated | logout | user_revoked | admin_revoked |
+	//         admin_revoked_all | replay_detected | cap_evicted |
+	//         credential_change | idle_expired
+	//
+	// Counts ROWS, not sessions: one session revoke touches every live token in
+	// the family, which is normally one. The ratio is not meaningful; the rate per
+	// reason is. Watch replay_detected especially — a sustained non-zero rate is
+	// either stolen tokens or a client that retries refreshes incorrectly, and the
+	// two need opposite responses.
+	SessionRevocations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "session_revocations_total",
+			Help:      "Refresh tokens revoked, by cause.",
+		},
+		[]string{"reason"},
+	)
+
+	// SessionDenylistErrors counts Redis failures on the revoked-session
+	// denylist. op: read | write.
+	//
+	// Worth alerting on rather than merely graphing: the denylist fails OPEN, so
+	// errors here mean revoked sessions keep working until their access tokens
+	// expire. Nothing else surfaces that — the revocation itself reports success.
+	SessionDenylistErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "session_denylist_errors_total",
+			Help:      "Redis errors on the revoked-session denylist, by operation.",
+		},
+		[]string{"op"},
+	)
+
+	// SessionsReaped counts refresh-token rows deleted by the retention reaper.
+	SessionsReaped = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "sessions_reaped_total",
+			Help:      "Expired refresh-token rows deleted by the retention reaper.",
+		},
+	)
+
+	// SessionReaperRuns counts reaper executions by outcome.
+	// outcome: success | failure | skipped_locked
+	//
+	// skipped_locked is normal and expected, not a fault: every replica runs the
+	// reaper on its own timer and the advisory lock lets exactly one win.
+	SessionReaperRuns = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "session_reaper_runs_total",
+			Help:      "Session retention reaper executions by outcome.",
+		},
+		[]string{"outcome"},
+	)
+
 	// OAuthGrants counts token-endpoint exchanges by grant type and outcome
 	// (issue #6).
 	//

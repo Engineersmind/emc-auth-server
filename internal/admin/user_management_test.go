@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-
 	"github.com/engineersmind/emc-auth-server/internal/admin"
+	"github.com/engineersmind/emc-auth-server/internal/auth"
 )
 
 // createTestUser creates a user in the fixture tenant (tenant-level scope) and
@@ -24,22 +24,38 @@ func createTestUser(t *testing.T, f adminFixture, email string) int64 {
 
 // seedRefreshToken inserts one refresh token row for the user and returns its
 // session family id (family id = row id, mirroring migration 00026's seeding).
+// seedRefreshToken creates one session with a single refresh token and returns the
+// session id — which is what the admin API lists and revokes by.
+//
+// A session row plus a token, not a bare token: sessions are their own entity now,
+// so lifetime and revocation live on the parent and a parentless token is invisible
+// to every session query. `expires` sets the session's deadlines, since that is what
+// liveness is judged on; a negative value seeds an already-expired session.
 func seedRefreshToken(t *testing.T, f adminFixture, userID int64, ua string, expires time.Duration) int64 {
 	t.Helper()
-	var id int64
-	err := f.pool.QueryRow(context.Background(), `
-		INSERT INTO refresh_tokens (user_id, tenant_id, token_hash, expires_at, user_agent, session_family_id)
-		VALUES ($1, $2, $3, NOW() + $4::interval, $5, 0)
+	ctx := context.Background()
+	window := fmt.Sprintf("%f seconds", expires.Seconds())
+
+	var sessionID int64
+	if err := f.pool.QueryRow(ctx, `
+		INSERT INTO user_sessions
+		    (user_id, tenant_id, user_agent, device_hint, idle_expires_at, absolute_expires_at)
+		VALUES ($1, $2, $3, $3, NOW() + $4::interval, NOW() + $4::interval)
 		RETURNING id
-	`, userID, f.tenantID, fmt.Sprintf("hash-%d-%s-%d", userID, ua, time.Now().UnixNano()), fmt.Sprintf("%f seconds", expires.Seconds()), ua).Scan(&id)
-	if err != nil {
+	`, userID, f.tenantID, ua, window).Scan(&sessionID); err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO refresh_tokens
+		    (user_id, tenant_id, token_hash, expires_at, session_id, session_family_id, user_agent)
+		VALUES ($1, $2, $3, NOW() + $4::interval, $5, $5, $6)
+	`, userID, f.tenantID,
+		fmt.Sprintf("hash-%d-%s-%d", userID, ua, time.Now().UnixNano()),
+		window, sessionID, ua); err != nil {
 		t.Fatalf("seed refresh token: %v", err)
 	}
-	if _, err := f.pool.Exec(context.Background(),
-		`UPDATE refresh_tokens SET session_family_id = id WHERE id = $1`, id); err != nil {
-		t.Fatalf("set session family: %v", err)
-	}
-	return id
+	return sessionID
 }
 
 func TestGetUserDetail_Enrichment(t *testing.T) {
@@ -151,7 +167,7 @@ func TestListUserSessions_ActiveOnly(t *testing.T) {
 	seedRefreshToken(t, f, userID, "Firefox", time.Hour)
 	expired := seedRefreshToken(t, f, userID, "OldBrowser", -time.Hour) // already expired
 
-	sessions, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userID)
+	sessions, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userID, "")
 	if err != nil {
 		t.Fatalf("ListUserSessions() error = %v", err)
 	}
@@ -165,10 +181,10 @@ func TestListUserSessions_ActiveOnly(t *testing.T) {
 	}
 
 	// Revoke one family; the list shrinks accordingly.
-	if err := f.svc.RevokeUserSession(ctx, f.tenantID, nil, userID, famA); err != nil {
+	if err := f.svc.RevokeUserSession(ctx, f.tenantID, nil, userID, famA, auth.RevokeReasonAdmin); err != nil {
 		t.Fatalf("RevokeUserSession() error = %v", err)
 	}
-	sessions, err = f.svc.ListUserSessions(ctx, f.tenantID, nil, userID)
+	sessions, err = f.svc.ListUserSessions(ctx, f.tenantID, nil, userID, "")
 	if err != nil {
 		t.Fatalf("ListUserSessions() after revoke error = %v", err)
 	}
@@ -188,7 +204,7 @@ func TestRevokeUserSession_WrongUserRejected(t *testing.T) {
 	famA := seedRefreshToken(t, f, userA, "Chrome", time.Hour)
 
 	// userB must not be able to have userA's session revoked through their id.
-	if err := f.svc.RevokeUserSession(ctx, f.tenantID, nil, userB, famA); !errors.Is(err, admin.ErrNotFound) {
+	if err := f.svc.RevokeUserSession(ctx, f.tenantID, nil, userB, famA, auth.RevokeReasonAdmin); !errors.Is(err, admin.ErrNotFound) {
 		t.Fatalf("RevokeUserSession(cross-user) error = %v, want ErrNotFound", err)
 	}
 }
@@ -221,7 +237,7 @@ func TestRevokeAllUserSessions(t *testing.T) {
 		t.Errorf("token_version = %d, want %d", versionAfter, versionBefore+1)
 	}
 
-	sessions, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userID)
+	sessions, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userID, "")
 	if err != nil {
 		t.Fatalf("ListUserSessions() error = %v", err)
 	}
@@ -256,13 +272,13 @@ func TestUserManagement_AppScopeIsolation(t *testing.T) {
 	if _, err := f.svc.SetUserActive(ctx, f.tenantID, &f.appID, userID, false); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("SetUserActive(wrong app scope) error = %v, want ErrNotFound", err)
 	}
-	if _, err := f.svc.ListUserSessions(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
+	if _, err := f.svc.ListUserSessions(ctx, f.tenantID, &f.appID, userID, ""); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("ListUserSessions(wrong app scope) error = %v, want ErrNotFound", err)
 	}
 	if _, err := f.svc.GetUserMFA(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("GetUserMFA(wrong app scope) error = %v, want ErrNotFound", err)
 	}
-	if err := f.svc.RevokeUserSession(ctx, f.tenantID, &f.appID, userID, famID); !errors.Is(err, admin.ErrNotFound) {
+	if err := f.svc.RevokeUserSession(ctx, f.tenantID, &f.appID, userID, famID, auth.RevokeReasonAdmin); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("RevokeUserSession(wrong app scope) error = %v, want ErrNotFound", err)
 	}
 	if _, err := f.svc.RevokeAllUserSessions(ctx, f.tenantID, &f.appID, userID); !errors.Is(err, admin.ErrNotFound) {
@@ -329,13 +345,13 @@ func TestUserManagement_CrossTenantIsolation(t *testing.T) {
 	if _, err := f.svc.SetUserActive(ctx, f.tenantID, nil, userB, false); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("SetUserActive(cross-tenant) error = %v, want ErrNotFound", err)
 	}
-	if _, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {
+	if _, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userB, ""); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("ListUserSessions(cross-tenant) error = %v, want ErrNotFound", err)
 	}
 	if _, err := f.svc.GetUserMFA(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("GetUserMFA(cross-tenant) error = %v, want ErrNotFound", err)
 	}
-	if err := f.svc.RevokeUserSession(ctx, f.tenantID, nil, userB, famB); !errors.Is(err, admin.ErrNotFound) {
+	if err := f.svc.RevokeUserSession(ctx, f.tenantID, nil, userB, famB, auth.RevokeReasonAdmin); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("RevokeUserSession(cross-tenant) error = %v, want ErrNotFound", err)
 	}
 	if _, err := f.svc.RevokeAllUserSessions(ctx, f.tenantID, nil, userB); !errors.Is(err, admin.ErrNotFound) {

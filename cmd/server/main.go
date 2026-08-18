@@ -265,6 +265,19 @@ func main() {
 	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Session retention reaper. Deletes refresh-token rows that can never be
+	// presented again, after a forensic retention margin.
+	//
+	// Started here rather than inside RegisterRoutes because it owns a goroutine and
+	// needs the shutdown context: RegisterRoutes wires request handling and has no
+	// lifecycle to hang a background worker off. Bound to shutdownCtx so the reaper
+	// stops at a batch boundary when the process is asked to exit — each batch commits
+	// independently, so an interrupted pass simply resumes on the next start.
+	//
+	// Every replica runs this; an advisory lock elects one winner per interval, so the
+	// losers skip the run rather than duplicating the deletes.
+	go auth.NewSessionReaper(pool, logger).Run(shutdownCtx)
+
 	s := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           e,

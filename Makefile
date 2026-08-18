@@ -71,16 +71,38 @@ run: build
 	./$(BINARY)
 
 # ─── Quality Gates ──────────────────────────────────────────────────────────
+#
+# TEST_FLAGS is shared by every target below so the two settings that the suite
+# genuinely depends on cannot drift between them.
+#
+#   -p 1       Packages must run one at a time. They share a single database and
+#              several truncate it between tests, so running two packages at once
+#              has one wiping the other's fixtures mid-run. The symptom is a
+#              different test failing on each run, which reads as flakiness rather
+#              than as the configuration problem it is.
+#
+#   -timeout   20 minutes, not the 300s this used to be and not Go's 600s default.
+#              internal/auth alone takes around 490s on a developer machine — every
+#              test in it stands up a pool, runs migrations, and seeds a tenant — so
+#              300s could never pass and 600s crosses over under any contention
+#              (an app container sharing the database is enough). A timeout that
+#              fires mid-suite panics the whole package, which looks like a code
+#              failure and is not one.
+#
+# If this package's runtime keeps growing, the fix is faster fixtures — a shared
+# migrated template database rather than migrating per test — not a larger number
+# here.
+TEST_FLAGS := -p 1 -timeout 20m
 
 ## Run all tests
 .PHONY: test
 test:
-	go test ./... -timeout 300s
+	go test ./... $(TEST_FLAGS)
 
 ## Run tests with coverage report
 .PHONY: test-cover
 test-cover:
-	go test ./... -coverprofile=coverage.out -covermode=atomic -timeout 300s
+	go test ./... -coverprofile=coverage.out -covermode=atomic $(TEST_FLAGS)
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 	go tool cover -func=coverage.out | grep total
@@ -88,7 +110,7 @@ test-cover:
 ## Run tests with race detector
 .PHONY: test-race
 test-race:
-	go test -race ./... -timeout 300s
+	go test -race ./... $(TEST_FLAGS)
 
 ## Run golangci-lint
 .PHONY: lint

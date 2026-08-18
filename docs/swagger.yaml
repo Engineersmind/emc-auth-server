@@ -155,6 +155,44 @@ definitions:
       tenant_id:
         type: string
     type: object
+  admin.SessionPolicyInput:
+    properties:
+      absolute_ttl_seconds:
+        type: integer
+      allow_persistent:
+        type: boolean
+      idle_ttl_seconds:
+        type: integer
+      max_concurrent_sessions:
+        type: integer
+      non_persistent_idle_ttl_seconds:
+        type: integer
+    type: object
+  admin.SessionPolicyView:
+    properties:
+      absolute_ttl_seconds:
+        type: integer
+      allow_persistent:
+        type: boolean
+      idle_ttl_seconds:
+        type: integer
+      inherited:
+        description: |-
+          Inherited is true when no row exists at the requested scope and these
+          values came from a broader one.
+        type: boolean
+      max_concurrent_sessions:
+        type: integer
+      non_persistent_idle_ttl_seconds:
+        type: integer
+      scope:
+        description: |-
+          Scope is "platform", "tenant", or "application" — which row actually
+          answered the request. Without it a caller cannot tell a policy they have set
+          from an inherited default, and would have no way to know that editing it
+          creates a new row rather than changing an existing one.
+        type: string
+    type: object
   admin.TenantAdminResult:
     properties:
       applications:
@@ -383,12 +421,54 @@ definitions:
     type: object
   admin.UserSession:
     properties:
+      absolute_expires_at:
+        type: string
+      amr:
+        description: AMR lists the authentication methods used to establish the session.
+        items:
+          type: string
+        type: array
+      auth_time:
+        description: |-
+          AuthTime is when the user actually authenticated, as opposed to when the
+          current token in the family was minted.
+        type: string
       created_at:
+        type: string
+      device_hint:
+        description: |-
+          DeviceHint is the server-parsed "Chrome on Windows" form of UserAgent.
+
+          Both are returned: the hint so a consumer does not need its own User-Agent
+          parser to show a user which device they are looking at, the raw header because
+          it is the evidence and a parser that guesses wrong must not destroy it.
         type: string
       expires_at:
         type: string
+      idle_expires_at:
+        description: |-
+          IdleExpiresAt is when the session dies if it is not used again, and
+          AbsoluteExpiresAt is the hard deadline it cannot outlive whatever it does.
+          Both are surfaced because "expires_at" alone cannot answer the question an
+          operator actually has — is this session about to go away on its own, or does
+          it need revoking? Nullable for rows written before migration 00068.
+        type: string
       ip_address:
         type: string
+      is_current:
+        description: |-
+          IsCurrent marks the session the caller is making this request from.
+
+          Only ever true on the end-user (/me/sessions) view, where the caller and the
+          subject are the same person: it prevents somebody from revoking the session
+          they are sitting in and wondering why the page broke. On the admin view the
+          caller is a different person from the subject, so no session in the list can
+          be theirs and the field stays false throughout.
+        type: boolean
+      is_persistent:
+        description: IsPersistent records whether the user asked to be remembered
+          on this device.
+        type: boolean
       last_used_at:
         type: string
       session_family_id:
@@ -906,6 +986,22 @@ definitions:
       secret_verified:
         type: boolean
     type: object
+  auth.RegisterResult:
+    properties:
+      application_id:
+        description: |-
+          ApplicationID is set when the account belongs to one application's isolated
+          user base, nil for a tenant-level account.
+        type: integer
+      email:
+        type: string
+      role:
+        type: string
+      tenant_id:
+        type: integer
+      user_id:
+        type: integer
+    type: object
   auth.TOTPStatus:
     properties:
       active:
@@ -960,6 +1056,9 @@ definitions:
         type: string
       password:
         type: string
+      remember_me:
+        description: RememberMe asks for a persistent session. See LoginRequest.RememberMe.
+        type: boolean
     required:
     - email
     - password
@@ -1150,6 +1249,17 @@ definitions:
         type: string
       password:
         type: string
+      remember_me:
+        description: |-
+          RememberMe asks for a persistent session — the tenant's longer idle timeout
+          instead of the short one meant for shared machines. Honoured only when the
+          tenant's session policy allows persistent sessions.
+
+          Absent means false, so a client that has not been updated keeps getting the
+          shorter session. That is the right default for an omitted security-relevant
+          flag: the failure mode is a user signing in more often than they need to,
+          not a month-long session on a library computer.
+        type: boolean
     required:
     - email
     - password
@@ -1358,6 +1468,17 @@ definitions:
         type: string
       password:
         type: string
+      remember_me:
+        description: |-
+          RememberMe asks for a persistent session — the tenant's longer idle timeout
+          instead of the short one meant for shared machines. Honoured only when the
+          tenant's session policy allows persistent sessions.
+
+          Absent means false, so a client that has not been updated keeps getting the
+          shorter session. That is the right default for an omitted security-relevant
+          flag: the failure mode is a user signing in more often than they need to,
+          not a month-long session on a library computer.
+        type: boolean
     required:
     - email
     - password
@@ -3152,7 +3273,8 @@ paths:
       description: 'Creates a user account owned by the authenticated application
         — the same email may hold independent accounts in different applications.
         Application credentials via Authorization: Basic header only; no tenant slug
-        needed.'
+        needed. Does NOT sign the user in — no session is created and no tokens are
+        returned; call /auth/apps/login afterwards.'
       parameters:
       - description: Basic base64(client_id:client_secret)
         in: header
@@ -3171,7 +3293,7 @@ paths:
         "201":
           description: Created
           schema:
-            $ref: '#/definitions/auth.AuthResult'
+            $ref: '#/definitions/auth.RegisterResult'
         "400":
           description: Bad Request
           schema:
@@ -4074,6 +4196,9 @@ paths:
       - application/json
       description: |-
         Issues a new access + refresh token pair and immediately invalidates the old refresh token.
+        Delivery depends on the identity behind the presented refresh token:
+        application-scoped sessions (those established through /auth/apps/login, /auth/apps/register or magic-link verify — their access token carries an `app_id` claim) receive the full pair in the JSON body (`access_token`, `refresh_token`, `token_type`, `expires_in`, `expires_at`) and no cookies, matching the shape /auth/apps/login already returns;
+        first-party sessions receive the pair as HttpOnly cookies and a body of `{message, expires_in, expires_at}` only — a refresh token is deliberately never placed where browser JavaScript can read it.
         Body-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:
         409 (`concurrent_refresh`) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.
         503 means the session store (Redis) is temporarily unavailable — the client should retry.
@@ -4123,8 +4248,9 @@ paths:
     post:
       consumes:
       - application/json
-      description: Creates a user account in the specified tenant and returns a token
-        pair.
+      description: Creates a user account in the specified tenant. Does NOT sign the
+        user in — no session is created and no tokens are returned; call /auth/session
+        or /auth/login afterwards.
       parameters:
       - description: Tenant slug (e.g. emc)
         in: header
@@ -4143,7 +4269,7 @@ paths:
         "201":
           description: Created
           schema:
-            $ref: '#/definitions/auth.AuthResult'
+            $ref: '#/definitions/auth.RegisterResult'
         "400":
           description: Bad Request
           schema:
@@ -4659,6 +4785,74 @@ paths:
       summary: Set an email template
       tags:
       - admin-email-templates
+  /api/v1/me/sessions:
+    delete:
+      description: Ends every session except the one this request came from.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Sign out your other sessions
+      tags:
+      - account
+    get:
+      description: Returns the caller's active sessions with device, IP, and last-activity,
+        marking the session the request came from.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List your own active sessions
+      tags:
+      - account
+  /api/v1/me/sessions/{familyID}:
+    delete:
+      description: Ends a single session belonging to the caller. Use the logout endpoint
+        to end the current session.
+      parameters:
+      - description: Session ID
+        in: path
+        name: familyID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Sign out one of your own sessions
+      tags:
+      - account
   /api/v1/permissions:
     get:
       description: Returns all permissions for the caller's tenant. Requires admin:access.
@@ -4967,6 +5161,76 @@ paths:
       summary: Create or update tenant SAML configuration
       tags:
       - saml
+  /api/v1/session-policy:
+    delete:
+      description: Removes this scope's policy override so it inherits from the tenant
+        or platform default. Requires apps:write (apps:read to view).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Reset the session lifetime policy
+      tags:
+      - admin-sessions
+    get:
+      description: Returns the session policy in force for the tenant or application,
+        and whether it is inherited. Requires apps:write (apps:read to view).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.SessionPolicyView'
+      security:
+      - BearerAuth: []
+      summary: Get the session lifetime policy
+      tags:
+      - admin-sessions
+    put:
+      consumes:
+      - application/json
+      description: Sets idle/absolute session lifetimes, the concurrent-session cap,
+        and whether "remember me" is allowed. Omitted fields are left unchanged. Requires
+        apps:write (apps:read to view).
+      parameters:
+      - description: Policy fields to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.SessionPolicyInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.SessionPolicyView'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update the session lifetime policy
+      tags:
+      - admin-sessions
   /api/v1/signing-keys:
     get:
       description: Public metadata for the tenant's signing keys. Never returns private

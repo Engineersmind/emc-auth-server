@@ -113,8 +113,19 @@ const platformAdminSelect = `
 	       u.email_verified,
 	       EXISTS (SELECT 1 FROM totp_secrets ts WHERE ts.user_id = u.id AND ts.is_active)
 	         OR EXISTS (SELECT 1 FROM email_mfa_settings em WHERE em.user_id = u.id AND em.is_active),
-	       (SELECT MAX(COALESCE(rt.last_used_at, rt.created_at))
-	        FROM refresh_tokens rt WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id),
+	       -- GREATEST over both sources: refresh_tokens is finer but is now reaped
+	       -- once sessions die, so on its own it would report NULL for a dormant
+	       -- administrator and show them as having never signed in. audit_logs is
+	       -- the durable half. Same reasoning as userEnrichmentColumns — see there.
+	       GREATEST(
+	           (SELECT MAX(COALESCE(rt.last_used_at, rt.created_at))
+	            FROM refresh_tokens rt WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id),
+	           (SELECT MAX(al.created_at) FROM audit_logs al
+	            WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
+	              AND al.action IN (
+	                  'auth.login', 'auth.google_login', 'auth.github_login',
+	                  'auth.magic_link_requested', 'auth.register'))
+	       ),
 	       -- Served by idx_audit_logs_user_action_created
 	       -- (user_id, action, created_at DESC) WHERE user_id IS NOT NULL, from
 	       -- migration 00055: the leading two columns match this predicate

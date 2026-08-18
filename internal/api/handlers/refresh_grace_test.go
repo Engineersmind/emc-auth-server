@@ -28,6 +28,17 @@ import (
 // happy path (200) and the replay path (401) were covered, but not the
 // concurrent-rotation 409 that the explicit refresh endpoints now return.
 func grace409Fixture(t *testing.T) (*AuthHandler, string) {
+	return grace409FixtureScoped(t, false)
+}
+
+// grace409FixtureScoped builds the grace-window fixture for either identity
+// shape. appScoped=true registers the user through an application's
+// client_id/client_secret so the resulting tokens carry an app_id claim — the
+// identity that, since issue #108, takes a different 200 branch in Refresh. A
+// grace hit must still be a 409 with no token pair for it, because the new
+// branch sits strictly after the grace return. This states that as a fact
+// rather than leaving it as an assumption.
+func grace409FixtureScoped(t *testing.T, appScoped bool) (*AuthHandler, string) {
 	t.Helper()
 
 	pool := testhelper.NewTestDB(t)
@@ -46,32 +57,71 @@ func grace409Fixture(t *testing.T) (*AuthHandler, string) {
 	if err != nil {
 		t.Fatalf("NewJWTService: %v", err)
 	}
-	svc := auth.NewAuthService(pool, jwtSvc, logger)
+	appSvc := auth.NewApplicationService(pool, logger)
+	svc := auth.NewAuthService(pool, jwtSvc, logger).WithApplications(appSvc)
 
-	reg, err := svc.Register(ctx, auth.RegisterInput{
+	email := fmt.Sprintf("grace-409-%d@test.example.com", time.Now().UnixNano())
+	in := auth.RegisterInput{
 		TenantSlug: "emc",
-		Email:      fmt.Sprintf("grace-409-%d@test.example.com", time.Now().UnixNano()),
+		Email:      email,
 		Password:   "Password123!",
 		FirstName:  "Grace",
 		LastName:   "Hit",
-	})
-	if err != nil {
+	}
+	if appScoped {
+		var tenantID int64
+		if err := pool.QueryRow(ctx,
+			`SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`,
+		).Scan(&tenantID); err != nil {
+			t.Fatalf("fetch seed tenant id: %v", err)
+		}
+		app, err := appSvc.CreateApplication(ctx, tenantID, fmt.Sprintf("grace-409-app-%d", time.Now().UnixNano()), "web", nil)
+		if err != nil {
+			t.Fatalf("CreateApplication() error = %v", err)
+		}
+		in.TenantSlug = ""
+		in.ClientID = app.ClientID
+		in.ClientSecret = app.ClientSecret
+	}
+
+	if _, err := svc.Register(ctx, in); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
 
-	// Look up the session family so we can pre-hold its rotation lock.
-	var familyID int64
+	// A separate sign-in, because registration no longer issues tokens — creating an
+	// account and starting a session are separate acts now. The application
+	// credentials have to be repeated here: it is the LOGIN that mints the token,
+	// so without them the session would come back first-party and the app_id
+	// branch under test would never be reached.
+	loginIn := auth.LoginInput{Email: email, Password: "Password123!"}
+	if appScoped {
+		loginIn.ClientID = in.ClientID
+		loginIn.ClientSecret = in.ClientSecret
+	}
+	res, err := svc.Login(ctx, loginIn)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	reg := res.Token
+
+	// Look up the session so we can pre-hold its rotation lock.
+	var sessionID int64
 	if err := pool.QueryRow(ctx,
-		`SELECT session_family_id FROM refresh_tokens WHERE token_hash = $1`,
+		`SELECT session_id FROM refresh_tokens WHERE token_hash = $1`,
 		auth.HashToken(reg.RefreshToken),
-	).Scan(&familyID); err != nil {
-		t.Fatalf("lookup session family: %v", err)
+	).Scan(&sessionID); err != nil {
+		t.Fatalf("lookup session: %v", err)
 	}
 
-	// Simulate a concurrent request that already holds the family lock. The
-	// handler's SetNX will fail, sending it into the grace-window branch where
+	// Simulate a concurrent request that already holds the session's rotation lock.
+	// The handler's SetNX will fail, sending it into the grace-window branch where
 	// the still-valid token issued moments ago yields a GraceResult → 409.
-	lockKey := fmt.Sprintf("renewal:lock:family:%d", familyID)
+	//
+	// The key must match the one RefreshWithLock builds. If it drifts, this test does
+	// not fail cleanly: the lock is simply not held, the handler rotates normally, and
+	// the 409 assertion fails somewhere further along — which is exactly what happened
+	// when the key was renamed from "family" to "session".
+	lockKey := fmt.Sprintf("renewal:lock:session:%d", sessionID)
 	ok, err := rdb.SetNX(ctx, lockKey, "1", 5*time.Second).Result()
 	if err != nil {
 		t.Fatalf("pre-hold rotation lock: %v", err)
@@ -113,6 +163,27 @@ func assertConcurrentRefresh409(t *testing.T, rec *httptest.ResponseRecorder) {
 // carries the fresh tokens).
 func TestRefresh_ConcurrentRotationReturns409(t *testing.T) {
 	h, refreshToken := grace409Fixture(t)
+
+	e := echo.New()
+	body := fmt.Sprintf(`{"refresh_token":%q}`, refreshToken)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/refresh", strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+
+	if err := h.Refresh(c); err != nil {
+		t.Fatalf("Refresh() returned error: %v", err)
+	}
+	assertConcurrentRefresh409(t, rec)
+}
+
+// TestRefresh_AppScopedConcurrentRotationReturns409 is the same grace hit for an
+// application-scoped identity. Since issue #108 those callers get the token pair
+// in the 200 body; a grace hit must not become a token response, because there
+// is no fresh pair to hand back — the sibling request holds it. The new branch
+// is placed after the grace return, and this pins it there.
+func TestRefresh_AppScopedConcurrentRotationReturns409(t *testing.T) {
+	h, refreshToken := grace409FixtureScoped(t, true)
 
 	e := echo.New()
 	body := fmt.Sprintf(`{"refresh_token":%q}`, refreshToken)

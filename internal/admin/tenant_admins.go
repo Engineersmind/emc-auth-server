@@ -792,10 +792,7 @@ func revokeAdminScopeTokens(ctx context.Context, tx pgx.Tx, tenantID, userID int
 	); err != nil {
 		return fmt.Errorf("bump token version: %w", err)
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE refresh_tokens SET revoked_at = NOW()
-		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
-	`, userID, tenantID); err != nil {
+	if err := auth.RevokeAllSessionsTx(ctx, tx, userID, tenantID, auth.RevokeReasonCredentialChange); err != nil {
 		return fmt.Errorf("revoke sessions: %w", err)
 	}
 	return nil

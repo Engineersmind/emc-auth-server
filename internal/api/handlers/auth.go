@@ -34,6 +34,14 @@ type AuthHandler struct {
 	chgSvc    *auth.EmailChangeService  // nil when email change is not configured
 	blockSvc  *auth.AccountBlockService // nil when account lockout is not configured
 	jwtSvc    *auth.JWTService
+	// adminSvc backs the end-user session self-service routes (/me/sessions).
+	//
+	// Reuses the admin service's session queries rather than duplicating them:
+	// listing your own sessions and an operator listing them differ only in whose
+	// ids are passed and whether the current session is marked, and a second
+	// implementation would be a second place for the liveness predicate to drift.
+	// nil disables those routes with a 503 rather than panicking.
+	adminSvc  SessionLister
 	audit     *audit.Logger
 	logger    zerolog.Logger
 	cookieCfg mw.CookieConfig
@@ -222,6 +230,15 @@ type RegisterRequest struct {
 type LoginRequest struct {
 	Email    string `json:"email"    validate:"required,email"`
 	Password string `json:"password" validate:"required"`
+	// RememberMe asks for a persistent session — the tenant's longer idle timeout
+	// instead of the short one meant for shared machines. Honoured only when the
+	// tenant's session policy allows persistent sessions.
+	//
+	// Absent means false, so a client that has not been updated keeps getting the
+	// shorter session. That is the right default for an omitted security-relevant
+	// flag: the failure mode is a user signing in more often than they need to,
+	// not a month-long session on a library computer.
+	RememberMe bool `json:"remember_me"`
 }
 
 // tenantSlugFromCtx extracts the X-Tenant-Slug header.
@@ -235,13 +252,13 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 // Register handles POST /api/v1/auth/register.
 //
 // @Summary      Register a new user
-// @Description  Creates a user account in the specified tenant and returns a token pair.
+// @Description  Creates a user account in the specified tenant. Does NOT sign the user in — no session is created and no tokens are returned; call /auth/session or /auth/login afterwards.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        X-Tenant-Slug  header    string          true  "Tenant slug (e.g. emc)"
 // @Param        body           body      RegisterRequest true  "Registration payload"
-// @Success      201            {object}  auth.AuthResult
+// @Success      201            {object}  auth.RegisterResult
 // @Failure      400            {object}  map[string]string
 // @Failure      404            {object}  map[string]string  "Tenant not found"
 // @Failure      409            {object}  map[string]string  "Email already registered"
@@ -282,12 +299,13 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
 
-	tid, uid, appID := claimsFromToken(result.AccessToken)
+	// Identity comes straight from the created row now. It used to be decoded back
+	// out of the access token, which only worked because registration minted one.
 	h.auditEvent(c, audit.Event{
-		TenantID:      tid,
-		UserID:        uid,
-		ApplicationID: appID,
-		ActorEmail:    req.Email,
+		TenantID:      &result.TenantID,
+		UserID:        &result.UserID,
+		ApplicationID: result.ApplicationID,
+		ActorEmail:    result.Email,
 		Action:        audit.ActionAuthRegister,
 		AuthMethod:    audit.AuthMethodPassword,
 		ResourceType:  "user",
@@ -295,7 +313,8 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		UserAgent:     c.Request().UserAgent(),
 	})
 
-	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
+	// No cookies and no token pair: creating an account does not start a session.
+	// The client signs in afterwards, which is what our own portal already did.
 	return c.JSON(http.StatusCreated, result)
 }
 
@@ -321,9 +340,10 @@ func (h *AuthHandler) Login(c echo.Context) error {
 	}
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
-		ClientID: clientIDFromCtx(c), // legacy X-Client-ID tagging only — no secret, no auth
-		Email:    req.Email,
-		Password: req.Password,
+		ClientID:   clientIDFromCtx(c), // legacy X-Client-ID tagging only — no secret, no auth
+		Email:      req.Email,
+		Password:   req.Password,
+		Persistent: req.RememberMe,
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("login failed")
@@ -387,6 +407,8 @@ type AppRegisterRequest struct {
 type AppLoginRequest struct {
 	Email    string `json:"email"    validate:"required,email"`
 	Password string `json:"password" validate:"required"`
+	// RememberMe asks for a persistent session. See LoginRequest.RememberMe.
+	RememberMe bool `json:"remember_me"`
 }
 
 // appCredentialsFromRequest resolves and requires the calling application's
@@ -408,13 +430,13 @@ func appCredentialsFromRequest(c echo.Context) (clientID, clientSecret string, e
 // AppRegister handles POST /api/v1/auth/apps/register.
 //
 // @Summary      Register an end user via application credentials
-// @Description  Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed.
+// @Description  Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed. Does NOT sign the user in — no session is created and no tokens are returned; call /auth/apps/login afterwards.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
 // @Param        Authorization  header  string              true  "Basic base64(client_id:client_secret)"
 // @Param        body           body    AppRegisterRequest  true  "Registration payload"
-// @Success      201  {object}  auth.AuthResult
+// @Success      201  {object}  auth.RegisterResult
 // @Failure      400  {object}  map[string]string
 // @Failure      401  {object}  map[string]string  "Invalid application credentials"
 // @Failure      409  {object}  map[string]string  "Email already registered in this application"
@@ -455,12 +477,13 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
 
-	tid, uid, appID := claimsFromToken(result.AccessToken)
+	// Identity comes straight from the created row now. It used to be decoded back
+	// out of the access token, which only worked because registration minted one.
 	h.auditEvent(c, audit.Event{
-		TenantID:      tid,
-		UserID:        uid,
-		ApplicationID: appID,
-		ActorEmail:    req.Email,
+		TenantID:      &result.TenantID,
+		UserID:        &result.UserID,
+		ApplicationID: result.ApplicationID,
+		ActorEmail:    result.Email,
 		Action:        audit.ActionAuthRegister,
 		AuthMethod:    audit.AuthMethodPassword,
 		ResourceType:  "user",
@@ -468,7 +491,8 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		UserAgent:     c.Request().UserAgent(),
 	})
 
-	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
+	// No cookies and no token pair: creating an account does not start a session.
+	// The client signs in afterwards, which is what our own portal already did.
 	return c.JSON(http.StatusCreated, result)
 }
 
@@ -504,6 +528,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		ClientSecret: clientSecret,
 		Email:        req.Email,
 		Password:     req.Password,
+		Persistent:   req.RememberMe,
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("app login failed")
@@ -1121,6 +1146,9 @@ type LogoutRequest struct {
 //
 // @Summary      Refresh token rotation
 // @Description  Issues a new access + refresh token pair and immediately invalidates the old refresh token.
+// @Description  Delivery depends on the identity behind the presented refresh token:
+// @Description  application-scoped sessions (those established through /auth/apps/login, /auth/apps/register or magic-link verify — their access token carries an `app_id` claim) receive the full pair in the JSON body (`access_token`, `refresh_token`, `token_type`, `expires_in`, `expires_at`) and no cookies, matching the shape /auth/apps/login already returns;
+// @Description  first-party sessions receive the pair as HttpOnly cookies and a body of `{message, expires_in, expires_at}` only — a refresh token is deliberately never placed where browser JavaScript can read it.
 // @Description  Body-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:
 // @Description  409 (`concurrent_refresh`) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.
 // @Description  503 means the session store (Redis) is temporarily unavailable — the client should retry.
@@ -1199,6 +1227,25 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		IPAddress:     c.RealIP(),
 		UserAgent:     c.Request().UserAgent(),
 	})
+
+	// DO NOT collapse this branch into the response below. It is the only thing
+	// that delivers tokens to an application-scoped caller, because
+	// setAuthCookies returns early for any access token carrying an app_id claim
+	// (see its first statement) — "cookies are for the portal, headers are for
+	// applications". So the cookie path writes nothing for these callers and the
+	// body below carries no tokens: removing this return reproduces issue #108,
+	// where the caller got a 200 with nothing usable in it, retried with the old
+	// refresh token, and that forced retry was correctly classified as a replay,
+	// revoking the whole family and ending every session for the user.
+	//
+	// The shape is byte-identical to POST /api/v1/auth/apps/login, which is what
+	// these callers already parse. Conversely, the first-party response below
+	// must keep withholding the pair: returning result unconditionally would put
+	// a refresh token where portal JavaScript can read it. Both directions are
+	// pinned by tests in refresh_app_scope_test.go.
+	if appID != nil {
+		return c.JSON(http.StatusOK, result)
+	}
 
 	setAuthCookies(c, result.AccessToken, result.RefreshToken, h.cookieCfg)
 	return c.JSON(http.StatusOK, map[string]interface{}{
@@ -2302,9 +2349,10 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 	}
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
-		ClientID: clientIDFromCtx(c),
-		Email:    req.Email,
-		Password: req.Password,
+		ClientID:   clientIDFromCtx(c),
+		Email:      req.Email,
+		Password:   req.Password,
+		Persistent: req.RememberMe,
 	})
 	if err != nil {
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("session login failed")
@@ -2458,9 +2506,17 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 // @Router       /api/v1/auth/session/logout [post]
 func (h *AuthHandler) SessionLogout(c echo.Context) error {
 	var refreshToken string
+	var revoked int64
 	if cookie, err := c.Cookie(mw.RefreshTokenCookie); err == nil && cookie.Value != "" {
 		refreshToken = cookie.Value
-		_ = h.svc.Logout(c.Request().Context(), refreshToken)
+		// Errors are deliberately not surfaced: the cookies are cleared either way,
+		// so the browser is signed out regardless, and telling the caller "logout
+		// failed" would invite a retry it cannot make succeed. The count is audited
+		// so a persistent failure is visible as logouts that revoke nothing.
+		var err error
+		if revoked, err = h.svc.LogoutSession(c.Request().Context(), refreshToken); err != nil {
+			h.logger.Error().Err(err).Msg("session logout: revoke failed")
+		}
 	}
 	clearAuthCookies(c, h.cookieCfg)
 
@@ -2470,7 +2526,7 @@ func (h *AuthHandler) SessionLogout(c echo.Context) error {
 		ResourceType: "session",
 		IPAddress:    c.RealIP(),
 		UserAgent:    c.Request().UserAgent(),
-		Metadata:     map[string]any{"flow": "session"},
+		Metadata:     map[string]any{"flow": "session", "tokens_revoked": revoked},
 	}
 	attachTokenOwner(c.Request().Context(), &ev, h.svc, refreshToken)
 	h.auditEvent(c, ev)

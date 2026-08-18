@@ -2238,7 +2238,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/apps/register": {
             "post": {
-                "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed.",
+                "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed. Does NOT sign the user in — no session is created and no tokens are returned; call /auth/apps/login afterwards.",
                 "consumes": [
                     "application/json"
                 ],
@@ -2271,7 +2271,7 @@ const docTemplate = `{
                     "201": {
                         "description": "Created",
                         "schema": {
-                            "$ref": "#/definitions/auth.AuthResult"
+                            "$ref": "#/definitions/auth.RegisterResult"
                         }
                     },
                     "400": {
@@ -3591,7 +3591,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/refresh": {
             "post": {
-                "description": "Issues a new access + refresh token pair and immediately invalidates the old refresh token.\nBody-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:\n409 (` + "`" + `concurrent_refresh` + "`" + `) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.\n503 means the session store (Redis) is temporarily unavailable — the client should retry.",
+                "description": "Issues a new access + refresh token pair and immediately invalidates the old refresh token.\nDelivery depends on the identity behind the presented refresh token:\napplication-scoped sessions (those established through /auth/apps/login, /auth/apps/register or magic-link verify — their access token carries an ` + "`" + `app_id` + "`" + ` claim) receive the full pair in the JSON body (` + "`" + `access_token` + "`" + `, ` + "`" + `refresh_token` + "`" + `, ` + "`" + `token_type` + "`" + `, ` + "`" + `expires_in` + "`" + `, ` + "`" + `expires_at` + "`" + `) and no cookies, matching the shape /auth/apps/login already returns;\nfirst-party sessions receive the pair as HttpOnly cookies and a body of ` + "`" + `{message, expires_in, expires_at}` + "`" + ` only — a refresh token is deliberately never placed where browser JavaScript can read it.\nBody-based (mobile/API) clients must handle two additional responses that the cookie flow absorbs transparently:\n409 (` + "`" + `concurrent_refresh` + "`" + `) means a sibling request already rotated this token family within the grace window — this response carries NO token pair; the client should use the in-flight sibling's response rather than treating 409 as an error.\n503 means the session store (Redis) is temporarily unavailable — the client should retry.",
                 "consumes": [
                     "application/json"
                 ],
@@ -3661,7 +3661,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/register": {
             "post": {
-                "description": "Creates a user account in the specified tenant and returns a token pair.",
+                "description": "Creates a user account in the specified tenant. Does NOT sign the user in — no session is created and no tokens are returned; call /auth/session or /auth/login afterwards.",
                 "consumes": [
                     "application/json"
                 ],
@@ -3694,7 +3694,7 @@ const docTemplate = `{
                     "201": {
                         "description": "Created",
                         "schema": {
-                            "$ref": "#/definitions/auth.AuthResult"
+                            "$ref": "#/definitions/auth.RegisterResult"
                         }
                     },
                     "400": {
@@ -4446,6 +4446,111 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/me/sessions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the caller's active sessions with device, IP, and last-activity, marking the session the request came from.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "account"
+                ],
+                "summary": "List your own active sessions",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends every session except the one this request came from.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "account"
+                ],
+                "summary": "Sign out your other sessions",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/me/sessions/{familyID}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends a single session belonging to the caller. Use the logout endpoint to end the current session.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "account"
+                ],
+                "summary": "Sign out one of your own sessions",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Session ID",
+                        "name": "familyID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/permissions": {
             "get": {
                 "security": [
@@ -4912,6 +5017,112 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/session-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the session policy in force for the tenant or application, and whether it is inherited. Requires apps:write (apps:read to view).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-sessions"
+                ],
+                "summary": "Get the session lifetime policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.SessionPolicyView"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets idle/absolute session lifetimes, the concurrent-session cap, and whether \"remember me\" is allowed. Omitted fields are left unchanged. Requires apps:write (apps:read to view).",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-sessions"
+                ],
+                "summary": "Update the session lifetime policy",
+                "parameters": [
+                    {
+                        "description": "Policy fields to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.SessionPolicyInput"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.SessionPolicyView"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes this scope's policy override so it inherits from the tenant or platform default. Requires apps:write (apps:read to view).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-sessions"
+                ],
+                "summary": "Reset the session lifetime policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -8098,6 +8309,54 @@ const docTemplate = `{
                 }
             }
         },
+        "admin.SessionPolicyInput": {
+            "type": "object",
+            "properties": {
+                "absolute_ttl_seconds": {
+                    "type": "integer"
+                },
+                "allow_persistent": {
+                    "type": "boolean"
+                },
+                "idle_ttl_seconds": {
+                    "type": "integer"
+                },
+                "max_concurrent_sessions": {
+                    "type": "integer"
+                },
+                "non_persistent_idle_ttl_seconds": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admin.SessionPolicyView": {
+            "type": "object",
+            "properties": {
+                "absolute_ttl_seconds": {
+                    "type": "integer"
+                },
+                "allow_persistent": {
+                    "type": "boolean"
+                },
+                "idle_ttl_seconds": {
+                    "type": "integer"
+                },
+                "inherited": {
+                    "description": "Inherited is true when no row exists at the requested scope and these\nvalues came from a broader one.",
+                    "type": "boolean"
+                },
+                "max_concurrent_sessions": {
+                    "type": "integer"
+                },
+                "non_persistent_idle_ttl_seconds": {
+                    "type": "integer"
+                },
+                "scope": {
+                    "description": "Scope is \"platform\", \"tenant\", or \"application\" — which row actually\nanswered the request. Without it a caller cannot tell a policy they have set\nfrom an inherited default, and would have no way to know that editing it\ncreates a new row rather than changing an existing one.",
+                    "type": "string"
+                }
+            }
+        },
         "admin.TenantAdminResult": {
             "type": "object",
             "properties": {
@@ -8401,14 +8660,44 @@ const docTemplate = `{
         "admin.UserSession": {
             "type": "object",
             "properties": {
+                "absolute_expires_at": {
+                    "type": "string"
+                },
+                "amr": {
+                    "description": "AMR lists the authentication methods used to establish the session.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "auth_time": {
+                    "description": "AuthTime is when the user actually authenticated, as opposed to when the\ncurrent token in the family was minted.",
+                    "type": "string"
+                },
                 "created_at": {
+                    "type": "string"
+                },
+                "device_hint": {
+                    "description": "DeviceHint is the server-parsed \"Chrome on Windows\" form of UserAgent.\n\nBoth are returned: the hint so a consumer does not need its own User-Agent\nparser to show a user which device they are looking at, the raw header because\nit is the evidence and a parser that guesses wrong must not destroy it.",
                     "type": "string"
                 },
                 "expires_at": {
                     "type": "string"
                 },
+                "idle_expires_at": {
+                    "description": "IdleExpiresAt is when the session dies if it is not used again, and\nAbsoluteExpiresAt is the hard deadline it cannot outlive whatever it does.\nBoth are surfaced because \"expires_at\" alone cannot answer the question an\noperator actually has — is this session about to go away on its own, or does\nit need revoking? Nullable for rows written before migration 00068.",
+                    "type": "string"
+                },
                 "ip_address": {
                     "type": "string"
+                },
+                "is_current": {
+                    "description": "IsCurrent marks the session the caller is making this request from.\n\nOnly ever true on the end-user (/me/sessions) view, where the caller and the\nsubject are the same person: it prevents somebody from revoking the session\nthey are sitting in and wondering why the page broke. On the admin view the\ncaller is a different person from the subject, so no session in the list can\nbe theirs and the field stays false throughout.",
+                    "type": "boolean"
+                },
+                "is_persistent": {
+                    "description": "IsPersistent records whether the user asked to be remembered on this device.",
+                    "type": "boolean"
                 },
                 "last_used_at": {
                     "type": "string"
@@ -9154,6 +9443,27 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.RegisterResult": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "description": "ApplicationID is set when the account belongs to one application's isolated\nuser base, nil for a tenant-level account.",
+                    "type": "integer"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "role": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "integer"
+                },
+                "user_id": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.TOTPStatus": {
             "type": "object",
             "properties": {
@@ -9233,6 +9543,10 @@ const docTemplate = `{
                 },
                 "password": {
                     "type": "string"
+                },
+                "remember_me": {
+                    "description": "RememberMe asks for a persistent session. See LoginRequest.RememberMe.",
+                    "type": "boolean"
                 }
             }
         },
@@ -9499,6 +9813,10 @@ const docTemplate = `{
                 },
                 "password": {
                     "type": "string"
+                },
+                "remember_me": {
+                    "description": "RememberMe asks for a persistent session — the tenant's longer idle timeout\ninstead of the short one meant for shared machines. Honoured only when the\ntenant's session policy allows persistent sessions.\n\nAbsent means false, so a client that has not been updated keeps getting the\nshorter session. That is the right default for an omitted security-relevant\nflag: the failure mode is a user signing in more often than they need to,\nnot a month-long session on a library computer.",
+                    "type": "boolean"
                 }
             }
         },
@@ -9774,6 +10092,10 @@ const docTemplate = `{
                 },
                 "password": {
                     "type": "string"
+                },
+                "remember_me": {
+                    "description": "RememberMe asks for a persistent session — the tenant's longer idle timeout\ninstead of the short one meant for shared machines. Honoured only when the\ntenant's session policy allows persistent sessions.\n\nAbsent means false, so a client that has not been updated keeps getting the\nshorter session. That is the right default for an omitted security-relevant\nflag: the failure mode is a user signing in more often than they need to,\nnot a month-long session on a library computer.",
+                    "type": "boolean"
                 }
             }
         },

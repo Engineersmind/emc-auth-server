@@ -59,4 +59,12 @@ docs/SPRINT_*.md
 EMC_M2M_Postman_Collection.json
 
 # Postman collection, environment and its verifier — local tooling, not shipped.
+# The whole directory, which supersedes master's narrower
+# postman/verify-collection.ps1 entry.
 postman/
+
+# Local verification / demo scratch — dated run-throughs and throwaway drivers.
+# Named individually rather than as docs/*: docs/ holds real deliverables
+# (DEPLOYMENT.md, swagger.json) that must stay in the remote.
+docs/*_VERIFICATION_*.md
+scripts/demo-*.sh

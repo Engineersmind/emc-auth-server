@@ -68,18 +68,23 @@ func TestReplayAttack_RefreshToken(t *testing.T) {
 	ctx := context.Background()
 	email := securityUniqueEmail("replay")
 
-	// Step 1: Register a user and capture the initial refresh token.
-	result, err := svc.Register(ctx, auth.RegisterInput{
+	// Step 1: Register a user, then sign in to capture the initial refresh token.
+	// Registration does not issue tokens — it creates an account without starting a
+	// session — so the sign-in is a separate call.
+	if _, err := svc.Register(ctx, auth.RegisterInput{
 		TenantSlug: "emc",
 		Email:      email,
 		Password:   "SecPass123!",
 		FirstName:  "R",
 		LastName:   "T",
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	originalRefreshToken := result.RefreshToken
+	login, err := svc.Login(ctx, auth.LoginInput{Email: email, Password: "SecPass123!"})
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	originalRefreshToken := login.Token.RefreshToken
 
 	// Step 2: First Refresh — rotates old token, issues a new one.
 	rotated, err := svc.Refresh(ctx, originalRefreshToken)

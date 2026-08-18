@@ -116,11 +116,20 @@ const (
 	ActionAuthMagicLinkRequested = "auth.magic_link_requested"
 
 	// Auth — invitations, email change, lockout, breached passwords
-	ActionAdminUserInvited        = "admin.user_invited"
-	ActionAuthInvitationAccepted  = "auth.invitation_accepted"
-	ActionAuthEmailChangeReq      = "auth.email_change_requested"
-	ActionAuthEmailChanged        = "auth.email_changed"
-	ActionAuthAccountBlocked      = "auth.account_blocked"
+	ActionAdminUserInvited       = "admin.user_invited"
+	ActionAuthInvitationAccepted = "auth.invitation_accepted"
+	ActionAuthEmailChangeReq     = "auth.email_change_requested"
+	ActionAuthEmailChanged       = "auth.email_changed"
+	ActionAuthAccountBlocked     = "auth.account_blocked"
+	// ActionAuthSuspiciousLogin is a risky sign-in the account owner was alerted
+	// about. The sign-in SUCCEEDED and the account is untouched.
+	//
+	// Split out of ActionAuthAccountBlocked, which the risk-alert path used to emit.
+	// That was actively misleading: the event landed on a successful login, against
+	// an account that was never blocked, so an operator reading the activity feed saw
+	// "account blocked" moments after "login succeeded" and had no way to reconcile
+	// them — and any alert or compliance query counting blocks was counting logins.
+	ActionAuthSuspiciousLogin     = "auth.suspicious_login"
 	ActionAuthAccountUnblocked    = "auth.account_unblocked"
 	ActionAuthPasswordBreachFound = "auth.password_breach_detected"
 
@@ -180,6 +189,25 @@ const (
 
 	// Admin — audit maintenance (compliance)
 	ActionAdminUserAuditErased = "admin.user_audit_erased"
+
+	// Session lifecycle — how sessions END.
+	//
+	// Distinct actions rather than one "session.revoked" with the reason buried in
+	// metadata, because these are asked about separately and by different people:
+	// a compliance reviewer wants everything policy terminated, an incident
+	// responder wants replays, and a support engineer wants "why was this user
+	// signed out?". A JSON metadata field cannot be indexed or alerted on as
+	// cheaply as the action column, which every audit query already filters by.
+	//
+	// Ordinary rotation is deliberately NOT audited: it happens every 15 minutes
+	// per active session and would swamp the trail with the one session event that
+	// carries no information. auth.token_refresh already records the exchange.
+	ActionSessionEndedUser        = "session.ended_by_user"
+	ActionSessionEndedIdle        = "session.expired_idle"
+	ActionSessionEndedCapEvicted  = "session.evicted_at_cap"
+	ActionSessionsReaped          = "session.rows_reaped"
+	ActionAdminSessionPolicySet   = "admin.session_policy_updated"
+	ActionAdminSessionPolicyReset = "admin.session_policy_reset"
 )
 
 // Event outcome — the `status` column. Derived from the action at enqueue time
