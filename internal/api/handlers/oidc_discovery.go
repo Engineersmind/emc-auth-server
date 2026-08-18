@@ -284,12 +284,19 @@ func (h *OIDCHandler) Discovery(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 
-	h.setDiscoveryHeaders(c, body)
+	// The ETag is computed once, from the body, and both the header and the
+	// If-None-Match comparison below read that one value. Setting the header and
+	// then reading it back to compare against would work — the body is
+	// deterministic, so the digest is too — but it reads as the response
+	// validating itself, and it would silently stop matching the moment anything
+	// between here and there rewrote the header.
+	etag := discoveryETag(body)
+	h.setDiscoveryHeaders(c, etag)
 
 	// Every OIDC client fetches discovery at process start, so a fleet restart
 	// is a synchronised burst. A 304 answers it without touching the tenants
 	// table again on the client's side of the cache.
-	if match := c.Request().Header.Get("If-None-Match"); match != "" && match == c.Response().Header().Get("ETag") {
+	if match := c.Request().Header.Get("If-None-Match"); match != "" && match == etag {
 		metrics.OIDCDiscoveryRequests.WithLabelValues(discoveryOutcomeNotModified).Inc()
 		return c.NoContent(http.StatusNotModified)
 	}
@@ -298,16 +305,21 @@ func (h *OIDCHandler) Discovery(c echo.Context) error {
 	return c.JSONBlob(http.StatusOK, body)
 }
 
+// discoveryETag derives the validator from the document body, so it changes if
+// and only if the bytes a client would receive change.
+func discoveryETag(body []byte) string {
+	sum := sha256.Sum256(body)
+	return `"` + base64.RawURLEncoding.EncodeToString(sum[:16]) + `"`
+}
+
 // setDiscoveryHeaders applies the caching and CORS headers a public discovery
-// document needs.
+// document needs. etag comes from discoveryETag and is passed in rather than
+// recomputed, so the header and the If-None-Match comparison cannot disagree.
 //
 // Wildcard CORS for the same reason jwks.go sets it: the document is specified
 // to be fetched by arbitrary relying parties, including browser-side ones, and
 // it contains nothing origin-sensitive.
-func (h *OIDCHandler) setDiscoveryHeaders(c echo.Context, body []byte) {
-	sum := sha256.Sum256(body)
-	etag := `"` + base64.RawURLEncoding.EncodeToString(sum[:16]) + `"`
-
+func (h *OIDCHandler) setDiscoveryHeaders(c echo.Context, etag string) {
 	head := c.Response().Header()
 	head.Set("Access-Control-Allow-Origin", "*")
 	head.Set("Access-Control-Allow-Methods", "GET, OPTIONS")

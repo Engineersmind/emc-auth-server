@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,6 +34,22 @@ const (
 	// mint a code without re-prompting.
 	AuthzSessionTTL = 12 * time.Hour
 
+	// authzNonceTTL is how long a burned nonce is remembered (security audit
+	// 2026-08-07, FED-3).
+	//
+	// Set to the ID token lifetime, because that is the whole window in which a
+	// replayed nonce could buy an attacker anything. The nonce exists so a client
+	// can confirm an ID token answers the authentication request it started
+	// (OIDC Core §3.1.2.1); a second ID token carrying the same nonce is only
+	// useful while it is still valid. Once it has expired the client rejects it
+	// on `exp` before it ever looks at `nonce`, so remembering the value beyond
+	// that point costs Redis keys and prevents nothing.
+	//
+	// Deliberately NOT authzRequestTTL. A parked request may sit on the login
+	// page for 15 minutes, but the nonce is not burned until a code is actually
+	// issued, so the clock starts at issuance and not at arrival.
+	authzNonceTTL = IDTokenTTL
+
 	// AuthzSessionCookie is the browser cookie holding the SSO session handle.
 	//
 	// Deliberately NOT the portal's emc_access_token. Two reasons, either
@@ -57,6 +74,10 @@ var (
 	// ErrAuthzSessionNotFound is returned when no valid SSO session backs the
 	// presented cookie.
 	ErrAuthzSessionNotFound = errors.New("oauth: no active authorization session")
+
+	// ErrNonceReplayed is returned by BurnNonce when this client has already had
+	// an authorization code issued against the same nonce value.
+	ErrNonceReplayed = errors.New("oauth: nonce has already been used")
 )
 
 // AuthzRequest is a validated authorization request held while the user
@@ -129,6 +150,78 @@ func NewAuthzSessionStore(rdb *redis.Client) *AuthzSessionStore {
 
 func authzRequestKey(handle string) string { return "oauth:authz:req:" + HashToken(handle) }
 func authzSessionKey(handle string) string { return "oauth:authz:sess:" + HashToken(handle) }
+
+// authzNonceKey scopes a burned nonce to the tenant and client that chose it.
+//
+// Scoped per client, not global. A nonce is only meaningful relative to the
+// client that generated it, and clients pick their own values — a global key
+// space would let one client with a weak generator (a counter, a fixed string in
+// a test suite) refuse another client's legitimate sign-ins. tenant_id is
+// included even though client_id is globally unique, so the key carries the same
+// isolation boundary as every other record in this file.
+//
+// The tuple is hashed rather than interpolated: the nonce is arbitrary input off
+// a query string, so putting it in the key verbatim would give a caller a say in
+// the Redis key space and no bound on its size.
+//
+// clientID and nonce are hashed INDIVIDUALLY before being joined, so the fields
+// cannot run together. Joining the raw values on ":" would leave the boundary
+// ambiguous the moment either contained one — client_id ("a:b", nonce "c") and
+// client_id ("a", nonce "b:c") would be the same key, which is a nonce from one
+// client silently spending another's. Fixed-width digests make the join
+// injective.
+func authzNonceKey(tenantID int64, clientID, nonce string) string {
+	return "oauth:authz:nonce:" + HashToken(
+		strconv.FormatInt(tenantID, 10)+":"+HashToken(clientID)+":"+HashToken(nonce))
+}
+
+// BurnNonce claims a nonce for one authorization code and refuses it thereafter
+// (security audit 2026-08-07, FED-3). An empty nonce is a no-op: OIDC Core makes
+// it OPTIONAL for the authorization-code flow, so its absence is not a replay.
+//
+// SET NX is what makes this a burn rather than a check: the test and the claim
+// are one Redis round-trip, so two authorize requests arriving together cannot
+// both observe the nonce as unused. A separate EXISTS-then-SET would be exactly
+// the race this is meant to close.
+//
+// Fails CLOSED — a Redis error refuses the request. That is not a new outage
+// mode: /oauth/authorize already cannot function without Redis (SaveRequest
+// parks every request there, and the SSO short-circuit reads its session from
+// there), so there is no state of the world in which failing open here keeps a
+// working flow alive. It would only mean that the one component whose failure is
+// most likely to be induced deliberately is also the one that disables this
+// check.
+func (s *AuthzSessionStore) BurnNonce(ctx context.Context, tenantID int64, clientID, nonce string) error {
+	if nonce == "" {
+		return nil
+	}
+	ok, err := s.redis.SetNX(ctx, authzNonceKey(tenantID, clientID, nonce), "1", authzNonceTTL).Result()
+	if err != nil {
+		return fmt.Errorf("burn authz nonce: %w", err)
+	}
+	if !ok {
+		return ErrNonceReplayed
+	}
+	return nil
+}
+
+// ReleaseNonce un-burns a nonce, for use when the code issuance that the burn
+// was claimed for then failed.
+//
+// Without this, a transient database error while minting the code would leave
+// the nonce spent: the client's perfectly reasonable retry of the same
+// authorization request would come back as a replay, turning a recoverable
+// blip into a sign-in that stays broken for the TTL. The burn only needs to hold
+// when a code was actually issued.
+//
+// Best-effort. If the release itself fails the caller is already returning an
+// error to the client, and the nonce expires on its own.
+func (s *AuthzSessionStore) ReleaseNonce(ctx context.Context, tenantID int64, clientID, nonce string) {
+	if nonce == "" {
+		return
+	}
+	_ = s.redis.Del(ctx, authzNonceKey(tenantID, clientID, nonce)).Err()
+}
 
 // SaveRequest stores a parked authorization request and returns its handle.
 func (s *AuthzSessionStore) SaveRequest(ctx context.Context, req *AuthzRequest) (string, error) {

@@ -68,7 +68,12 @@ const (
 	authzOutcomeMFAEnrollment      = "mfa_enrollment_required"
 	authzOutcomeLoginFailed        = "login_failed"
 	authzOutcomeRequestExpired     = "request_expired"
-	authzOutcomeError              = "error"
+	// authzOutcomeNonceReplayed is worth its own label rather than folding into
+	// invalid_request: a rise in it is either a client reusing nonces (an
+	// integration bug to report) or a replay attempt, and neither is visible if
+	// it is counted alongside malformed PKCE parameters.
+	authzOutcomeNonceReplayed = "nonce_replayed"
+	authzOutcomeError         = "error"
 )
 
 // countAuthorize records one authorize-endpoint outcome.
@@ -467,6 +472,43 @@ func (h *OAuthAuthorizeHandler) completeLogin(c echo.Context, handle string, req
 func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle string, req *auth.AuthzRequest, sess *auth.AuthzSession) error {
 	ctx := c.Request().Context()
 
+	// Nonce burn-on-use (security audit 2026-08-07, FED-3). Placed HERE, at the
+	// moment a code is actually minted, and deliberately not where the authorize
+	// request arrives.
+	//
+	// Burning on arrival would spend the nonce on events that consume nothing: a
+	// browser reload of the login page, a back-then-forward, a prefetch, or a
+	// request abandoned after three wrong passwords all re-enter Authorize with
+	// the same URL. Every one of those would come back as a replay, so the check
+	// would break far more real sign-ins than it would stop attacks. The property
+	// worth enforcing is narrower and is exactly this line: one nonce yields at
+	// most one authorization code, and therefore at most one ID token.
+	//
+	// This is the single chokepoint for both routes to a code — the SSO
+	// short-circuit in Authorize and a completed hosted login — so neither can
+	// acquire one without passing through it.
+	if err := h.sessions.BurnNonce(ctx, req.TenantID, req.ClientID, req.Nonce); err != nil {
+		if handle != "" {
+			// The parked request is finished either way: it cannot be completed
+			// with this nonce, and leaving it live would keep a resumable
+			// half-login in Redis for the rest of its TTL.
+			h.sessions.DeleteRequest(ctx, handle)
+		}
+		if errors.Is(err, auth.ErrNonceReplayed) {
+			h.auditEvent(c, "oauth.authorize_denied", req, sess.UserID, false, "nonce replay")
+			countAuthorize(authzOutcomeNonceReplayed)
+			// Named explicitly because the audience is the integrator whose
+			// client generated the value. It leaks nothing: the only party the
+			// error reaches is the client's own registered redirect_uri, and it
+			// tells that client about a nonce it chose itself.
+			return h.redirectError(c, req.RedirectURI, req.State, errInvalidRequest,
+				"nonce has already been used — generate a fresh nonce per authorization request")
+		}
+		h.logger.Error().Err(err).Msg("authorize: nonce burn failed")
+		countAuthorize(authzOutcomeError)
+		return h.redirectError(c, req.RedirectURI, req.State, errServerError, "sign-in failed")
+	}
+
 	code, err := h.authz.IssueAuthorizationCode(ctx, auth.IssueAuthorizationCodeParams{
 		TenantID:      req.TenantID,
 		ClientID:      req.ClientID,
@@ -478,6 +520,11 @@ func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle stri
 		AuthTime:      sess.AuthTime,
 	})
 	if err != nil {
+		// No code was minted, so the nonce was not really consumed. Give it back,
+		// or the client's retry of the same request answers "replay" and a
+		// transient database error becomes a sign-in that stays broken until the
+		// nonce expires.
+		h.sessions.ReleaseNonce(ctx, req.TenantID, req.ClientID, req.Nonce)
 		h.logger.Error().Err(err).Msg("authorize: could not issue code")
 		countAuthorize(authzOutcomeError)
 		return h.redirectError(c, req.RedirectURI, req.State, errServerError, "sign-in failed")

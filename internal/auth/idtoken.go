@@ -43,8 +43,15 @@ const IDTokenTTL = AccessTokenTTL
 // an attacker-registerable client_id rather than a fixed token type.
 type IDTokenClaims struct {
 	// Nonce binds the token to the client's authorization request (OIDC Core
-	// §3.1.2.1). Omitted when the request carried none. Security audit
-	// 2026-08-07 FED-3 requires it before an inbound authorize endpoint exists.
+	// §3.1.2.1). Omitted when the request carried none.
+	//
+	// Security audit 2026-08-07 FED-3 required this before an inbound authorize
+	// endpoint existed, and echoing the value is only half of it — that alone
+	// leaves the client as the sole party checking for replay. The server-side
+	// half is AuthzSessionStore.BurnNonce, called at the one point in
+	// issueCodeAndRedirect where a code is minted, so a given nonce yields at
+	// most one code and therefore at most one of these tokens. FED-3 is closed by
+	// the pair, not by this field.
 	Nonce string `json:"nonce,omitempty"`
 
 	// AuthTime is when the user actually authenticated, which is not the same
