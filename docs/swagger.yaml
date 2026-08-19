@@ -1303,6 +1303,82 @@ definitions:
       login_code:
         type: string
     type: object
+  handlers.OIDCDiscoveryDocument:
+    properties:
+      authorization_endpoint:
+        type: string
+      claims_parameter_supported:
+        description: |-
+          The three *_supported booleans below are stated explicitly as false rather
+          than omitted. Omission means "use the default", and a client reading a
+          document with no opinion may probe the feature anyway; an explicit false
+          stops the request being made at all.
+        type: boolean
+      claims_supported:
+        items:
+          type: string
+        type: array
+      code_challenge_methods_supported:
+        description: |-
+          CodeChallengeMethodsSupported advertises S256 and nothing else. This is a
+          security statement, not an omission: pkce.go refuses "plain" outright, and
+          a document offering it would invite a client to negotiate down to a method
+          that provides no protection against the attacker PKCE exists to stop.
+        items:
+          type: string
+        type: array
+      grant_types_supported:
+        items:
+          type: string
+        type: array
+      id_token_signing_alg_values_supported:
+        items:
+          type: string
+        type: array
+      issuer:
+        description: |-
+          Issuer must be byte-identical to the "iss" claim of every token this
+          tenant issues. This is the one field a conformant client hard-fails on:
+          go-oidc, openid-client, MSAL and Spring Security all compare the string
+          they fetched discovery from against this value and refuse a mismatch.
+        type: string
+      jwks_uri:
+        type: string
+      request_parameter_supported:
+        type: boolean
+      request_uri_parameter_supported:
+        type: boolean
+      response_modes_supported:
+        items:
+          type: string
+        type: array
+      response_types_supported:
+        items:
+          type: string
+        type: array
+      revocation_endpoint:
+        type: string
+      scopes_supported:
+        items:
+          type: string
+        type: array
+      subject_types_supported:
+        description: |-
+          SubjectTypesSupported is ["public"] because "sub" is the raw user id, the
+          same value for every client (see UserInfoResponse.Subject). Advertising
+          "pairwise" would be a false claim about a privacy property we do not have.
+        items:
+          type: string
+        type: array
+      token_endpoint:
+        type: string
+      token_endpoint_auth_methods_supported:
+        items:
+          type: string
+        type: array
+      userinfo_endpoint:
+        type: string
+    type: object
   handlers.RefreshRequest:
     properties:
       refresh_token:
@@ -7126,6 +7202,42 @@ paths:
       summary: Tenant JWKS (public signing keys)
       tags:
       - system
+  /tenants/{slug}/.well-known/openid-configuration:
+    get:
+      description: OpenID Provider Metadata for one tenant (OIDC Discovery 1.0 §3).
+        Public and unauthenticated. Point an OIDC client at {base}/tenants/{slug}
+        as its issuer and it will fetch this and configure itself. Cacheable — supports
+        ETag / If-None-Match.
+      parameters:
+      - description: Tenant slug
+        in: path
+        name: slug
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.OIDCDiscoveryDocument'
+        "304":
+          description: Not Modified — document unchanged since the supplied ETag
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: Internal Server Error
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: OIDC discovery document
+      tags:
+      - oidc
 securityDefinitions:
   BearerAuth:
     description: 'Enter: Bearer <your_access_token>'

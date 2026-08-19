@@ -283,6 +283,31 @@ func (h *OAuthTokenHandler) refreshTokenGrant(c echo.Context) error {
 	// confidential. RFC 6749 §6 requires it, and skipping it would let a
 	// stolen refresh token be used without the secret that was needed to obtain
 	// it in the first place.
+	//
+	// A request carrying NO client_id at all therefore proceeds unauthenticated,
+	// and that is intended, not the unauthenticated-revocation bug PR #107 fixed
+	// on /oauth/revoke. The two differ in what the caller must already hold. A
+	// public client has no secret to authenticate with by definition (RFC 6749
+	// §6, §2.1) — a native or browser app cannot keep one — so refusing an
+	// unauthenticated refresh would make the grant unusable for exactly the
+	// clients PKCE exists to serve. The refresh token itself is the credential
+	// here: it is single-use, rotated on every call, and a replay revokes the
+	// whole family, so presenting one is proof of possession in a way that
+	// #107's case was not (revoke needed no valid token at all — any guessed
+	// value reached the UPDATE).
+	//
+	// What this does NOT do is let a caller pick which client they are. Omitting
+	// client_id skips authentication; it never grants a client's identity. The
+	// tenant and application the new tokens are scoped to come from the stored
+	// refresh-token row, not from the request: Refresh is handed the raw token
+	// and nothing else.
+	//
+	// The converse is not checked — an authenticated client_id is not compared
+	// against the application that owns the refresh token, so two clients in one
+	// tenant could refresh each other's tokens if one obtained the other's. Same
+	// missing column as CLAUDE.md deferred #22 (refresh_tokens has no
+	// application_id) and it is fixed there, for both endpoints at once, rather
+	// than half-solved here.
 	if clientID != "" {
 		client, err := h.authenticateClient(c, clientID, clientSecret)
 		if err != nil {

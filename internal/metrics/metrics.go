@@ -439,6 +439,31 @@ var (
 		},
 		[]string{"outcome"},
 	)
+
+	// OIDCDiscoveryRequests counts fetches of a tenant's OpenID Connect
+	// discovery document (issue #7b).
+	//
+	// Incremented on every terminal path through OIDCHandler.Discovery — see
+	// the discoveryOutcome* constants in
+	// internal/api/handlers/oidc_discovery.go, which are the authority on these
+	// values. Keep the two lists in step.
+	//
+	// outcome: served | not_modified | unknown_tenant | error
+	//
+	// Two things make this worth a counter rather than log-grepping. First,
+	// served vs not_modified IS the cache-hit ratio: every OIDC client fetches
+	// discovery on process start, so a fleet restart with a broken ETag shows
+	// up here as a sudden all-served spike before it shows up as load on the
+	// tenants table. Second, unknown_tenant at volume is someone enumerating
+	// slugs, which is otherwise indistinguishable from a misconfigured client.
+	OIDCDiscoveryRequests = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "oidc_discovery_requests_total",
+			Help:      "OpenID Connect discovery document fetches by outcome.",
+		},
+		[]string{"outcome"},
+	)
 )
 
 // RecordOp is a convenience wrapper around AuthOperations.WithLabelValues.

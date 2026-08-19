@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -230,4 +231,132 @@ func TestJWTRequired_NoAudiencesFailsClosed(t *testing.T) {
 	if status != http.StatusUnauthorized {
 		t.Errorf("status = %d (code %q), want %d", status, code, http.StatusUnauthorized)
 	}
+}
+
+// TestJWTRequired_EmitsBearerChallenge covers RFC 6750 §3 on the path that
+// actually rejects most requests: the middleware.
+//
+// This gap survived a full ticket. handlers/oidc_test.go asserts the challenge
+// too, but it calls the handler directly with empty claims — so it exercised
+// the one path that already set the header, while the common rejection (a token
+// of the wrong audience, refused by JWTRequired before the handler runs) emitted
+// no challenge at all. A Postman run against the real route found it. The lesson
+// is in the shape of the test, not the fix: a handler-only test cannot see what
+// the middleware in front of it does.
+func TestJWTRequired_EmitsBearerChallenge(t *testing.T) {
+	jwtSvc, tenantID, userIDStr := jwtEnv(t)
+	ctx := context.Background()
+
+	// A machine token: validly signed, wrong audience for a user route.
+	m2m, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceM2M, &auth.Claims{
+		UserID:   userIDStr,
+		TenantID: strconv.FormatInt(tenantID, 10),
+		Email:    "svc@emc.local",
+		Role:     "service",
+	})
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	// challengeFor sends one request and returns status + the challenge header.
+	challengeFor := func(token string) (int, string) {
+		e := echo.New()
+		e.GET("/oauth/userinfo", func(c echo.Context) error {
+			return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+		}, middleware.JWTRequired(jwtSvc, auth.AudienceAPI))
+
+		req := httptest.NewRequest(http.MethodGet, "/oauth/userinfo", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec.Code, rec.Header().Get("WWW-Authenticate")
+	}
+
+	t.Run("wrong audience", func(t *testing.T) {
+		status, challenge := challengeFor(m2m)
+		if status != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", status)
+		}
+		if challenge == "" {
+			t.Fatal("401 carries no WWW-Authenticate; RFC 6750 §3 requires one, " +
+				"and clients that read it will retry the dead token instead of re-authenticating")
+		}
+		if !strings.Contains(challenge, `error="invalid_token"`) {
+			t.Errorf("challenge = %q, want error=\"invalid_token\"", challenge)
+		}
+		// Issue #84: the challenge must not reveal that the token was merely of
+		// the wrong TYPE. That is the oracle the generic JSON body withholds.
+		for _, leak := range []string{"audience", "aud", auth.AudienceM2M} {
+			if strings.Contains(strings.ToLower(challenge), strings.ToLower(leak)) {
+				t.Errorf("challenge %q leaks %q — it must be indistinguishable "+
+					"from any other invalid token", challenge, leak)
+			}
+		}
+	})
+
+	t.Run("no credential at all", func(t *testing.T) {
+		status, challenge := challengeFor("")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", status)
+		}
+		if !strings.HasPrefix(challenge, "Bearer ") {
+			t.Errorf("challenge = %q, want a Bearer challenge", challenge)
+		}
+		// RFC 6750 §3.1: with no credential there is no failed credential to
+		// describe, so the challenge SHOULD NOT carry an error code.
+		if strings.Contains(challenge, "error=") {
+			t.Errorf("challenge = %q; §3.1 says omit the error code when the "+
+				"request carried no authentication information", challenge)
+		}
+	})
+
+	t.Run("garbage token", func(t *testing.T) {
+		status, challenge := challengeFor("not.a.jwt")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", status)
+		}
+		if !strings.Contains(challenge, `error="invalid_token"`) {
+			t.Errorf("challenge = %q, want error=\"invalid_token\"", challenge)
+		}
+	})
+
+	// RFC 6750 §3, from the Copilot review on PR #111. Asserted on all three
+	// rejection shapes rather than one, because they leave unauthorized() by
+	// different call sites and a header set on only some of them is the failure
+	// mode worth catching. Every rejection is a 401 regardless of cause, so a
+	// cached one would answer a different caller's request with this caller's
+	// authentication outcome.
+	t.Run("cache directives on every rejection", func(t *testing.T) {
+		for _, tc := range []struct{ name, token string }{
+			{"wrong audience", m2m},
+			{"no credential at all", ""},
+			{"garbage token", "not.a.jwt"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				e := echo.New()
+				e.GET("/oauth/userinfo", func(c echo.Context) error {
+					return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+				}, middleware.JWTRequired(jwtSvc, auth.AudienceAPI))
+
+				req := httptest.NewRequest(http.MethodGet, "/oauth/userinfo", nil)
+				if tc.token != "" {
+					req.Header.Set("Authorization", "Bearer "+tc.token)
+				}
+				rec := httptest.NewRecorder()
+				e.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("status = %d, want 401", rec.Code)
+				}
+				if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+					t.Errorf("Cache-Control = %q, want \"no-store\"", got)
+				}
+				if got := rec.Header().Get("Pragma"); got != "no-cache" {
+					t.Errorf("Pragma = %q, want \"no-cache\"", got)
+				}
+			})
+		}
+	})
 }

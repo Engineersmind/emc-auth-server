@@ -9,6 +9,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
 
+	"github.com/engineersmind/emc-auth-server/internal/api/paths"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 )
@@ -229,7 +230,12 @@ func (h *SigningKeyHandler) jwksURL(c echo.Context, tenantID int64) string {
 		h.logger.Warn().Err(err).Int64("tenant_id", tenantID).Msg("signing keys: could not resolve tenant slug for jwks_url")
 		return ""
 	}
-	return h.appBaseURL + "/tenants/" + slug + "/.well-known/jwks.json"
+	// Built from the same route constant the router registers and the discovery
+	// document publishes, not assembled by hand. This value is handed to an
+	// operator through the admin API, so a hand-built copy that drifted would
+	// send them to a 404 and look like a broken endpoint rather than a stale
+	// string.
+	return h.appBaseURL + paths.TenantPath(paths.TenantJWKS, slug)
 }
 
 // record writes a fire-and-forget audit event. Key rotation is a

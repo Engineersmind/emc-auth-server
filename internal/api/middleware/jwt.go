@@ -57,10 +57,11 @@ func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.Middl
 			}
 
 			if !found || tokenString == "" {
-				return c.JSON(http.StatusUnauthorized, map[string]string{
-					"error": "authorization required",
-					"code":  "token_missing",
-				})
+				// No credential at all. RFC 6750 §3.1 says the challenge SHOULD
+				// NOT carry an error code in this case — there is no failed
+				// credential to describe, only an invitation to authenticate.
+				return unauthorized(c, "token_missing", "authorization required",
+					`Bearer realm="`+bearerRealm+`"`)
 			}
 
 			claims, err := jwtSvc.VerifyForAudience(c.Request().Context(), tokenString, allowedAudiences...)
@@ -68,19 +69,20 @@ func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.Middl
 				// Distinguish expired tokens from invalid ones.
 				// Clients should refresh on token_expired; redirect to login on token_invalid.
 				if errors.Is(err, gojwt.ErrTokenExpired) {
-					return c.JSON(http.StatusUnauthorized, map[string]string{
-						"error": "access token expired",
-						"code":  "token_expired",
-					})
+					return unauthorized(c, "token_expired", "access token expired",
+						`Bearer realm="`+bearerRealm+`", error="invalid_token", `+
+							`error_description="the access token expired"`)
 				}
 				if errors.Is(err, auth.ErrUnexpectedAudience) {
 					metrics.TokenAudienceRejections.
 						WithLabelValues(presentedAudience(tokenString), c.Path()).Inc()
 				}
-				return c.JSON(http.StatusUnauthorized, map[string]string{
-					"error": "invalid token",
-					"code":  "token_invalid",
-				})
+				// Deliberately the same challenge for every remaining failure —
+				// bad signature, unknown tenant, wrong audience. Naming the
+				// reason here would hand back precisely the oracle the generic
+				// JSON body withholds (issue #84).
+				return unauthorized(c, "token_invalid", "invalid token",
+					`Bearer realm="`+bearerRealm+`", error="invalid_token"`)
 			}
 
 			// Publish claims for downstream handlers and apply the
@@ -88,6 +90,49 @@ func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.Middl
 			return proceedAuthenticated(c, claims, viaCookie, next)
 		}
 	}
+}
+
+// bearerRealm names the protection space in the RFC 6750 challenge. One value
+// for the whole server: the realm identifies who to authenticate WITH, and that
+// is this auth server regardless of which route refused.
+const bearerRealm = "emc-auth"
+
+// unauthorized writes a 401 carrying the RFC 6750 §3 WWW-Authenticate challenge
+// alongside the JSON body this API already returned.
+//
+// Why the header matters, given the body was already there. A bearer-protected
+// resource that answers 401 without a challenge is not conformant, and standard
+// OIDC/OAuth client libraries read the challenge rather than the body: on
+// error="invalid_token" they discard the credential and re-authenticate, while
+// a bare 401 is treated by several as a transport fault worth retrying — with
+// the same dead token.
+//
+// This lives in the middleware, not only in the handler, because the middleware
+// is where the common rejection happens. handlers/oidc.go sets its own challenge
+// for the case where a request reaches the handler with unusable claims, but a
+// token of the wrong audience never gets that far: JWTRequired refuses it first
+// (issue #84), and until now that path emitted no challenge at all. The gap
+// survived because the handler test calls the handler directly, so it exercised
+// the one path that was already correct.
+//
+// The two cache directives are RFC 6750 §3 as well, and they matter less for
+// correctness than for not being surprising: 401 is not heuristically cacheable
+// under RFC 9111 §4.2.2, so a conforming intermediary would not store this
+// anyway. They are set because a response that turns on a credential should say
+// so itself rather than rely on every proxy in the path reading the status code
+// the same way, and because every other credential-bearing response in this
+// codebase already says it — the token endpoint (oauth_token.go), the authorize
+// pages (oauth_authorize.go), and userinfo (oidc.go). This was the one bearer
+// path that did not. From the Copilot review on PR #111.
+func unauthorized(c echo.Context, code, message, challenge string) error {
+	head := c.Response().Header()
+	head.Set("WWW-Authenticate", challenge)
+	head.Set("Cache-Control", "no-store")
+	head.Set("Pragma", "no-cache")
+	return c.JSON(http.StatusUnauthorized, map[string]string{
+		"error": message,
+		"code":  code,
+	})
 }
 
 // presentedAudience reads the "aud" claim for metric labelling only.

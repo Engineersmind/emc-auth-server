@@ -45,6 +45,17 @@ name: CI
 #   Cause: docker run missing -e PORT=8080; curl targeted 8080, server was on 9090
 #   Fix:   Add PORT=8080 to docker run env; replace fixed sleep 5 with 30s retry loop
 #
+# [CI-12] Lint fail — staticcheck SA4000 in oidc_discovery_etag_test.go
+#   Cause: A determinism assertion compared two identical calls inline
+#          (discoveryETag(x) != discoveryETag(x)); SA4000 flags identical
+#          expressions either side of an operator and cannot tell that repeating
+#          the call IS the assertion. Never seen locally because `make lint` ran
+#          golangci-lint v1 (@latest) while this job pins v2.10.1.
+#   Fix:   Bind the two results to variables before comparing, AND align the
+#          Makefile with this job (LINT_VERSION, GOSEC_EXCLUDE, `make ci-local`)
+#          so a local run predicts this job instead of a different linter's
+#          opinion.
+#
 # [CI-CD-01] ci-cd.yml deploy startup failure — missing AWS secrets/variables
 #   Cause: AWS_CICD_ROLE_ARN secret + AWS_REGION/ECR_REPO/EC2_TAG_NAME/SECRET_ID/DOMAIN
 #          vars not configured in this repo
@@ -117,10 +128,22 @@ jobs:
       - name: Run tests with coverage
         # [CI-05] -p 1: serialize packages to prevent DB race between test packages
         #         that share the same PostgreSQL instance (FK violation in jwt_test.go)
-        # -timeout is per-package: internal/auth runs full migrations + bcrypt per
-        # test and legitimately needs >2m, so give the DB suites headroom.
+        #
+        # -timeout is PER-PACKAGE and internal/auth legitimately needs ~205s: it runs
+        # full migrations and bcrypt at cost 12 throughout. At 300s that left ~95s of
+        # headroom, which a slow runner eats — PR #111 saw the same commit pass at
+        # 205.231s on one runner and time out at 300.017s on another, with the
+        # goroutine dump naming whichever test happened to be in flight rather than a
+        # real hang.
+        #
+        # Raised to 900s. This is a deadlock backstop, not a performance budget: a
+        # ceiling close enough to the real runtime to fire on runner variance reports
+        # a hang that did not happen, and costs more in re-runs and misdirected
+        # investigation than it ever catches. A genuine deadlock still fails, 10
+        # minutes later. If the honest runtime is what needs attention, that is the
+        # per-package split in CLAUDE.md deferred #8, not this number.
         run: |
-          go test -p 1 ./... -coverprofile=coverage.out -covermode=atomic -timeout 300s
+          go test -p 1 ./... -coverprofile=coverage.out -covermode=atomic -timeout 900s
           go tool cover -func=coverage.out
 
       - name: Enforce ≥80% coverage on auth core
