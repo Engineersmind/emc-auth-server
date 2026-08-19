@@ -45,6 +45,17 @@ name: CI
 #   Cause: docker run missing -e PORT=8080; curl targeted 8080, server was on 9090
 #   Fix:   Add PORT=8080 to docker run env; replace fixed sleep 5 with 30s retry loop
 #
+# [CI-12] Lint fail — staticcheck SA4000 in oidc_discovery_etag_test.go
+#   Cause: A determinism assertion compared two identical calls inline
+#          (discoveryETag(x) != discoveryETag(x)); SA4000 flags identical
+#          expressions either side of an operator and cannot tell that repeating
+#          the call IS the assertion. Never seen locally because `make lint` ran
+#          golangci-lint v1 (@latest) while this job pins v2.10.1.
+#   Fix:   Bind the two results to variables before comparing, AND align the
+#          Makefile with this job (LINT_VERSION, GOSEC_EXCLUDE, `make ci-local`)
+#          so a local run predicts this job instead of a different linter's
+#          opinion.
+#
 # [CI-CD-01] ci-cd.yml deploy startup failure — missing AWS secrets/variables
 #   Cause: AWS_CICD_ROLE_ARN secret + AWS_REGION/ECR_REPO/EC2_TAG_NAME/SECRET_ID/DOMAIN
 #          vars not configured in this repo

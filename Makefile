@@ -112,15 +112,25 @@ test-cover:
 test-race:
 	go test -race ./... $(TEST_FLAGS)
 
-## Run golangci-lint
+# LINT_VERSION and the two commands below must stay byte-identical to the
+# "Lint + SAST" job in .github/workflows/ci.yml. They drifted once — the Makefile
+# installed golangci-lint v1 (@latest) while CI pinned v2.10.1, and gosec ran a
+# shorter exclude list here than there — so a clean `make check` said nothing
+# about whether CI would pass. PR #111 failed on a staticcheck rule (SA4000) that
+# the local linter never ran. If you change a flag in one place, change it in
+# both.
+LINT_VERSION := v2.10.1
+GOSEC_EXCLUDE := G101,G117,G124,G401,G501
+
+## Run golangci-lint (same version + flags as CI)
 .PHONY: lint
 lint:
-	golangci-lint run ./...
+	golangci-lint run --timeout=5m
 
-## Run gosec security scanner
+## Run gosec security scanner (same exclude list as CI)
 .PHONY: gosec
 gosec:
-	gosec -exclude=G401,G501 ./...
+	gosec -exclude=$(GOSEC_EXCLUDE) ./...
 
 ## Run govulncheck (CVE scan)
 .PHONY: vuln
@@ -130,6 +140,13 @@ vuln:
 ## Run all quality gates (lint + gosec + vuln + test)
 .PHONY: check
 check: lint gosec vuln test
+
+## Everything CI blocks on, in CI's own order, minus the Docker smoke test.
+## Run this before every push: it is the only local target that can be trusted
+## to predict the "Lint + SAST" and "Test" jobs.
+.PHONY: ci-local
+ci-local: lint gosec test
+	@echo "ci-local: lint + gosec + tests passed"
 
 ## Run k6 load test (requires k6 installed and server running on localhost:9090)
 .PHONY: load-test
@@ -174,7 +191,7 @@ clean-all: clean
 ## Install all required dev tools
 .PHONY: tools
 tools:
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(LINT_VERSION)
 	go install github.com/securego/gosec/v2/cmd/gosec@latest
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 	go install github.com/swaggo/swag/cmd/swag@latest

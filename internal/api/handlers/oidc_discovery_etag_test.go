@@ -125,11 +125,20 @@ func TestDiscoveryETag_ChangesWithTheBody(t *testing.T) {
 	// The validator has to be a function of the bytes a client receives, or a 304
 	// would tell a client its cached copy is current when it is not — the one
 	// failure mode in this area that actually serves wrong data.
-	if discoveryETag([]byte(`{"issuer":"a"}`)) == discoveryETag([]byte(`{"issuer":"b"}`)) {
+	docA := []byte(`{"issuer":"a"}`)
+	docB := []byte(`{"issuer":"b"}`)
+
+	if discoveryETag(docA) == discoveryETag(docB) {
 		t.Fatal("two different documents share an ETag")
 	}
-	if discoveryETag([]byte(`{"issuer":"a"}`)) != discoveryETag([]byte(`{"issuer":"a"}`)) {
-		t.Fatal("the same document produced two ETags; 304 would never fire")
+
+	// Bound to variables rather than compared inline: staticcheck SA4000 flags
+	// identical expressions either side of an operator, and it is right to in
+	// general — it just cannot tell that repeating the call IS the assertion here.
+	first, second := discoveryETag(docA), discoveryETag(docA)
+	if first != second {
+		t.Fatalf("the same document produced two ETags (%s, %s); 304 would never fire",
+			first, second)
 	}
 	// Quoted per the entity-tag grammar, so the value we emit is one our own
 	// comparison would accept back.
