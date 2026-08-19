@@ -114,8 +114,21 @@ const bearerRealm = "emc-auth"
 // (issue #84), and until now that path emitted no challenge at all. The gap
 // survived because the handler test calls the handler directly, so it exercised
 // the one path that was already correct.
+//
+// The two cache directives are RFC 6750 §3 as well, and they matter less for
+// correctness than for not being surprising: 401 is not heuristically cacheable
+// under RFC 9111 §4.2.2, so a conforming intermediary would not store this
+// anyway. They are set because a response that turns on a credential should say
+// so itself rather than rely on every proxy in the path reading the status code
+// the same way, and because every other credential-bearing response in this
+// codebase already says it — the token endpoint (oauth_token.go), the authorize
+// pages (oauth_authorize.go), and userinfo (oidc.go). This was the one bearer
+// path that did not. From the Copilot review on PR #111.
 func unauthorized(c echo.Context, code, message, challenge string) error {
-	c.Response().Header().Set("WWW-Authenticate", challenge)
+	head := c.Response().Header()
+	head.Set("WWW-Authenticate", challenge)
+	head.Set("Cache-Control", "no-store")
+	head.Set("Pragma", "no-cache")
 	return c.JSON(http.StatusUnauthorized, map[string]string{
 		"error": message,
 		"code":  code,

@@ -321,4 +321,42 @@ func TestJWTRequired_EmitsBearerChallenge(t *testing.T) {
 			t.Errorf("challenge = %q, want error=\"invalid_token\"", challenge)
 		}
 	})
+
+	// RFC 6750 §3, from the Copilot review on PR #111. Asserted on all three
+	// rejection shapes rather than one, because they leave unauthorized() by
+	// different call sites and a header set on only some of them is the failure
+	// mode worth catching. Every rejection is a 401 regardless of cause, so a
+	// cached one would answer a different caller's request with this caller's
+	// authentication outcome.
+	t.Run("cache directives on every rejection", func(t *testing.T) {
+		for _, tc := range []struct{ name, token string }{
+			{"wrong audience", m2m},
+			{"no credential at all", ""},
+			{"garbage token", "not.a.jwt"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				e := echo.New()
+				e.GET("/oauth/userinfo", func(c echo.Context) error {
+					return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+				}, middleware.JWTRequired(jwtSvc, auth.AudienceAPI))
+
+				req := httptest.NewRequest(http.MethodGet, "/oauth/userinfo", nil)
+				if tc.token != "" {
+					req.Header.Set("Authorization", "Bearer "+tc.token)
+				}
+				rec := httptest.NewRecorder()
+				e.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusUnauthorized {
+					t.Fatalf("status = %d, want 401", rec.Code)
+				}
+				if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+					t.Errorf("Cache-Control = %q, want \"no-store\"", got)
+				}
+				if got := rec.Header().Get("Pragma"); got != "no-cache" {
+					t.Errorf("Pragma = %q, want \"no-cache\"", got)
+				}
+			})
+		}
+	})
 }
