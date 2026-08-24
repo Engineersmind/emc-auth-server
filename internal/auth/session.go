@@ -91,6 +91,12 @@ const (
 	// RevokeReasonCredentialChange — a password reset, email change, or role
 	// change invalidated every existing session.
 	RevokeReasonCredentialChange = "credential_change"
+	// RevokeReasonPasskeyCloned — an assertion showed evidence that a passkey's
+	// private key exists in more than one place, so every session the account
+	// had was ended. Distinct from replay_detected: that one says a token was
+	// reused, this one says a hardware-backed key was copied, and the second is
+	// the more serious finding of the two.
+	RevokeReasonPasskeyCloned = "passkey_cloned"
 )
 
 // ---------------------------------------------------------------------------
@@ -116,6 +122,16 @@ const (
 	AMRMFA       = "mfa"  // multiple factors were used
 	AMRMagicLink = "link" // emailed sign-in link (no registered RFC 8176 value)
 	AMRFederated = "fed"  // federated / external identity provider
+	// AMRWebAuthn is RFC 8176 "hwk": proof of possession of a hardware-backed
+	// key. Covers every passkey — platform authenticators (Windows Hello, Touch
+	// ID) and roaming security keys alike, since the distinction is not one the
+	// relying party can verify.
+	AMRWebAuthn = "hwk"
+	// AMRUserVerif is RFC 8176 "user": the authenticator performed user
+	// verification (biometric or PIN). Emitted only when the ASSERTION says so —
+	// never because we asked for it — because it is what justifies also claiming
+	// AMRMFA on a passwordless sign-in.
+	AMRUserVerif = "user"
 )
 
 // ---------------------------------------------------------------------------

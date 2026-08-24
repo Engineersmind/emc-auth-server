@@ -68,3 +68,15 @@ postman/
 # (DEPLOYMENT.md, swagger.json) that must stay in the remote.
 docs/*_VERIFICATION_*.md
 scripts/demo-*.sh
+
+# WebAuthn/passkey working notes — superseded local scratch, per the status
+# banner in WEBAUTHN_MASTER_PLAN.md §12. Named individually rather than as
+# docs/WEBAUTHN_* because two of that family ARE deliverables and must reach the
+# remote: PASSKEY_API_CONTRACT.md (referenced by EMC-Auth-Frontend#134) and
+# WEBAUTHN_MASTER_PLAN.md (the single source of truth for the track).
+docs/WEBAUTHN_API_CONTRACT_ACTUAL.md
+docs/WEBAUTHN_DEMO_COMMANDS.md
+docs/WEBAUTHN_DEMO_RUNBOOK.md
+docs/WEBAUTHN_FRONTEND_PROMPT.md
+docs/WEBAUTHN_PREREQUISITES.md
+docs/WEBAUTHN_TEST_PROCEDURE.md

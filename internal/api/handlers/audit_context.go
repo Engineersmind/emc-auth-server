@@ -71,6 +71,23 @@ func authFailureReason(err error) string {
 		return "invalid_client"
 	case errors.Is(err, auth.ErrTooManyOTPAttempts):
 		return "too_many_attempts"
+	// Passkey failures, classified before the message-substring cases below.
+	// Each is a distinct operational story — a cloned authenticator, a tenant
+	// with the feature off, and a stale browser tab are three different tickets —
+	// and lumping them into "error" would make the audit log useless for exactly
+	// the events it exists to record.
+	case errors.Is(err, auth.ErrCredentialCloned):
+		return "passkey_cloned"
+	case errors.Is(err, auth.ErrPasskeysNotAllowed):
+		return "passkeys_disabled"
+	case errors.Is(err, auth.ErrPasswordlessNotAllowed):
+		return "passwordless_disabled"
+	case errors.Is(err, auth.ErrOriginNotAllowed):
+		return "origin_not_allowed"
+	case errors.Is(err, auth.ErrChallengeExpired):
+		return "challenge_expired"
+	case errors.Is(err, auth.ErrWebAuthnVerification):
+		return "passkey_verification_failed"
 	case containsMsg(err, "invalid credentials"):
 		return "invalid_credentials"
 	case containsMsg(err, "not verified"):
@@ -168,8 +185,11 @@ func defaultStatusFor(action, status string) int {
 // serves for it, so a failure audit row records the same code the caller saw.
 func statusForError(err error) int {
 	switch authFailureReason(err) {
-	case "invalid_credentials", "invalid_client", "email_not_verified", "invalid_or_expired_code":
+	case "invalid_credentials", "invalid_client", "email_not_verified", "invalid_or_expired_code",
+		"passkey_cloned", "passkey_verification_failed", "challenge_expired":
 		return http.StatusUnauthorized
+	case "passkeys_disabled", "passwordless_disabled", "origin_not_allowed":
+		return http.StatusForbidden
 	case "too_many_attempts":
 		return http.StatusTooManyRequests
 	case "not_configured":
@@ -196,6 +216,18 @@ func safeErrorMessage(err error) string {
 		return "too many attempts — temporarily locked"
 	case "not_configured":
 		return "feature not configured"
+	case "passkey_cloned":
+		return "passkey signature counter or backup flag indicates a cloned authenticator"
+	case "passkey_verification_failed":
+		return "passkey assertion could not be verified"
+	case "challenge_expired":
+		return "challenge expired or already used"
+	case "passkeys_disabled":
+		return "passkeys are not enabled for this scope"
+	case "passwordless_disabled":
+		return "passkey sign-in is not enabled for this scope"
+	case "origin_not_allowed":
+		return "request origin is not on the passkey allow-list"
 	case "":
 		return ""
 	default:

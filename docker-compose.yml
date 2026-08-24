@@ -85,7 +85,23 @@ services:
       JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS: "${JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS:-}"
       SEED_DEMO_DATA: "true"
       SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
-      GLOBAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090,https://emc-auth.senie.ai"
+      # :8080 is the passkey demo app (demo-tenant-app/). Without it the demo's
+      # cross-origin calls are blocked by the browser before reaching any handler.
+      GLOBAL_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:8080,http://localhost:9090,https://emc-auth.senie.ai"
+      # ── Passkeys / WebAuthn ────────────────────────────────────────────────
+      # Interpolated from the repo .env rather than hardcoded, so this committed
+      # file does not decide which relying party a developer's stack serves.
+      #
+      # Note this block's existence is load-bearing: compose sets `environment`
+      # EXPLICITLY, so a variable absent here is invisible to the container no
+      # matter what .env says. Empty WEBAUTHN_RP_ID disables passkeys entirely
+      # and the endpoints 404 — which is correct for a stack that has not opted
+      # in, but is indistinguishable from "my config was ignored" if you do not
+      # know the rule.
+      WEBAUTHN_RP_ID: "${WEBAUTHN_RP_ID:-}"
+      WEBAUTHN_RP_DISPLAY_NAME: "${WEBAUTHN_RP_DISPLAY_NAME:-EMC Auth}"
+      WEBAUTHN_ORIGINS: "${WEBAUTHN_ORIGINS:-}"
+      WEBAUTHN_REQUIRE_UV: "${WEBAUTHN_REQUIRE_UV:-true}"
       # ── Email ──────────────────────────────────────────────────────────────
       # Values interpolate from the repo .env. Leave EMAIL_PROVIDER empty for
       # local dev so it infers SMTP → the Mailpit catcher (http://localhost:8025).

@@ -276,12 +276,22 @@ func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID in
 	return nil
 }
 
-// ResetUserMFA removes a user's second factors — TOTP enrollment AND email
-// MFA — on behalf of an admin (lost phone + backup codes, lost mailbox
-// access). The target user must belong to the tenant and, when appRowID is
-// non-nil, to that application's isolated user base — a foreign user is
-// reported as not found, never touched. Idempotent: resetting a user with no
+// ResetUserMFA removes a user's second factors — TOTP enrollment, email MFA,
+// AND passkeys — on behalf of an admin (lost phone + backup codes, lost mailbox
+// access, lost laptop). The target user must belong to the tenant and, when
+// appRowID is non-nil, to that application's isolated user base — a foreign user
+// is reported as not found, never touched. Idempotent: resetting a user with no
 // enrollment succeeds.
+//
+// Passkeys are included because leaving them out made this endpoint lie. An
+// operator resetting a user who lost their laptop cleared TOTP and email and
+// left the laptop's passkey usable — a factor still live on the device the reset
+// was performed BECAUSE of. The API reported success; the credential kept
+// working. Deactivating them here is what makes "reset this user's MFA" mean
+// what its name says.
+//
+// Soft-deactivated rather than deleted, like every other passkey revocation:
+// which credential an operator removed and when is the audit-relevant part.
 func (s *TOTPService) ResetUserMFA(ctx context.Context, tenantID int64, appRowID *int64, userID int64) error {
 	var exists bool
 	err := s.pool.QueryRow(ctx, `
@@ -304,6 +314,16 @@ func (s *TOTPService) ResetUserMFA(ctx context.Context, tenantID int64, appRowID
 	}
 	if _, err = s.pool.Exec(ctx, `DELETE FROM email_mfa_settings WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("reset user email MFA: %w", err)
+	}
+	// revoked_by_admin, because that is what happened, and because the user's own
+	// settings list reads that column to say "removed by your administrator"
+	// rather than leaving them to wonder where their passkey went.
+	if _, err = s.pool.Exec(ctx, `
+		UPDATE webauthn_credentials
+		SET is_active = false, revoked_at = NOW(), revoked_by_admin = true
+		WHERE user_id = $1 AND tenant_id = $2 AND is_active
+	`, userID, tenantID); err != nil {
+		return fmt.Errorf("reset user passkeys: %w", err)
 	}
 	return nil
 }

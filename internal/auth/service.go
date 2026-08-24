@@ -33,6 +33,9 @@ type AuthService struct {
 	verifSvc *VerificationService // nil when email verification is not configured
 	blockSvc *AccountBlockService // nil when brute-force lockout is not configured
 	brchSvc  *BreachService       // nil when breached-password detection is off
+	// webauthnSvc runs the passkey ceremonies. nil when WEBAUTHN_RP_ID is unset,
+	// which is how a deployment opts out of passkeys entirely.
+	webauthnSvc *WebAuthnService
 	// policySvc resolves per-tenant session lifetime policy. Never nil after
 	// NewAuthService: a nil-safe zero value would mean every deployment that
 	// forgot to wire it silently reverted to unbounded sessions, so the

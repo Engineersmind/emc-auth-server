@@ -937,6 +937,85 @@ definitions:
       user_id:
         type: string
     type: object
+  auth.PasskeyPolicy:
+    properties:
+      allowPasskeys:
+        description: |-
+          AllowPasskeys is the master switch. False refuses registration and
+          passwordless sign-in alike.
+        type: boolean
+      allowPasswordless:
+        description: |-
+          AllowPasswordless gates sign-in specifically. False still permits
+          registration and management, so a tenant can hold passkeys as a
+          second factor without accepting them as the whole credential.
+        type: boolean
+      maxCredentialsPerUser:
+        description: MaxCredentialsPerUser caps live credentials per account.
+        type: integer
+      origins:
+        description: |-
+          Origins is the exact-match allow-list of page origins permitted to run a
+          ceremony, including scheme and port.
+        items:
+          type: string
+        type: array
+      requireUserVerification:
+        description: RequireUserVerification demands a biometric or PIN gesture.
+        type: boolean
+      rpdisplayName:
+        description: RPDisplayName is what the authenticator shows the user.
+        type: string
+      rpid:
+        description: |-
+          RPID is the relying-party ID actually in force: the registrable domain,
+          no scheme and no port.
+        type: string
+      source:
+        description: |-
+          Source records which row won resolution — "application", "tenant",
+          "platform", or "server" when no row matched at all. Logged, never
+          returned to a client; an operator debugging "why is my RP ID wrong"
+          needs to know which row answered.
+        type: string
+    type: object
+  auth.PasskeyPolicyRecord:
+    properties:
+      allow_passkeys:
+        type: boolean
+      allow_passwordless:
+        type: boolean
+      application_id:
+        type: integer
+      effective:
+        allOf:
+        - $ref: '#/definitions/auth.PasskeyPolicy'
+        description: |-
+          Effective is what the scope actually resolves to right now, after
+          inheritance. An operator needs both: what this row says, and what it means.
+      exists:
+        type: boolean
+      max_credentials_per_user:
+        type: integer
+      origins:
+        items:
+          type: string
+        type: array
+      require_user_verification:
+        type: boolean
+      rp_display_name:
+        type: string
+      rp_id:
+        description: RPID and Origins are empty when the row inherits them.
+        type: string
+      scope:
+        description: Scope is "platform", "tenant", or "application".
+        type: string
+      tenant_id:
+        type: integer
+      updated_at:
+        type: string
+    type: object
   auth.ProviderConfigDetail:
     properties:
       callback_url:
@@ -1001,6 +1080,41 @@ definitions:
         type: integer
       user_id:
         type: integer
+    type: object
+  auth.StoredCredential:
+    properties:
+      aaguid:
+        description: |-
+          AAGUID is the raw model identifier, so a frontend can supply its own icon
+          for a model we have no name for, and so an unrecognised authenticator is
+          still reportable in a support ticket.
+        type: string
+      authenticator_name:
+        description: |-
+          AuthenticatorName is the model that created the credential ("iCloud
+          Keychain", "Windows Hello", "YubiKey 5 Series"), or empty when the
+          authenticator did not identify itself — which is the normal case under the
+          'none' attestation we request. A DISPLAY LABEL ONLY: it comes from an
+          unattested response and must never gate anything. See aaguid.go.
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      last_used_at:
+        type: string
+      name:
+        type: string
+      rp_id:
+        type: string
+      synced:
+        type: boolean
+      synced_label:
+        description: |-
+          SyncedLabel is the phrase to show a user. "This device only" is the fact
+          that matters to them: a device-bound passkey (Windows Hello) dies with the
+          laptop, a synced one does not.
+        type: string
     type: object
   auth.TOTPStatus:
     properties:
@@ -1623,6 +1737,29 @@ definitions:
           type: string
         type: array
     type: object
+  handlers.UpdatePasskeyPolicyRequest:
+    properties:
+      allow_passkeys:
+        type: boolean
+      allow_passwordless:
+        type: boolean
+      max_credentials_per_user:
+        type: integer
+      origins:
+        items:
+          type: string
+        type: array
+      require_user_verification:
+        type: boolean
+      rp_display_name:
+        type: string
+      rp_id:
+        description: |-
+          RPID, RPDisplayName and Origins accept "" / [] as a deliberate
+          clear-to-inherit, which is why they are pointers rather than plain values:
+          there has to be a way to say "go back to the server's relying party".
+        type: string
+    type: object
   handlers.UpdateRolePermissionsRequest:
     properties:
       permission_ids:
@@ -1752,12 +1889,23 @@ definitions:
           which is what the rest of this API returns for timestamps.
         type: integer
     type: object
+  handlers.renamePasskeyRequest:
+    properties:
+      name:
+        type: string
+    type: object
   handlers.tokenError:
     properties:
       error:
         type: string
       error_description:
         type: string
+    type: object
+  handlers.webauthnBeginResponse:
+    properties:
+      ceremony_token:
+        type: string
+      publicKey: {}
     type: object
   saml.SAMLConfig:
     properties:
@@ -2388,6 +2536,101 @@ paths:
       summary: Set application MFA policy
       tags:
       - admin-applications
+  /api/v1/applications/{appID}/passkey-policy:
+    delete:
+      description: Removes the application's override so it inherits the tenant's
+        policy again. 404 when there was no override to remove.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: cleared
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Clear application passkey policy
+      tags:
+      - admin-passkeys
+    get:
+      description: Returns the application's own policy row (or exists=false when
+        it inherits from the tenant) plus the effective policy.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.PasskeyPolicyRecord'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get application passkey policy
+      tags:
+      - admin-passkeys
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the application's passkey policy, overriding
+        the tenant's. This is where a tenant sets the relying-party ID for an application
+        served from its own domain.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Policy fields to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdatePasskeyPolicyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.PasskeyPolicyRecord'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set application passkey policy
+      tags:
+      - admin-passkeys
   /api/v1/applications/{appID}/rate-limit:
     delete:
       description: Removes the custom rate limit; the app falls back to the default.
@@ -4853,6 +5096,73 @@ paths:
       summary: Sign out one of your own sessions
       tags:
       - account
+  /api/v1/passkey-policy:
+    get:
+      description: Returns the tenant's own passkey policy row (or exists=false when
+        it inherits) plus the effective policy after inheritance from the platform
+        default and server configuration.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.PasskeyPolicyRecord'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "501":
+          description: passkeys not configured on this server
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get tenant passkey policy
+      tags:
+      - admin-passkeys
+    put:
+      consumes:
+      - application/json
+      description: Creates or updates the tenant's passkey policy. Omitted fields
+        keep their stored value; sending rp_id as "" reverts to the server's relying
+        party. Origins are normalised and must be full origins including scheme and
+        port.
+      parameters:
+      - description: Policy fields to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdatePasskeyPolicyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.PasskeyPolicyRecord'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set tenant passkey policy
+      tags:
+      - admin-passkeys
   /api/v1/permissions:
     get:
       description: Returns all permissions for the caller's tenant. Requires admin:access.
@@ -6829,6 +7139,344 @@ paths:
       summary: Block or unblock a user
       tags:
       - admin-users
+  /api/v1/users/{uid}/passkeys:
+    get:
+      description: Support view of one user's registered passkeys. Carries no key
+        material — a public key is useless to a client and a credential id is only
+        meaningful inside a ceremony.
+      parameters:
+      - description: User ID
+        in: path
+        name: uid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.StoredCredential'
+            type: array
+        "404":
+          description: user not found in this scope
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List a user's passkeys
+      tags:
+      - admin-passkeys
+  /api/v1/users/{uid}/passkeys/{pid}:
+    delete:
+      description: 'Deactivates one of a user''s passkeys on their behalf — the lost-device
+        case. Unlike the user''s own delete, this is not blocked when the passkey
+        is their last sign-in method: leaving a factor live on a stolen device is
+        worse than needing a password reset.'
+      parameters:
+      - description: User ID
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Passkey ID
+        in: path
+        name: pid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: removed
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Remove a user's passkey
+      tags:
+      - admin-passkeys
+  /auth/me/passkeys:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.StoredCredential'
+            type: array
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List my passkeys
+      tags:
+      - Passkeys
+  /auth/me/passkeys/{id}:
+    delete:
+      description: Removes a passkey. Refused with last_factor when it is the account's
+        only way to sign in — a passwordless account with one passkey has no recoverable
+        route back in.
+      parameters:
+      - description: Credential row id
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: removed
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: last remaining sign-in method
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Remove one of my passkeys
+      tags:
+      - Passkeys
+    patch:
+      consumes:
+      - application/json
+      description: Relabels a passkey. The label is the only thing distinguishing
+        several passkeys in a list, and the name chosen mid-ceremony at registration
+        is the one most likely to be wrong.
+      parameters:
+      - description: Credential row id
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: New name (1-64 characters)
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.renamePasskeyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.StoredCredential'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Rename one of my passkeys
+      tags:
+      - Passkeys
+  /auth/passkey/login/begin:
+    post:
+      description: Returns PublicKeyCredentialRequestOptions with an empty allowCredentials,
+        usable with either the default mediation (a "sign in with a passkey" button)
+        or mediation:"conditional" (autofill).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.webauthnBeginResponse'
+        "403":
+          description: passkeys or passwordless sign-in disabled, or origin not allowed
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Begin passwordless passkey sign-in
+      tags:
+      - Passkeys
+  /auth/passkey/login/complete:
+    post:
+      description: Verifies the assertion and returns a token pair. The request body
+        is the raw PublicKeyCredential from the browser.
+      parameters:
+      - description: Token from login/begin
+        in: query
+        name: ceremony_token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Complete passwordless passkey sign-in
+      tags:
+      - Passkeys
+  /auth/passkey/register/begin:
+    post:
+      description: Returns PublicKeyCredentialCreationOptions for navigator.credentials.create().
+        Requires an authenticated caller (bearer token or session cookie).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.webauthnBeginResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: passkeys disabled for this tenant, or origin not allowed
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: credential limit reached
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Begin passkey registration
+      tags:
+      - Passkeys
+  /auth/passkey/register/complete:
+    post:
+      description: Verifies the attestation and stores the credential. The request
+        body is the raw PublicKeyCredential from the browser.
+      parameters:
+      - description: Token from register/begin
+        in: query
+        name: ceremony_token
+        required: true
+        type: string
+      - description: User-facing label for this passkey (max 64 chars)
+        in: query
+        name: name
+        type: string
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.StoredCredential'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Conflict
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Complete passkey registration
+      tags:
+      - Passkeys
+  /auth/passkey/session:
+    post:
+      description: Verifies a passkey assertion and stores the token pair in HttpOnly
+        cookies. Browser/console counterpart of /auth/passkey/login/complete.
+      parameters:
+      - description: Token from login/begin
+        in: query
+        name: ceremony_token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: application-scoped account — cookies are not available
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Cookie-session passkey sign-in
+      tags:
+      - Passkeys
   /health:
     get:
       produces:
