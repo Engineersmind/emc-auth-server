@@ -240,6 +240,9 @@ func (s *AppRateLimitService) GetLimitForClientID(ctx context.Context, clientID 
 		}
 	}
 
+	// No is_active predicate on purpose: a suspended client that keeps calling
+	// the token endpoint must stay rate limited. Going unkeyed here would exempt
+	// it from limits precisely while it is misbehaving.
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id FROM oauth_clients
 		WHERE client_id = $1 AND deleted_at IS NULL

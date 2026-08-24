@@ -187,6 +187,29 @@ type InvitationPreview struct {
 	// GrantsAdmin reports that accepting will also activate a pending
 	// administrative grant, so the page can say what is being confirmed.
 	GrantsAdmin bool `json:"grants_admin"`
+
+	// TenantName is the tenant this invitation is FOR. Named because a recipient
+	// who administers several tenants cannot otherwise tell which one they are
+	// being asked to confirm.
+	TenantName string `json:"tenant_name"`
+	// AdminRole is "owner" or "co_owner" for an administrative invitation, and
+	// empty otherwise. The two confer very different reach, and the page should
+	// not describe them identically.
+	AdminRole string `json:"admin_role,omitempty"`
+
+	// ExistingTenants names the tenants this account ALREADY administers, so the
+	// page can say "you already administer Acme; this adds Bolt" rather than
+	// implying a fresh account is being created.
+	//
+	// This is what makes a cross-tenant invitation legible. Since one identity may
+	// now administer several tenants (migration 00071), an invitation to a
+	// second one looks identical to a first-time invitation unless the page says
+	// otherwise — and a recipient who is told to "set a password" for an account
+	// they have used for months will reasonably assume something is wrong.
+	//
+	// Empty for a brand-new account, which is exactly the signal the page needs to
+	// switch between the onboarding and confirmation wordings.
+	ExistingTenants []string `json:"existing_tenants,omitempty"`
 }
 
 // Preview resolves a live invitation token for display. It reports
@@ -194,6 +217,7 @@ type InvitationPreview struct {
 // consumes it.
 func (s *InvitationService) Preview(ctx context.Context, rawToken string) (*InvitationPreview, error) {
 	var p InvitationPreview
+	var adminRole *string
 	err := s.pool.QueryRow(ctx, `
 		SELECT u.email,
 		       NOT EXISTS (SELECT 1 FROM user_credentials c WHERE c.user_id = u.id),
@@ -205,17 +229,48 @@ func (s *InvitationService) Preview(ctx context.Context, rawToken string) (*Invi
 		           SELECT 1 FROM tenant_admins ta
 		           WHERE ta.user_id = u.id AND ta.tenant_id = i.tenant_id
 		             AND ta.deleted_at IS NULL AND ta.activated_at IS NULL
-		       )
+		       ),
+		       COALESCE(NULLIF(t.display_name, ''), t.name),
+		       -- The tier being offered, from the same pending row the flag above
+		       -- reports. NULL for a non-administrative invitation.
+		       (
+		           SELECT ta.admin_role FROM tenant_admins ta
+		           WHERE ta.user_id = u.id AND ta.tenant_id = i.tenant_id
+		             AND ta.deleted_at IS NULL AND ta.activated_at IS NULL
+		           LIMIT 1
+		       ),
+		       -- Tenants this account ALREADY administers, excluding the one being
+		       -- offered. activated_at IS NOT NULL: a second pending invitation is
+		       -- not an administration, and listing it would tell the recipient
+		       -- they already have access they have not accepted.
+		       COALESCE((
+		           SELECT array_agg(DISTINCT COALESCE(NULLIF(t2.display_name, ''), t2.name)
+		                            ORDER BY COALESCE(NULLIF(t2.display_name, ''), t2.name))
+		           FROM tenant_admins ta2
+		           JOIN tenants t2 ON t2.id = ta2.tenant_id
+		           WHERE ta2.user_id = u.id
+		             AND ta2.tenant_id <> i.tenant_id
+		             AND ta2.deleted_at IS NULL
+		             AND ta2.activated_at IS NOT NULL
+		             AND t2.deleted_at IS NULL
+		       ), '{}')
 		FROM user_invitations i
+		JOIN tenants t ON t.id = i.tenant_id
 		JOIN users u ON u.id = i.user_id
 		WHERE i.token_hash = $1 AND i.used_at IS NULL AND i.expires_at > NOW()
 		  AND u.deleted_at IS NULL
-	`, HashToken(rawToken)).Scan(&p.Email, &p.RequiresPassword, &p.GrantsAdmin)
+	`, HashToken(rawToken)).Scan(
+		&p.Email, &p.RequiresPassword, &p.GrantsAdmin,
+		&p.TenantName, &adminRole, &p.ExistingTenants,
+	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidInvitation
 		}
 		return nil, fmt.Errorf("preview invitation: %w", err)
+	}
+	if adminRole != nil {
+		p.AdminRole = *adminRole
 	}
 	return &p, nil
 }
@@ -340,13 +395,40 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 	// token_version is bumped either way: an activated administrative grant
 	// changes what the account may do, so tokens issued a moment ago must not
 	// keep asserting the old reach.
-	if _, err := tx.Exec(ctx, `
+	// Keyed on the user id alone, NOT on tenant_id.
+	//
+	// users.tenant_id is where an account's CREDENTIALS live — its home tenant —
+	// while t.TenantID is the tenant this invitation grants administration of.
+	// For a cross-tenant invitation those differ, so "AND tenant_id = $2" matched
+	// zero rows: the recipient followed their link, the invitation was marked
+	// used, the grant activated, and email_verified was silently left false.
+	//
+	// The consequence was not cosmetic. countUsableAdmins requires
+	// email_verified, so such an owner did not count as usable — a tenant with two
+	// accepted owners reported only one, and removing the other was refused with
+	// last_owner ("appoint another owner first") when another owner had in fact
+	// already been appointed and had accepted.
+	//
+	// Dropping the tenant predicate is safe because the row is identified by
+	// t.UserID, which came out of the invitation token itself: the token is a
+	// 256-bit single-use secret bound to one user, so there is no caller-supplied
+	// value here for a tenant check to defend. Verifying an email address is a
+	// property of the ACCOUNT, not of one tenant's view of it, so scoping it to a
+	// tenant was wrong in principle as well as in effect.
+	tag, err := tx.Exec(ctx, `
 		UPDATE users
 		SET email_verified = true, is_active = (blocked_at IS NULL),
 		    token_version = token_version + 1, updated_at = NOW()
-		WHERE id = $1 AND tenant_id = $2
-	`, t.UserID, t.TenantID); err != nil {
+		WHERE id = $1
+	`, t.UserID)
+	if err != nil {
 		return nil, fmt.Errorf("mark invited user verified: %w", err)
+	}
+	// A zero-row update here means the account vanished mid-transaction. Silence
+	// was how the original bug hid for so long, so it is now an error rather than
+	// a successful acceptance that verified nobody.
+	if tag.RowsAffected() == 0 {
+		return nil, fmt.Errorf("mark invited user verified: account %d no longer exists", t.UserID)
 	}
 
 	if err := activatePendingAdminGrant(ctx, tx, t.UserID, t.TenantID); err != nil {

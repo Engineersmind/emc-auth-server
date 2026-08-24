@@ -88,6 +88,31 @@ const (
 	ActionAdminApplicationDeleted       = "admin.application_deleted"
 	ActionAdminApplicationSecretRotated = "admin.application_secret_rotated"
 
+	// Admin — multi-tenant administrative grants (migration 00071).
+	//
+	// Granting cross-tenant administrative access is among the most
+	// security-sensitive events in the system, so each entry records the actor,
+	// the target user, the tenant, and the application (or an explicit
+	// "all applications" marker). Without the application dimension the log
+	// cannot answer "who could reach this application last Tuesday", which is
+	// the question an incident actually asks.
+	ActionAdminGrantCreated   = "admin.grant_created"
+	ActionAdminGrantActivated = "admin.grant_activated"
+	ActionAdminGrantRevoked   = "admin.grant_revoked"
+	ActionAdminGrantPromoted  = "admin.grant_promoted"
+	// ActionAdminGrantDenied records a REFUSED grant write — an owner attempting
+	// to mint a peer owner, or to act in a tenant they do not own. These are
+	// privilege-escalation attempts and belong in the log even though nothing
+	// changed.
+	ActionAdminGrantDenied = "admin.grant_denied"
+	// ActionAdminTenantSwitched is the only record that one identity acted across
+	// a tenant boundary. Reconstructing a multi-tenant administrator's session is
+	// impossible without it.
+	ActionAdminTenantSwitched = "admin.tenant_switched"
+	// ActionAdminIdentityMerged records Phase 0: duplicate administrator
+	// identities collapsed into one, naming every retired user id.
+	ActionAdminIdentityMerged = "admin.identity_merged"
+
 	// Auth — machine-to-machine client_credentials grant
 	ActionAuthClientCredentials       = "auth.client_credentials"
 	ActionAuthClientCredentialsFailed = "auth.client_credentials_failed"
@@ -547,17 +572,48 @@ func (l *Logger) Log(_ context.Context, e Event) {
 // ---------------------------------------------------------------------------
 
 // StatsResult holds aggregated counts for the monitoring dashboard.
+//
+// Every counter is a ROLLING window, not a calendar period: "today" means the
+// last 24 hours and "week" the last 7 days. The field names say today/week
+// because they are published API, and the dashboard labels them "(24h)" and
+// "(7d)" to match the behaviour rather than the names.
 type StatsResult struct {
-	LoginsToday       int        `json:"logins_today"`
-	FailedLoginsToday int        `json:"failed_logins_today"`
-	LogoutsToday      int        `json:"logouts_today"`
-	ActiveUsersWeek   int        `json:"active_users_week"`
-	TotalAuditEvents  int        `json:"total_audit_events"`
-	RecentEvents      []LogEntry `json:"recent_events"`
+	LoginsToday       int `json:"logins_today"`
+	FailedLoginsToday int `json:"failed_logins_today"`
+	LogoutsToday      int `json:"logouts_today"`
+	// ActiveUsersWeek counts distinct users who SIGNED IN over the last 7 days.
+	//
+	// Deliberately not "users who produced any audit event": that counted a
+	// failed login, a password-reset request, or an admin acting ON the user as
+	// activity, so a tenant with nobody able to get in still reported active
+	// users. The number a tile labelled "Active Users" has to mean is people who
+	// actually reached the product.
+	ActiveUsersWeek  int `json:"active_users_week"`
+	TotalAuditEvents int `json:"total_audit_events"`
+
+	// RecentEvents is OPT-IN via ?include=recent, and empty otherwise.
+	//
+	// It used to be returned unconditionally: ten fully-hydrated audit rows,
+	// carrying IP addresses, full user agents, request ids and response bodies,
+	// on an endpoint a dashboard polls. No client reads it — the audit page has
+	// its own paginated endpoint with its own guard — so the default was several
+	// kilobytes of the most sensitive rows in the system, sent repeatedly to
+	// satisfy nobody.
+	//
+	// Kept rather than deleted because the field is published API and something
+	// outside this repository may parse it. omitempty so a caller that does not
+	// ask sees no key at all, which is the honest shape for "not requested".
+	//
+	// Deprecated: query /audit-logs instead. This exists for compatibility and
+	// will be removed once no caller passes include=recent.
+	RecentEvents []LogEntry `json:"recent_events,omitempty"`
 }
 
 // Stats returns aggregated counts for the monitoring dashboard.
 // When tenantID is nil, returns system-wide counts.
+//
+// Counters only. Use StatsScopedWithRecent when the caller explicitly asked for
+// the recent-events list.
 func (l *Logger) Stats(ctx context.Context, tenantID *int64) (*StatsResult, error) {
 	return l.StatsScoped(ctx, tenantID, nil)
 }
@@ -569,6 +625,17 @@ func (l *Logger) Stats(ctx context.Context, tenantID *int64) (*StatsResult, erro
 // get. An empty non-nil slice means nothing, so the counts an administrator with
 // no grants sees are zeros rather than the tenant's totals.
 func (l *Logger) StatsScoped(ctx context.Context, tenantID *int64, onlyAppIDs []int64) (*StatsResult, error) {
+	return l.StatsScopedWithRecent(ctx, tenantID, onlyAppIDs, false)
+}
+
+// StatsScopedWithRecent is StatsScoped with the deprecated recent-events list
+// controlled explicitly.
+//
+// includeRecent is threaded from ?include=recent rather than defaulting to true,
+// because the list is expensive in exactly the way a polled dashboard endpoint
+// should not be: a second query, ten fully-hydrated rows, and the most sensitive
+// columns in the schema. See StatsResult.RecentEvents.
+func (l *Logger) StatsScopedWithRecent(ctx context.Context, tenantID *int64, onlyAppIDs []int64, includeRecent bool) (*StatsResult, error) {
 	where := "WHERE 1=1"
 	args := []any{}
 	if tenantID != nil {
@@ -586,7 +653,24 @@ func (l *Logger) StatsScoped(ctx context.Context, tenantID *int64, onlyAppIDs []
 			COUNT(*) FILTER (WHERE action = 'auth.login'        AND created_at >= NOW() - INTERVAL '24 hours'),
 			COUNT(*) FILTER (WHERE action = 'auth.login_failed' AND created_at >= NOW() - INTERVAL '24 hours'),
 			COUNT(*) FILTER (WHERE action = 'auth.logout'       AND created_at >= NOW() - INTERVAL '24 hours'),
-			COUNT(DISTINCT user_id) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days' AND user_id IS NOT NULL),
+			-- Distinct users who actually SIGNED IN, not users who appear anywhere
+			-- in the log. The previous predicate counted any event, so a failed
+			-- login, a password-reset request, or an administrator acting ON a
+			-- user all made that user "active" — a tenant nobody could get into
+			-- still reported active users.
+			--
+			-- The action list matches the one platform_admins.go uses for
+			-- last-sign-in, so "active" means the same thing in both places.
+			-- auth.register is included for the same reason it is there: creating
+			-- an account is a session-establishing act, and excluding it would
+			-- show a brand-new tenant as having nobody.
+			COUNT(DISTINCT user_id) FILTER (
+				WHERE created_at >= NOW() - INTERVAL '7 days'
+				  AND user_id IS NOT NULL
+				  AND action IN (
+				      'auth.login', 'auth.google_login', 'auth.github_login',
+				      'auth.magic_link_requested', 'auth.register')
+			),
 			COUNT(*)
 		FROM audit_logs %s
 	`, where), args...).Scan(
@@ -595,6 +679,13 @@ func (l *Logger) StatsScoped(ctx context.Context, tenantID *int64, onlyAppIDs []
 	)
 	if err != nil {
 		return nil, fmt.Errorf("audit stats: %w", err)
+	}
+
+	// Skipped unless asked for: one fewer query, and several kilobytes of the
+	// most sensitive rows in the schema not sent to a caller that never reads
+	// them. See StatsResult.RecentEvents.
+	if !includeRecent {
+		return &s, nil
 	}
 
 	// The recent-events list carries the same restriction as the counts.

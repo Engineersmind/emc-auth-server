@@ -124,7 +124,6 @@ type CreateTenantRequest struct {
 	DisplayName string `json:"display_name"`
 	Domain      string `json:"domain"`
 	Region      string `json:"region"`
-	Description string `json:"description"`
 	Plan        string `json:"plan"`
 	OwnerEmail  string `json:"owner_email"`
 }
@@ -135,7 +134,6 @@ type UpdateTenantRequest struct {
 	DisplayName string `json:"display_name"`
 	Domain      string `json:"domain"`
 	Region      string `json:"region"`
-	Description string `json:"description"`
 	Plan        string `json:"plan"`
 }
 
@@ -185,7 +183,6 @@ func (h *AdminHandler) CreateTenant(c echo.Context) error {
 		DisplayName: req.DisplayName,
 		Domain:      req.Domain,
 		Region:      req.Region,
-		Description: req.Description,
 		Plan:        req.Plan,
 		OwnerEmail:  req.OwnerEmail,
 	})
@@ -338,7 +335,6 @@ func (h *AdminHandler) UpdateTenant(c echo.Context) error {
 		DisplayName: req.DisplayName,
 		Domain:      req.Domain,
 		Region:      req.Region,
-		Description: req.Description,
 		Plan:        req.Plan,
 	})
 	if err != nil {
@@ -1762,9 +1758,10 @@ func (h *AdminHandler) GetUserMFAStatus(c echo.Context) error {
 // GetStats handles GET /api/v1/admin/stats.
 //
 // @Summary      Tenant activity stats
-// @Description  Returns audit-log-based activity counts scoped to the caller's tenant. Requires admin:access.
+// @Description  Returns audit-log-based activity counts scoped to the caller's tenant. Requires admin:access. All windows are ROLLING, not calendar: logins/failed/logouts cover the last 24 hours and active users the last 7 days, which is why the dashboard labels them "(24h)" and "(7d)". active_users_week counts distinct users who actually SIGNED IN, not every user appearing in the log. recent_events is omitted unless include=recent is passed.
 // @Tags         admin-audit
 // @Produce      json
+// @Param        include  query  string  false  "Comma-separated extras. Pass 'recent' to add the deprecated recent_events list; query /audit-logs instead."
 // @Security     BearerAuth
 // @Success      200  {object}  audit.StatsResult
 // @Failure      401  {object}  map[string]string
@@ -1778,7 +1775,7 @@ func (h *AdminHandler) GetStats(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
 	}
-	result, err := h.audit.StatsScoped(c.Request().Context(), &tenantID, monitoringScope(claims))
+	result, err := h.audit.StatsScopedWithRecent(c.Request().Context(), &tenantID, monitoringScope(claims), wantsRecentEvents(c))
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: stats query failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query stats"})
@@ -1789,15 +1786,16 @@ func (h *AdminHandler) GetStats(c echo.Context) error {
 // GetSystemStats handles GET /api/v1/admin/stats/system.
 //
 // @Summary      System-wide activity stats
-// @Description  Returns audit-log-based activity counts across all tenants. Requires tenant:manage permission.
+// @Description  Returns audit-log-based activity counts across all tenants. Requires tenant:manage permission. Windows are rolling (24 hours / 7 days) and active_users_week counts distinct users who signed in. recent_events is omitted unless include=recent is passed.
 // @Tags         admin-audit
 // @Produce      json
+// @Param        include  query  string  false  "Comma-separated extras. Pass 'recent' to add the deprecated recent_events list; query /audit-logs instead."
 // @Security     BearerAuth
 // @Success      200  {object}  audit.StatsResult
 // @Failure      403  {object}  map[string]string
 // @Router       /api/v1/stats/system [get]
 func (h *AdminHandler) GetSystemStats(c echo.Context) error {
-	result, err := h.audit.Stats(c.Request().Context(), nil)
+	result, err := h.audit.StatsScopedWithRecent(c.Request().Context(), nil, nil, wantsRecentEvents(c))
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: system stats query failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query system stats"})
@@ -2592,6 +2590,12 @@ type UpdateApplicationRequest struct {
 	// Nil leaves the flag unchanged.
 	RequirePKCE *bool `json:"require_pkce"`
 	FirstParty  *bool `json:"first_party"`
+	// IsActive nil leaves the flag unchanged. False suspends the application so
+	// its client credentials stop authenticating; the row and its client_id are
+	// preserved, unlike DELETE which soft-deletes.
+	IsActive *bool `json:"is_active"`
+	// DisplayName empty leaves it unchanged.
+	DisplayName string `json:"display_name"`
 }
 
 // tenantFromClaimsOrPath resolves the target tenant for application handlers.
@@ -2820,12 +2824,20 @@ func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
+	// Bounded here rather than by a CHECK constraint so an over-long value comes
+	// back as a 400 the form can display, not a constraint violation surfacing as
+	// a 500. 200 mirrors the tenants.name bound.
+	if len(req.DisplayName) > 200 {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "display_name must be at most 200 characters"})
+	}
 
 	app, err := h.appSvc.UpdateApplicationWithOptions(c.Request().Context(), tenantID, appID,
 		req.Name, req.AppType, req.Scopes, auth.AppUpdate{
 			RedirectURIs: req.RedirectURIs,
 			RequirePKCE:  req.RequirePKCE,
 			FirstParty:   req.FirstParty,
+			IsActive:     req.IsActive,
+			DisplayName:  req.DisplayName,
 		})
 	if err != nil {
 		switch {
@@ -3635,11 +3647,12 @@ func (h *AdminHandler) DeleteEmailTemplate(c echo.Context) error {
 // TenantGetStats handles GET /api/v1/tenants/:tid/stats.
 //
 // @Summary      Activity stats for a target tenant
-// @Description  Returns audit-log-based activity counts for the specified tenant. Requires tenant:manage (super_admin only).
+// @Description  Returns audit-log-based activity counts for the specified tenant. Requires tenant:manage (super_admin only). Windows are rolling (24 hours / 7 days) and active_users_week counts distinct users who signed in. recent_events is omitted unless include=recent is passed.
 // @Tags         admin-cross-tenant
 // @Produce      json
 // @Security     BearerAuth
-// @Param        tid  path      string  true  "Target tenant ID"
+// @Param        tid      path   string  true   "Target tenant ID"
+// @Param        include  query  string  false  "Comma-separated extras. Pass 'recent' to add the deprecated recent_events list; query /audit-logs instead."
 // @Success      200  {object}  audit.StatsResult
 // @Failure      400  {object}  map[string]string
 // @Router       /api/v1/tenants/{tid}/stats [get]
@@ -3649,7 +3662,7 @@ func (h *AdminHandler) TenantGetStats(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid tenant id"})
 	}
 	claims, _ := claimsFromCtx(c)
-	result, err := h.audit.StatsScoped(c.Request().Context(), &tid, monitoringScope(claims))
+	result, err := h.audit.StatsScopedWithRecent(c.Request().Context(), &tid, monitoringScope(claims), wantsRecentEvents(c))
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: tenant stats query failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query stats"})
@@ -3690,4 +3703,26 @@ func (h *AdminHandler) TenantGetActivity(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to query activity"})
 	}
 	return c.JSON(http.StatusOK, result)
+}
+
+// wantsRecentEvents reports whether the caller asked for the deprecated
+// recent-events list on a stats endpoint, via ?include=recent.
+//
+// Opt-in rather than opt-out: the list costs a second query and returns ten
+// fully-hydrated audit rows — IP addresses, user agents, request ids, response
+// bodies — from an endpoint dashboards poll. No first-party client reads it (the
+// audit page has its own paginated endpoint behind its own guard), so sending it
+// by default was pure cost with a real disclosure surface.
+//
+// Comma-separated so the parameter can grow without another flag:
+// ?include=recent,something-else. Unknown values are ignored rather than
+// rejected — a caller asking for something this version does not know about
+// should still get its counters.
+func wantsRecentEvents(c echo.Context) bool {
+	for _, part := range strings.Split(c.QueryParam("include"), ",") {
+		if strings.EqualFold(strings.TrimSpace(part), "recent") {
+			return true
+		}
+	}
+	return false
 }

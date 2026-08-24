@@ -337,8 +337,26 @@ func (s *EmailSink) notifySubject(ctx context.Context, n *notice, tenantID int64
 	if !ok {
 		return
 	}
-	to, apps := s.accessChangeSubject(ctx, tenantID, n.ev.ResourceType, n.ev.ResourceID)
+	to, apps, activated := s.accessChangeSubject(ctx, tenantID, n.ev.ResourceType, n.ev.ResourceID)
 	if to == "" || strings.EqualFold(to, n.ev.ActorEmail) {
+		return
+	}
+
+	// A grant the recipient has not accepted yet is announced by the INVITATION,
+	// not by this notice.
+	//
+	// Two emails used to land together for one invitation: "You have been invited,
+	// click to accept" and "Your access has changed … you will see the change the
+	// next time you sign in". The second is wrong twice over for a pending grant —
+	// nothing has changed until they accept, and a brand-new invitee has no
+	// account to sign in to, so the instruction is impossible to follow. It also
+	// undercuts the invitation, which is the one mail that carries the link they
+	// actually need.
+	//
+	// Scoped to the invited action alone. A grants change or a withdrawal on a
+	// still-pending row is a genuine change to something already communicated, and
+	// a withdrawal in particular is the most important message this feature sends.
+	if !activated && n.ev.Action == audit.ActionAdminTenantAdminInvited {
 		return
 	}
 	if !s.allow(to) {

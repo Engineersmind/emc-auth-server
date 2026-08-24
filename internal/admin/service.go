@@ -57,7 +57,6 @@ type TenantResult struct {
 	DisplayName *string   `json:"display_name"`
 	Domain      *string   `json:"domain"`
 	Region      *string   `json:"region"`
-	Description *string   `json:"description"`
 	Plan        string    `json:"plan"`
 	IsActive    bool      `json:"is_active"`
 	CORSOrigins []string  `json:"cors_origins"`
@@ -158,7 +157,6 @@ type CreateTenantInput struct {
 	DisplayName string
 	Domain      string
 	Region      string
-	Description string
 	Plan        string // defaults to "free" when empty
 	OwnerEmail  string // required; the tenant owner's real, deliverable email
 }
@@ -169,7 +167,6 @@ type UpdateTenantInput struct {
 	DisplayName string
 	Domain      string
 	Region      string
-	Description string
 	Plan        string
 }
 
@@ -459,11 +456,11 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// Step 1: insert tenant row.
 	var tenantID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO tenants (name, slug, jwt_secret, display_name, domain, region, description, plan, is_active)
-		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), NULLIF($7, ''), $8, true)
+		INSERT INTO tenants (name, slug, jwt_secret, display_name, domain, region, plan, is_active)
+		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, true)
 		RETURNING id
 	`, in.Name, in.Slug, secret,
-		in.DisplayName, in.Domain, in.Region, in.Description, plan,
+		in.DisplayName, in.Domain, in.Region, plan,
 	).Scan(&tenantID)
 	if err != nil {
 		if isDuplicateErr(err) {
@@ -508,20 +505,60 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 		}
 	}
 
-	// Step 5: create owner user.
+	// Step 5: resolve the owner's identity, reusing an existing account when the
+	// address already administers somewhere.
 	//
-	// role_id is left NULL: like every other administrative grant, the owner's
-	// takes effect when they accept the invitation, and the role is what carries
-	// its permissions. auth.activatePendingAdminGrant attaches roleID then.
+	// The lookup is deliberately NOT scoped to this tenant. One administrator may
+	// administer several tenants (migration 00071), so creating a second tenant for
+	// someone who already has an account must GRANT that account rather than mint a
+	// parallel one.
+	//
+	// Inserting blindly here is what produced duplicate identities: one users row
+	// per tenant, each with its own password hash, MFA enrolment and audit history,
+	// sharing only the email string. Both passwords then worked — each signing the
+	// operator in as a different person holding exactly one tenant — and neither
+	// could reach the other's, because grants are keyed on user_id rather than on
+	// the address. InviteTenantAdmin had the same defect; this is the other door
+	// into it, and the one an operator walks through when they create two tenants
+	// with the same owner.
+	//
+	// ORDER BY id LIMIT 1 rather than a bare single-row scan:
+	// users_tenant_email_tenant_level_key (migration 00042) is unique per TENANT, so
+	// duplicates predating this fix can still exist. Choosing the lowest id keeps
+	// the result stable instead of leaving it to the planner;
+	// scripts/phase0_merge_duplicate_admin.sql is how those get collapsed.
 	ownerEmail := ownerEmailAddr
 	var userID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO users (tenant_id, email, first_name, last_name, is_active)
-		VALUES ($1, $2, 'Owner', $3, true)
-		RETURNING id
-	`, tenantID, ownerEmail, in.Slug).Scan(&userID)
-	if err != nil {
-		return nil, fmt.Errorf("create owner user: %w", err)
+		SELECT id FROM users
+		WHERE email = $1 AND application_id IS NULL AND deleted_at IS NULL
+		ORDER BY id
+		LIMIT 1
+	`, ownerEmail).Scan(&userID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// A brand-new administrator. Their home tenant is the one being created,
+		// because there is nowhere else for their credentials to live.
+		//
+		// role_id is left NULL: like every other administrative grant, the owner's
+		// takes effect when they accept the invitation, and the role is what
+		// carries its permissions. auth.activatePendingAdminGrant attaches roleID
+		// then.
+		if err = tx.QueryRow(ctx, `
+			INSERT INTO users (tenant_id, email, first_name, last_name, is_active)
+			VALUES ($1, $2, 'Owner', $3, true)
+			RETURNING id
+		`, tenantID, ownerEmail, in.Slug).Scan(&userID); err != nil {
+			return nil, fmt.Errorf("create owner user: %w", err)
+		}
+	case err != nil:
+		return nil, fmt.Errorf("look up owner user: %w", err)
+	default:
+		// An existing administrator gains a second tenant. Their users row is left
+		// entirely alone — home tenant, name, and above all role_id and their
+		// password. The new authority lives in the tenant_admins/admin_grants row
+		// written below, and takes effect only when they accept the invitation,
+		// exactly as it would for a fresh account.
 	}
 
 	// Step 6: record the owner as a tenant administrator. This is the row that
@@ -545,6 +582,21 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 		`UPDATE tenants SET primary_admin_id = $1 WHERE id = $2`, adminID, tenantID,
 	); err != nil {
 		return nil, fmt.Errorf("set primary admin: %w", err)
+	}
+
+	// Mirror the seeded owner into admin_grants (00071), and point the new
+	// grant-shaped primary-admin column at it. Both columns are maintained until
+	// tenant_admins is dropped, so ADMIN_GRANTS_ENABLED can be flipped either way.
+	if err = mirrorAdminGrants(ctx, tx, tenantID, userID); err != nil {
+		return nil, err
+	}
+	if _, err = tx.Exec(ctx, `
+		UPDATE tenants t SET primary_admin_grant_id = g.id
+		FROM admin_grants g
+		WHERE t.id = $1 AND g.user_id = $2 AND g.tenant_id = $1
+		  AND g.admin_role = 'owner' AND g.deleted_at IS NULL
+	`, tenantID, userID); err != nil {
+		return nil, fmt.Errorf("set primary admin grant: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -635,7 +687,7 @@ func (s *Service) ListTenantsPaginated(ctx context.Context, f TenantFilter) (*Te
 
 	offset := (f.Page - 1) * f.Limit
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, name, slug, display_name, domain, region, description, plan,
+		SELECT id, name, slug, display_name, domain, region, plan,
 		       is_active, cors_origins, created_at, updated_at
 		FROM tenants
 		WHERE ($1 = '%%' OR name ILIKE $1 OR display_name ILIKE $1 OR domain ILIKE $1)
@@ -686,19 +738,36 @@ func (s *Service) GetTenantByID(ctx context.Context, tenantID int64) (*TenantRes
 	return t, nil
 }
 
-// UpdateTenant replaces the editable fields on a tenant.
+// UpdateTenant updates the editable fields on a tenant.
+//
+// Every field is patch-style: an empty string leaves the column unchanged. It
+// used to be replace-style, which made a partial update destructive — a caller
+// sending only {name} blanked domain and region, and wrote plan = '' into a NOT
+// NULL column with no CHECK, leaving a tenant on a plan that is not one of
+// free/pro/enterprise. Callers that legitimately want to CLEAR domain or region
+// need an explicit tri-state (*string) rather than the empty string, which is
+// why clearing is deliberately not expressible here yet.
+//
+// DisplayName keeps NULLIF so that a name and an identical display_name do not
+// both have to be stored; the read path already falls back with
+// COALESCE(NULLIF(display_name, ''), name).
 func (s *Service) UpdateTenant(ctx context.Context, tenantID int64, in UpdateTenantInput) (*TenantResult, error) {
+	// Reject a no-op rather than bumping updated_at for nothing: with patch
+	// semantics an all-empty input matches every column to itself, so the write
+	// would silently succeed while changing nothing the caller asked for.
+	if in.Name == "" && in.DisplayName == "" && in.Domain == "" && in.Region == "" && in.Plan == "" {
+		return nil, fmt.Errorf("nothing to update — provide name, display_name, domain, region, and/or plan")
+	}
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE tenants
-		SET name         = $1,
-		    display_name = NULLIF($2, ''),
-		    domain       = NULLIF($3, ''),
-		    region       = NULLIF($4, ''),
-		    description  = NULLIF($5, ''),
-		    plan         = $6,
+		SET name         = COALESCE(NULLIF($1, ''), name),
+		    display_name = COALESCE(NULLIF($2, ''), display_name),
+		    domain       = COALESCE(NULLIF($3, ''), domain),
+		    region       = COALESCE(NULLIF($4, ''), region),
+		    plan         = COALESCE(NULLIF($5, ''), plan),
 		    updated_at   = NOW()
-		WHERE id = $7
-	`, in.Name, in.DisplayName, in.Domain, in.Region, in.Description, in.Plan, tenantID)
+		WHERE id = $6
+	`, in.Name, in.DisplayName, in.Domain, in.Region, in.Plan, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("update tenant: %w", err)
 	}
@@ -2006,7 +2075,7 @@ func (s *Service) GetUserMFA(ctx context.Context, tenantID int64, applicationID 
 // getTenantByID fetches a single tenant row by primary key.
 func (s *Service) getTenantByID(ctx context.Context, tenantID int64) (*TenantResult, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT id, name, slug, display_name, domain, region, description, plan,
+		SELECT id, name, slug, display_name, domain, region, plan,
 		       is_active, cors_origins, created_at, updated_at
 		FROM tenants
 		WHERE id = $1
@@ -2030,18 +2099,60 @@ func (s *Service) ListOwnedTenants(ctx context.Context, email string) ([]OwnedTe
 	// The email arrives from a JWT claim, which may predate normalization.
 	email = emailaddr.Normalize(email)
 
+	// Tenants are resolved from admin_grants, NOT from users.tenant_id.
+	//
+	// This used to join "tenants t ON t.id = u.tenant_id" — one row per users
+	// record — which was only ever right by accident. It worked while a second
+	// tenant meant a second parallel account for the same address, so three
+	// tenants produced three users rows and the join produced three tenants. Once
+	// duplicate identities were fixed (one person, one account, N grants) the same
+	// query returned exactly ONE tenant: the administrator's home tenant, the
+	// place their credentials live, which says nothing about what they administer.
+	//
+	// users.tenant_id is the credential home; admin_grants is reach. Only the
+	// second answers "which tenants may I see?".
+	//
+	// activated_at IS NOT NULL: a granted-but-unaccepted invitation is not reach,
+	// and listing it would offer a tenant the caller cannot actually enter.
+	//
+	// GROUPed by tenant because a co-owner holds one grant per application, and
+	// this listing is per tenant. The role reported is the admin_role from the
+	// GRANT rather than users.role_id — that column names a role in the home
+	// tenant, so for any other tenant it would be simply wrong.
 	rows, err := s.pool.Query(ctx, `
 		SELECT
-			t.id, t.name, t.slug, t.display_name, t.domain, t.region, t.description,
+			t.id, t.name, t.slug, t.display_name, t.domain, t.region,
 			t.plan, t.is_active, t.cors_origins, t.created_at, t.updated_at,
-			COALESCE(r.name, '') AS role_name,
+			-- An owner grant wins: holding tenant-wide reach cannot be narrowed by
+			-- also holding application grants, and a co-owner holds one grant per
+			-- application so several rows collapse to one tenant here.
+			CASE WHEN BOOL_OR(g.admin_role = 'owner') THEN 'owner' ELSE 'co_owner' END AS role_name,
 			(SELECT COUNT(*) FROM users        WHERE tenant_id = t.id AND deleted_at IS NULL) AS user_count,
 			(SELECT COUNT(*) FROM roles        WHERE tenant_id = t.id)                        AS role_count,
 			(SELECT COUNT(*) FROM oauth_clients WHERE tenant_id = t.id AND deleted_at IS NULL) AS app_count
-		FROM users u
-		JOIN tenants t ON t.id = u.tenant_id
-		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.email = $1 AND u.is_active = true AND u.deleted_at IS NULL
+		FROM admin_grants g
+		JOIN users u   ON u.id = g.user_id
+		JOIN tenants t ON t.id = g.tenant_id
+		WHERE u.email = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND g.deleted_at IS NULL
+		  AND g.activated_at IS NOT NULL
+		  AND t.deleted_at IS NULL
+		GROUP BY t.id, t.name, t.slug, t.display_name, t.domain, t.region,
+		         t.plan, t.is_active, t.cors_origins,
+		         t.created_at, t.updated_at
+		-- Newest first, and deliberately NOT alphabetical.
+		--
+		-- This feeds the tenant TABLE, where the reader is reviewing what they
+		-- just did: a tenant created a moment ago belongs at the top. The tenant
+		-- SWITCHER orders the same tenants by name instead (see
+		-- auth.ListReachableTenants) because there the reader is finding a known
+		-- tenant, and a list that reshuffles every time one is created is
+		-- impossible to build muscle memory against.
+		--
+		-- The two orderings disagreeing is intentional. Aligning them would make
+		-- one of the two surfaces worse.
 		ORDER BY t.created_at DESC
 	`, email)
 	if err != nil {
@@ -2054,7 +2165,7 @@ func (s *Service) ListOwnedTenants(ctx context.Context, email string) ([]OwnedTe
 		var r OwnedTenantResult
 		var id int64
 		if err := rows.Scan(
-			&id, &r.Name, &r.Slug, &r.DisplayName, &r.Domain, &r.Region, &r.Description,
+			&id, &r.Name, &r.Slug, &r.DisplayName, &r.Domain, &r.Region,
 			&r.Plan, &r.IsActive, &r.CORSOrigins, &r.CreatedAt, &r.UpdatedAt,
 			&r.Role, &r.Stats.UserCount, &r.Stats.RoleCount, &r.Stats.AppCount,
 		); err != nil {
@@ -2080,7 +2191,7 @@ func scanTenantRow(row pgxScanner) (TenantResult, error) {
 	var id int64
 	if err := row.Scan(
 		&id, &t.Name, &t.Slug, &t.DisplayName, &t.Domain, &t.Region,
-		&t.Description, &t.Plan, &t.IsActive, &t.CORSOrigins, &t.CreatedAt, &t.UpdatedAt,
+		&t.Plan, &t.IsActive, &t.CORSOrigins, &t.CreatedAt, &t.UpdatedAt,
 	); err != nil {
 		return TenantResult{}, err
 	}

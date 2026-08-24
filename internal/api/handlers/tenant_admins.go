@@ -96,12 +96,14 @@ func (h *AdminHandler) InviteTenantAdmin(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "application_ids must be numeric"})
 	}
 
+	actor := grantActorFromClaims(claims)
 	result, err := h.svc.InviteTenantAdmin(c.Request().Context(), admin.InviteTenantAdminInput{
 		TenantID:       tenantID,
 		Email:          req.Email,
 		Role:           req.Role,
 		ApplicationIDs: appIDs,
 		InviterName:    claims.Email,
+		Actor:          &actor,
 	})
 	if err != nil {
 		return h.tenantAdminError(c, err, "invite tenant admin")
@@ -175,7 +177,7 @@ func (h *AdminHandler) RemoveTenantAdmin(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid administrator id"})
 	}
-	if err := h.svc.RemoveTenantAdmin(c.Request().Context(), tenantID, adminID); err != nil {
+	if err := h.svc.RemoveTenantAdminAs(c.Request().Context(), tenantID, adminID, grantActorFromClaims(claims)); err != nil {
 		return h.tenantAdminError(c, err, "remove tenant admin")
 	}
 	h.auditAdmin(c, claims, audit.ActionAdminTenantAdminRemoved, "tenant_admin", c.Param("adminID"))
@@ -240,6 +242,30 @@ func (h *AdminHandler) PlatformAdminSummary(c echo.Context) error {
 // hit, and these rules are ones callers are expected to run into legitimately.
 func (h *AdminHandler) tenantAdminError(c echo.Context, err error, op string) error {
 	switch {
+	// Privilege-escalation refusals (grant_escalation.go). 403 rather than 400:
+	// the request was well-formed and the caller may write here in general — what
+	// they may not do is write THIS. Audited by the handler so the attempt is
+	// visible even though nothing changed.
+	case errors.Is(err, admin.ErrOwnerCannotGrantOwnership):
+		return c.JSON(http.StatusForbidden, map[string]string{
+			"error": "only a platform administrator may grant tenant ownership",
+			"code":  "owner_cannot_grant_ownership",
+		})
+	case errors.Is(err, admin.ErrOwnerCannotRemoveOwner):
+		return c.JSON(http.StatusForbidden, map[string]string{
+			"error": "only a platform administrator may remove a tenant owner",
+			"code":  "owner_cannot_remove_owner",
+		})
+	case errors.Is(err, admin.ErrCannotModifyOwnGrant):
+		return c.JSON(http.StatusForbidden, map[string]string{
+			"error": "an administrator cannot modify their own grant",
+			"code":  "cannot_modify_own_grant",
+		})
+	case errors.Is(err, admin.ErrForbiddenGrantWrite):
+		return c.JSON(http.StatusForbidden, map[string]string{
+			"error": "your administrative role does not permit this change",
+			"code":  "forbidden_grant_write",
+		})
 	case errors.Is(err, admin.ErrNotFound):
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "administrator not found"})
 	case errors.Is(err, admin.ErrLastOwner):
@@ -251,6 +277,22 @@ func (h *AdminHandler) tenantAdminError(c echo.Context, err error, op string) er
 		return c.JSON(http.StatusConflict, map[string]string{
 			"error": "this address already administers the tenant with exactly these applications",
 			"code":  "already_granted",
+		})
+	case errors.Is(err, admin.ErrInviteWouldDemote):
+		// 409, not 400: the request is well formed, it conflicts with the reach the
+		// account already holds. Owner covers every application, so co-owner of one
+		// is a reduction — and an invitation must never quietly reduce anybody.
+		//
+		// The message stops at stating the conflict. It deliberately does NOT
+		// suggest "change their role instead", because no such route exists:
+		// SetTenantAdminGrants refuses owners (ErrGrantsForOwner) and there is no
+		// PUT for admin_role. Reducing an owner today means removing them and
+		// re-inviting as a co-owner, which is a different decision with its own
+		// last-owner guard — so pointing at a phantom endpoint would be worse than
+		// saying nothing.
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error": "this account already owns the tenant, which includes every application; an owner cannot also be a co-owner",
+			"code":  "invite_would_demote",
 		})
 	case errors.Is(err, admin.ErrGrantsRequired):
 		return c.JSON(http.StatusBadRequest, map[string]string{
@@ -307,4 +349,31 @@ func parseIDs(in []string) ([]int64, error) {
 		out = append(out, id)
 	}
 	return out, nil
+}
+
+// grantActorFromClaims builds the escalation-rule actor from a caller's claims.
+//
+// IsPlatformAdmin comes from tenant:manage, the permission the tenant guards
+// short-circuit on — a platform administrator holds no tenant_admins or
+// admin_grants row at all, so their authority cannot be discovered by looking for
+// one (migration 00062).
+//
+// A UserID that fails to parse is left at 0, which matches no account. That fails
+// closed: the rules then see a non-platform actor with no grant anywhere and
+// refuse the write.
+func grantActorFromClaims(claims *auth.Claims) admin.GrantActor {
+	a := admin.GrantActor{}
+	if claims == nil {
+		return a
+	}
+	if uid, err := strconv.ParseInt(claims.UserID, 10, 64); err == nil {
+		a.UserID = uid
+	}
+	for _, p := range claims.Permissions {
+		if p == "tenant:manage" {
+			a.IsPlatformAdmin = true
+			break
+		}
+	}
+	return a
 }

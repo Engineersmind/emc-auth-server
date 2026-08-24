@@ -124,7 +124,7 @@ func (s *AuthorizationServer) LookupClient(ctx context.Context, clientID string)
 		       redirect_uris, scopes, grant_types, require_pkce, first_party,
 		       client_secret_hash
 		FROM   oauth_clients
-		WHERE  client_id = $1 AND deleted_at IS NULL
+		WHERE  client_id = $1 AND deleted_at IS NULL AND is_active
 	`, clientID).Scan(&c.RowID, &c.TenantID, &c.ClientID, &c.Name, &c.AppType,
 		&c.RedirectURIs, &c.Scopes, &c.GrantTypes, &c.RequirePKCE, &c.FirstParty,
 		&secretHash)

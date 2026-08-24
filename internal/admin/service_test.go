@@ -454,3 +454,70 @@ func TestRolesOneDefaultPerApp_UniqueIndex(t *testing.T) {
 		t.Fatal("second default-role insert succeeded, want unique index violation")
 	}
 }
+
+// TestUpdateTenantIsPatchNotReplace pins the patch semantics of UpdateTenant.
+//
+// It used to be replace-style: every column was assigned unconditionally, so a
+// caller updating only the name blanked domain and region, and wrote plan = ''
+// into a NOT NULL column that has no CHECK constraint — leaving a tenant on a
+// plan outside free/pro/enterprise. An edit form that exposes just name and
+// display_name is exactly such a caller, which is why this is pinned.
+func TestUpdateTenantIsPatchNotReplace(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	created, err := f.svc.CreateTenant(ctx, admin.CreateTenantInput{
+		Name:        "Patch Probe",
+		Slug:        "patch-probe",
+		DisplayName: "Patch Probe Display",
+		Domain:      "patch.example.com",
+		Region:      "us-east",
+		Plan:        "pro",
+		OwnerEmail:  "patch-owner@example.com",
+	})
+	if err != nil {
+		t.Fatalf("CreateTenant: %v", err)
+	}
+	tenantID, err := strconv.ParseInt(created.Tenant.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse tenant id: %v", err)
+	}
+
+	// The exact shape the edit card sends: name + display_name only.
+	updated, err := f.svc.UpdateTenant(ctx, tenantID, admin.UpdateTenantInput{
+		Name:        "Patch Probe Renamed",
+		DisplayName: "Renamed Display",
+	})
+	if err != nil {
+		t.Fatalf("UpdateTenant: %v", err)
+	}
+
+	if updated.Name != "Patch Probe Renamed" {
+		t.Errorf("Name = %q, want %q", updated.Name, "Patch Probe Renamed")
+	}
+	if updated.DisplayName == nil || *updated.DisplayName != "Renamed Display" {
+		t.Errorf("DisplayName = %v, want %q", updated.DisplayName, "Renamed Display")
+	}
+	// The untouched fields must survive.
+	if updated.Domain == nil || *updated.Domain != "patch.example.com" {
+		t.Errorf("Domain = %v, want it preserved as patch.example.com", updated.Domain)
+	}
+	if updated.Region == nil || *updated.Region != "us-east" {
+		t.Errorf("Region = %v, want it preserved as us-east", updated.Region)
+	}
+	if updated.Plan != "pro" {
+		t.Errorf("Plan = %q, want it preserved as pro", updated.Plan)
+	}
+}
+
+// TestUpdateTenantRejectsEmptyInput covers the no-op guard: with patch semantics
+// an all-empty input matches every column to itself, so without the guard the
+// write would succeed while changing nothing the caller asked for.
+func TestUpdateTenantRejectsEmptyInput(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	if _, err := f.svc.UpdateTenant(ctx, f.tenantID, admin.UpdateTenantInput{}); err == nil {
+		t.Fatal("UpdateTenant with empty input = nil error, want a refusal")
+	}
+}

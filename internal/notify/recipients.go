@@ -262,15 +262,19 @@ func (s *EmailSink) platformRecipients(ctx context.Context) ([]string, error) {
 // Soft-deleted rows are included deliberately: a withdrawal deletes the row, and
 // telling somebody their access was removed is the single most important message
 // in this whole feature. Excluding them would silently drop exactly that one.
-func (s *EmailSink) accessChangeSubject(ctx context.Context, tenantID int64, resourceType, resourceID string) (email string, apps string) {
+func (s *EmailSink) accessChangeSubject(ctx context.Context, tenantID int64, resourceType, resourceID string) (email string, apps string, activated bool) {
 	if resourceType != "tenant_admin" || resourceID == "" {
-		return "", ""
+		return "", "", false
 	}
 	adminID, err := strconv.ParseInt(resourceID, 10, 64)
 	if err != nil {
-		return "", ""
+		return "", "", false
 	}
 
+	// activated_at is selected so a grant the recipient has not accepted can be
+	// skipped by the caller. Not filtered in SQL: a withdrawal must still notify
+	// (see the comment above about soft-deleted rows), and a row can be both
+	// deleted and never activated.
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email,
 		       COALESCE((
@@ -278,15 +282,16 @@ func (s *EmailSink) accessChangeSubject(ctx context.Context, tenantID int64, res
 		           FROM tenant_admin_app_scopes sc
 		           JOIN oauth_clients oc ON oc.id = sc.application_id
 		           WHERE sc.admin_id = ta.id
-		       ), '')
+		       ), ''),
+		       ta.activated_at IS NOT NULL
 		FROM tenant_admins ta
 		JOIN users u ON u.id = ta.user_id
 		WHERE ta.id = $1 AND ta.tenant_id = $2
-	`, adminID, tenantID).Scan(&email, &apps)
+	`, adminID, tenantID).Scan(&email, &apps, &activated)
 	if err != nil {
-		return "", ""
+		return "", "", false
 	}
-	return email, apps
+	return email, apps, activated
 }
 
 // tenantName resolves the display name for the email body. Falls back to the

@@ -75,6 +75,22 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	); err != nil {
 		return fmt.Errorf("activate admin grant: %w", err)
 	}
+	// Mirror the activation into admin_grants (00071), inside this transaction.
+	//
+	// This is the write that confers authority, so the two models must not
+	// disagree on it: a mirror left pending would deny a legitimately activated
+	// administrator the moment ADMIN_GRANTS_ENABLED is flipped, and a mirror
+	// activated early would hand reach to someone who never accepted.
+	if _, err = tx.Exec(ctx, `
+		UPDATE admin_grants g SET activated_at = NOW(), updated_at = NOW()
+		FROM tenant_admins ta
+		WHERE ta.id = $1
+		  AND g.user_id = ta.user_id AND g.tenant_id = ta.tenant_id
+		  AND g.admin_role = ta.admin_role
+		  AND g.deleted_at IS NULL AND g.activated_at IS NULL
+	`, adminID); err != nil {
+		return fmt.Errorf("activate admin grant mirror: %w", err)
+	}
 	// token_version is bumped here rather than relying on the caller. Accept
 	// bumps it too, but this function is the one that changes what the account
 	// may do, so the invalidation belongs with the change: any future caller

@@ -194,8 +194,10 @@ func TestApplicationService_GetAndUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateApplication() error = %v", err)
 	}
-	if created.AppType != "web" {
-		t.Errorf("CreateApplication() default AppType = %q, want \"web\"", created.AppType)
+	// Default is m2m, not web: every application here is a backend service using
+	// client_credentials. See TestOmittedAppTypeDefaultsToM2M.
+	if created.AppType != "m2m" {
+		t.Errorf("CreateApplication() default AppType = %q, want \"m2m\"", created.AppType)
 	}
 	appID, _ := strconv.ParseInt(created.ID, 10, 64)
 
@@ -203,8 +205,8 @@ func TestApplicationService_GetAndUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetApplication() error = %v", err)
 	}
-	if !got.IsActive || got.Name != "get-update-app" || got.AppType != "web" {
-		t.Errorf("GetApplication() = %+v, want active web app named get-update-app", got)
+	if !got.IsActive || got.Name != "get-update-app" || got.AppType != "m2m" {
+		t.Errorf("GetApplication() = %+v, want active m2m app named get-update-app", got)
 	}
 
 	// Cross-tenant get must fail.
@@ -439,5 +441,157 @@ func TestApplicationService_ScopesRoundTrip(t *testing.T) {
 	}
 	if _, err := svc.UpdateApplication(ctx, tenantA, appID, "", "", []string{":action-only"}); err != auth.ErrInvalidScope {
 		t.Errorf("UpdateApplication(bad scope) error = %v, want ErrInvalidScope", err)
+	}
+}
+
+// TestAppTypeDerivesGrantTypes pins the rule that app_type decides which OAuth
+// grants a client may use.
+//
+// Before this, every application took the column default
+// {authorization_code, refresh_token} whatever its type, so an application
+// created as m2m could not perform the client_credentials grant: /oauth/token
+// refused it at the GrantTypes check. Nothing surfaced the mismatch until a
+// backend service tried to fetch its first token, which is why this is pinned
+// here rather than left to the column default.
+func TestAppTypeDerivesGrantTypes(t *testing.T) {
+	svc, ctx, tenantID, _ := newApplicationService(t)
+
+	cases := []struct {
+		appType string
+		want    []string
+		pkce    bool
+	}{
+		// client_credentials only, and NOT refresh_token: RFC 6749 §4.4.3 forbids
+		// a refresh token in a client_credentials response.
+		{"m2m", []string{"client_credentials"}, false},
+		{"web", []string{"authorization_code", "refresh_token"}, true},
+		{"spa", []string{"authorization_code", "refresh_token"}, true},
+		{"native", []string{"authorization_code", "refresh_token"}, true},
+	}
+
+	for _, tc := range cases {
+		created, err := svc.CreateApplication(ctx, tenantID, "grants-"+tc.appType, tc.appType, nil)
+		if err != nil {
+			t.Fatalf("create %s: %v", tc.appType, err)
+		}
+		appID, err := strconv.ParseInt(created.ID, 10, 64)
+		if err != nil {
+			t.Fatalf("parse id: %v", err)
+		}
+		got, err := svc.GetApplication(ctx, tenantID, appID)
+		if err != nil {
+			t.Fatalf("get %s: %v", tc.appType, err)
+		}
+		if strings.Join(got.GrantTypes, ",") != strings.Join(tc.want, ",") {
+			t.Errorf("%s: grant_types = %v, want %v", tc.appType, got.GrantTypes, tc.want)
+		}
+		if got.RequirePKCE != tc.pkce {
+			t.Errorf("%s: require_pkce = %v, want %v", tc.appType, got.RequirePKCE, tc.pkce)
+		}
+	}
+}
+
+// TestOmittedAppTypeDefaultsToM2M pins the default. Every application registered
+// in this system is a backend service using client_credentials; defaulting to web
+// handed such a service grants it could never exercise, so an omitted app_type
+// produced a client that could not get a token at all.
+func TestOmittedAppTypeDefaultsToM2M(t *testing.T) {
+	svc, ctx, tenantID, _ := newApplicationService(t)
+
+	created, err := svc.CreateApplication(ctx, tenantID, "default-type-app", "", nil)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if created.AppType != "m2m" {
+		t.Fatalf("app_type = %q, want m2m", created.AppType)
+	}
+	appID, err := strconv.ParseInt(created.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse id: %v", err)
+	}
+	got, err := svc.GetApplication(ctx, tenantID, appID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if strings.Join(got.GrantTypes, ",") != "client_credentials" {
+		t.Fatalf("grant_types = %v, want [client_credentials]", got.GrantTypes)
+	}
+}
+
+// TestChangingAppTypeRewritesGrantTypes covers the update path. A row left with
+// authorization_code after being switched to m2m describes a client /oauth/token
+// will refuse, so the two fields must not be allowed to disagree.
+func TestChangingAppTypeRewritesGrantTypes(t *testing.T) {
+	svc, ctx, tenantID, _ := newApplicationService(t)
+
+	created, err := svc.CreateApplication(ctx, tenantID, "retype-app", "web", nil)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	appID, err := strconv.ParseInt(created.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse id: %v", err)
+	}
+
+	updated, err := svc.UpdateApplication(ctx, tenantID, appID, "", "m2m", nil)
+	if err != nil {
+		t.Fatalf("update to m2m: %v", err)
+	}
+	if strings.Join(updated.GrantTypes, ",") != "client_credentials" {
+		t.Fatalf("after switch to m2m: grant_types = %v, want [client_credentials]", updated.GrantTypes)
+	}
+
+	// A rename must NOT disturb grant_types — only a type change re-derives them.
+	renamed, err := svc.UpdateApplication(ctx, tenantID, appID, "retype-app-renamed", "", nil)
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if strings.Join(renamed.GrantTypes, ",") != "client_credentials" {
+		t.Fatalf("after rename: grant_types = %v, want unchanged [client_credentials]", renamed.GrantTypes)
+	}
+}
+
+// TestApplicationDisplayNameFallsBackToName pins the read-side fallback: an
+// application with no display_name reports its name there, so a consumer can
+// render DisplayName unconditionally without checking which field is set.
+func TestApplicationDisplayNameFallsBackToName(t *testing.T) {
+	svc, ctx, tenantID, _ := newApplicationService(t)
+
+	created, err := svc.CreateApplication(ctx, tenantID, "fallback-app", "m2m", nil)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	appID, err := strconv.ParseInt(created.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse id: %v", err)
+	}
+
+	got, err := svc.GetApplication(ctx, tenantID, appID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.DisplayName != "fallback-app" {
+		t.Errorf("DisplayName = %q, want the name %q as fallback", got.DisplayName, "fallback-app")
+	}
+
+	// Setting one takes precedence; a rename must not disturb it.
+	updated, err := svc.UpdateApplicationWithOptions(ctx, tenantID, appID, "", "", nil,
+		auth.AppUpdate{DisplayName: "Customer Portal"})
+	if err != nil {
+		t.Fatalf("set display_name: %v", err)
+	}
+	if updated.DisplayName != "Customer Portal" {
+		t.Errorf("DisplayName = %q, want %q", updated.DisplayName, "Customer Portal")
+	}
+
+	renamed, err := svc.UpdateApplication(ctx, tenantID, appID, "fallback-app-renamed", "", nil)
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if renamed.Name != "fallback-app-renamed" {
+		t.Errorf("Name = %q, want renamed", renamed.Name)
+	}
+	if renamed.DisplayName != "Customer Portal" {
+		t.Errorf("DisplayName = %q, want it preserved across a rename", renamed.DisplayName)
 	}
 }
