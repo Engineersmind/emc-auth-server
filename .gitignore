@@ -80,3 +80,7 @@ docs/WEBAUTHN_DEMO_RUNBOOK.md
 docs/WEBAUTHN_FRONTEND_PROMPT.md
 docs/WEBAUTHN_PREREQUISITES.md
 docs/WEBAUTHN_TEST_PROCEDURE.md
+
+# Passkey gap tracker — local follow-up notes, same class as GAP_ANALYSIS.md.
+# Its contents become GitHub issues; the file itself stays private.
+docs/PASSKEY_GAPS.md
