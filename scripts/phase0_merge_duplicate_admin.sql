@@ -29,7 +29,7 @@
 -- string. Both passwords then worked, each signing the operator in as a different
 -- person who administered exactly one tenant, and neither could reach the other's.
 --
--- Migration 00072 stops NEW duplicates: InviteTenantAdmin now finds an existing
+-- Migration 00079 stops NEW duplicates: InviteTenantAdmin now finds an existing
 -- tenant-level account across tenants and grants it instead of creating a second
 -- row. Rows created before that fix still need collapsing, and that is this
 -- script.

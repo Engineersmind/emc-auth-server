@@ -14,7 +14,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Multi-tenant administrative reach (migration 00071).
+// Multi-tenant administrative reach (migration 00078).
 //
 // admin_grants replaces the tenant_admins + tenant_admin_app_scopes pair from
 // migration 00062, and lifts the constraint that made an administrator
@@ -71,7 +71,7 @@ func AdminGrantsEnabled() bool {
 //   - An owner returns (AdminScopeTenant, nil): no application list is produced.
 //     Enumerating would freeze the list at token-issue time, so an application
 //     created a minute later would be invisible to its own owner until they
-//     signed in again. Absence means all — see migration 00071's header for why
+//     signed in again. Absence means all — see migration 00078's header for why
 //     the alternative fails silently.
 //
 //   - A co-owner returns a NON-NIL, possibly EMPTY slice. A co-owner whose last
@@ -111,7 +111,7 @@ func loadAdminScopeFromGrants(ctx context.Context, pool *pgxpool.Pool, userID, t
 		}
 		isAdmin = true
 		// An owner grant ends the question: tenant-wide reach cannot be narrowed
-		// by also holding application grants, and the CHECK in 00071 means an
+		// by also holding application grants, and the CHECK in 00078 means an
 		// owner row never carries an application_id anyway.
 		if role == AdminRoleOwner {
 			return AdminScopeTenant, nil, nil
@@ -135,7 +135,7 @@ func loadAdminScopeFromGrants(ctx context.Context, pool *pgxpool.Pool, userID, t
 // as a shadow to surface disagreements before they can affect anybody.
 //
 // The shadow pass is what turns "the backfill looked right" into evidence. The
-// static verification in migration 00071 checks the two models agree on rows;
+// static verification in migration 00078 checks the two models agree on rows;
 // this checks they agree on the ANSWER, under real traffic, including rows
 // written after the migration ran. Flip the flag only once the mismatch log has
 // been quiet across a full day.

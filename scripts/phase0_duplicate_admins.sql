@@ -1,8 +1,8 @@
 -- Phase 0 inventory: duplicate tenant-level administrator identities.
 --
--- READ-ONLY. Run this against production BEFORE migration 00071 and keep the
+-- READ-ONLY. Run this against production BEFORE migration 00078 and keep the
 -- output — it is the only record of what administrative reach existed before the
--- merge, and 00071's verification queries use it as their reference.
+-- merge, and 00078's verification queries use it as their reference.
 --
 --   psql "$DATABASE_URL" -f scripts/phase0_duplicate_admins.sql
 --
@@ -13,7 +13,7 @@
 -- docs/plans/multi-tenant-admin-grants.md §5 for the procedure and the
 -- survivor-selection rules.
 --
--- If section 1 returns no rows, Phase 0 is a no-op and 00071 may proceed.
+-- If section 1 returns no rows, Phase 0 is a no-op and 00078 may proceed.
 
 \echo ''
 \echo '=== 1. Duplicate tenant-level emails (each row is one merge set) ==='
@@ -58,7 +58,7 @@ ORDER BY u.email, u.tenant_id;
 
 \echo ''
 \echo '=== 3. Administrative reach that must survive the merge ==='
--- Captured from the 00062 model, because Phase 0 runs before 00071 exists.
+-- Captured from the 00062 model, because Phase 0 runs before 00078 exists.
 -- Every row here must reappear as an admin_grants row pointing at the survivor.
 SELECT u.email,
        u.id            AS user_id,
@@ -111,6 +111,6 @@ SELECT (SELECT COUNT(*) FROM (
                           WHERE application_id IS NULL AND deleted_at IS NULL
                           GROUP BY email HAVING COUNT(*) > 1)) AS blocked_rows_needing_escalation;
 \echo ''
-\echo 'If merge_sets = 0, Phase 0 is a no-op and migration 00071 may proceed.'
+\echo 'If merge_sets = 0, Phase 0 is a no-op and migration 00078 may proceed.'
 \echo 'Otherwise: follow docs/plans/multi-tenant-admin-grants.md section 5.'
 \echo ''

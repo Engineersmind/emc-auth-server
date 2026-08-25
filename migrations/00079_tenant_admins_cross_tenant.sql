@@ -4,7 +4,7 @@
 -- Allow a tenant administrator to administer a tenant that is not their home
 -- tenant, in the legacy 00062 model.
 --
--- Migration 00071 lifted the one-tenant-per-administrator limit in admin_grants,
+-- Migration 00078 lifted the one-tenant-per-administrator limit in admin_grants,
 -- but tenant_admins is still written on every invitation (the dual-write that
 -- keeps ADMIN_GRANTS_ENABLED reversible), and its trigger asserts
 --
@@ -20,7 +20,7 @@
 -- them is refused because neither holds a grant in the other's tenant.
 --
 -- The same-tenant assertion is what has to go. What replaces it is the rule
--- 00071 states: users.tenant_id is where an account's CREDENTIALS live — its home
+-- 00078 states: users.tenant_id is where an account's CREDENTIALS live — its home
 -- tenant — and carries no administrative authority of its own. Reach is
 -- admin_grants (and, until it is dropped, tenant_admins).
 --
@@ -68,7 +68,7 @@ $$;
 -- an administrator can be removed and later re-invited without colliding with
 -- their own tombstone.
 --
--- Mirrors admin_grants_owner_key in 00071. The two models must agree on
+-- Mirrors admin_grants_owner_key in 00078. The two models must agree on
 -- cardinality for the dual-write to be meaningful.
 DROP INDEX IF EXISTS tenant_admins_user_key;
 CREATE UNIQUE INDEX IF NOT EXISTS tenant_admins_user_tenant_key

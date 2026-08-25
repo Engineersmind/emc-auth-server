@@ -249,7 +249,7 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 	// Existing tenant-level identity for this address, ACROSS tenants.
 	//
 	// Deliberately NOT scoped to in.TenantID, and that is the whole fix. An
-	// administrator may now administer several tenants (migration 00071), so the
+	// administrator may now administer several tenants (migration 00078), so the
 	// same person invited to a second tenant must be FOUND and granted, never
 	// re-created. Scoping this lookup to the invited tenant is what produced
 	// parallel accounts: one users row per tenant, each with its own password
@@ -338,7 +338,7 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		return nil, err
 	}
 
-	// Mirror to admin_grants (00071) now that role and grants are both settled.
+	// Mirror to admin_grants (00078) now that role and grants are both settled.
 	// Inside the same transaction, so the two models cannot diverge on a rollback.
 	if err = mirrorAdminGrants(ctx, tx, in.TenantID, userID); err != nil {
 		return nil, err
@@ -519,7 +519,7 @@ func (s *Service) SetTenantAdminGrants(ctx context.Context, tenantID, adminID in
 	if err != nil {
 		return nil, err
 	}
-	// Mirror to admin_grants (00071), inside the same transaction.
+	// Mirror to admin_grants (00078), inside the same transaction.
 	if err = mirrorAdminGrants(ctx, tx, tenantID, userID); err != nil {
 		return nil, err
 	}

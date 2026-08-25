@@ -9,7 +9,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Dual-write bridge to admin_grants (migration 00071).
+// Dual-write bridge to admin_grants (migration 00078).
 //
 // While ADMIN_GRANTS_ENABLED is off, tenant_admins + tenant_admin_app_scopes
 // remain authoritative and admin_grants is a mirror. While it is on, the mirror

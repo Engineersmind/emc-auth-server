@@ -202,7 +202,7 @@ type InvitationPreview struct {
 	// implying a fresh account is being created.
 	//
 	// This is what makes a cross-tenant invitation legible. Since one identity may
-	// now administer several tenants (migration 00071), an invitation to a
+	// now administer several tenants (migration 00078), an invitation to a
 	// second one looks identical to a first-time invitation unless the page says
 	// otherwise — and a recipient who is told to "set a password" for an account
 	// they have used for months will reasonably assume something is wrong.

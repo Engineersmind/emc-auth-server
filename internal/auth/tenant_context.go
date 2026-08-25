@@ -13,7 +13,7 @@ import (
 // ---------------------------------------------------------------------------
 // Tenant context switching for multi-tenant administrators (plan step 4).
 //
-// An administrator may now reach several tenants (migration 00071), but an access
+// An administrator may now reach several tenants (migration 00078), but an access
 // token names exactly one: claims.TenantID is a scalar, and the two guards that
 // authorise tenant-scoped routes compare the path :tid against it
 // (middleware/permission.go). So entering a second tenant means holding a token
