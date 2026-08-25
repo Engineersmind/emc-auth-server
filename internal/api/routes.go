@@ -640,6 +640,34 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, mw.OTPRateLimiter(rlCfg)) // forced enrollment: first code → tokens
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
+
+	// Change the active tenant for a multi-tenant administrator (plan step 4).
+	//
+	// NOT re-authentication: the caller's existing access token authenticates the
+	// request, and the target tenant is verified against admin_grants rather than
+	// trusted from the body. Needs JWTRequired explicitly because authGroup also
+	// carries the unauthenticated login and refresh routes.
+	//
+	// TokenRateLimiter because it mints tokens, and per-user rather than per-IP —
+	// a client looping over tenant ids should be bounded by identity, which is what
+	// the limiter keys on once claims are present.
+	authGroup.POST("/tenant-context", authHandler.TenantContext,
+		mw.JWTRequired(jwtSvc, auth.AudienceAPI, auth.AudienceManagement),
+		mw.TokenRateLimiter(rlCfg))
+
+	// Which tenants may I administer? (plan step 5)
+	//
+	// Any authenticated administrator, with no permission guard: the endpoint
+	// reports only what the CALLER reaches, so there is nothing to escalate to. It
+	// deliberately ignores the token's own tenant and queries admin_grants by user
+	// id, which is what lets an owner of five tenants see all five immediately
+	// after login, before any tenant change has happened.
+	//
+	// Registered on authGroup (with JWTRequired) rather than adminGroup so it is
+	// reachable by an administrator whose current token names a tenant they are
+	// about to leave.
+	authGroup.GET("/my-tenants", authHandler.MyTenants,
+		mw.JWTRequired(jwtSvc, auth.AudienceAPI, auth.AudienceManagement))
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
@@ -926,6 +954,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// everything.
 	tidStatsRead := mw.RequireTenantSelfScoped("stats:read")
 
+	// Deleting an application is platform-tier only.
+	//
+	// It is irreversible from the operator's point of view: every client_id and
+	// secret stops authenticating, every integration built on them breaks at once,
+	// and nothing in the dashboard brings the application back. apps:write covers
+	// configuring an application — its name, scopes, redirect URIs, MFA policy —
+	// and treating destruction as the same authority meant any owner, or a
+	// co-owner granted that one application, could end it.
+	//
+	// Reserved to tenant:manage for the same reason ownership itself is
+	// (ErrOwnerCannotGrantOwnership): the actions with no path back belong to the
+	// tier that also created the tenant.
+	platformOnly := mw.RequirePermission("tenant:manage")
+
 	// Per-application variants (issue #97). Same tenant + permission check as
 	// above, plus "does this administrator's scope actually cover THIS
 	// application?" — the question RequireTenantSelfOrAny cannot ask, and which
@@ -996,7 +1038,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.POST("/tenants/:tid/applications", adminHandler.CreateApplication, tidAppsWrite)
 	adminGroup.GET("/tenants/:tid/applications/:id", adminHandler.GetApplication, appIDAppsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:id", adminHandler.UpdateApplication, appIDAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication, appIDAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:id", adminHandler.DeactivateApplication, platformOnly)
 	adminGroup.POST("/tenants/:tid/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, appIDAppsWrite)
 
 	// End-user application roles under the canonical family (mirrors the flat
@@ -1176,7 +1218,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications", adminHandler.ListApplications, appsRead)
 	adminGroup.GET("/applications/:id", adminHandler.GetApplication, appsRead)
 	adminGroup.PUT("/applications/:id", adminHandler.UpdateApplication, appsWrite)
-	adminGroup.DELETE("/applications/:id", adminHandler.DeactivateApplication, appsWrite)
+	adminGroup.DELETE("/applications/:id", adminHandler.DeactivateApplication, platformOnly)
 	adminGroup.POST("/applications/:id/rotate-secret", adminHandler.RotateApplicationSecret, appsWrite)
 
 	// End-user application roles — roles:read / roles:write, scoped to one of
@@ -1272,9 +1314,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, appsWrite)
 	// Cross-tenant / tenant-scoped mirror for super_admin (:tid overrides the JWT tenant).
 	adminGroup.GET("/tenants/:tid/app-limits", adminHandler.ListAppLimits, tidAppsRead)
-	adminGroup.GET("/tenants/:tid/applications/:appID/rate-limit", adminHandler.GetAppLimit, tidAppsRead)
-	adminGroup.PUT("/tenants/:tid/applications/:appID/rate-limit", adminHandler.SetAppLimit, tidAppsWrite)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/rate-limit", adminHandler.GetAppLimit, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/rate-limit", adminHandler.SetAppLimit, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, appAppsWrite)
 
 	// JWT signing-key management (issue #95) — tenant:manage, because rotating a
 	// signing key is a tenant-wide security operation, not an application-level one.
@@ -1409,16 +1451,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// OWN tenant's providers. These carry the target tenant in the path,
 	// guarded by RequireTenantSelfOrAny exactly like every other
 	// /tenants/:tid resource family (email settings, roles, users, ...).
-	adminGroup.GET("/tenants/:tid/applications/:appID/identity-providers", oauthHandler.ListProviderConfigs, tidAppsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/identity-providers", oauthHandler.ListProviderConfigs, appAppsRead)
 	// The two mutating routes carry the same token rate limiter as /test: each
 	// performs AES-256-GCM work, a DB upsert/delete and an audit write, so
 	// leaving the heavier endpoints unguarded while the lighter one is limited
 	// would be the wrong asymmetry.
-	adminGroup.PUT("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.UpsertProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.DeleteProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
-	adminGroup.POST("/tenants/:tid/applications/:appID/identity-providers/:provider/test", oauthHandler.TestProviderConfig, tidAppsWrite, mw.TokenRateLimiter(rlCfg))
-	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/identities", oauthHandler.ListUserIdentities, tidUsersRead)
-	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/identities/:provider", oauthHandler.UnlinkUserIdentity, tidUsersWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.UpsertProviderConfig, appAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/identity-providers/:provider", oauthHandler.DeleteProviderConfig, appAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.POST("/tenants/:tid/applications/:appID/identity-providers/:provider/test", oauthHandler.TestProviderConfig, appAppsWrite, mw.TokenRateLimiter(rlCfg))
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/identities", oauthHandler.ListUserIdentities, appUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/identities/:provider", oauthHandler.UnlinkUserIdentity, appUsersWrite)
 
 	// Agent management — apps:read / apps:write (agents are machine clients) (08-01, 08-04)
 	adminGroup.POST("/agents", agentHandler.RegisterAgent, appsWrite)

@@ -285,12 +285,19 @@ func TestApplicationIDRoundTrip(t *testing.T) {
 
 	// Stats carries the same restriction, counts AND recent events. Without it a
 	// scoped admin would read zeroed totals above their neighbours' events.
-	stats, err := l.StatsScoped(ctx, &tenantID, []int64{appID})
+	//
+	// WithRecent(true) explicitly: the list is opt-in now, so StatsScoped alone
+	// would leave RecentEvents empty and the loop below would assert nothing
+	// while still passing.
+	stats, err := l.StatsScopedWithRecent(ctx, &tenantID, []int64{appID}, true)
 	if err != nil {
-		t.Fatalf("StatsScoped: %v", err)
+		t.Fatalf("StatsScopedWithRecent: %v", err)
 	}
 	if stats.TotalAuditEvents != 1 {
 		t.Errorf("scoped TotalAuditEvents = %d, want 1", stats.TotalAuditEvents)
+	}
+	if len(stats.RecentEvents) == 0 {
+		t.Fatal("RecentEvents is empty with includeRecent=true — the scoping assertion below would be vacuous")
 	}
 	for _, e := range stats.RecentEvents {
 		if e.ApplicationID == nil || *e.ApplicationID != fmt.Sprintf("%d", appID) {
@@ -445,5 +452,139 @@ func TestDefaultStatusIsSuccess(t *testing.T) {
 				}
 				return ""
 			}())
+	}
+}
+
+// TestStatsRecentEventsAreOptIn pins the default shape of the stats endpoints.
+//
+// RecentEvents used to be returned unconditionally: ten fully-hydrated audit
+// rows carrying IP addresses, user agents, request ids and response bodies, from
+// an endpoint dashboards poll. No first-party client reads it — the audit page
+// has its own paginated endpoint behind its own guard — so the default was
+// several kilobytes of the most sensitive rows in the schema, sent to satisfy
+// nobody. It is now opt-in via ?include=recent.
+func TestStatsRecentEventsAreOptIn(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	ctx := context.Background()
+
+	slug := fmt.Sprintf("audit-optin-%d", time.Now().UnixNano())
+	var tenantID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO tenants (name, slug, jwt_secret) VALUES ($1, $1, 'test-secret') RETURNING id`,
+		slug).Scan(&tenantID); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM audit_logs WHERE tenant_id = $1`, tenantID)
+		_, _ = pool.Exec(ctx, `DELETE FROM tenants WHERE id = $1`, tenantID)
+	})
+
+	l := audit.New(pool, testhelper.TestLogger(), audit.WithFlushInterval(50*time.Millisecond))
+	l.Log(ctx, audit.Event{
+		TenantID:   &tenantID,
+		ActorEmail: "someone@example.com",
+		Action:     audit.ActionAuthLogin,
+		Status:     audit.StatusSuccess,
+	})
+	if err := l.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Default: counters only, no event list.
+	quiet, err := l.Stats(ctx, &tenantID)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if len(quiet.RecentEvents) != 0 {
+		t.Errorf("RecentEvents has %d entries by default, want 0 — the list is opt-in", len(quiet.RecentEvents))
+	}
+	// The counters still work; withholding the list must not zero them.
+	if quiet.TotalAuditEvents == 0 {
+		t.Error("TotalAuditEvents = 0; withholding RecentEvents must not affect the counts")
+	}
+
+	// Explicitly requested: the list comes back.
+	loud, err := l.StatsScopedWithRecent(ctx, &tenantID, nil, true)
+	if err != nil {
+		t.Fatalf("StatsScopedWithRecent: %v", err)
+	}
+	if len(loud.RecentEvents) == 0 {
+		t.Error("RecentEvents is empty with includeRecent=true, want the event back")
+	}
+}
+
+// TestStatsActiveUsersCountsSignInsOnly is the semantic fix.
+//
+// active_users_week was COUNT(DISTINCT user_id) over ANY audit event, so a failed
+// login, a password-reset request, or an administrator acting ON a user all made
+// that user "active" — a tenant nobody could get into still reported active
+// users. A tile labelled "Active Users" has to mean people who actually reached
+// the product.
+func TestStatsActiveUsersCountsSignInsOnly(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	ctx := context.Background()
+
+	slug := fmt.Sprintf("audit-active-%d", time.Now().UnixNano())
+	var tenantID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO tenants (name, slug, jwt_secret) VALUES ($1, $1, 'test-secret') RETURNING id`,
+		slug).Scan(&tenantID); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	// Two distinct users: one who signed in, one who only ever failed.
+	var signedIn, failedOnly int64
+	for i, email := range []string{"in@active.test", "out@active.test"} {
+		var id int64
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO users (tenant_id, application_id, email, first_name, last_name, is_active)
+			VALUES ($1, NULL, $2, '', '', true) RETURNING id
+		`, tenantID, email).Scan(&id); err != nil {
+			t.Fatalf("create user %s: %v", email, err)
+		}
+		if i == 0 {
+			signedIn = id
+		} else {
+			failedOnly = id
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, `DELETE FROM audit_logs WHERE tenant_id = $1`, tenantID)
+		_, _ = pool.Exec(ctx, `DELETE FROM users WHERE tenant_id = $1`, tenantID)
+		_, _ = pool.Exec(ctx, `DELETE FROM tenants WHERE id = $1`, tenantID)
+	})
+
+	l := audit.New(pool, testhelper.TestLogger(), audit.WithFlushInterval(50*time.Millisecond))
+	l.Log(ctx, audit.Event{
+		TenantID: &tenantID, UserID: &signedIn,
+		ActorEmail: "in@active.test", Action: audit.ActionAuthLogin, Status: audit.StatusSuccess,
+	})
+	// A failed login, and an administrative action ON the second user. Neither is
+	// that person reaching the product.
+	l.Log(ctx, audit.Event{
+		TenantID: &tenantID, UserID: &failedOnly,
+		ActorEmail: "out@active.test", Action: audit.ActionAuthLoginFailed, Status: audit.StatusFailure,
+	})
+	l.Log(ctx, audit.Event{
+		TenantID: &tenantID, UserID: &failedOnly,
+		ActorEmail: "admin@active.test", Action: audit.ActionAdminUserUpdated, Status: audit.StatusSuccess,
+	})
+	if err := l.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	stats, err := l.Stats(ctx, &tenantID)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if stats.ActiveUsersWeek != 1 {
+		t.Errorf("ActiveUsersWeek = %d, want 1 — only the user who signed in counts", stats.ActiveUsersWeek)
+	}
+	// The other counters must still see everything: narrowing "active" must not
+	// narrow the failure count, which is what an operator watches for trouble.
+	if stats.FailedLoginsToday != 1 {
+		t.Errorf("FailedLoginsToday = %d, want 1", stats.FailedLoginsToday)
+	}
+	if stats.TotalAuditEvents != 3 {
+		t.Errorf("TotalAuditEvents = %d, want 3", stats.TotalAuditEvents)
 	}
 }

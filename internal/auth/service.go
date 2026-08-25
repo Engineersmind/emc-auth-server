@@ -385,7 +385,11 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	// completion, magic link, OAuth callbacks — funnels through this function.
 	// Resolving it once means a co-owner's grants cannot survive their own
 	// revocation by riding a refresh rotation that forgot to reload them.
-	adminScope, adminApps, err := loadAdminScope(ctx, s.pool, userID, tenantID)
+	// resolveAdminScope picks between the 00062 tables and admin_grants (00071)
+	// according to ADMIN_GRANTS_ENABLED, and shadow-compares the two while the
+	// flag is off. The claim's shape is identical either way, so a token minted
+	// across the cutover is indistinguishable to every guard.
+	adminScope, adminApps, err := s.resolveAdminScope(ctx, userID, tenantID)
 	if err != nil {
 		return nil, err
 	}

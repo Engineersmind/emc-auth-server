@@ -187,7 +187,27 @@ func (s *Service) ListPlatformAdministrators(ctx context.Context, f PlatformAdmi
 	}
 
 	rows, err := s.pool.Query(ctx, platformAdminSelect+platformAdminWhere+`
-		ORDER BY t.name, ta.admin_role, u.email
+		-- Newest grant first.
+		--
+		-- Not by tenant name, which is what this was: grouping by tenant scattered
+		-- one administrator across the list, so a person holding three tenants
+		-- appeared under three separate headings. Tenant is a column on the row and
+		-- a filter — it does not need to be the sort.
+		--
+		-- Recency is the right default for a directory an operator opens after
+		-- acting: the administrator they just invited is the one they came to check,
+		-- and it belongs at the top. Same reasoning as the tenant table
+		-- (admin.ListOwnedTenants). Finding a KNOWN address is served by the search
+		-- filter above, which is the tool for that job — a sort cannot do both.
+		--
+		-- ta.id DESC as the tie-break, and it is required rather than cosmetic. This
+		-- listing is PAGINATED, so the sort has to be total: created_at is not
+		-- unique — a tenant's seeded owner and every grant written in the same
+		-- transaction share a timestamp to the microsecond — and equal values may
+		-- come back in any order, which lets a row repeat on one page and vanish
+		-- from another. ta.id is monotonic, so DESC on it preserves the
+		-- newest-first intent inside a timestamp collision rather than fighting it.
+		ORDER BY ta.created_at DESC, ta.id DESC
 		LIMIT $4 OFFSET $5
 	`, search, f.Role, f.Status, f.Limit, (f.Page-1)*f.Limit)
 	if err != nil {

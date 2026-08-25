@@ -293,7 +293,7 @@ func (s *OAuthLoginService) BuildAuthURL(ctx context.Context, providerName, clie
 	var appRowID, tenantID int64
 	err = s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id FROM oauth_clients
-		WHERE client_id = $1 AND deleted_at IS NULL
+		WHERE client_id = $1 AND deleted_at IS NULL AND is_active
 	`, clientID).Scan(&appRowID, &tenantID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -3,10 +3,13 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
@@ -906,5 +909,179 @@ func TestBreach_DisabledIsNoop(t *testing.T) {
 	}
 	if len(e.mail.breaches) != 0 {
 		t.Errorf("breach warnings = %d with detection disabled, want 0", len(e.mail.breaches))
+	}
+}
+
+// TestInvitationPreview_NamesTenantRoleAndExistingReach covers the context the
+// acceptance page needs to be honest about what it is asking.
+//
+// Without it a cross-tenant invitation is indistinguishable from a first-time one:
+// the page tells someone who has used the account for months to "set a password",
+// which reads as an error, or worse as a phishing attempt. Naming the tenant, the
+// tier, and what they already administer is what makes the request legible.
+func TestInvitationPreview_NamesTenantRoleAndExistingReach(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	// One identity that ALREADY administers the seed tenant, activated.
+	email := uniqueEmail("preview-reach")
+	userID := e.seedUser(t, email, "$2a$10$abcdefghijklmnopqrstuvwxyz012345678901234567890123456")
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role, activated_at)
+		VALUES ($1, $2, 'owner', NOW())
+	`, e.tenantID, userID); err != nil {
+		t.Fatalf("seed activated administration: %v", err)
+	}
+
+	// A second tenant, with a PENDING co-owner grant for the same identity — the
+	// cross-tenant case that migration 00072 made representable.
+	var secondTenantID int64
+	if err := e.pool.QueryRow(e.ctx, `
+		INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		VALUES ('Bolt Industries', $1, 'secret-for-bolt-tenant-preview', true)
+		RETURNING id
+	`, fmt.Sprintf("bolt-preview-%d", time.Now().UnixNano())).Scan(&secondTenantID); err != nil {
+		t.Fatalf("seed second tenant: %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role) VALUES ($1, $2, 'co_owner')
+	`, secondTenantID, userID); err != nil {
+		t.Fatalf("seed pending cross-tenant grant: %v", err)
+	}
+
+	if err := invSvc.Invite(e.ctx, secondTenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	raw := tokenFromLink(t, e.mail.invitations[0].Link)
+
+	preview, err := invSvc.Preview(e.ctx, raw)
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+
+	// The tenant being offered, so the recipient knows which one they are joining.
+	if preview.TenantName != "Bolt Industries" {
+		t.Errorf("tenant_name = %q, want %q", preview.TenantName, "Bolt Industries")
+	}
+	// The tier, because owner and co_owner confer very different reach.
+	if preview.AdminRole != auth.AdminRoleCoOwner {
+		t.Errorf("admin_role = %q, want %q", preview.AdminRole, auth.AdminRoleCoOwner)
+	}
+	// The account already has a password, so the page must ask them to confirm it
+	// rather than offering to set one.
+	if preview.RequiresPassword {
+		t.Error("requires_password = true for an account that already has credentials")
+	}
+	// And it must name what they already administer, so "you already have an
+	// account" is a statement the page can actually back up.
+	if len(preview.ExistingTenants) != 1 {
+		t.Fatalf("existing_tenants = %v, want exactly the seed tenant", preview.ExistingTenants)
+	}
+	// The tenant being INVITED to must not appear in the existing list: it would
+	// tell the recipient they already hold access they are being asked to accept.
+	for _, name := range preview.ExistingTenants {
+		if name == "Bolt Industries" {
+			t.Errorf("existing_tenants %v contains the invitation's own tenant", preview.ExistingTenants)
+		}
+	}
+}
+
+// TestInvitationPreview_NewAccountReportsNoExistingReach: the onboarding case must
+// stay distinguishable, since it is what selects the "set your password" wording.
+func TestInvitationPreview_NewAccountReportsNoExistingReach(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	email := uniqueEmail("preview-fresh")
+	userID := e.seedUser(t, email, "") // no credentials
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO tenant_admins (tenant_id, user_id, admin_role) VALUES ($1, $2, 'owner')
+	`, e.tenantID, userID); err != nil {
+		t.Fatalf("seed pending grant: %v", err)
+	}
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+
+	preview, err := invSvc.Preview(e.ctx, tokenFromLink(t, e.mail.invitations[0].Link))
+	if err != nil {
+		t.Fatalf("Preview: %v", err)
+	}
+	if !preview.RequiresPassword {
+		t.Error("requires_password = false for an account with no credentials")
+	}
+	if len(preview.ExistingTenants) != 0 {
+		t.Errorf("existing_tenants = %v, want empty for a brand-new administrator", preview.ExistingTenants)
+	}
+	if preview.AdminRole != auth.AdminRoleOwner {
+		t.Errorf("admin_role = %q, want %q", preview.AdminRole, auth.AdminRoleOwner)
+	}
+}
+
+// TestInvitation_CrossTenantAcceptVerifiesEmail pins the fix for a silent
+// verification failure.
+//
+// Accept updated the recipient with "WHERE id = $1 AND tenant_id = $2", where $2
+// is the tenant the invitation grants administration of. But users.tenant_id is
+// the account's HOME tenant — where its credentials live — and migration 00071
+// established the two as separate axes. For a cross-tenant invitation they
+// differ, so the predicate matched zero rows: the link was consumed, the grant
+// activated, and email_verified stayed false.
+//
+// countUsableAdmins requires email_verified, so such an owner never counted as
+// usable. A tenant with two accepted owners reported one, and removing either was
+// refused with last_owner ("appoint another owner first") when another owner had
+// in fact accepted — leaving the tenant stuck.
+func TestInvitation_CrossTenantAcceptVerifiesEmail(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	// A second tenant, so the invitation crosses a tenant boundary.
+	var otherTenantID int64
+	if err := e.pool.QueryRow(e.ctx, `
+		INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		VALUES ($1, $1, 'xtenant-verify-secret', true)
+		RETURNING id
+	`, "xtenant-verify-"+strconv.FormatInt(time.Now().UnixNano(), 10)).Scan(&otherTenantID); err != nil {
+		t.Fatalf("create second tenant: %v", err)
+	}
+
+	// The account's HOME tenant is e.tenantID; the invitation is for otherTenantID.
+	email := uniqueEmail("xtenant-verify")
+	userID := e.seedUser(t, email, "")
+	if _, err := e.pool.Exec(e.ctx,
+		`UPDATE users SET email_verified = false WHERE id = $1`, userID); err != nil {
+		t.Fatalf("reset email_verified: %v", err)
+	}
+
+	if err := invSvc.Invite(e.ctx, otherTenantID, nil, userID, email, "", nil); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	link := e.mail.invitations[len(e.mail.invitations)-1].Link
+	token := link[strings.Index(link, "token=")+len("token="):]
+
+	if _, err := invSvc.Accept(e.ctx, token, auth.AcceptOptions{NewPassword: "NewPassw0rd!"}); err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+
+	// The whole point: verification is a property of the ACCOUNT, so accepting an
+	// invitation for a tenant that is not the account's home tenant must still
+	// verify it.
+	var verified bool
+	var homeTenant int64
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT email_verified, tenant_id FROM users WHERE id = $1`, userID,
+	).Scan(&verified, &homeTenant); err != nil {
+		t.Fatalf("load user: %v", err)
+	}
+	if !verified {
+		t.Errorf("email_verified = false after accepting a cross-tenant invitation, want true")
+	}
+	if homeTenant == otherTenantID {
+		t.Fatalf("home tenant = %d, which equals the invited tenant — the test no longer crosses a boundary",
+			homeTenant)
 	}
 }

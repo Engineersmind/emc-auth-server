@@ -57,6 +57,22 @@ var (
 	// bounds mail per recipient, which is the quantity a mailbox owner and the
 	// sending domain's reputation actually feel.
 	ErrInviteCooldown = errors.New("an invitation was sent to this address moments ago; wait before resending")
+	// ErrInviteWouldDemote is returned when a co-owner invitation names somebody
+	// who already owns the tenant.
+	//
+	// An invitation may only ADD reach. Owner already means every application in
+	// the tenant, so co-owner of one application is a strict subset — the request
+	// is not a widening but a contradiction, and it used to be resolved by
+	// silently choosing the narrower role: upsertTenantAdmin wrote
+	// admin_role = 'co_owner', the grants mirror deleted the owner's
+	// NULL-application row in favour of app-scoped ones, and
+	// revokeAdminScopeTokens signed the person out because their live reach had
+	// narrowed. An owner adding themselves as co-owner therefore demoted
+	// themselves to a single application, with no confirmation.
+	//
+	// Demotion is a legitimate operation, but it is a deliberate role change with
+	// consequences worth stating — not a side effect of an invitation.
+	ErrInviteWouldDemote = errors.New("this account already owns the tenant, which includes every application; an invitation cannot reduce an owner to a co-owner")
 )
 
 // inviteResendCooldown is the minimum gap between two invitations for one
@@ -99,6 +115,23 @@ type InviteTenantAdminInput struct {
 	// tenant administrator.
 	InviterAdminID *int64
 	InviterName    string
+
+	// Actor is who is performing this write, for the privilege-escalation rules in
+	// grant_escalation.go. The route already decided WHETHER the caller may write
+	// here; these rules decide what the write may CONTAIN — most importantly that
+	// an owner may create co-owners but not peer owners, so ownership cannot
+	// propagate itself.
+	//
+	// NIL means the caller has already established its own authority and the rules
+	// are skipped: the platform-admin paths (CreateTenant seeding the first owner)
+	// and tests. HTTP handlers must always set it — see grantActorFromClaims.
+	//
+	// Deliberately a pointer rather than a zero-value struct. A zero GrantActor has
+	// UserID 0 and IsPlatformAdmin false, which reads as "a non-platform actor who
+	// is nobody" and would refuse every write — including the ones that legitimately
+	// have no actor. Making the absence explicit keeps "not checked" distinct from
+	// "checked and denied".
+	Actor *GrantActor
 }
 
 // InviteTenantAdminResult reports what an invitation actually did, which is not
@@ -161,6 +194,13 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 	// administrator; it is an inert row and a support ticket. Refused before
 	// anything is written, so a misconfigured server creates nothing rather than
 	// half of something.
+	//
+	// Kept strict even though a widening for an already-active administrator sends
+	// no mail: whether this call is a widening is not known until the row is
+	// locked and read, well inside the transaction below. Relaxing it would mean
+	// opening a transaction on a server that cannot invite anybody, to discover
+	// afterwards whether it needed to — and a server with no invitation service is
+	// misconfigured for the common case regardless.
 	if s.invSvc == nil {
 		return nil, ErrInvitationsUnavailable
 	}
@@ -184,6 +224,21 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		return nil, fmt.Errorf("lock tenant for admin invite: %w", err)
 	}
 
+	// Privilege-escalation rules, INSIDE the transaction and after the tenant
+	// lock: an owner whose own grant is revoked concurrently must not have their
+	// in-flight invitation succeed on a stale read.
+	//
+	// targetUserID is 0 because the recipient is identified by email and may not
+	// have an account yet, so rule 4 (nobody modifies their own grant) cannot be
+	// evaluated here — AssertMayGrant skips it for an unknown target rather than
+	// matching a zero actor against a zero target. What IS enforced is rule 1: an
+	// owner may create co-owners only.
+	if in.Actor != nil {
+		if err = AssertMayGrant(ctx, tx, *in.Actor, in.TenantID, 0, in.Role); err != nil {
+			return nil, err
+		}
+	}
+
 	// Seed the role now even though nobody is assigned to it yet: confirmation
 	// attaches it, and creating it up front means that path cannot fail because
 	// the tenant never had the role to begin with.
@@ -191,16 +246,35 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		return nil, err
 	}
 
-	// Existing tenant-level identity for this address, if any. previousRoleID is
-	// whatever role they held before this promotion — remembered so that
-	// withdrawing administration later can put it back instead of leaving an
-	// admin role attached to someone who no longer administers anything.
+	// Existing tenant-level identity for this address, ACROSS tenants.
+	//
+	// Deliberately NOT scoped to in.TenantID, and that is the whole fix. An
+	// administrator may now administer several tenants (migration 00071), so the
+	// same person invited to a second tenant must be FOUND and granted, never
+	// re-created. Scoping this lookup to the invited tenant is what produced
+	// parallel accounts: one users row per tenant, each with its own password
+	// hash, MFA enrolment and audit history, sharing only the email string — so
+	// both passwords worked, each signing the operator in as a different person
+	// holding exactly one tenant, and neither could reach the other's.
+	//
+	// users.tenant_id on the row that comes back is the account's HOME tenant,
+	// where its credentials live, and is deliberately not compared to in.TenantID:
+	// authority comes from the grant, not from where the password is stored.
+	//
+	// LIMIT 1 over a deterministic order rather than a bare single-row scan.
+	// users_tenant_email_tenant_level_key (migration 00042) is unique per TENANT,
+	// so duplicates predating this fix can still exist; picking the lowest id
+	// makes the choice stable instead of leaving it to the planner.
+	// scripts/phase0_duplicate_admins.sql is how those get merged.
 	var userID int64
 	var previousRoleID *int64
+	var homeTenantID int64
 	err = tx.QueryRow(ctx, `
-		SELECT id, role_id FROM users
-		WHERE tenant_id = $1 AND email = $2 AND application_id IS NULL AND deleted_at IS NULL
-	`, in.TenantID, email).Scan(&userID, &previousRoleID)
+		SELECT id, role_id, tenant_id FROM users
+		WHERE email = $1 AND application_id IS NULL AND deleted_at IS NULL
+		ORDER BY id
+		LIMIT 1
+	`, email).Scan(&userID, &previousRoleID, &homeTenantID)
 
 	action := "grants_added"
 	switch {
@@ -208,6 +282,9 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		action = "invited"
 		// role_id stays NULL: the grant is not effective until confirmed, and
 		// the role is what carries its permissions.
+		//
+		// The new account's home tenant is the one being administered, because
+		// there is nowhere else for its credentials to live.
 		if err = tx.QueryRow(ctx, `
 			INSERT INTO users (tenant_id, email, first_name, last_name, is_active)
 			VALUES ($1, $2, '', '', true)
@@ -218,6 +295,17 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 	case err != nil:
 		return nil, fmt.Errorf("look up administrator user: %w", err)
 	default:
+		// previousRoleID is what removal restores, and it is only meaningful when
+		// the role belongs to the tenant being administered.
+		//
+		// For a cross-tenant invitation it never is: users.role_id names a role in
+		// the account's HOME tenant, so restoring it when this administration is
+		// withdrawn would attach a foreign tenant's role — meaningless at best,
+		// and at worst one carrying permissions nobody intended here. Nil is the
+		// honest answer, and removal then simply strips the administrative role.
+		if homeTenantID != in.TenantID {
+			previousRoleID = nil
+		}
 		// An administrative role is never a sensible thing to "restore" to: it
 		// is one this flow attached, and treating it as the pre-promotion state
 		// would make removal a no-op. Only a genuine non-admin role is kept.
@@ -247,6 +335,12 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 
 	changed, err := replaceGrants(ctx, tx, adminID, in.ApplicationIDs)
 	if err != nil {
+		return nil, err
+	}
+
+	// Mirror to admin_grants (00071) now that role and grants are both settled.
+	// Inside the same transaction, so the two models cannot diverge on a rollback.
+	if err = mirrorAdminGrants(ctx, tx, in.TenantID, userID); err != nil {
 		return nil, err
 	}
 
@@ -305,17 +399,20 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 	//
 	// Activation itself revokes separately, in auth.activatePendingAdminGrant —
 	// which is where the reach actually starts.
-	if changed || !existed {
-		var live bool
-		if err = tx.QueryRow(ctx,
-			`SELECT activated_at IS NOT NULL FROM tenant_admins WHERE id = $1`, adminID,
-		).Scan(&live); err != nil {
-			return nil, fmt.Errorf("check grant activation: %w", err)
-		}
-		if live {
-			if err = revokeAdminScopeTokens(ctx, tx, in.TenantID, userID); err != nil {
-				return nil, err
-			}
+	// Read once, inside the transaction, and used for two decisions: whether to
+	// revoke tokens below, and whether an invitation is required after the commit.
+	// Both turn on the same fact — is this grant already live — so reading it
+	// twice would risk the two answers disagreeing.
+	var alreadyActive bool
+	if err = tx.QueryRow(ctx,
+		`SELECT activated_at IS NOT NULL FROM tenant_admins WHERE id = $1`, adminID,
+	).Scan(&alreadyActive); err != nil {
+		return nil, fmt.Errorf("check grant activation: %w", err)
+	}
+
+	if (changed || !existed) && alreadyActive {
+		if err = revokeAdminScopeTokens(ctx, tx, in.TenantID, userID); err != nil {
+			return nil, err
 		}
 	}
 
@@ -325,17 +422,36 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 
 	res := &InviteTenantAdminResult{Action: action}
 
-	// Every new grant is confirmed by the recipient, including one for an
-	// address that is already verified and already has a password. Skipping the
-	// email for those was what let an operator re-instate a removed
-	// administrator with no involvement from them; being verified proves the
-	// address is theirs, not that they agreed to administer anything.
+	// A PENDING grant is confirmed by the recipient, including one for an address
+	// that is already verified and already has a password. Skipping the email for
+	// those was what let an operator re-instate a removed administrator with no
+	// involvement from them; being verified proves the address is theirs, not that
+	// they agreed to administer anything.
 	//
-	// For an account that already has a password the link only confirms — it
-	// does not reset the password or end their sessions. See
+	// For an account that already has a password the link only confirms — it does
+	// not reset the password or end their sessions. See
 	// auth.InvitationService.Accept.
-	// s.invSvc is non-nil: checked before the transaction opened.
-	if err := s.invSvc.InviteRequired(ctx, in.TenantID, nil, userID, email, in.InviterName, nil); err != nil {
+	//
+	// An ALREADY ACTIVE grant is different, and is deliberately not re-invited.
+	// Widening a role the person already accepted and is actively using takes
+	// effect the instant the row is written — upsertTenantAdmin never clears
+	// activated_at — so the mail would gate nothing. Worse, invite() supersedes
+	// every outstanding invitation for that account
+	// (`UPDATE user_invitations SET used_at = NOW() WHERE user_id = $1`), so
+	// promoting an active co-owner in one tenant silently killed a genuine, live
+	// invitation they were holding for another, and minted a fresh claim token
+	// nobody needed. The consent argument does not apply either: they already
+	// consented to administering this tenant.
+	//
+	// Re-instatement stays safe because removal soft-deletes the tenant_admins
+	// row, so a re-invite falls to upsertTenantAdmin's ErrNoRows branch and
+	// INSERTs a fresh row with activated_at NULL — pending, and therefore invited.
+	if alreadyActive {
+		s.logger.Info().Str("email", email).Int64("tenant_id", in.TenantID).
+			Str("role", in.Role).
+			Msg("admin: grant widened for an already-active administrator; no invitation needed")
+	} else if err := s.invSvc.InviteRequired(ctx, in.TenantID, nil, userID, email, in.InviterName, nil); err != nil {
+		// s.invSvc is non-nil: checked before the transaction opened.
 		res.InviteError = err.Error()
 		s.logger.Error().Err(err).Str("email", email).Int64("tenant_id", in.TenantID).
 			Msg("admin: administrator added but the confirmation was not delivered")
@@ -403,6 +519,10 @@ func (s *Service) SetTenantAdminGrants(ctx context.Context, tenantID, adminID in
 	if err != nil {
 		return nil, err
 	}
+	// Mirror to admin_grants (00071), inside the same transaction.
+	if err = mirrorAdminGrants(ctx, tx, tenantID, userID); err != nil {
+		return nil, err
+	}
 	if changed {
 		if err = revokeAdminScopeTokens(ctx, tx, tenantID, userID); err != nil {
 			return nil, err
@@ -414,12 +534,29 @@ func (s *Service) SetTenantAdminGrants(ctx context.Context, tenantID, adminID in
 	return s.getTenantAdmin(ctx, tenantID, adminID)
 }
 
-// RemoveTenantAdmin revokes a tenant administrator.
+// RemoveTenantAdmin revokes a tenant administrator, without escalation checks.
 //
-// The users row survives — the person may still be an ordinary tenant-level
-// user, and deleting an identity because it lost an administrative role would
-// take their audit history with it. Only the administration is withdrawn.
+// Retained for callers that have already established authority themselves —
+// platform-admin paths and tests. Prefer RemoveTenantAdminAs, which enforces the
+// rules in grant_escalation.go: an owner may remove a co-owner in their own tenant
+// but not a peer owner, and nobody may remove themselves.
 func (s *Service) RemoveTenantAdmin(ctx context.Context, tenantID, adminID int64) error {
+	return s.removeTenantAdmin(ctx, tenantID, adminID, nil)
+}
+
+// RemoveTenantAdminAs revokes a tenant administrator on behalf of an actor, with
+// the escalation rules enforced.
+//
+// Rule 5 is the one that matters here: removing a peer owner is reserved to the
+// platform tier. Two owners able to remove each other means the tenant belongs to
+// whoever committed first, which is not a resolution anybody chose.
+func (s *Service) RemoveTenantAdminAs(ctx context.Context, tenantID, adminID int64, actor GrantActor) error {
+	return s.removeTenantAdmin(ctx, tenantID, adminID, &actor)
+}
+
+// removeTenantAdmin is the shared implementation. actor nil skips the
+// escalation rules; non-nil enforces them inside the transaction.
+func (s *Service) removeTenantAdmin(ctx context.Context, tenantID, adminID int64, actor *GrantActor) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin remove admin tx: %w", err)
@@ -441,6 +578,14 @@ func (s *Service) RemoveTenantAdmin(ctx context.Context, tenantID, adminID int64
 			return ErrNotFound
 		}
 		return fmt.Errorf("load administrator: %w", err)
+	}
+
+	// Escalation rules, inside the transaction and after the FOR UPDATE above, so
+	// the target's role cannot change underneath the decision.
+	if actor != nil {
+		if err = AssertMayRemove(ctx, tx, *actor, tenantID, userID); err != nil {
+			return err
+		}
 	}
 
 	// tenant_id in the predicate as well as id. The FOR UPDATE select above
@@ -473,6 +618,11 @@ func (s *Service) RemoveTenantAdmin(ctx context.Context, tenantID, adminID int64
 		`UPDATE tenants SET primary_admin_id = NULL WHERE id = $1 AND primary_admin_id = $2`, tenantID, adminID,
 	); err != nil {
 		return fmt.Errorf("clear primary administrator: %w", err)
+	}
+	// Retire the mirror rows for THIS tenant only. A multi-tenant administrator
+	// removed here keeps whatever they administer elsewhere.
+	if err = mirrorAdminGrants(ctx, tx, tenantID, userID); err != nil {
+		return err
 	}
 
 	// Two distinct guards, because "the tenant still has an owner" and "the
@@ -706,8 +856,24 @@ func upsertTenantAdmin(ctx context.Context, tx pgx.Tx, tenantID, userID int64, r
 		return 0, false, fmt.Errorf("look up tenant admin: %w", err)
 	}
 
+	// An invitation may only ADD reach, so the narrowing direction is refused
+	// rather than written. Previously this branch fired for any role difference:
+	// owner → co_owner wrote through, the mirror replaced the owner's
+	// NULL-application grant with app-scoped rows, and the token revoke fired
+	// because reach had narrowed — so an owner who invited themselves as co-owner
+	// silently demoted themselves to one application and was signed out.
+	//
+	// Refused here rather than in InviteTenantAdmin because this is the function
+	// that holds the FOR UPDATE lock on the row: checking earlier would race a
+	// concurrent promotion between the read and the write.
+	if existingRole == auth.AdminRoleOwner && role == auth.AdminRoleCoOwner {
+		return 0, false, ErrInviteWouldDemote
+	}
+
 	if existingRole != role {
-		// The promote trigger clears any grants when this widens to owner.
+		// Only widening reaches here (co_owner → owner). The promote trigger
+		// clears any application grants, since an owner's reach is the absence
+		// of them.
 		if _, err = tx.Exec(ctx,
 			`UPDATE tenant_admins SET admin_role = $1, updated_at = NOW() WHERE id = $2`, role, adminID,
 		); err != nil {

@@ -356,3 +356,107 @@ func keysOf(m map[string]mailer.AdminActivityEmail) []string {
 	}
 	return out
 }
+
+// An invitation announces itself. A second "your access has changed" mail
+// alongside it said nothing had changed yet was already true, and closed with
+// "you will see the change the next time you sign in" — an instruction a
+// brand-new invitee cannot follow, because they have no account until they
+// accept. It also competed with the invitation, the one mail carrying the link
+// they actually need.
+func TestEmit_DoesNotTellAPendingInviteeTheirAccessChanged(t *testing.T) {
+	f := newNotifyFixture(t)
+	m := &captureMailer{}
+	s := f.liveSink(t, m)
+
+	// A tenant_admins row that has NOT been accepted, which is the state every
+	// invitation starts in.
+	var adminID int64
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
+		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.coOwner).Scan(&adminID); err != nil {
+		t.Fatalf("find co-owner admin row: %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE tenant_admins SET activated_at = NULL WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("make the grant pending: %v", err)
+	}
+
+	s.Emit([]audit.Event{
+		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminInvited, "tenant_admin", itoa(adminID)),
+	})
+	s.Close()
+
+	if got := m.accessNotices(); len(got) != 0 {
+		t.Errorf("sent %d access notices to a pending invitee, want 0 — the invitation covers it", len(got))
+	}
+	// The tier-up copies still go out: the people who oversee the tenant do need
+	// to know an invitation was issued.
+	if len(m.messages()) == 0 {
+		t.Error("no admin-activity notification was sent; the tier-up audience must still hear about it")
+	}
+}
+
+// The inverse: once the grant is live, an invitation event that WIDENS it is a
+// real change to something the recipient already holds, so it is announced.
+func TestEmit_TellsAnActiveAdminWhenAnInvitationWidensTheirGrant(t *testing.T) {
+	f := newNotifyFixture(t)
+	m := &captureMailer{}
+	s := f.liveSink(t, m)
+
+	var adminID int64
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
+		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.coOwner).Scan(&adminID); err != nil {
+		t.Fatalf("find co-owner admin row: %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE tenant_admins SET activated_at = NOW() WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("activate the grant: %v", err)
+	}
+
+	s.Emit([]audit.Event{
+		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminInvited, "tenant_admin", itoa(adminID)),
+	})
+	s.Close()
+
+	notices := m.accessNotices()
+	if len(notices) != 1 {
+		t.Fatalf("sent %d access notices, want 1 to the already-active administrator", len(notices))
+	}
+	if notices[0].To != f.coOwner {
+		t.Errorf("notice went to %s, want %s", notices[0].To, f.coOwner)
+	}
+}
+
+// A withdrawal must reach a pending invitee too: it is the most consequential
+// message this feature sends, and suppressing it would leave somebody believing
+// an invitation is still open.
+func TestEmit_TellsAPendingInviteeTheirAccessWasWithdrawn(t *testing.T) {
+	f := newNotifyFixture(t)
+	m := &captureMailer{}
+	s := f.liveSink(t, m)
+
+	var adminID int64
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
+		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.coOwner).Scan(&adminID); err != nil {
+		t.Fatalf("find co-owner admin row: %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE tenant_admins SET activated_at = NULL WHERE id = $1`, adminID); err != nil {
+		t.Fatalf("make the grant pending: %v", err)
+	}
+
+	s.Emit([]audit.Event{
+		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminRemoved, "tenant_admin", itoa(adminID)),
+	})
+	s.Close()
+
+	notices := m.accessNotices()
+	if len(notices) != 1 {
+		t.Fatalf("sent %d access notices for a withdrawal, want 1 even though the grant was pending", len(notices))
+	}
+	if notices[0].ActionLabel != "Your administrator access was withdrawn" {
+		t.Errorf("ActionLabel = %q, want the withdrawal phrasing", notices[0].ActionLabel)
+	}
+}

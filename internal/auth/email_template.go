@@ -172,6 +172,28 @@ func (s *EmailTemplateService) Get(ctx context.Context, tenantID int64, appRowID
 		out.ApplicationID = &idStr
 	}
 	out.UpdatedAt = &updatedAt
+
+	// A SUPPRESSION row — inactive with empty bodies — holds no content of its
+	// own. It exists to say "do not send this", which is how a new application
+	// starts (migration 00073), and Resolve already ignores it so the built-in
+	// default is what would go out once it is enabled.
+	//
+	// Fill the editor from that default rather than returning the empty strings
+	// literally. Otherwise the admin UI shows a blank subject and body for every
+	// template on a new application, and the operator has to retype content that
+	// already exists — or worse, saves the blank as their template.
+	//
+	// IsDefault stays true: the content IS the maintained default, so the UI
+	// correctly offers "customise" rather than "reset", and enabling without
+	// editing keeps receiving upstream improvements.
+	if !out.IsActive && out.Subject == "" && out.HTMLBody == "" {
+		if def, ok := mailer.BuiltinTemplate(tt); ok {
+			out.Subject = def.Subject
+			out.HTMLBody = def.HTML
+			out.TextBody = def.Text
+			out.IsDefault = true
+		}
+	}
 	return &out, nil
 }
 

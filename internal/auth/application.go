@@ -14,6 +14,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/mailer"
 )
 
 const (
@@ -42,6 +44,11 @@ var ErrInvalidScope = errors.New("invalid scope — each scope must be a reserve
 
 // validAppTypes mirrors the CHECK constraint on oauth_clients.app_type.
 var validAppTypes = map[string]bool{"web": true, "spa": true, "m2m": true, "native": true}
+
+// appTypeM2M is the machine-to-machine client type: a backend service with no
+// user and no redirect, authenticating with client_credentials. It is the default
+// for new applications here.
+const appTypeM2M = "m2m"
 
 const (
 	maxScopesPerApp = 50
@@ -162,10 +169,47 @@ func validateRedirectURIs(uris []string) error {
 	return nil
 }
 
+// grantTypesForAppType derives the OAuth grants a client type may use.
+//
+// Until now every application took the column default
+// {authorization_code, refresh_token} whatever its declared type, so an
+// application created as "m2m" could not perform the client_credentials grant at
+// all: /oauth/token refused it at the GrantTypes check, with nothing pointing at
+// the type as the cause. The failure appeared only when a backend service tried
+// to fetch its first token.
+//
+//   - m2m has no user and no redirect, so client_credentials is the only grant
+//     that applies. refresh_token is excluded deliberately -- RFC 6749 §4.4.3 says
+//     a client_credentials response MUST NOT include a refresh token, and the
+//     client can request a new access token with credentials it already holds.
+//   - web, spa and native are user-facing redirect flows: authorization_code,
+//     plus refresh_token so the user is not re-prompted.
+func grantTypesForAppType(appType string) []string {
+	if appType == appTypeM2M {
+		return []string{"client_credentials"}
+	}
+	return []string{"authorization_code", "refresh_token"}
+}
+
+// isPublicClient reports whether a client type cannot keep a secret.
+//
+// spa runs in a browser and native ships to a user's device, so any embedded
+// secret is readable by that user; RFC 8252 §8.1 and the OAuth browser-app BCP
+// treat both as public clients that authenticate with PKCE alone. web and m2m run
+// on servers the operator controls and are confidential.
+func isPublicClient(appType string) bool {
+	return appType == "spa" || appType == "native"
+}
+
 // normalizeAppType applies the default type and validates against validAppTypes.
+//
+// The default is m2m: every application registered in this system is a backend
+// service using the client_credentials grant. Defaulting to web instead handed
+// such a service authorization_code + refresh_token -- grants it can never
+// exercise -- so an omitted app_type produced a client that could not get a token.
 func normalizeAppType(appType string) (string, error) {
 	if appType == "" {
-		return "web", nil
+		return appTypeM2M, nil
 	}
 	if !validAppTypes[appType] {
 		return "", ErrInvalidAppType
@@ -215,6 +259,10 @@ type AppSummary struct {
 type AppDetail struct {
 	ID       string   `json:"id"`
 	Name     string   `json:"name"`
+	// DisplayName is the optional end-user-facing label. Empty means fall back to
+	// Name, which is what every read does — so a consumer can render DisplayName
+	// or Name without checking which is set.
+	DisplayName string `json:"display_name"`
 	AppType  string   `json:"app_type"`
 	ClientID string   `json:"client_id"`
 	Scopes   []string `json:"scopes"`
@@ -227,7 +275,12 @@ type AppDetail struct {
 	// FirstParty false means a consent screen is required before a code may be
 	// issued. No consent screen exists yet, so /oauth/authorize refuses such a
 	// client outright rather than skipping consent silently.
-	FirstParty bool      `json:"first_party"`
+	FirstParty bool `json:"first_party"`
+	// GrantTypes is derived from AppType, never set directly: /oauth/token
+	// enforces it, so it is the field that decides whether the application can get
+	// a token at all. Exposed read-only because an operator debugging a refused
+	// token request has no other way to see it.
+	GrantTypes []string  `json:"grant_types"`
 	IsActive   bool      `json:"is_active"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
@@ -306,10 +359,22 @@ func (s *ApplicationService) CreateApplicationWithOptions(ctx context.Context, t
 	if redirectURIs == nil {
 		redirectURIs = []string{}
 	}
-	// Defaults mirror the column defaults in migration 00067 rather than being
-	// re-derived here, so there is one answer to "what does a new client get".
+	// Defaults follow from the declared type rather than from the column
+	// defaults, so choosing a type yields a client that can actually perform that
+	// type's flow.
+	//
+	// PKCE: a public client has no secret, so PKCE is the only thing binding an
+	// authorization code to the client that requested it -- not overridable there.
+	// m2m has no authorization code at all, so PKCE does not apply and claiming
+	// otherwise would misdescribe the row. Only the confidential redirect flow
+	// leaves the choice to the caller.
 	requirePKCE := true
-	if opts.RequirePKCE != nil {
+	switch {
+	case normType == appTypeM2M:
+		requirePKCE = false
+	case isPublicClient(normType):
+		requirePKCE = true
+	case opts.RequirePKCE != nil:
 		requirePKCE = *opts.RequirePKCE
 	}
 	firstParty := true
@@ -323,18 +388,36 @@ func (s *ApplicationService) CreateApplicationWithOptions(ctx context.Context, t
 	}
 	secretHash := HashToken(rawSecret)
 
+	// One transaction: the application and its email suppression rows are the same
+	// fact. Inserting the client and then failing to seed would leave an
+	// application sending all thirteen kinds of mail — the exact state this is
+	// meant to prevent, and invisible until a user registered.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin create application tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
 	var rowID int64
 	var createdAt time.Time
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO oauth_clients
 		    (tenant_id, name, app_type, client_id, client_secret_hash, scopes,
-		     redirect_uris, require_pkce, first_party, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+		     redirect_uris, require_pkce, first_party, grant_types, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
 		RETURNING id, created_at
 	`, tenantID, name, normType, clientID, secretHash, scopes,
-		redirectURIs, requirePKCE, firstParty).Scan(&rowID, &createdAt)
+		redirectURIs, requirePKCE, firstParty, grantTypesForAppType(normType)).Scan(&rowID, &createdAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert application: %w", err)
+	}
+
+	if err = seedSuppressedEmailTemplates(ctx, tx, tenantID, rowID); err != nil {
+		return nil, err
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit create application tx: %w", err)
 	}
 
 	return &AppResult{
@@ -430,7 +513,12 @@ func (s *ApplicationService) ListApplicationsPaginated(ctx context.Context, tena
 
 	args = append(args, f.Limit, (f.Page-1)*f.Limit)
 	query := `
-		SELECT id, name, app_type, client_id, (deleted_at IS NULL) AS is_active, created_at, updated_at
+		-- is_active must reflect BOTH conditions that make a client unusable: the
+		-- stored suspension flag AND the soft delete. Reading the column alone
+		-- reported a deleted application as active, because DeactivateApplication
+		-- sets deleted_at and never touches is_active.
+		SELECT id, name, app_type, client_id, (is_active AND deleted_at IS NULL) AS is_active,
+		       created_at, updated_at
 		FROM   oauth_clients ` + where + `
 		ORDER  BY created_at DESC
 		LIMIT  $` + strconv.Itoa(len(args)-1) + ` OFFSET $` + strconv.Itoa(len(args))
@@ -472,12 +560,14 @@ func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID
 	var a AppDetail
 	var id int64
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, name, app_type, client_id, scopes, redirect_uris, require_pkce, first_party,
-		       (deleted_at IS NULL) AS is_active, created_at, updated_at
+		SELECT id, name, COALESCE(NULLIF(display_name, ''), name) AS display_name,
+		       app_type, client_id, scopes, redirect_uris, require_pkce, first_party,
+		       grant_types, (is_active AND deleted_at IS NULL) AS is_active,
+		       created_at, updated_at
 		FROM   oauth_clients
 		WHERE  id = $1 AND tenant_id = $2
-	`, appID, tenantID).Scan(&id, &a.Name, &a.AppType, &a.ClientID, &a.Scopes,
-		&a.RedirectURIs, &a.RequirePKCE, &a.FirstParty, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	`, appID, tenantID).Scan(&id, &a.Name, &a.DisplayName, &a.AppType, &a.ClientID, &a.Scopes,
+		&a.RedirectURIs, &a.RequirePKCE, &a.FirstParty, &a.GrantTypes, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAppNotFound
@@ -508,9 +598,18 @@ type AppUpdate struct {
 	// RedirectURIs nil leaves the list unchanged; an empty non-nil slice clears
 	// it, matching how scopes already behaves.
 	RedirectURIs []string
+	// DisplayName empty leaves it unchanged. Clearing it back to "fall back to
+	// name" is therefore not expressible here yet; that needs a *string tri-state,
+	// the same limitation UpdateTenant carries.
+	DisplayName string
 	// RequirePKCE / FirstParty nil leaves the flag unchanged.
 	RequirePKCE *bool
 	FirstParty  *bool
+	// IsActive nil leaves the flag unchanged. False suspends the application:
+	// its client credentials stop authenticating, while the row, its client_id
+	// and its audit history are preserved — unlike DeactivateApplication, which
+	// soft-deletes. Reversible by setting it back to true.
+	IsActive *bool
 }
 
 // UpdateApplication updates name, app_type and/or scopes only. Retained with
@@ -524,8 +623,9 @@ func (s *ApplicationService) UpdateApplication(ctx context.Context, tenantID, ap
 // authorization-server fields added in issue #6.
 func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, tenantID, appID int64, name, appType string, scopes []string, upd AppUpdate) (*AppDetail, error) {
 	if name == "" && appType == "" && scopes == nil &&
-		upd.RedirectURIs == nil && upd.RequirePKCE == nil && upd.FirstParty == nil {
-		return nil, fmt.Errorf("nothing to update — provide name, app_type, scopes, redirect_uris, require_pkce, and/or first_party")
+		upd.RedirectURIs == nil && upd.RequirePKCE == nil && upd.FirstParty == nil &&
+		upd.IsActive == nil && upd.DisplayName == "" {
+		return nil, fmt.Errorf("nothing to update — provide name, display_name, app_type, scopes, redirect_uris, require_pkce, first_party, and/or is_active")
 	}
 	if appType != "" {
 		if _, err := normalizeAppType(appType); err != nil {
@@ -539,6 +639,40 @@ func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, t
 		return nil, err
 	}
 
+	// Changing the type re-derives grant_types, because the two cannot disagree:
+	// a row left as authorization_code after being switched to m2m describes a
+	// client /oauth/token will refuse. nil when the type is unchanged, so COALESCE
+	// keeps whatever the row already had.
+	var newGrantTypes []string
+	if appType != "" {
+		newGrantTypes = grantTypesForAppType(appType)
+	}
+
+	// A type change re-derives require_pkce for the same reason it re-derives
+	// grant_types: the flag describes a property of the type's flow, not a
+	// standalone preference. Converting a web/spa client to m2m used to leave
+	// require_pkce = true on a row with no authorization-code flow at all — the
+	// exact contradiction CreateApplicationWithOptions forces false to avoid — and
+	// converting m2m to spa left it false on a public client that has nothing else
+	// binding a code to its requester.
+	//
+	// The rule matches the create path exactly: m2m false, public true, and only
+	// the confidential redirect flow (web) leaves the choice to the caller. An
+	// explicit upd.RequirePKCE therefore still wins on a web type change and is
+	// still honoured when the type is unchanged (pkceOverride nil), so no existing
+	// caller loses control of the flag.
+	pkceOverride := upd.RequirePKCE
+	if appType != "" {
+		derived := true
+		switch {
+		case appType == appTypeM2M:
+			derived = false
+			pkceOverride = &derived
+		case isPublicClient(appType):
+			pkceOverride = &derived
+		}
+	}
+
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oauth_clients
 		SET    name          = COALESCE(NULLIF($1, ''), name),
@@ -547,9 +681,12 @@ func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, t
 		       redirect_uris = COALESCE($6, redirect_uris),
 		       require_pkce  = COALESCE($7, require_pkce),
 		       first_party   = COALESCE($8, first_party),
+		       is_active     = COALESCE($9, is_active),
+		       grant_types   = COALESCE($10, grant_types),
+		       display_name  = COALESCE(NULLIF($11, ''), display_name),
 		       updated_at    = NOW()
 		WHERE  id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-	`, name, appType, scopes, appID, tenantID, upd.RedirectURIs, upd.RequirePKCE, upd.FirstParty)
+	`, name, appType, scopes, appID, tenantID, upd.RedirectURIs, pkceOverride, upd.FirstParty, upd.IsActive, newGrantTypes, upd.DisplayName)
 	if err != nil {
 		return nil, fmt.Errorf("update application: %w", err)
 	}
@@ -642,6 +779,13 @@ func (s *ApplicationService) ValidateClientID(ctx context.Context, tenantID int6
 // attribute audit events for application-scoped flows — including failures —
 // so the trail always carries the tenant + application the request targeted.
 // Cheap indexed lookup; ok=false when the client_id is unknown.
+//
+// Deliberately does NOT filter on is_active. A suspended application's rejected
+// token attempts still have to be attributed to their tenant and application —
+// dropping them from the audit trail would blind the operator exactly when a
+// suspended client starts retrying. Callers that must refuse a suspended client
+// (AuthenticateClient, LookupClient, the social-login resolve) enforce that
+// themselves.
 func (s *ApplicationService) ResolveClient(ctx context.Context, clientID string) (tenantID, appID int64, ok bool) {
 	if clientID == "" {
 		return 0, 0, false
@@ -663,7 +807,7 @@ func (s *ApplicationService) AuthenticateClient(ctx context.Context, clientID, c
 	err = s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id
 		FROM   oauth_clients
-		WHERE  client_id = $1 AND client_secret_hash = $2 AND deleted_at IS NULL
+		WHERE  client_id = $1 AND client_secret_hash = $2 AND deleted_at IS NULL AND is_active
 	`, clientID, HashToken(clientSecret)).Scan(&appID, &tenantID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -672,4 +816,57 @@ func (s *ApplicationService) AuthenticateClient(ctx context.Context, clientID, c
 		return 0, 0, fmt.Errorf("authenticate client: %w", err)
 	}
 	return tenantID, appID, nil
+}
+
+// seedSuppressedEmailTemplates disables every customizable email type for a
+// newly created application.
+//
+// Email delivery is opt-in per application (migration 00073). A new application
+// is a blank slate: it sends nothing until its operator turns a template on.
+// Without these rows, absence in email_templates means "send the built-in
+// default" (migration 00060), so creating an application silently switched on
+// every kind of outbound mail — verification, reset, MFA codes, invitations —
+// before anyone had configured a sender or asked for it.
+//
+// The rows carry EMPTY bodies rather than a copy of the built-in default, and
+// that distinction is the whole design:
+//
+//   - EmailTemplateService.Resolve filters is_active = true, so an inactive row
+//     is invisible to content resolution. Enabling the row later returns the
+//     MAINTAINED default, which keeps receiving improvements.
+//   - Seeding the default's content instead would fork it at today's wording,
+//     permanently — the trap the admin UI warns about when disabling a default.
+//   - IsTypeEnabled reads is_active alone, so suppression works regardless of
+//     what the bodies hold.
+//
+// mailer.AllTemplateTypes is the source of truth: it already excludes types that
+// are not operator-customizable, and a type added there is suppressed here
+// automatically rather than quietly defaulting to on.
+//
+// Takes a tx because it must commit with the application row. An application
+// that exists while its suppression rows do not is precisely the state this
+// prevents, and it would be invisible until a user registered.
+func seedSuppressedEmailTemplates(ctx context.Context, tx pgx.Tx, tenantID, appRowID int64) error {
+	types := make([]string, 0, len(mailer.AllTemplateTypes))
+	for _, tt := range mailer.AllTemplateTypes {
+		types = append(types, string(tt))
+	}
+
+	// One statement over the whole set: thirteen round trips inside the
+	// application-creation transaction would hold it open for no reason.
+	//
+	// ON CONFLICT DO NOTHING for idempotency. The partial unique index
+	// email_templates_app_key covers exactly this shape, so a retry — or a caller
+	// that seeds twice — cannot fail on a duplicate and cannot overwrite a
+	// template an operator has already configured.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO email_templates
+		    (tenant_id, application_id, template_type, subject, html_body, text_body, is_active)
+		SELECT $1, $2, t, '', '', '', false
+		FROM unnest($3::text[]) AS t
+		ON CONFLICT DO NOTHING
+	`, tenantID, appRowID, types); err != nil {
+		return fmt.Errorf("seed suppressed email templates: %w", err)
+	}
+	return nil
 }
