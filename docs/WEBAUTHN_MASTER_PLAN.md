@@ -300,8 +300,8 @@ authenticator's response is evidence.
 | 3 | Challenge single-use, 120s, consumed by `GETDEL` before verification | ✅ tested (replay → `challenge_expired`) |
 | 4 | `clientData.type` per ceremony | ✅ library |
 | 5 | Opaque 64-byte user handle, not email, not PK | ✅ verified in DB |
-| 6 | Sign-counter regression → reject | ✅ implemented. **Inert here**: platform authenticators report 0, so only a decrease from non-zero triggers. Correct, but means this control does nothing for most real credentials. |
-| 7 | `backup_eligible` immutable → reject on change | ✅ implemented, not triggerable in testing |
+| 6 | Sign-counter regression → reject | ✅ implemented. Fires once a credential has reported a non-zero counter, on any asserted value at or below the stored one — a reset to zero included. **Inert here**: platform authenticators report 0 forever, so this control does nothing for most real credentials. |
+| 7 | `backup_eligible` immutable → reject on change | ✅ implemented, not triggerable on real hardware. Compared **after** the assertion verifies, so containment cannot be provoked with a credential ID alone. |
 | 8 | UV enforced when policy requires | ✅ implemented; live-verified only in the positive direction |
 | 9 | Every lookup scoped by `tenant_id` + `rp_id` | ✅ |
 | 10 | Duplicate credential → clean 409 | ✅ |

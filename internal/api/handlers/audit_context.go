@@ -86,6 +86,13 @@ func authFailureReason(err error) string {
 		return "origin_not_allowed"
 	case errors.Is(err, auth.ErrChallengeExpired):
 		return "challenge_expired"
+	// Distinct from passkey_verification_failed even though the CLIENT sees the
+	// same opaque response: an assertion that verified but carried no gesture
+	// under a require_uv policy is a configuration/UX story, not a possible
+	// attack, and an operator reading a wall of "verification failed" cannot tell
+	// the two apart.
+	case errors.Is(err, auth.ErrUserVerificationRequired):
+		return "passkey_uv_required"
 	case errors.Is(err, auth.ErrWebAuthnVerification):
 		return "passkey_verification_failed"
 	case containsMsg(err, "invalid credentials"):
@@ -186,7 +193,7 @@ func defaultStatusFor(action, status string) int {
 func statusForError(err error) int {
 	switch authFailureReason(err) {
 	case "invalid_credentials", "invalid_client", "email_not_verified", "invalid_or_expired_code",
-		"passkey_cloned", "passkey_verification_failed", "challenge_expired":
+		"passkey_cloned", "passkey_verification_failed", "passkey_uv_required", "challenge_expired":
 		return http.StatusUnauthorized
 	case "passkeys_disabled", "passwordless_disabled", "origin_not_allowed":
 		return http.StatusForbidden
@@ -220,6 +227,8 @@ func safeErrorMessage(err error) string {
 		return "passkey signature counter or backup flag indicates a cloned authenticator"
 	case "passkey_verification_failed":
 		return "passkey assertion could not be verified"
+	case "passkey_uv_required":
+		return "passkey assertion carried no user-verification gesture and policy requires one"
 	case "challenge_expired":
 		return "challenge expired or already used"
 	case "passkeys_disabled":

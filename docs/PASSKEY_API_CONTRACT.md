@@ -249,10 +249,16 @@ edit it would change the default for all of them.
 }
 ```
 
-Sending `rp_id: ""` reverts to the server's relying party. `origins` may only be
-set together with `rp_id` — origins without one would look configured while the
-ceremony ran under a different RP, creating credentials the browser then never
-offers.
+Sending `rp_id: ""` reverts to the server's relying party, **and clears
+`origins` with it** — whether or not you mention `origins` in the same call. The
+two are one setting: `origins` may only be set together with `rp_id`, because
+origins without one would look configured while the ceremony ran under a
+different RP, creating credentials the browser then never offers. A row that
+inherits its relying party therefore cannot keep a hand-written allow-list for a
+different one.
+
+Sending `rp_id: ""` and a non-empty `origins` in the **same** call is refused
+with `400 invalid_policy`: that is a contradiction only the caller can resolve.
 
 The response reports the row **and** what the scope resolves to:
 
@@ -280,18 +286,25 @@ alternative is an account permanently reachable from a stolen laptop.
 |---|---|
 | `auth.passkey_registered` | Credential stored; metadata carries the model and RP |
 | `auth.passkey_login` | Sign-in succeeded; metadata carries `user_verified` |
-| `auth.passkey_login_failed` | Any rejection. No user id — inherent, since only a verified assertion would have named them |
+| `auth.passkey_login_failed` | Any rejection, **including policy refusals** (`passkeys_disabled`, `passwordless_disabled`, `origin_not_allowed`) and `passkey_uv_required`. No user id — inherent, since only a verified assertion would have named them |
 | `auth.passkey_renamed` | Label changed |
 | `auth.passkey_removed` | Revoked; `by_admin: true` when support did it |
 | `auth.passkey_clone_detected` | **See below** |
-| `admin.passkey_policy_updated` | Policy write; metadata carries the effective result |
+| `admin.passkey_policy_updated` | Policy write **or clear**; `operation` is `updated` or `cleared`. Metadata carries the resulting effective policy when it could be read — `effective_policy_read: false` marks the rare case where the change committed but the follow-up read failed. The event fires either way |
 
 ### `auth.passkey_clone_detected`
 
-Fires when an assertion shows a credential's private key exists in more than one
-place — a backup-eligibility flag that changed, or a signature counter that went
-backwards. It is the only auth event in the system that implies key material was
-extracted from an authenticator.
+Fires when a **cryptographically verified** assertion shows a credential's
+private key exists in more than one place — a backup-eligibility flag that
+changed, or a signature counter that failed to advance (including a reset to
+zero from a non-zero stored value). It is the only auth event in the system that
+implies key material was extracted from an authenticator.
+
+The assertion is verified *before* the comparison runs, deliberately.
+Containment is destructive and account-wide, and a credential ID is an
+identifier rather than a secret — so anything less would let whoever learned one
+sign an account out everywhere without possessing the key. An assertion that
+fails verification is refused as `webauthn_failed` and contains nothing.
 
 By the time the event is written, containment has **already happened**: the
 credential is deactivated, every session for the account is revoked
@@ -306,14 +319,21 @@ session-ended state and their passkey list.
 Two honest notes on the detection:
 
 - **The signature-counter control is inert for most real passkeys.** Apple and
-  Google authenticators always report 0, so only a decrease from a non-zero
-  stored value triggers. Backup-eligibility is the control that will actually
-  fire.
-- The checks run **before** library verification, and that ordering is
-  load-bearing. `go-webauthn` validates the backup-eligibility flag itself and
-  rejects a change with a generic bad request — if it gets there first, a cloned
-  authenticator is indistinguishable from a bad signature and none of the
-  containment above runs.
+  Google authenticators always report 0, so it only triggers once a credential
+  has reported a non-zero counter — after which any value at or below the stored
+  one counts, a reset to zero included. Backup-eligibility is the control that
+  will actually fire.
+- The comparison runs **after** the assertion is verified, and the verification
+  is handed a copy of the stored credential whose backup-eligibility flag is
+  aligned to the asserted one. That indirection is load-bearing in both
+  directions. `go-webauthn` validates the flag itself and rejects a change with a
+  generic bad request — so without the aligned copy a cloned authenticator would
+  be indistinguishable from a bad signature and none of the containment above
+  would run. And without verification first, containment would fire on unverified
+  input, which is an unauthenticated account lockout for anyone who learns a
+  credential ID. The library's own flag check sits after its signature check, so
+  aligning the copy suppresses only that one comparison and removes no
+  cryptographic guarantee.
 
 ---
 

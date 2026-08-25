@@ -98,7 +98,7 @@ func requestOrigin(c echo.Context) string {
 // @Failure      401  {object}  map[string]string
 // @Failure      403  {object}  map[string]string  "passkeys disabled for this tenant, or origin not allowed"
 // @Failure      409  {object}  map[string]string  "credential limit reached"
-// @Router       /auth/passkey/register/begin [post]
+// @Router       /api/v1/auth/passkey/register/begin [post]
 func (h *WebAuthnHandler) RegisterBegin(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -137,7 +137,7 @@ func (h *WebAuthnHandler) RegisterBegin(c echo.Context) error {
 // @Failure      401  {object}  map[string]string
 // @Failure      403  {object}  map[string]string
 // @Failure      409  {object}  map[string]string
-// @Router       /auth/passkey/register/complete [post]
+// @Router       /api/v1/auth/passkey/register/complete [post]
 func (h *WebAuthnHandler) RegisterComplete(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -188,7 +188,7 @@ func (h *WebAuthnHandler) RegisterComplete(c echo.Context) error {
 // @Produce      json
 // @Success      200  {object}  webauthnBeginResponse
 // @Failure      403  {object}  map[string]string  "passkeys or passwordless sign-in disabled, or origin not allowed"
-// @Router       /auth/passkey/login/begin [post]
+// @Router       /api/v1/auth/passkey/login/begin [post]
 func (h *WebAuthnHandler) LoginBegin(c echo.Context) error {
 	assertion, token, err := h.svc.LoginBegin(c.Request().Context(), requestOrigin(c))
 	if err != nil {
@@ -212,7 +212,7 @@ func (h *WebAuthnHandler) LoginBegin(c echo.Context) error {
 // @Success      200  {object}  auth.AuthResult
 // @Failure      401  {object}  map[string]string
 // @Failure      403  {object}  map[string]string
-// @Router       /auth/passkey/login/complete [post]
+// @Router       /api/v1/auth/passkey/login/complete [post]
 func (h *WebAuthnHandler) LoginComplete(c echo.Context) error {
 	result, id, err := h.authSvc.LoginWebAuthn(c.Request().Context(), c.QueryParam("ceremony_token"), c.Request())
 	if err != nil {
@@ -243,7 +243,7 @@ func (h *WebAuthnHandler) LoginComplete(c echo.Context) error {
 // @Failure      400  {object}  map[string]string  "application-scoped account — cookies are not available"
 // @Failure      401  {object}  map[string]string
 // @Failure      403  {object}  map[string]string
-// @Router       /auth/passkey/session [post]
+// @Router       /api/v1/auth/passkey/session [post]
 func (h *WebAuthnHandler) SessionLoginComplete(c echo.Context) error {
 	result, id, err := h.authSvc.LoginWebAuthn(c.Request().Context(), c.QueryParam("ceremony_token"), c.Request())
 	if err != nil {
@@ -305,6 +305,12 @@ func (h *WebAuthnHandler) loginFailure(c echo.Context, err error) error {
 		errors.Is(err, auth.ErrPasswordlessNotAllowed),
 		errors.Is(err, auth.ErrOriginNotAllowed),
 		errors.Is(err, auth.ErrWebAuthnNotConfigured):
+		// Audited like any other refused sign-in. A policy refusal at COMPLETE has
+		// already resolved a credential to an account, so this is a real failed
+		// attempt against a real account and the one thing an auditor asking "who
+		// tried to sign in while passkeys were switched off" has to be able to
+		// find. Recorded before the response so the return path cannot skip it.
+		h.auditLoginFailed(c, err)
 		return h.passkeyError(c, "", "passkey login", err)
 	}
 
@@ -349,7 +355,7 @@ func (h *WebAuthnHandler) loginRejected(c echo.Context) error {
 // @Security     BearerAuth
 // @Success      200  {array}   auth.StoredCredential
 // @Failure      401  {object}  map[string]string
-// @Router       /auth/me/passkeys [get]
+// @Router       /api/v1/auth/me/passkeys [get]
 func (h *WebAuthnHandler) ListCredentials(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -381,7 +387,7 @@ func (h *WebAuthnHandler) ListCredentials(c echo.Context) error {
 // @Success      200  {object}  auth.StoredCredential
 // @Failure      400  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
-// @Router       /auth/me/passkeys/{id} [patch]
+// @Router       /api/v1/auth/me/passkeys/{id} [patch]
 func (h *WebAuthnHandler) RenameCredential(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -419,7 +425,7 @@ func (h *WebAuthnHandler) RenameCredential(c echo.Context) error {
 // @Success      204  "removed"
 // @Failure      404  {object}  map[string]string
 // @Failure      409  {object}  map[string]string  "last remaining sign-in method"
-// @Router       /auth/me/passkeys/{id} [delete]
+// @Router       /api/v1/auth/me/passkeys/{id} [delete]
 func (h *WebAuthnHandler) RevokeCredential(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
 	if !ok || claims == nil {
@@ -495,7 +501,12 @@ func (h *WebAuthnHandler) passkeyError(c echo.Context, userID, op string, err er
 		// accepting it would leave them with a passkey that never works.
 		return c.JSON(http.StatusBadRequest, body{
 			"This authenticator cannot create a passkey that works for sign-in. Try a different device or your device's built-in passkey.", "not_discoverable"})
-	case errors.Is(err, auth.ErrWebAuthnVerification):
+	case errors.Is(err, auth.ErrWebAuthnVerification),
+		errors.Is(err, auth.ErrUserVerificationRequired):
+		// Deliberately one arm and one message. ErrUserVerificationRequired is a
+		// separate sentinel so the LOG and the audit row can say which refusal it
+		// was; telling the client apart would hand a caller a way to learn that a
+		// credential exists and only the gesture was missing.
 		return c.JSON(http.StatusBadRequest, body{
 			"The passkey could not be verified.", "verification_failed"})
 	default:

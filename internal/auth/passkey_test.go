@@ -1,9 +1,12 @@
 package auth_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/go-webauthn/webauthn/protocol"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -269,6 +272,53 @@ func TestPasskeyPolicyMostSpecificWins(t *testing.T) {
 	}
 }
 
+// TestPasskeyPolicyClearRPIDClearsOrigins covers the documented
+// clear-to-inherit operation on a row that has custom origins.
+//
+// rp_id and origins are one setting as far as the schema is concerned —
+// constraint passkey_policies_origins_need_rp_id forbids origins without an
+// rp_id, because an allow-list means nothing without the relying party it is an
+// allow-list FOR. So {"rp_id": ""} has to take the origins with it; leaving them
+// behind turned the contract's own example into a constraint violation for every
+// tenant that had configured its own domain.
+func TestPasskeyPolicyClearRPIDClearsOrigins(t *testing.T) {
+	f := newPasskeyFixture(t)
+
+	yes := true
+	rpID := "acme.test"
+	origins := []string{"https://acme.test"}
+	if _, err := f.svc.Policy().SetPolicy(f.ctx, &f.tenantID, nil, auth.PasskeyPolicyUpdate{
+		AllowPasskeys: &yes, RPID: &rpID, Origins: &origins,
+	}); err != nil {
+		t.Fatalf("SetPolicy(custom rp): %v", err)
+	}
+
+	// The contract's exact call: clear rp_id, say nothing about origins.
+	blank := ""
+	rec, err := f.svc.Policy().SetPolicy(f.ctx, &f.tenantID, nil, auth.PasskeyPolicyUpdate{RPID: &blank})
+	if err != nil {
+		t.Fatalf(`SetPolicy({"rp_id": ""}) on a row with custom origins: %v`, err)
+	}
+	if rec.RPID != "" {
+		t.Errorf("row rp_id = %q after clearing, want empty", rec.RPID)
+	}
+	if len(rec.Origins) != 0 {
+		t.Errorf("row origins = %v after clearing rp_id, want none — origins cannot outlive the relying party they belong to", rec.Origins)
+	}
+	// And the scope now inherits the server's relying party.
+	if rec.Effective.RPID != testRPID {
+		t.Errorf("effective rp_id = %q, want the inherited %q", rec.Effective.RPID, testRPID)
+	}
+
+	// Setting origins while clearing rp_id in one call is the caller's own
+	// contradiction and is refused rather than silently resolved.
+	if _, err := f.svc.Policy().SetPolicy(f.ctx, &f.tenantID, nil, auth.PasskeyPolicyUpdate{
+		RPID: &blank, Origins: &origins,
+	}); !errors.Is(err, auth.ErrInvalidPasskeyPolicy) {
+		t.Errorf(`SetPolicy(rp_id="", origins=[...]) = %v, want ErrInvalidPasskeyPolicy`, err)
+	}
+}
+
 // TestPasskeyPolicyServerUVIsAFloor proves a tenant cannot relax a deployment
 // that demanded user verification. Policy may only ever be as strict or stricter.
 func TestPasskeyPolicyServerUVIsAFloor(t *testing.T) {
@@ -465,8 +515,13 @@ func TestPasskeyRequiresUVWhenPolicyDemandsIt(t *testing.T) {
 		t.Fatalf("LoginBegin: %v", err)
 	}
 	req := dev.AssertionRequest(t, testRPID, testOrigin, assertion.Response.Challenge.String(), f.userHandle(t))
-	if _, err := f.svc.LoginComplete(f.ctx, token, req); err == nil {
-		t.Fatal("assertion with no UV flag succeeded under a require_uv policy")
+	// The specific sentinel, not merely "an error". Asserting err != nil would
+	// keep passing if the assertion started being refused for an unrelated reason
+	// — a wrong RP ID after a refactor, say — and the UV requirement itself could
+	// silently stop being enforced with the test still green.
+	_, err = f.svc.LoginComplete(f.ctx, token, req)
+	if !errors.Is(err, auth.ErrUserVerificationRequired) {
+		t.Fatalf("assertion with no UV flag under a require_uv policy = %v, want ErrUserVerificationRequired", err)
 	}
 }
 
@@ -532,7 +587,14 @@ func TestPasskeyCloneDetectionOnBackupFlagChange(t *testing.T) {
 	dev := newVirtualAuthenticator(t)
 	f.register(t, dev, "Device")
 
+	// BOTH bits move. BE=0 with BS=1 is an invalid combination the spec forbids
+	// and go-webauthn rejects outright, so a clone that reports itself as no
+	// longer backup-eligible must also report itself as not backed up — which is
+	// what a device-bound copy of a previously synced key would actually look
+	// like. Setting only BE would test the library's malformed-input path instead
+	// of our clone path.
 	dev.backupEligible = false
+	dev.backupState = false
 	_, err := f.login(t, dev)
 
 	var cloned *auth.ClonedCredentialError
@@ -542,6 +604,175 @@ func TestPasskeyCloneDetectionOnBackupFlagChange(t *testing.T) {
 	if cloned.Reason != "backup_eligibility_changed" {
 		t.Errorf("reason = %q, want %q", cloned.Reason, "backup_eligibility_changed")
 	}
+}
+
+// TestPasskeyCloneContainmentRequiresAValidSignature is the regression test for
+// the review finding that mattered most: containment must never run on
+// unverified input.
+//
+// A credential ID is an identifier, not a secret — it travels in every assertion
+// and is not something the account owner can rotate. When the clone comparison
+// ran BEFORE verification, anyone holding one could post a malformed assertion
+// with a single flipped flag and have the credential deactivated, every session
+// for the account revoked, token_version bumped and a Redis denylist entry
+// written, all without proving possession of the private key. That is an
+// unauthenticated account lockout, and it is repeatable.
+//
+// So: a flipped backup-eligibility flag with a signature that does NOT verify
+// must be refused as an ordinary verification failure and change nothing.
+func TestPasskeyCloneContainmentRequiresAValidSignature(t *testing.T) {
+	f := newPasskeyFixture(t)
+	f.allowPasskeys(t, false)
+	dev := newVirtualAuthenticator(t)
+	cred := f.register(t, dev, "Device")
+
+	// A live session, so an escaped containment would have something to destroy.
+	// Through AuthService, not the bare service: only the token-issuing path
+	// writes a session row, and sessions are what the containment destroys.
+	assertion, token, err := f.svc.LoginBegin(f.ctx, testOrigin)
+	if err != nil {
+		t.Fatalf("LoginBegin: %v", err)
+	}
+	if _, _, err := f.authSvc.LoginWebAuthn(f.ctx, token,
+		dev.AssertionRequest(t, testRPID, testOrigin, assertion.Response.Challenge.String(), f.userHandle(t))); err != nil {
+		t.Fatalf("baseline login: %v", err)
+	}
+	var sessionsBefore int
+	if err := f.pool.QueryRow(f.ctx, `
+		SELECT COUNT(*) FROM user_sessions WHERE user_id = $1 AND revoked_at IS NULL
+	`, f.userID).Scan(&sessionsBefore); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessionsBefore == 0 {
+		t.Fatal("no live session after a successful passkey login; the test cannot prove anything")
+	}
+
+	// The attacker's request: the victim's real credential ID, the clone signal,
+	// and a signature from a key that is not the credential's.
+	forged := newVirtualAuthenticator(t)
+	forged.credID = dev.credID
+	forged.backupEligible = !dev.backupEligible
+	forged.backupState = forged.backupEligible
+
+	assertion, token, err = f.svc.LoginBegin(f.ctx, testOrigin)
+	if err != nil {
+		t.Fatalf("LoginBegin: %v", err)
+	}
+	req := forged.AssertionRequest(t, testRPID, testOrigin, assertion.Response.Challenge.String(), f.userHandle(t))
+
+	_, _, err = f.authSvc.LoginWebAuthn(f.ctx, token, req)
+	if err == nil {
+		t.Fatal("an assertion signed by the wrong key was accepted")
+	}
+	var cloned *auth.ClonedCredentialError
+	if errors.As(err, &cloned) {
+		t.Fatalf("unverified assertion triggered clone containment (%v); a credential id must not be enough to lock an account out", err)
+	}
+	if !errors.Is(err, auth.ErrWebAuthnVerification) {
+		t.Errorf("forged assertion = %v, want ErrWebAuthnVerification", err)
+	}
+
+	// Nothing may have been contained.
+	var active bool
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT is_active FROM webauthn_credentials WHERE id::TEXT = $1`, cred.ID).Scan(&active); err != nil {
+		t.Fatalf("read credential state: %v", err)
+	}
+	if !active {
+		t.Error("credential was deactivated by an assertion that never verified")
+	}
+
+	var sessionsAfter int
+	if err := f.pool.QueryRow(f.ctx, `
+		SELECT COUNT(*) FROM user_sessions WHERE user_id = $1 AND revoked_at IS NULL
+	`, f.userID).Scan(&sessionsAfter); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessionsAfter != sessionsBefore {
+		t.Errorf("live sessions went %d -> %d; an unverified assertion revoked sessions", sessionsBefore, sessionsAfter)
+	}
+
+	// And the genuine authenticator still works, which is the user-visible half
+	// of "nothing was contained".
+	if _, err := f.login(t, dev); err != nil {
+		t.Errorf("genuine authenticator = %v after a forged clone attempt, want success", err)
+	}
+}
+
+// TestPasskeyCloneDetectionOnCounterResetToZero covers the gap the review found
+// in the counter rule: a stored counter of 10 followed by an asserted 0 is a
+// regression, and the old guard skipped it by requiring the ASSERTED value to be
+// non-zero. A second authenticator that keeps no counter is exactly what produces
+// that shape.
+func TestPasskeyCloneDetectionOnCounterResetToZero(t *testing.T) {
+	f := newPasskeyFixture(t)
+	f.allowPasskeys(t, false)
+	dev := newVirtualAuthenticator(t)
+	dev.signCount = 5
+	f.register(t, dev, "Device")
+
+	dev.signCount = 10
+	if _, err := f.login(t, dev); err != nil {
+		t.Fatalf("baseline login: %v", err)
+	}
+
+	dev.signCount = 0
+	_, err := f.login(t, dev)
+
+	var cloned *auth.ClonedCredentialError
+	if !errors.As(err, &cloned) {
+		t.Fatalf("counter reset from 10 to 0 = %v, want a ClonedCredentialError", err)
+	}
+	if cloned.Reason != "sign_count_regression" {
+		t.Errorf("reason = %q, want %q", cloned.Reason, "sign_count_regression")
+	}
+}
+
+// TestPasskeyRegisterBeginExcludesActiveCredentials pins excludeCredentials.
+//
+// It is what stops a user enrolling the same authenticator twice, and it is
+// invisible when it breaks: the browser would go ahead, and the duplicate would
+// only be caught by the partial unique index at complete — after the user has
+// performed a gesture, and reported as "already registered" for a device they
+// were told to add. A revoked credential must NOT appear, or re-enrolling a
+// device the user removed on purpose becomes impossible.
+func TestPasskeyRegisterBeginExcludesActiveCredentials(t *testing.T) {
+	f := newPasskeyFixture(t)
+	f.allowPasskeys(t, false)
+
+	first := newVirtualAuthenticator(t)
+	cred := f.register(t, first, "First")
+
+	creation, _, err := f.svc.RegisterBegin(f.ctx, f.userID, f.tenantID, f.email, "", testOrigin)
+	if err != nil {
+		t.Fatalf("RegisterBegin: %v", err)
+	}
+	if !containsCredentialID(creation.Response.CredentialExcludeList, first.credID) {
+		t.Errorf("excludeCredentials = %v, want it to contain the active credential; the browser would let the same device enrol twice",
+			creation.Response.CredentialExcludeList)
+	}
+
+	// Revoke it, and it must drop out — the partial unique index allows re-enrol,
+	// so excludeCredentials must not be the thing that blocks it.
+	if err := f.svc.RevokeCredential(f.ctx, f.userID, f.tenantID, cred.ID, false); err != nil {
+		t.Fatalf("RevokeCredential: %v", err)
+	}
+	creation, _, err = f.svc.RegisterBegin(f.ctx, f.userID, f.tenantID, f.email, "", testOrigin)
+	if err != nil {
+		t.Fatalf("RegisterBegin after revoke: %v", err)
+	}
+	if containsCredentialID(creation.Response.CredentialExcludeList, first.credID) {
+		t.Error("excludeCredentials still lists a revoked credential; the user could never re-enrol that device")
+	}
+}
+
+func containsCredentialID(list []protocol.CredentialDescriptor, id []byte) bool {
+	for _, d := range list {
+		if bytes.Equal(d.CredentialID, id) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestPasskeyCloneRevokesAllSessions asserts the containment the ticket asks for:
@@ -575,8 +806,13 @@ func TestPasskeyCloneRevokesAllSessions(t *testing.T) {
 		t.Fatal("no live session after a successful passkey sign-in — cannot test revocation")
 	}
 
-	// Now trip the clone detector through the same entry point.
+	// Now trip the clone detector through the same entry point. Both backup bits
+	// move together: BE=0 with BS=1 is a combination the spec forbids and
+	// go-webauthn rejects on its own, which would refuse the assertion before the
+	// clone comparison ever ran. A device-bound copy of a previously synced key is
+	// what this represents.
 	dev.backupEligible = false
+	dev.backupState = false
 	assertion, token, err = f.svc.LoginBegin(f.ctx, testOrigin)
 	if err != nil {
 		t.Fatalf("LoginBegin: %v", err)

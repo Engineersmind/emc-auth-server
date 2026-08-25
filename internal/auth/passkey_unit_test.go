@@ -1,6 +1,7 @@
 package auth_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
@@ -136,4 +137,51 @@ func TestAuthenticatorName(t *testing.T) {
 func parseAAGUID(t *testing.T, s string) []byte {
 	t.Helper()
 	return mustDecodeAAGUID(t, s)
+}
+
+// TestPasskeyPolicyRecordJSONShape pins the admin API's wire format.
+//
+// PasskeyPolicy is embedded as `effective` in the record the admin endpoints
+// return, so an untagged field there ships a Go identifier — AllowPasskeys,
+// RPID — where PASSKEY_API_CONTRACT.md and the console both expect snake_case.
+// Nothing in Go's type system catches that, and neither does a handler test that
+// only checks the status code: the payload is simply wrong in a way only a
+// consumer notices. Hence a test on the bytes.
+func TestPasskeyPolicyRecordJSONShape(t *testing.T) {
+	raw, err := json.Marshal(auth.PasskeyPolicyRecord{
+		Scope:   "tenant",
+		Origins: []string{},
+		Effective: auth.PasskeyPolicy{
+			AllowPasskeys: true, AllowPasswordless: true, RequireUserVerification: true,
+			RPID: "acme.test", RPDisplayName: "Acme", Origins: []string{"https://acme.test"},
+			MaxCredentialsPerUser: 10, Source: "tenant",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal record: %v", err)
+	}
+
+	var out struct {
+		Effective map[string]json.RawMessage `json:"effective"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal record: %v", err)
+	}
+
+	for _, key := range []string{
+		"allow_passkeys", "allow_passwordless", "require_user_verification",
+		"rp_id", "rp_display_name", "origins", "max_credentials_per_user", "source",
+	} {
+		if _, ok := out.Effective[key]; !ok {
+			t.Errorf("effective.%s missing; got keys %v", key, mapKeys(out.Effective))
+		}
+	}
+}
+
+func mapKeys(m map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

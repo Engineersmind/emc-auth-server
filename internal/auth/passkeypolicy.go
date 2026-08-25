@@ -28,31 +28,35 @@ import (
 // PasskeyPolicy is the resolved, ready-to-use policy for one scope. Every field
 // is already merged with the server configuration, so a caller never has to
 // decide whether a zero value means "inherit" — that is resolved here, once.
+// Every field is tagged. This type is not internal-only: it is embedded as
+// `effective` in PasskeyPolicyRecord, which the admin API returns, so untagged
+// fields would ship Go identifiers (AllowPasskeys, RPID) on the wire instead of
+// the snake_case names PASSKEY_API_CONTRACT.md documents and the console reads.
 type PasskeyPolicy struct {
 	// AllowPasskeys is the master switch. False refuses registration and
 	// passwordless sign-in alike.
-	AllowPasskeys bool
+	AllowPasskeys bool `json:"allow_passkeys"`
 	// AllowPasswordless gates sign-in specifically. False still permits
 	// registration and management, so a tenant can hold passkeys as a
 	// second factor without accepting them as the whole credential.
-	AllowPasswordless bool
+	AllowPasswordless bool `json:"allow_passwordless"`
 	// RequireUserVerification demands a biometric or PIN gesture.
-	RequireUserVerification bool
+	RequireUserVerification bool `json:"require_user_verification"`
 	// RPID is the relying-party ID actually in force: the registrable domain,
 	// no scheme and no port.
-	RPID string
+	RPID string `json:"rp_id"`
 	// RPDisplayName is what the authenticator shows the user.
-	RPDisplayName string
+	RPDisplayName string `json:"rp_display_name"`
 	// Origins is the exact-match allow-list of page origins permitted to run a
 	// ceremony, including scheme and port.
-	Origins []string
+	Origins []string `json:"origins"`
 	// MaxCredentialsPerUser caps live credentials per account.
-	MaxCredentialsPerUser int
+	MaxCredentialsPerUser int `json:"max_credentials_per_user"`
 	// Source records which row won resolution — "application", "tenant",
-	// "platform", or "server" when no row matched at all. Logged, never
-	// returned to a client; an operator debugging "why is my RP ID wrong"
-	// needs to know which row answered.
-	Source string
+	// "platform", or "server" when no row matched at all. An operator debugging
+	// "why is my RP ID wrong" needs to know which row answered, which is why it
+	// is on the ADMIN response; it is never part of an end-user payload.
+	Source string `json:"source"`
 }
 
 // AllowsOrigin reports whether a page origin may run a ceremony under this
@@ -432,6 +436,13 @@ func (s *PasskeyPolicyService) SetPolicy(ctx context.Context, tenantID *int64, a
 	if upd.MaxCredentialsPerUser != nil && (*upd.MaxCredentialsPerUser < 1 || *upd.MaxCredentialsPerUser > 100) {
 		return nil, ErrInvalidPasskeyPolicy
 	}
+	// Setting origins while clearing rp_id in the SAME call is contradictory, and
+	// it is the caller's contradiction rather than an inherited-state problem — so
+	// it is refused with the sentence ErrInvalidPasskeyPolicy carries instead of
+	// being silently resolved one way or the other.
+	if upd.RPID != nil && *upd.RPID == "" && upd.Origins != nil && len(*upd.Origins) > 0 {
+		return nil, ErrInvalidPasskeyPolicy
+	}
 
 	// Normalise origins before they are stored, so the exact-match comparison at
 	// ceremony time is against a canonical form rather than against whatever an
@@ -449,6 +460,23 @@ func (s *PasskeyPolicyService) SetPolicy(ctx context.Context, tenantID *int64, a
 			clean = append(clean, o)
 		}
 		origins = &clean
+	}
+
+	// Clearing rp_id clears the origins pair with it, whether or not the caller
+	// mentioned origins.
+	//
+	// The two are one setting as far as the schema is concerned: constraint
+	// passkey_policies_origins_need_rp_id (migration 00072) forbids a row with
+	// origins and no rp_id, because an origin allow-list means nothing without
+	// the relying party it is an allow-list FOR. So the documented
+	// clear-to-inherit call — {"rp_id": ""} — would otherwise fail the constraint
+	// on every row that has custom origins, and an operator reverting a tenant to
+	// the server's relying party would get a database error for a legal request.
+	// Clearing both is also the only coherent reading: a row that inherits its
+	// relying party cannot keep a hand-written allow-list for a different one.
+	if upd.RPID != nil && *upd.RPID == "" && origins == nil {
+		empty := []string{}
+		origins = &empty
 	}
 
 	// UPDATE then INSERT rather than one ON CONFLICT.

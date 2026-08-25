@@ -292,38 +292,67 @@ func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID in
 //
 // Soft-deactivated rather than deleted, like every other passkey revocation:
 // which credential an operator removed and when is the audit-relevant part.
+//
+// SCOPE NOTE — the reset is TENANT-wide, not application-wide. appRowID narrows
+// the existence check above (an operator with rights over one application cannot
+// reset a user outside it), but every mutation below is keyed on
+// (user_id, tenant_id) and therefore clears the user's factors across every
+// application under that tenant. That is deliberate and it is what the lost-laptop
+// case requires — a factor left live on the lost device because it was enrolled
+// through a different application is exactly the hole this endpoint is supposed
+// to close, and it matches how TOTP and email MFA have always behaved here. It IS
+// an over-reach relative to an application-scoped caller's other powers, so it is
+// written down rather than left to be discovered: anyone narrowing this to one
+// application must decide what happens to the credentials outside it.
+//
+// All three mutations run in ONE transaction. Sequential statements meant a
+// failure on the passkey UPDATE returned an error having already deleted TOTP and
+// email MFA — leaving the account with the lost device's passkey as its only
+// remaining factor, which is the precise state this function exists to prevent.
 func (s *TOTPService) ResetUserMFA(ctx context.Context, tenantID int64, appRowID *int64, userID int64) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin user MFA reset: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Inside the transaction with the writes, so a user who is deleted or moved
+	// out of scope concurrently cannot have their factors cleared by a check that
+	// passed a moment earlier.
 	var exists bool
-	err := s.pool.QueryRow(ctx, `
+	if err = tx.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM users
 			WHERE id = $1 AND tenant_id = $2
 			  AND ($3::BIGINT IS NULL OR application_id = $3)
 			  AND deleted_at IS NULL
 		)
-	`, userID, tenantID, appRowID).Scan(&exists)
-	if err != nil {
+	`, userID, tenantID, appRowID).Scan(&exists); err != nil {
 		return fmt.Errorf("verify user scope: %w", err)
 	}
 	if !exists {
 		return ErrUserNotFound
 	}
 
-	if _, err = s.pool.Exec(ctx, `DELETE FROM totp_secrets WHERE user_id = $1`, userID); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM totp_secrets WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("reset user TOTP: %w", err)
 	}
-	if _, err = s.pool.Exec(ctx, `DELETE FROM email_mfa_settings WHERE user_id = $1`, userID); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM email_mfa_settings WHERE user_id = $1`, userID); err != nil {
 		return fmt.Errorf("reset user email MFA: %w", err)
 	}
 	// revoked_by_admin, because that is what happened, and because the user's own
 	// settings list reads that column to say "removed by your administrator"
 	// rather than leaving them to wonder where their passkey went.
-	if _, err = s.pool.Exec(ctx, `
+	if _, err = tx.Exec(ctx, `
 		UPDATE webauthn_credentials
 		SET is_active = false, revoked_at = NOW(), revoked_by_admin = true
 		WHERE user_id = $1 AND tenant_id = $2 AND is_active
 	`, userID, tenantID); err != nil {
 		return fmt.Errorf("reset user passkeys: %w", err)
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit user MFA reset: %w", err)
 	}
 	return nil
 }

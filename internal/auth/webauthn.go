@@ -80,6 +80,17 @@ var (
 	// endpoint cannot be used to probe which credentials or accounts exist.
 	ErrWebAuthnVerification = errors.New("passkey verification failed")
 
+	// ErrUserVerificationRequired is returned when a verified assertion carried no
+	// user-verification gesture under a policy that demands one.
+	//
+	// It exists so the refusal is distinguishable INTERNALLY — in the log, in the
+	// audit row, and in a test that needs to prove the UV requirement is what
+	// rejected an assertion rather than some other failure it would be
+	// indistinguishable from. The client is still told only the opaque
+	// webauthn_failed: see loginRejected. A separate sentinel for an identical
+	// response is the point, not an oversight.
+	ErrUserVerificationRequired = errors.New("passkey verification failed: user verification required")
+
 	// ErrCredentialCloned is returned when an assertion shows evidence that the
 	// private key exists in more than one place. Wrapped by
 	// ClonedCredentialError, which carries who and which credential — see there
@@ -340,6 +351,34 @@ func (u *webauthnUser) WebAuthnDisplayName() string { return u.email }
 
 func (u *webauthnUser) WebAuthnCredentials() []webauthn.Credential { return u.creds }
 
+// beAligned returns a shallow copy of the user whose credential matching rawID
+// carries the ASSERTED backup-eligibility flag rather than the stored one.
+//
+// It exists for exactly one reason: go-webauthn refuses a BE change with a
+// generic bad request, which would mask a cloned authenticator as an ordinary
+// verification failure and skip containment entirely (see LoginComplete). The
+// library's BE comparison runs after the signature check, so suppressing it here
+// removes no cryptographic guarantee — the signature is still verified against
+// the stored public key, and the real stored flag is compared by our own check
+// once verification has succeeded.
+//
+// The copy is deliberate. Mutating resolved.creds would leave the caller holding
+// a credential set that no longer reflects the database, and the one field this
+// touches is the field a clone detection turns on.
+func beAligned(u *webauthnUser, rawID []byte, assertedBE bool) *webauthnUser {
+	creds := make([]webauthn.Credential, len(u.creds))
+	copy(creds, u.creds)
+	for i := range creds {
+		if bytes.Equal(creds[i].ID, rawID) {
+			creds[i].Flags.BackupEligible = assertedBE
+			break
+		}
+	}
+	clone := *u
+	clone.creds = creds
+	return &clone
+}
+
 // ---------------------------------------------------------------------------
 // User handle
 // ---------------------------------------------------------------------------
@@ -349,9 +388,15 @@ func (u *webauthnUser) WebAuthnCredentials() []webauthn.Credential { return u.cr
 // first-time registrations cannot produce two handles for one account — which
 // would split the user's credentials into two authenticator accounts.
 func (s *WebAuthnService) userHandle(ctx context.Context, userID, tenantID int64) ([]byte, error) {
+	// Scoped by tenant even though user_id alone is the primary key here, so no
+	// cross-tenant row could be returned. The invariant is that every query in
+	// this codebase names the tenant it means — the INSERT below already does —
+	// and an unscoped read is the one that silently becomes wrong if this table
+	// ever grows a composite key.
 	var handle []byte
 	err := s.pool.QueryRow(ctx,
-		`SELECT handle FROM webauthn_user_handles WHERE user_id = $1`, userID,
+		`SELECT handle FROM webauthn_user_handles WHERE user_id = $1 AND tenant_id = $2`,
+		userID, tenantID,
 	).Scan(&handle)
 	if err == nil {
 		return handle, nil
@@ -551,50 +596,69 @@ func (s *WebAuthnService) RenameCredential(ctx context.Context, userID, tenantID
 // must not block, because the alternative is an account permanently signed in
 // on a stolen laptop.
 func (s *WebAuthnService) RevokeCredential(ctx context.Context, userID, tenantID int64, credRowID string, byAdmin bool) error {
-	if !byAdmin {
-		last, err := s.isLastSignInMethod(ctx, userID, tenantID, credRowID)
-		if err != nil {
-			return err
-		}
-		if last {
-			return ErrLastFactor
-		}
-	}
-
-	tag, err := s.pool.Exec(ctx, `
+	// The guard and the revocation are ONE statement, not a check followed by an
+	// update. Two settings-page requests deleting two different passkeys can each
+	// see the other one as "another active credential", both pass a separate
+	// guard, and both commit — leaving a passwordless account with no way in at
+	// all, which is the single state this guard exists to prevent and the one with
+	// no self-service recovery (master plan P8 is not built). Folding the count
+	// into the UPDATE's WHERE clause makes the row lock serialise them: the second
+	// writer re-evaluates the subquery after the first has committed and finds
+	// nothing to update.
+	//
+	// The admin path keeps no guard at all, deliberately — support removing a lost
+	// device must not be blocked — so it runs the plain form.
+	sql := `
 		UPDATE webauthn_credentials
 		SET is_active = false, revoked_at = NOW(), revoked_by_admin = $4
-		WHERE id::TEXT = $1 AND user_id = $2 AND tenant_id = $3 AND is_active
-	`, credRowID, userID, tenantID, byAdmin)
+		WHERE id::TEXT = $1 AND user_id = $2 AND tenant_id = $3 AND is_active`
+	//
+	// "Another way in" means a password row or another active passkey, and
+	// nothing else. TOTP and email MFA deliberately do not count: both are SECOND
+	// factors gated behind a first one, so an account holding TOTP but no password
+	// and no passkey cannot sign in at all. Counting them would let the guard pass
+	// on an account that is in fact locked out — the exact failure it exists to
+	// prevent.
+	if !byAdmin {
+		sql += `
+		  AND (
+		    EXISTS (SELECT 1 FROM user_credentials
+		             WHERE user_id = $2 AND tenant_id = $3)
+		    OR EXISTS (SELECT 1 FROM webauthn_credentials other
+		                WHERE other.user_id = $2 AND other.tenant_id = $3
+		                  AND other.is_active AND other.id::TEXT <> $1)
+		  )`
+	}
+
+	tag, err := s.pool.Exec(ctx, sql, credRowID, userID, tenantID, byAdmin)
 	if err != nil {
 		return fmt.Errorf("revoke webauthn credential: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
+		// Nothing updated means either the credential is not the caller's, or the
+		// last-factor clause refused it. They are told apart with a second read
+		// rather than collapsed, because "not found" and "this is your only way to
+		// sign in" need different words in a settings page. Existence is checked
+		// first: without it, a bogus id on an account that has no password and no
+		// other passkeys would look exactly like a last-factor refusal for a
+		// credential that never existed. Only reached on the failure path, so the
+		// extra queries cost nothing in the normal case.
+		if !byAdmin {
+			var exists bool
+			if err := s.pool.QueryRow(ctx, `
+				SELECT EXISTS (SELECT 1 FROM webauthn_credentials
+				                WHERE id::TEXT = $1 AND user_id = $2 AND tenant_id = $3
+				                  AND is_active)
+			`, credRowID, userID, tenantID).Scan(&exists); err != nil {
+				return fmt.Errorf("revoke webauthn credential: %w", err)
+			}
+			if exists {
+				return ErrLastFactor
+			}
+		}
 		return ErrCredentialNotFound
 	}
 	return nil
-}
-
-// isLastSignInMethod reports whether the named credential is the account's only
-// remaining way to authenticate.
-//
-// "Only way in" means: no password, and no other active passkey. TOTP and email
-// MFA deliberately do not count — both are SECOND factors gated behind a first
-// one, so an account with TOTP and no password and no passkey still cannot sign
-// in. Counting them would let this guard pass on an account that is in fact
-// locked out, which is the exact failure it exists to prevent.
-func (s *WebAuthnService) isLastSignInMethod(ctx context.Context, userID, tenantID int64, credRowID string) (bool, error) {
-	var hasPassword bool
-	var otherCreds int
-	err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM user_credentials WHERE user_id = $1 AND tenant_id = $2),
-		       (SELECT COUNT(*) FROM webauthn_credentials
-		         WHERE user_id = $1 AND tenant_id = $2 AND is_active AND id::TEXT <> $3)
-	`, userID, tenantID, credRowID).Scan(&hasPassword, &otherCreds)
-	if err != nil {
-		return false, fmt.Errorf("check last sign-in method: %w", err)
-	}
-	return !hasPassword && otherCreds == 0, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -852,7 +916,11 @@ func (s *WebAuthnService) RegisterComplete(ctx context.Context, userID, tenantID
 		return nil, err
 	}
 	// Re-checked here and not only at begin: two ceremonies started in parallel
-	// would both pass the check at begin and both insert.
+	// would both pass the check at begin. This read is the fast, friendly refusal
+	// — it stops before the attestation is verified — but it is NOT the one that
+	// holds the ceiling. The INSERT below carries the same bound in its WHERE
+	// clause, because two completions racing each other would both read
+	// limit-1 here and both insert.
 	if len(existing) >= policy.MaxCredentialsPerUser {
 		return nil, ErrTooManyCredentials
 	}
@@ -917,18 +985,29 @@ func (s *WebAuthnService) RegisterComplete(ctx context.Context, userID, tenantID
 
 	var out StoredCredential
 	var aaguid []byte
+	// INSERT ... SELECT so the ceiling is evaluated by the database at write time
+	// rather than by us beforehand. The count and the insert are then one
+	// statement and cannot interleave: a second completion racing this one
+	// re-evaluates the subquery after the first has committed and inserts nothing.
+	// Cheaper than a per-user advisory lock on a user-interactive path, and it
+	// keeps the bound where the rows are.
 	err = s.pool.QueryRow(ctx, `
 		INSERT INTO webauthn_credentials (
 			user_id, tenant_id, application_id, rp_id,
 			credential_id, public_key, aaguid, attestation_type, transports,
 			sign_count, backup_eligible, backup_state, uv_capable, discoverable, name
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14)
+		)
+		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14
+		WHERE (
+			SELECT COUNT(*) FROM webauthn_credentials
+			 WHERE user_id = $1 AND tenant_id = $2 AND rp_id = $4 AND is_active
+		) < $15
 		RETURNING id::TEXT, name, rp_id, backup_state, aaguid, created_at, last_used_at
 	`,
 		userID, tenantID, appRowIDFromClaim(st.AppID), st.RPID,
 		cred.ID, cred.PublicKey, cred.Authenticator.AAGUID, cred.AttestationType, transports,
 		int64(cred.Authenticator.SignCount), cred.Flags.BackupEligible, cred.Flags.BackupState,
-		cred.Flags.UserVerified, label,
+		cred.Flags.UserVerified, label, policy.MaxCredentialsPerUser,
 	).Scan(&out.ID, &out.Name, &out.RPID, &out.Synced, &aaguid, &out.CreatedAt, &out.LastUsedAt)
 	if err != nil {
 		// The unique index on credential_id is the backstop for browsers that
@@ -936,6 +1015,13 @@ func (s *WebAuthnService) RegisterComplete(ctx context.Context, userID, tenantID
 		// server error.
 		if isUniqueViolation(err) {
 			return nil, ErrCredentialAlreadyRegistered
+		}
+		// No row returned means the WHERE clause refused: the ceiling was reached
+		// between the read above and this write. Same answer the read gives, so the
+		// caller cannot tell whether it lost a race — which is correct, because
+		// there is nothing they would do differently.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrTooManyCredentials
 		}
 		return nil, fmt.Errorf("store webauthn credential: %w", err)
 	}
@@ -1035,17 +1121,9 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 		return nil, err
 	}
 
-	// Parsed before verification, and resolved before verification, so the
-	// clone checks below can run FIRST.
-	//
-	// This ordering is not stylistic. The library validates the
-	// backup-eligibility flag itself and rejects a change with a generic bad
-	// request (login.go, "Backup Eligible flag inconsistency"). If we let it get
-	// there first, a cloned authenticator is indistinguishable from a bad
-	// signature: no clone audit event, no session revocation, no credential
-	// deactivation — the containment the ticket asks for simply never runs.
-	// Discovered by a test that expected a clone error and got a verification
-	// failure, which is the only way this would ever have surfaced.
+	// Parsed and resolved before verification because the assertion has to be
+	// matched to a stored credential before anything can be verified against it.
+	// The clone checks themselves run AFTER verification — see below.
 	parsed, err := protocol.ParseCredentialRequestResponse(r)
 	if err != nil {
 		s.logger.Warn().Err(err).Str("rp_id", st.RPID).Msg("webauthn login: malformed response")
@@ -1061,18 +1139,51 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 		return nil, ErrWebAuthnVerification
 	}
 
-	// Clone signals, checked against what the authenticator CLAIMS before any
-	// signature is verified.
+	// Verification comes FIRST, and the clone comparison second, because
+	// containment is destructive and account-wide: it deactivates the credential,
+	// revokes every session the account has, bumps token_version and writes a
+	// Redis denylist entry. Running any of that on unverified input would mean
+	// anyone who learned a credential ID — an identifier, not a secret — could
+	// sign an account out everywhere and disable its passkey by posting a
+	// malformed assertion with one flipped flag, without ever proving possession
+	// of the private key. Nothing may be contained until a signature over our own
+	// challenge has been checked against the stored public key.
 	//
-	// Checking unverified input is safe here and deliberate: both branches only
-	// ever REFUSE, and the credential row was found by an unguessable 32-byte
-	// credential ID that the genuine authenticator issued. The failure mode of
-	// checking early is that someone who already holds a valid credential ID can
-	// trip their own credential's revocation — which is a self-inflicted denial
-	// of their own passkey, not an attack on anyone else.
+	// The library performs the checks that must not be reimplemented here:
+	// challenge equality, origin against the allow-list, rpIdHash against
+	// SHA256(rp_id), clientData.type == "webauthn.get", the assertion signature
+	// over authenticatorData ‖ SHA256(clientDataJSON), and user presence.
+	//
+	// The account already resolved above is returned rather than looked up again —
+	// a second query is a second chance to resolve to a different answer than the
+	// one the clone checks are made against.
+	//
+	// beAligned is what lets our clone check survive the library's own. The
+	// library compares the stored BackupEligible flag against the asserted one
+	// (login.go, "Backup Eligible flag inconsistency") and rejects a change with a
+	// generic bad request — behind which a cloned authenticator is
+	// indistinguishable from a bad signature, so no clone audit event, no session
+	// revocation and no credential deactivation would ever run. Its check sits
+	// AFTER the signature verification it performs, so aligning the flag on a
+	// throwaway copy suppresses only that one comparison and weakens nothing: the
+	// signature is still verified against the real stored public key, and the real
+	// stored flag is compared immediately below.
 	assertedFlags := parsed.Response.AuthenticatorData.Flags
 	assertedCount := int64(parsed.Response.AuthenticatorData.Counter)
 
+	verifyUser := beAligned(resolved, parsed.RawID, assertedFlags.HasBackupEligible())
+	_, cred, err := rp.ValidatePasskeyLogin(func(_, _ []byte) (webauthn.User, error) {
+		return verifyUser, nil
+	}, st.Session, parsed)
+	if err != nil {
+		s.logger.Warn().Err(err).Str("rp_id", st.RPID).Msg("webauthn login verification failed")
+		return nil, ErrWebAuthnVerification
+	}
+
+	// Possession of the private key is now proven, so a mismatch here is evidence
+	// about the authenticator rather than about the caller, and containment is
+	// safe to run.
+	//
 	// Backup Eligible is fixed for the life of a credential. A change means the
 	// private key exists somewhere it did not before — a clone or a swapped
 	// authenticator.
@@ -1084,34 +1195,21 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 		return nil, s.clonedError(ctx, resolved, storedRow, "backup_eligibility_changed")
 	}
 
-	// A signature counter that goes backwards means two copies of the key are in
-	// use. Counters that stay at zero are normal — most platform authenticators
-	// (Apple, Google) never increment — so only a DECREASE from a non-zero
-	// stored value is evidence of anything. Which also means this control is
-	// inert for the majority of real passkeys; backup-eligibility above is the
-	// one that will actually fire.
-	if storedRow.signCount > 0 && assertedCount > 0 && assertedCount <= storedRow.signCount {
+	// A signature counter that fails to advance means two copies of the key are in
+	// use. Only a stored non-zero value gives us anything to compare against:
+	// counters that stay at zero are normal, because most platform authenticators
+	// (Apple, Google) never increment. Once a credential HAS reported a non-zero
+	// counter, any value at or below it is a regression — including a drop to
+	// zero, which is the signal a second authenticator that does not keep a
+	// counter would produce. Which also means this control is inert for the
+	// majority of real passkeys; backup-eligibility above is the one that will
+	// actually fire.
+	if storedRow.signCount > 0 && assertedCount <= storedRow.signCount {
 		s.logger.Error().Int64("credential_row", storedRow.rowID).
 			Int64("user_id", resolved.userID).
 			Int64("stored", storedRow.signCount).Int64("asserted", assertedCount).
 			Msg("webauthn: signature counter did not advance — possible cloned credential")
 		return nil, s.clonedError(ctx, resolved, storedRow, "sign_count_regression")
-	}
-
-	// Now the library performs the checks that must not be reimplemented here:
-	// challenge equality, origin against the allow-list, rpIdHash against
-	// SHA256(rp_id), clientData.type == "webauthn.get", the assertion signature
-	// over authenticatorData ‖ SHA256(clientDataJSON), and user presence.
-	//
-	// The handler returns the account already resolved above rather than looking
-	// it up again — a second query is a second chance to resolve to a different
-	// answer than the one the clone checks were made against.
-	_, cred, err := rp.ValidatePasskeyLogin(func(_, _ []byte) (webauthn.User, error) {
-		return resolved, nil
-	}, st.Session, parsed)
-	if err != nil {
-		s.logger.Warn().Err(err).Str("rp_id", st.RPID).Msg("webauthn login verification failed")
-		return nil, ErrWebAuthnVerification
 	}
 
 	// The account is now known, so policy can be evaluated against the scope the
@@ -1139,7 +1237,10 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 	// requires UV must not have it relaxed by a login begun from a surface whose
 	// policy was laxer.
 	if policy.RequireUserVerification && !cred.Flags.UserVerified {
-		return nil, ErrWebAuthnVerification
+		s.logger.Warn().Int64("credential_row", storedRow.rowID).
+			Int64("user_id", resolved.userID).
+			Msg("webauthn login: policy requires user verification and the assertion had none")
+		return nil, ErrUserVerificationRequired
 	}
 
 	if _, err := s.pool.Exec(ctx, `
@@ -1377,6 +1478,16 @@ func (s *AuthService) LoginWebAuthn(ctx context.Context, token string, r *http.R
 // here is logged at error, because a clone detection whose containment did not
 // run is exactly the event somebody has to see.
 func (s *AuthService) revokeAllAfterClone(ctx context.Context, cloned *ClonedCredentialError) {
+	// Detached from the request, for the same reason clonedError detaches its own
+	// write: the request is being refused, and a caller who sends a clone
+	// assertion and drops the connection would otherwise cancel the containment
+	// mid-way — leaving the credential deactivated (that write survives) but
+	// every session still live. Containment that only completes when the attacker
+	// waits for the response is not containment. Bounded rather than unbounded so
+	// a stalled database cannot pin the goroutine indefinitely.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.logger.Error().Err(err).Int64("user_id", cloned.UserID).

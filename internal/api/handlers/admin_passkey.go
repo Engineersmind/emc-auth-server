@@ -137,7 +137,7 @@ func (h *AdminHandler) UpdateTenantPasskeyPolicy(c echo.Context) error {
 		return h.passkeyPolicyError(c, "set tenant passkey policy", err)
 	}
 
-	h.auditPasskeyPolicy(c, tenantID, nil, rec)
+	h.auditPasskeyPolicy(c, tenantID, nil, rec, map[string]any{"operation": "updated"})
 	return c.JSON(http.StatusOK, rec)
 }
 
@@ -203,7 +203,7 @@ func (h *AdminHandler) UpdateApplicationPasskeyPolicy(c echo.Context) error {
 		return h.passkeyPolicyError(c, "set application passkey policy", err)
 	}
 
-	h.auditPasskeyPolicy(c, tenantID, &appID, rec)
+	h.auditPasskeyPolicy(c, tenantID, &appID, rec, map[string]any{"operation": "updated"})
 	return c.JSON(http.StatusOK, rec)
 }
 
@@ -241,10 +241,18 @@ func (h *AdminHandler) DeleteApplicationPasskeyPolicy(c echo.Context) error {
 		})
 	}
 
-	rec, err := svc.GetPolicyRecord(c.Request().Context(), &tenantID, &appID)
-	if err == nil {
-		h.auditPasskeyPolicy(c, tenantID, &appID, rec)
+	// Audited unconditionally, and only ENRICHED by the effective-policy read.
+	// The override is already gone by this point; making the event conditional on
+	// a read that can fail transiently means a committed change to a
+	// security-relevant setting can leave no trace at all, which is precisely the
+	// case an audit log exists for.
+	rec, rerr := svc.GetPolicyRecord(c.Request().Context(), &tenantID, &appID)
+	if rerr != nil {
+		rec = nil
+		h.logger.Warn().Err(rerr).Int64("tenant_id", tenantID).Int64("app_id", appID).
+			Msg("cleared application passkey policy, but could not read the resulting effective policy for the audit event")
 	}
+	h.auditPasskeyPolicy(c, tenantID, &appID, rec, map[string]any{"operation": "cleared"})
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -405,7 +413,7 @@ func (h *AdminHandler) passkeyPolicyError(c echo.Context, op string, err error) 
 // "allow_passkeys was set to true" is not the interesting fact if the RP ID
 // still resolves from somewhere else, and an auditor reading this later needs to
 // know what the change actually meant at the time it was made.
-func (h *AdminHandler) auditPasskeyPolicy(c echo.Context, tenantID int64, appID *int64, rec *auth.PasskeyPolicyRecord) {
+func (h *AdminHandler) auditPasskeyPolicy(c echo.Context, tenantID int64, appID *int64, rec *auth.PasskeyPolicyRecord, extra map[string]any) {
 	claims, _ := c.Get("user").(*auth.Claims)
 	actor := ""
 	if claims != nil {
@@ -415,6 +423,28 @@ func (h *AdminHandler) auditPasskeyPolicy(c echo.Context, tenantID int64, appID 
 	if appID != nil {
 		resourceID = strconv.FormatInt(*appID, 10)
 	}
+
+	// rec is nil when the write landed but the follow-up read of the resulting
+	// effective policy did not. The event still fires: what an audit log must
+	// record is that a named operator changed a security-relevant setting, and
+	// that fact is already known from the write. The resulting policy is
+	// enrichment, and losing enrichment is not a reason to lose the event.
+	meta := map[string]any{"effective_policy_read": rec != nil}
+	if rec != nil {
+		meta["scope"] = rec.Scope
+		meta["exists"] = rec.Exists
+		meta["effective_allow_passkeys"] = rec.Effective.AllowPasskeys
+		meta["effective_passwordless"] = rec.Effective.AllowPasswordless
+		meta["effective_require_uv"] = rec.Effective.RequireUserVerification
+		meta["effective_rp_id"] = rec.Effective.RPID
+		meta["effective_origins"] = rec.Effective.Origins
+		meta["effective_policy_source"] = rec.Effective.Source
+		meta["max_credentials_per_user"] = rec.Effective.MaxCredentialsPerUser
+	}
+	for k, v := range extra {
+		meta[k] = v
+	}
+
 	h.auditEvent(c, audit.Event{
 		TenantID:      &tenantID,
 		ApplicationID: appID,
@@ -422,16 +452,6 @@ func (h *AdminHandler) auditPasskeyPolicy(c echo.Context, tenantID int64, appID 
 		Action:        audit.ActionAdminPasskeyPolicyUpdated,
 		ResourceType:  "passkey_policy",
 		ResourceID:    resourceID,
-		Metadata: map[string]any{
-			"scope":                    rec.Scope,
-			"exists":                   rec.Exists,
-			"effective_allow_passkeys": rec.Effective.AllowPasskeys,
-			"effective_passwordless":   rec.Effective.AllowPasswordless,
-			"effective_require_uv":     rec.Effective.RequireUserVerification,
-			"effective_rp_id":          rec.Effective.RPID,
-			"effective_origins":        rec.Effective.Origins,
-			"effective_policy_source":  rec.Effective.Source,
-			"max_credentials_per_user": rec.Effective.MaxCredentialsPerUser,
-		},
+		Metadata:      meta,
 	})
 }
