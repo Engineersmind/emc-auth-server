@@ -436,6 +436,52 @@ func TestPasskeyChallengeIsSingleUse(t *testing.T) {
 	}
 }
 
+// TestPasskeyChallengeExpiredSurvivesTheAuthServiceWrapper pins ErrChallengeExpired
+// across the layer the handler actually calls.
+//
+// TestPasskeyChallengeIsSingleUse covers the same rejection at the bare service.
+// This one goes through AuthService.LoginWebAuthn, because the concern raised in
+// review was not whether the sentinel is returned but whether it SURVIVES: the
+// handler tells challenge_expired apart from every other failure so a stale tab
+// can silently re-arm instead of showing the user an error, and one fmt.Errorf
+// with %w on this path would collapse it into the opaque webauthn_failed with
+// nothing failing loudly.
+//
+// Both shapes that produce it are covered. A spent ceremony is byte-for-byte the
+// state a naturally expired one leaves behind — takeCeremony uses GETDEL, so
+// "consumed" and "timed out" are the same absent key — which is why an
+// artificially shortened TTL would assert nothing this does not.
+func TestPasskeyChallengeExpiredSurvivesTheAuthServiceWrapper(t *testing.T) {
+	f := newPasskeyFixture(t)
+	f.allowPasskeys(t, false)
+	dev := newVirtualAuthenticator(t)
+	f.register(t, dev, "Device")
+
+	// A token that was never issued: no ceremony state behind it at all.
+	if _, _, err := f.authSvc.LoginWebAuthn(f.ctx, "never-issued-ceremony-token",
+		dev.AssertionRequest(t, testRPID, testOrigin, "unused", f.userHandle(t))); !errors.Is(err, auth.ErrChallengeExpired) {
+		t.Errorf("unknown ceremony token = %v, want ErrChallengeExpired", err)
+	}
+
+	// A token consumed by a successful sign-in, which is the same absent key an
+	// expiry leaves behind.
+	assertion, token, err := f.svc.LoginBegin(f.ctx, testOrigin)
+	if err != nil {
+		t.Fatalf("LoginBegin: %v", err)
+	}
+	challenge := assertion.Response.Challenge.String()
+	handle := f.userHandle(t)
+	if _, _, err := f.authSvc.LoginWebAuthn(f.ctx, token,
+		dev.AssertionRequest(t, testRPID, testOrigin, challenge, handle)); err != nil {
+		t.Fatalf("first LoginWebAuthn: %v", err)
+	}
+	_, _, err = f.authSvc.LoginWebAuthn(f.ctx, token,
+		dev.AssertionRequest(t, testRPID, testOrigin, challenge, handle))
+	if !errors.Is(err, auth.ErrChallengeExpired) {
+		t.Fatalf("spent ceremony through LoginWebAuthn = %v, want ErrChallengeExpired", err)
+	}
+}
+
 // TestPasskeyRejectsForeignOriginSignature proves the origin inside the SIGNED
 // clientDataJSON is checked, not merely the header. This is the property that
 // makes passkeys phishing-resistant, and it is the library's job — asserted here
