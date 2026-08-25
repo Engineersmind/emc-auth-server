@@ -156,6 +156,42 @@ type Config struct {
 	// per-tenant CORS lookups don't apply. Comma-separated via GLOBAL_CORS_ORIGINS.
 	GlobalCORSOrigins []string
 
+	// WebAuthnRPID is the WebAuthn Relying Party ID: the registrable domain that
+	// passkeys are bound to, with no scheme and no port ("localhost",
+	// "insurance.acme.com"). Empty (the default) disables passkeys entirely —
+	// the endpoints are not registered at all.
+	//
+	// It is NOT derived from APP_BASE_URL, deliberately. A credential is
+	// permanently bound to this value: change it and every passkey ever issued
+	// stops working, with no migration path. That is not something to have happen
+	// as a side effect of editing an unrelated URL. Set via WEBAUTHN_RP_ID.
+	WebAuthnRPID string
+
+	// WebAuthnRPDisplayName is the human-readable name the authenticator shows
+	// when asking the user whether to create a passkey, and the label the
+	// credential keeps in their password manager afterwards. Set via
+	// WEBAUTHN_RP_DISPLAY_NAME.
+	WebAuthnRPDisplayName string
+
+	// WebAuthnOrigins is the exact-match allow-list of page origins permitted to
+	// run a ceremony, INCLUDING scheme and port
+	// ("http://localhost:5173,https://app.acme.com").
+	//
+	// Separate from GlobalCORSOrigins even though the values often coincide: CORS
+	// governs which pages may read our responses, this governs which pages may
+	// mint credentials against our relying party. Conflating them would mean
+	// widening CORS for an unrelated reason silently widened the set of origins
+	// that can create passkeys. Set via WEBAUTHN_ORIGINS.
+	WebAuthnOrigins []string
+
+	// WebAuthnRequireUserVerification demands a biometric or PIN gesture during
+	// the ceremony. Defaults TRUE: in a passwordless sign-in there is no password,
+	// so the gesture is the only evidence the right human is present, and without
+	// it a passkey on an unlocked stolen laptop signs in with one click.
+	// Set WEBAUTHN_REQUIRE_UV=false only to support older security keys that
+	// cannot do UV, and only where a password is still the first factor.
+	WebAuthnRequireUserVerification bool
+
 	// GeoIPDatabasePath points to a MaxMind GeoLite2/GeoIP2-City .mmdb file used
 	// to enrich audit rows with a coarse location. Empty (the default) disables
 	// geo enrichment — the .mmdb is licensed and not shipped with the server.
@@ -236,16 +272,21 @@ func Load() *Config {
 		// Defaults to APP_BASE_URL: in the single-binary deployment the auth server
 		// and the origin used for email links are the same host, so requiring both
 		// to be set would be a config trap with one obviously correct answer.
-		OIDCIssuerBaseURL:        getEnv("OIDC_ISSUER_BASE_URL", getEnv("APP_BASE_URL", "http://localhost:9090")),
-		CookieDomain:             getEnv("COOKIE_DOMAIN", ""),
-		GlobalCORSOrigins:        getEnvList("GLOBAL_CORS_ORIGINS", ""),
-		GeoIPDatabasePath:        getEnv("GEOIP_DATABASE_PATH", ""),
-		UntrustedIPCIDRs:         getEnvList("UNTRUSTED_IP_CIDRS", ""),
-		BreachDetectionEnabled:   getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
-		AuditCaptureResponseBody: getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
-		AuditRetentionDays:       mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
-		AuditSIEMWebhookURL:      getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
-		AuditSIEMWebhookSecret:   getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		OIDCIssuerBaseURL:     getEnv("OIDC_ISSUER_BASE_URL", getEnv("APP_BASE_URL", "http://localhost:9090")),
+		CookieDomain:          getEnv("COOKIE_DOMAIN", ""),
+		GlobalCORSOrigins:     getEnvList("GLOBAL_CORS_ORIGINS", ""),
+		WebAuthnRPID:          getEnv("WEBAUTHN_RP_ID", ""),
+		WebAuthnRPDisplayName: getEnv("WEBAUTHN_RP_DISPLAY_NAME", "EMC Auth"),
+		WebAuthnOrigins:       getEnvList("WEBAUTHN_ORIGINS", ""),
+		// Default true — see the field comment. Only an explicit "false" opts out.
+		WebAuthnRequireUserVerification: getEnv("WEBAUTHN_REQUIRE_UV", "true") != "false",
+		GeoIPDatabasePath:               getEnv("GEOIP_DATABASE_PATH", ""),
+		UntrustedIPCIDRs:                getEnvList("UNTRUSTED_IP_CIDRS", ""),
+		BreachDetectionEnabled:          getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
+		AuditCaptureResponseBody:        getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
+		AuditRetentionDays:              mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
+		AuditSIEMWebhookURL:             getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
+		AuditSIEMWebhookSecret:          getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
 	}
 }
 

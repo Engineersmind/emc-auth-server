@@ -30,6 +30,10 @@ type AdminHandler struct {
 	tmplSvc     *auth.EmailTemplateService
 	mailer      mailer.Mailer
 	corsSvc     *mw.TenantCORSService
+	// webauthnSvc backs the passkey policy and admin credential handlers. nil
+	// when WEBAUTHN_RP_ID is unset, which makes those routes answer 501 rather
+	// than panicking — the same shape as the other optional services here.
+	webauthnSvc *auth.WebAuthnService
 	audit       *audit.Logger
 	logger      zerolog.Logger
 }
@@ -60,6 +64,12 @@ func (h *AdminHandler) WithApplications(svc *auth.ApplicationService) *AdminHand
 // WithTOTP attaches the TOTPService for per-application MFA policy handlers.
 func (h *AdminHandler) WithTOTP(svc *auth.TOTPService) *AdminHandler {
 	h.totpSvc = svc
+	return h
+}
+
+// WithWebAuthn attaches the passkey service for policy and credential handlers.
+func (h *AdminHandler) WithWebAuthn(svc *auth.WebAuthnService) *AdminHandler {
+	h.webauthnSvc = svc
 	return h
 }
 
@@ -2563,8 +2573,8 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 // CreateApplicationRequest is the body for POST /api/v1/applications.
 // Scopes become the permissions claim of the app's client_credentials tokens.
 type CreateApplicationRequest struct {
-	Name    string   `json:"name"`
-	AppType string   `json:"app_type"` // web | spa | m2m | native; defaults to web
+	Name    string `json:"name"`
+	AppType string `json:"app_type"` // web | spa | m2m | native; defaults to web
 	// Scopes accepts resource:action permission strings and the reserved OIDC
 	// scopes (openid, profile, email, offline_access). Optional.
 	Scopes []string `json:"scopes"`

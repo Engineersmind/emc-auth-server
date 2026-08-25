@@ -37,6 +37,17 @@ type TenantCORSService struct {
 }
 
 // NewTenantCORSService creates a TenantCORSService.
+// corsAllowedMethods is the method list echoed on every preflight.
+//
+// One constant rather than two literals because it WAS two literals, and they
+// were both missing PATCH — so the API's first PATCH route (passkey rename,
+// issue #112) preflighted successfully and then the browser refused to send the
+// request, which looks exactly like a broken handler and is not.
+//
+// Any method used by a route in routes.go must appear here. A missing one fails
+// only in a browser, only cross-origin, and never in curl or the Go tests.
+const corsAllowedMethods = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+
 func NewTenantCORSService(pool *pgxpool.Pool, redisCli *redis.Client, logger zerolog.Logger) *TenantCORSService {
 	return &TenantCORSService{pool: pool, redisCli: redisCli, logger: logger}
 }
@@ -188,7 +199,7 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 				h.Set("Access-Control-Allow-Origin", requestOrigin)
 				h.Set("Access-Control-Allow-Credentials", "true")
 				h.Set("Vary", "Origin")
-				h.Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+				h.Set("Access-Control-Allow-Methods", corsAllowedMethods)
 				if reqHeaders := req.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
 					h.Set("Access-Control-Allow-Headers", reqHeaders)
 				}
@@ -251,7 +262,7 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 				reqMethod := c.Request().Header.Get("Access-Control-Request-Method")
 				reqHeaders := c.Request().Header.Get("Access-Control-Request-Headers")
 				if reqMethod != "" {
-					h.Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS")
+					h.Set("Access-Control-Allow-Methods", corsAllowedMethods)
 				}
 				if reqHeaders != "" {
 					h.Set("Access-Control-Allow-Headers", reqHeaders)

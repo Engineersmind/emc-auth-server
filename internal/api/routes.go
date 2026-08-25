@@ -78,6 +78,17 @@ type RoutesConfig struct {
 	// OAuthClientSecretEncryptionKeyPrevious is the old key accepted for
 	// decryption during rotation (empty when no rotation is in progress).
 	OAuthClientSecretEncryptionKeyPrevious string
+	// WebAuthnRPID is the passkey relying-party ID (registrable domain, no scheme
+	// or port). Empty disables passkeys: the routes are never registered.
+	WebAuthnRPID string
+	// WebAuthnRPDisplayName is the name the authenticator shows the user when
+	// creating a passkey, and the label it keeps thereafter.
+	WebAuthnRPDisplayName string
+	// WebAuthnOrigins is the exact-match allow-list of origins permitted to run a
+	// ceremony, including scheme and port.
+	WebAuthnOrigins []string
+	// WebAuthnRequireUserVerification demands a biometric/PIN gesture.
+	WebAuthnRequireUserVerification bool
 	// EmailProvider selects the global transport ("sendgrid"|"smtp"; empty = inferred).
 	EmailProvider string
 	// SendGridAPIKey is the global SendGrid API key (provider="sendgrid").
@@ -377,6 +388,24 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithTemplates(tmplSvc)
 	authSvc.WithEmailMFA(emailMFASvc)
 
+	// Passkey (WebAuthn) service — spike slice; see docs/WEBAUTHN_PLAN.md.
+	//
+	// A nil service means WEBAUTHN_RP_ID was not set, which is how a deployment
+	// opts out: the routes below are simply never registered, so the endpoints do
+	// not exist rather than existing and failing. A config that IS set but
+	// invalid (RP ID with no origins) is a hard startup error instead — a
+	// half-configured relying party would accept ceremonies it should refuse.
+	webauthnSvc, waErr := auth.NewWebAuthnService(deps.Pool, deps.Redis, auth.WebAuthnConfig{
+		RPID:                    deps.Config.WebAuthnRPID,
+		RPDisplayName:           deps.Config.WebAuthnRPDisplayName,
+		Origins:                 deps.Config.WebAuthnOrigins,
+		RequireUserVerification: deps.Config.WebAuthnRequireUserVerification,
+	}, deps.Logger)
+	if waErr != nil {
+		deps.Logger.Fatal().Err(waErr).Msg("passkey service init failed — check WEBAUTHN_RP_ID / WEBAUTHN_ORIGINS")
+	}
+	authSvc.WithWebAuthn(webauthnSvc)
+
 	// Invitations, self-service email change, account lockout, and breached-
 	// password warnings — the remaining transactional email flows. Each reuses
 	// the same sender + template resolvers, so their mail is branded per scope
@@ -480,7 +509,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithEmailSenders(senderSvc).
 		WithEmailTemplates(tmplSvc).
 		WithMailer(m).
-		WithCORS(corsSvc)
+		WithCORS(corsSvc).
+		WithWebAuthn(webauthnSvc)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
 	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
@@ -764,6 +794,60 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	otpGroup.POST("/email/send", authHandler.EmailMFASendCode)     // fresh code as proof for self-service actions
 	otpGroup.DELETE("/email", authHandler.EmailMFADisable)         // code-verified; last-factor guard under 'required'
 
+	// Passkeys (WebAuthn) — issue #112. Registered only when a relying party is
+	// configured; without WEBAUTHN_RP_ID these paths 404, which is the correct
+	// answer for a feature the deployment has not turned on. Whether a given
+	// TENANT may use them is a separate, per-scope decision — see
+	// passkey_policies (migration 00072) — so a registered route can still
+	// refuse with passkeys_disabled.
+	//
+	// Deliberately NOT under /otp: a passkey is not a one-time password, and in
+	// the passwordless flow it is a FIRST factor, so filing it under the
+	// second-factor group would misname it permanently in every client.
+	if webauthnSvc != nil {
+		webauthnHandler := handlers.NewWebAuthnHandler(webauthnSvc, authSvc, cookieCfg, deps.Audit, deps.Logger)
+
+		// Registration: authenticated, same middleware as the other self-service
+		// factor endpoints.
+		pkGroup := authGroup.Group("/passkey", jwtRenew, appRateLimit)
+		pkGroup.POST("/register/begin", webauthnHandler.RegisterBegin)
+		pkGroup.POST("/register/complete", webauthnHandler.RegisterComplete)
+
+		// Credential management under /me, alongside /me/sessions: these are the
+		// caller's own resources, scoped by the ids in their token and never by a
+		// path parameter, and grouping them by ownership rather than by protocol
+		// is what makes that obvious at the routing table.
+		meGroup := authGroup.Group("/me/passkeys", jwtRenew, appRateLimit)
+		meGroup.GET("", webauthnHandler.ListCredentials)
+		meGroup.PATCH("/:id", webauthnHandler.RenameCredential)
+		meGroup.DELETE("/:id", webauthnHandler.RevokeCredential)
+
+		// Passwordless sign-in: pre-auth, so no JWT middleware.
+		//
+		// TokenRateLimiter (per IP) rather than the per-account limiter, because
+		// at /login/begin there is no account yet — the authenticator has not told
+		// us who the user is. The IP is the only subject available to limit on,
+		// and it stays the only one at /login/complete too: the account is not
+		// known until the assertion verifies, by which point the work is done.
+		//
+		// Note the load shape: /login/begin is hit once per login-page view by
+		// every visitor, passkey or not, because conditional-mediation autofill
+		// requires the challenge before the user interacts with the page.
+		authGroup.POST("/passkey/login/begin", webauthnHandler.LoginBegin, mw.TokenRateLimiter(rlCfg))
+		authGroup.POST("/passkey/login/complete", webauthnHandler.LoginComplete, mw.TokenRateLimiter(rlCfg))
+
+		// Cookie-session variant for browser clients (the admin console), which
+		// cannot use the body tokens /login/complete returns — nothing in
+		// JavaScript may write an HttpOnly cookie. Mirrors the /auth/login vs
+		// /auth/session split that already exists for password login.
+		//
+		// sessionCSRF for the same reason the other cookie-session routes have
+		// it: this endpoint mutates session state and is reachable with ambient
+		// cookies, so a cross-site POST must be refused by origin.
+		authGroup.POST("/passkey/session", webauthnHandler.SessionLoginComplete,
+			mw.TokenRateLimiter(rlCfg), sessionCSRF)
+	}
+
 	// Admin routes — require a valid JWT, supplied either as a Bearer token or as
 	// the emc_access_token cookie (scoped to /api/v1, so browser sessions reach
 	// these routes). JWTRequired (not JWTRenew) is used here because the refresh
@@ -938,6 +1022,30 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, appUsersWrite)
 
+	// Per-scope passkey policy under the canonical family (issue #112).
+	//
+	// Rides the apps:* permissions for the same reason MFA policy does: this is
+	// application configuration, not user administration. The tenant-scope
+	// routes take apps:* too — a tenant-wide default for an application setting
+	// is still an application setting.
+	//
+	// There is deliberately NO route for the platform-default row. It is the
+	// fallback every other scope inherits from, so an API that let one tenant's
+	// administrator edit it would let them change the default for all of them.
+	// Changing it is a deployment action, done by migration or by hand.
+	adminGroup.GET("/tenants/:tid/passkey-policy", adminHandler.GetTenantPasskeyPolicy, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/passkey-policy", adminHandler.UpdateTenantPasskeyPolicy, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/passkey-policy", adminHandler.GetApplicationPasskeyPolicy, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/passkey-policy", adminHandler.UpdateApplicationPasskeyPolicy, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/passkey-policy", adminHandler.DeleteApplicationPasskeyPolicy, appAppsWrite)
+
+	// A user's passkeys, seen and revoked by an operator. users:* rather than
+	// apps:*: this is somebody's credential, not configuration.
+	adminGroup.GET("/tenants/:tid/users/:uid/passkeys", adminHandler.ListUserPasskeys, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/users/:uid/passkeys/:pid", adminHandler.RevokeUserPasskey, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/passkeys", adminHandler.ListUserPasskeys, appUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/passkeys/:pid", adminHandler.RevokeUserPasskey, appUsersWrite)
+
 	// White-label email senders under the canonical family (issue #63
 	// follow-on) — tenant-level sender plus optional per-application override;
 	// MFA code emails resolve application → tenant → global.
@@ -1094,6 +1202,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications/:appID/mfa", adminHandler.GetApplicationMFA, appsRead)
 	adminGroup.PUT("/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appsWrite)
 	adminGroup.DELETE("/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, usersWrite)
+
+	// Per-scope passkey policy — flat aliases of the canonical
+	// /tenants/:tid/... family (issue #112). Tenant comes from the JWT.
+	adminGroup.GET("/passkey-policy", adminHandler.GetTenantPasskeyPolicy, appsRead)
+	adminGroup.PUT("/passkey-policy", adminHandler.UpdateTenantPasskeyPolicy, appsWrite)
+	adminGroup.GET("/applications/:appID/passkey-policy", adminHandler.GetApplicationPasskeyPolicy, appsRead)
+	adminGroup.PUT("/applications/:appID/passkey-policy", adminHandler.UpdateApplicationPasskeyPolicy, appsWrite)
+	adminGroup.DELETE("/applications/:appID/passkey-policy", adminHandler.DeleteApplicationPasskeyPolicy, appsWrite)
+
+	adminGroup.GET("/users/:uid/passkeys", adminHandler.ListUserPasskeys, usersRead)
+	adminGroup.DELETE("/users/:uid/passkeys/:pid", adminHandler.RevokeUserPasskey, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/passkeys", adminHandler.ListUserPasskeys, usersRead)
+	adminGroup.DELETE("/applications/:appID/users/:uid/passkeys/:pid", adminHandler.RevokeUserPasskey, usersWrite)
 
 	// White-label email senders — flat aliases (tenant from JWT).
 	adminGroup.GET("/email-settings", adminHandler.GetEmailSender, appsRead)

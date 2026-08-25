@@ -208,6 +208,25 @@ const (
 	ActionSessionsReaped          = "session.rows_reaped"
 	ActionAdminSessionPolicySet   = "admin.session_policy_updated"
 	ActionAdminSessionPolicyReset = "admin.session_policy_reset"
+
+	// Auth — passkeys / WebAuthn (issue #112).
+	//
+	// Names follow the ticket. passkey_clone_detected is the one that matters:
+	// it fires when an assertion shows a credential's private key exists in more
+	// than one place, and it is the only auth event in this file that implies
+	// somebody extracted key material from an authenticator. It is accompanied
+	// by an automatic revocation of the credential and every session the account
+	// had, so an operator seeing it is reading about containment that has
+	// already happened, not a decision they need to make.
+	ActionAuthPasskeyRegistered    = "auth.passkey_registered"
+	ActionAuthPasskeyLogin         = "auth.passkey_login"
+	ActionAuthPasskeyLoginFailed   = "auth.passkey_login_failed"
+	ActionAuthPasskeyRemoved       = "auth.passkey_removed"
+	ActionAuthPasskeyRenamed       = "auth.passkey_renamed"
+	ActionAuthPasskeyCloneDetected = "auth.passkey_clone_detected"
+
+	// Admin — per-scope passkey policy management (issue #112).
+	ActionAdminPasskeyPolicyUpdated = "admin.passkey_policy_updated"
 )
 
 // Event outcome — the `status` column. Derived from the action at enqueue time
@@ -233,6 +252,12 @@ const (
 	AuthMethodRefreshToken      = "refresh_token"
 	AuthMethodAPIKey            = "api_key"
 	AuthMethodAgent             = "agent"
+	// AuthMethodPasskey is a WebAuthn assertion. One value covers both the
+	// with-gesture and without-gesture cases: whether user verification actually
+	// happened is recorded on the session's amr claim, which is derived from the
+	// authenticator's response rather than from what we asked for, and splitting
+	// it here would invite reading the audit row as evidence of the factor count.
+	AuthMethodPasskey = "passkey"
 )
 
 // SocialLoginAction returns the audit action for a successful social login

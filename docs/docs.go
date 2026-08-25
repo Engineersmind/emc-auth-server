@@ -918,6 +918,149 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/passkey-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's own policy row (or exists=false when it inherits from the tenant) plus the effective policy.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-passkeys"
+                ],
+                "summary": "Get application passkey policy",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasskeyPolicyRecord"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Creates or updates the application's passkey policy, overriding the tenant's. This is where a tenant sets the relying-party ID for an application served from its own domain.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-passkeys"
+                ],
+                "summary": "Set application passkey policy",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Policy fields to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdatePasskeyPolicyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasskeyPolicyRecord"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the application's override so it inherits the tenant's policy again. 404 when there was no override to remove.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-passkeys"
+                ],
+                "summary": "Clear application passkey policy",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "cleared"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/rate-limit": {
             "get": {
                 "security": [
@@ -2995,6 +3138,153 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/me/passkeys": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "List my passkeys",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.StoredCredential"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/me/passkeys/{id}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes a passkey. Refused with last_factor when it is the account's only way to sign in — a passwordless account with one passkey has no recoverable route back in.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "Remove one of my passkeys",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Credential row id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "removed"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "last remaining sign-in method",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "patch": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Relabels a passkey. The label is the only thing distinguishing several passkeys in a list, and the name chosen mid-ceremony at registration is the one most likely to be wrong.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "Rename one of my passkeys",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Credential row id",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "New name (1-64 characters)",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.renamePasskeyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.StoredCredential"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/my-activity": {
             "get": {
                 "security": [
@@ -3579,6 +3869,269 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/passkey/login/begin": {
+            "post": {
+                "description": "Returns PublicKeyCredentialRequestOptions with an empty allowCredentials, usable with either the default mediation (a \"sign in with a passkey\" button) or mediation:\"conditional\" (autofill).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "Begin passwordless passkey sign-in",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.webauthnBeginResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "passkeys or passwordless sign-in disabled, or origin not allowed",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/passkey/login/complete": {
+            "post": {
+                "description": "Verifies the assertion and returns a token pair. The request body is the raw PublicKeyCredential from the browser.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "Complete passwordless passkey sign-in",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Token from login/begin",
+                        "name": "ceremony_token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/passkey/register/begin": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns PublicKeyCredentialCreationOptions for navigator.credentials.create(). Requires an authenticated caller (bearer token or session cookie).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "Begin passkey registration",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.webauthnBeginResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "passkeys disabled for this tenant, or origin not allowed",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "credential limit reached",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/passkey/register/complete": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Verifies the attestation and stores the credential. The request body is the raw PublicKeyCredential from the browser.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "Complete passkey registration",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Token from register/begin",
+                        "name": "ceremony_token",
+                        "in": "query",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User-facing label for this passkey (max 64 chars)",
+                        "name": "name",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.StoredCredential"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/passkey/session": {
+            "post": {
+                "description": "Verifies a passkey assertion and stores the token pair in HttpOnly cookies. Browser/console counterpart of /auth/passkey/login/complete.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Passkeys"
+                ],
+                "summary": "Cookie-session passkey sign-in",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Token from login/begin",
+                        "name": "ceremony_token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "application-scoped account — cookies are not available",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4541,6 +5094,104 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/passkey-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the tenant's own passkey policy row (or exists=false when it inherits) plus the effective policy after inheritance from the platform default and server configuration.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-passkeys"
+                ],
+                "summary": "Get tenant passkey policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasskeyPolicyRecord"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "501": {
+                        "description": "passkeys not configured on this server",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Creates or updates the tenant's passkey policy. Omitted fields keep their stored value; sending rp_id as \"\" reverts to the server's relying party. Origins are normalised and must be full origins including scheme and port.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-passkeys"
+                ],
+                "summary": "Set tenant passkey policy",
+                "parameters": [
+                    {
+                        "description": "Policy fields to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdatePasskeyPolicyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasskeyPolicyRecord"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -7510,6 +8161,99 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/users/{uid}/passkeys": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Support view of one user's registered passkeys. Carries no key material — a public key is useless to a client and a credential id is only meaningful inside a ceremony.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-passkeys"
+                ],
+                "summary": "List a user's passkeys",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.StoredCredential"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "user not found in this scope",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/users/{uid}/passkeys/{pid}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Deactivates one of a user's passkeys on their behalf — the lost-device case. Unlike the user's own delete, this is not blocked when the passkey is their last sign-in method: leaving a factor live on a stolen device is worse than needing a password reset.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-passkeys"
+                ],
+                "summary": "Remove a user's passkey",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Passkey ID",
+                        "name": "pid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "removed"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/health": {
             "get": {
                 "produces": [
@@ -9368,6 +10112,100 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.PasskeyPolicy": {
+            "type": "object",
+            "properties": {
+                "allow_passkeys": {
+                    "description": "AllowPasskeys is the master switch. False refuses registration and\npasswordless sign-in alike.",
+                    "type": "boolean"
+                },
+                "allow_passwordless": {
+                    "description": "AllowPasswordless gates sign-in specifically. False still permits\nregistration and management, so a tenant can hold passkeys as a\nsecond factor without accepting them as the whole credential.",
+                    "type": "boolean"
+                },
+                "max_credentials_per_user": {
+                    "description": "MaxCredentialsPerUser caps live credentials per account.",
+                    "type": "integer"
+                },
+                "origins": {
+                    "description": "Origins is the exact-match allow-list of page origins permitted to run a\nceremony, including scheme and port.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_user_verification": {
+                    "description": "RequireUserVerification demands a biometric or PIN gesture.",
+                    "type": "boolean"
+                },
+                "rp_display_name": {
+                    "description": "RPDisplayName is what the authenticator shows the user.",
+                    "type": "string"
+                },
+                "rp_id": {
+                    "description": "RPID is the relying-party ID actually in force: the registrable domain,\nno scheme and no port.",
+                    "type": "string"
+                },
+                "source": {
+                    "description": "Source records which row won resolution — \"application\", \"tenant\",\n\"platform\", or \"server\" when no row matched at all. An operator debugging\n\"why is my RP ID wrong\" needs to know which row answered, which is why it\nis on the ADMIN response; it is never part of an end-user payload.",
+                    "type": "string"
+                }
+            }
+        },
+        "auth.PasskeyPolicyRecord": {
+            "type": "object",
+            "properties": {
+                "allow_passkeys": {
+                    "type": "boolean"
+                },
+                "allow_passwordless": {
+                    "type": "boolean"
+                },
+                "application_id": {
+                    "type": "integer"
+                },
+                "effective": {
+                    "description": "Effective is what the scope actually resolves to right now, after\ninheritance. An operator needs both: what this row says, and what it means.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/auth.PasskeyPolicy"
+                        }
+                    ]
+                },
+                "exists": {
+                    "type": "boolean"
+                },
+                "max_credentials_per_user": {
+                    "type": "integer"
+                },
+                "origins": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_user_verification": {
+                    "type": "boolean"
+                },
+                "rp_display_name": {
+                    "type": "string"
+                },
+                "rp_id": {
+                    "description": "RPID and Origins are empty when the row inherits them.",
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "Scope is \"platform\", \"tenant\", or \"application\".",
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.ProviderConfigDetail": {
             "type": "object",
             "properties": {
@@ -9461,6 +10299,41 @@ const docTemplate = `{
                 },
                 "user_id": {
                     "type": "integer"
+                }
+            }
+        },
+        "auth.StoredCredential": {
+            "type": "object",
+            "properties": {
+                "aaguid": {
+                    "description": "AAGUID is the raw model identifier, so a frontend can supply its own icon\nfor a model we have no name for, and so an unrecognised authenticator is\nstill reportable in a support ticket.",
+                    "type": "string"
+                },
+                "authenticator_name": {
+                    "description": "AuthenticatorName is the model that created the credential (\"iCloud\nKeychain\", \"Windows Hello\", \"YubiKey 5 Series\"), or empty when the\nauthenticator did not identify itself — which is the normal case under the\n'none' attestation we request. A DISPLAY LABEL ONLY: it comes from an\nunattested response and must never gate anything. See aaguid.go.",
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "last_used_at": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "rp_id": {
+                    "type": "string"
+                },
+                "synced": {
+                    "type": "boolean"
+                },
+                "synced_label": {
+                    "description": "SyncedLabel is the phrase to show a user. \"This device only\" is the fact\nthat matters to them: a device-bound passkey (Windows Hello) dies with the\nlaptop, a synced one does not.",
+                    "type": "string"
                 }
             }
         },
@@ -10296,6 +11169,36 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.UpdatePasskeyPolicyRequest": {
+            "type": "object",
+            "properties": {
+                "allow_passkeys": {
+                    "type": "boolean"
+                },
+                "allow_passwordless": {
+                    "type": "boolean"
+                },
+                "max_credentials_per_user": {
+                    "type": "integer"
+                },
+                "origins": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "require_user_verification": {
+                    "type": "boolean"
+                },
+                "rp_display_name": {
+                    "type": "string"
+                },
+                "rp_id": {
+                    "description": "RPID, RPDisplayName and Origins accept \"\" / [] as a deliberate\nclear-to-inherit, which is why they are pointers rather than plain values:\nthere has to be a way to say \"go back to the server's relying party\".",
+                    "type": "string"
+                }
+            }
+        },
         "handlers.UpdateRolePermissionsRequest": {
             "type": "object",
             "properties": {
@@ -10460,6 +11363,14 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.renamePasskeyRequest": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.tokenError": {
             "type": "object",
             "properties": {
@@ -10469,6 +11380,15 @@ const docTemplate = `{
                 "error_description": {
                     "type": "string"
                 }
+            }
+        },
+        "handlers.webauthnBeginResponse": {
+            "type": "object",
+            "properties": {
+                "ceremony_token": {
+                    "type": "string"
+                },
+                "publicKey": {}
             }
         },
         "saml.SAMLConfig": {
