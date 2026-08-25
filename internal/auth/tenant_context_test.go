@@ -227,3 +227,75 @@ func TestReachableTenants_SkipsInactiveTenant(t *testing.T) {
 		t.Errorf("reachable = %+v, want only the active tenant A (%d)", got, e.tenantA)
 	}
 }
+
+// TestReachableTenants_AppCountExcludesDeleted pins the count against the
+// tenant TABLE's, which has always filtered soft-deleted applications.
+//
+// The two listings answer the same question ("how many applications does this
+// tenant have?") from two queries, and they disagreed: this one counted every
+// oauth_clients row, so an owner who deleted an application saw one number in
+// the switcher and a smaller one in the table for the same tenant. A count the
+// reader can catch contradicting itself is worse than no count.
+//
+// Suspended applications stay counted on purpose — is_active = false preserves
+// the row and it remains administrable, which is exactly what a count of
+// administrable applications should include.
+func TestReachableTenants_AppCountExcludesDeleted(t *testing.T) {
+	e := newGrantsEnv(t)
+	user := e.seedAdminUser(t, e.tenantA, "appcount")
+	e.grant(t, user, e.tenantA, auth.AdminRoleOwner, nil)
+
+	// Tenant A ships with two applications: delete one, suspend the other.
+	if _, err := e.pool.Exec(e.ctx,
+		`UPDATE oauth_clients SET deleted_at = NOW() WHERE id = $1`, e.appA1); err != nil {
+		t.Fatalf("soft-delete app A1: %v", err)
+	}
+	if _, err := e.pool.Exec(e.ctx,
+		`UPDATE oauth_clients SET is_active = false WHERE id = $1`, e.appA2); err != nil {
+		t.Fatalf("suspend app A2: %v", err)
+	}
+
+	got, err := auth.ListReachableTenants(e.ctx, e.pool, user)
+	if err != nil {
+		t.Fatalf("ListReachableTenants: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("reachable = %d tenants, want 1 (%+v)", len(got), got)
+	}
+	if got[0].AppCount != 1 {
+		t.Errorf("app_count = %d, want 1 — the deleted application must not count, the suspended one must", got[0].AppCount)
+	}
+}
+
+// TestReachableTenants_ApplicationsAreOrdered pins the co-owner applications
+// array to ascending application id.
+//
+// Without ORDER BY inside array_agg the order is whatever the planner produces,
+// so the same grants could serialise in two different orders — which makes any
+// client comparing the array against a previous response see a change that did
+// not happen.
+func TestReachableTenants_ApplicationsAreOrdered(t *testing.T) {
+	e := newGrantsEnv(t)
+	user := e.seedAdminUser(t, e.tenantA, "ordered-apps")
+
+	// Granted highest-id first, so an unordered aggregate has a fair chance of
+	// echoing back insertion order rather than sorted order.
+	e.grant(t, user, e.tenantB, auth.AdminRoleCoOwner, &e.appB2)
+	e.grant(t, user, e.tenantB, auth.AdminRoleCoOwner, &e.appB1)
+
+	got, err := auth.ListReachableTenants(e.ctx, e.pool, user)
+	if err != nil {
+		t.Fatalf("ListReachableTenants: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("reachable = %d tenants, want 1 (%+v)", len(got), got)
+	}
+	want := []int64{e.appB1, e.appB2}
+	if e.appB1 > e.appB2 {
+		want = []int64{e.appB2, e.appB1}
+	}
+	apps := got[0].Applications
+	if len(apps) != 2 || apps[0] != want[0] || apps[1] != want[1] {
+		t.Errorf("applications = %v, want %v (ascending application id)", apps, want)
+	}
+}

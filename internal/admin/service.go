@@ -2127,6 +2127,26 @@ func (s *Service) ListOwnedTenants(ctx context.Context, email string) ([]OwnedTe
 			-- also holding application grants, and a co-owner holds one grant per
 			-- application so several rows collapse to one tenant here.
 			CASE WHEN BOOL_OR(g.admin_role = 'owner') THEN 'owner' ELSE 'co_owner' END AS role_name,
+			-- Three correlated subqueries, so an administrator of N tenants runs
+			-- ~3N counting scans per load. Deliberate at this scale: N is a
+			-- handful, each subquery hits a tenant_id index, and the alternative
+			-- (LEFT JOIN LATERAL, or grouped aggregates) has to survive the
+			-- GROUP BY this query already needs for the co-owner collapse — more
+			-- shape for no measurable gain. If an administrator ever reaches
+			-- tens of tenants, collapse these into one pass; the counts are
+			-- display-only, so nothing else depends on how they are computed.
+			--
+			-- deleted_at IS NULL on users and oauth_clients: soft-deleted rows are
+			-- gone as far as any reader is concerned. auth.ListReachableTenants and
+			-- auth.AllTenantsForPlatformAdmin filter app_count identically, so the
+			-- switcher and this table never report different numbers for one
+			-- tenant.
+			--
+			-- role_count takes no deleted_at filter, and matches ListRoles, which
+			-- takes none either: roles are hard-DELETEd (see DeleteRole), so the
+			-- deleted_at column migration 00020 added to the table is never
+			-- written. Filtering on it would only imply a soft-delete path that
+			-- does not exist.
 			(SELECT COUNT(*) FROM users        WHERE tenant_id = t.id AND deleted_at IS NULL) AS user_count,
 			(SELECT COUNT(*) FROM roles        WHERE tenant_id = t.id)                        AS role_count,
 			(SELECT COUNT(*) FROM oauth_clients WHERE tenant_id = t.id AND deleted_at IS NULL) AS app_count

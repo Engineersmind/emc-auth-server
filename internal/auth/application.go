@@ -648,6 +648,31 @@ func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, t
 		newGrantTypes = grantTypesForAppType(appType)
 	}
 
+	// A type change re-derives require_pkce for the same reason it re-derives
+	// grant_types: the flag describes a property of the type's flow, not a
+	// standalone preference. Converting a web/spa client to m2m used to leave
+	// require_pkce = true on a row with no authorization-code flow at all — the
+	// exact contradiction CreateApplicationWithOptions forces false to avoid — and
+	// converting m2m to spa left it false on a public client that has nothing else
+	// binding a code to its requester.
+	//
+	// The rule matches the create path exactly: m2m false, public true, and only
+	// the confidential redirect flow (web) leaves the choice to the caller. An
+	// explicit upd.RequirePKCE therefore still wins on a web type change and is
+	// still honoured when the type is unchanged (pkceOverride nil), so no existing
+	// caller loses control of the flag.
+	pkceOverride := upd.RequirePKCE
+	if appType != "" {
+		derived := true
+		switch {
+		case appType == appTypeM2M:
+			derived = false
+			pkceOverride = &derived
+		case isPublicClient(appType):
+			pkceOverride = &derived
+		}
+	}
+
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE oauth_clients
 		SET    name          = COALESCE(NULLIF($1, ''), name),
@@ -661,7 +686,7 @@ func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, t
 		       display_name  = COALESCE(NULLIF($11, ''), display_name),
 		       updated_at    = NOW()
 		WHERE  id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-	`, name, appType, scopes, appID, tenantID, upd.RedirectURIs, upd.RequirePKCE, upd.FirstParty, upd.IsActive, newGrantTypes, upd.DisplayName)
+	`, name, appType, scopes, appID, tenantID, upd.RedirectURIs, pkceOverride, upd.FirstParty, upd.IsActive, newGrantTypes, upd.DisplayName)
 	if err != nil {
 		return nil, fmt.Errorf("update application: %w", err)
 	}

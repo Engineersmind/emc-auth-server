@@ -595,3 +595,107 @@ func TestApplicationDisplayNameFallsBackToName(t *testing.T) {
 		t.Errorf("DisplayName = %q, want it preserved across a rename", renamed.DisplayName)
 	}
 }
+
+// TestTypeChangeRederivesRequirePKCE is the update-path half of
+// TestAppTypeDerivesGrantTypes.
+//
+// The update already re-derived grant_types on a type change but left
+// require_pkce alone, so a web client converted to m2m kept require_pkce = true
+// on a row with no authorization-code flow at all — the same self-contradicting
+// row the create path forces false to avoid. The reverse direction was worse:
+// m2m converted to spa kept require_pkce = false on a PUBLIC client, where PKCE
+// is the only thing binding an authorization code to the client that requested
+// it.
+//
+// web is the one type that keeps the choice, because it is the only confidential
+// redirect flow — so an explicit require_pkce must still win there.
+func TestTypeChangeRederivesRequirePKCE(t *testing.T) {
+	svc, ctx, tenantID, _ := newApplicationService(t)
+
+	newApp := func(t *testing.T, label, appType string) int64 {
+		t.Helper()
+		created, err := svc.CreateApplication(ctx, tenantID, label, appType, nil)
+		if err != nil {
+			t.Fatalf("create %s: %v", label, err)
+		}
+		id, err := strconv.ParseInt(created.ID, 10, 64)
+		if err != nil {
+			t.Fatalf("parse id: %v", err)
+		}
+		return id
+	}
+	pkceOf := func(t *testing.T, appID int64) bool {
+		t.Helper()
+		got, err := svc.GetApplication(ctx, tenantID, appID)
+		if err != nil {
+			t.Fatalf("get %d: %v", appID, err)
+		}
+		return got.RequirePKCE
+	}
+	yes, no := true, false
+
+	t.Run("web to m2m clears it", func(t *testing.T) {
+		appID := newApp(t, "pkce-web-to-m2m", "web")
+		if !pkceOf(t, appID) {
+			t.Fatalf("precondition: web app should start with require_pkce = true")
+		}
+		if _, err := svc.UpdateApplication(ctx, tenantID, appID, "", "m2m", nil); err != nil {
+			t.Fatalf("update to m2m: %v", err)
+		}
+		if pkceOf(t, appID) {
+			t.Error("require_pkce = true after converting to m2m — m2m has no authorization code to bind")
+		}
+	})
+
+	t.Run("m2m to spa sets it", func(t *testing.T) {
+		appID := newApp(t, "pkce-m2m-to-spa", "m2m")
+		if pkceOf(t, appID) {
+			t.Fatalf("precondition: m2m app should start with require_pkce = false")
+		}
+		if _, err := svc.UpdateApplication(ctx, tenantID, appID, "", "spa", nil); err != nil {
+			t.Fatalf("update to spa: %v", err)
+		}
+		if !pkceOf(t, appID) {
+			t.Error("require_pkce = false after converting to spa — a public client has nothing else binding the code")
+		}
+	})
+
+	t.Run("m2m ignores an explicit true", func(t *testing.T) {
+		appID := newApp(t, "pkce-m2m-explicit", "web")
+		if _, err := svc.UpdateApplicationWithOptions(ctx, tenantID, appID, "", "m2m", nil,
+			auth.AppUpdate{RequirePKCE: &yes}); err != nil {
+			t.Fatalf("update to m2m with require_pkce=true: %v", err)
+		}
+		if pkceOf(t, appID) {
+			t.Error("require_pkce = true on an m2m client — the type's rule outranks the caller, as on create")
+		}
+	})
+
+	t.Run("web honours an explicit false", func(t *testing.T) {
+		appID := newApp(t, "pkce-web-explicit", "m2m")
+		if _, err := svc.UpdateApplicationWithOptions(ctx, tenantID, appID, "", "web", nil,
+			auth.AppUpdate{RequirePKCE: &no}); err != nil {
+			t.Fatalf("update to web with require_pkce=false: %v", err)
+		}
+		if pkceOf(t, appID) {
+			t.Error("require_pkce = true on web despite an explicit false — web is the one type that keeps the choice")
+		}
+	})
+
+	t.Run("unchanged type leaves the flag alone", func(t *testing.T) {
+		appID := newApp(t, "pkce-untouched", "web")
+		if _, err := svc.UpdateApplicationWithOptions(ctx, tenantID, appID, "", "", nil,
+			auth.AppUpdate{RequirePKCE: &no}); err != nil {
+			t.Fatalf("update require_pkce only: %v", err)
+		}
+		if pkceOf(t, appID) {
+			t.Error("require_pkce = true after an explicit false with no type change — the override must still apply")
+		}
+		if _, err := svc.UpdateApplication(ctx, tenantID, appID, "renamed", "", nil); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		if pkceOf(t, appID) {
+			t.Error("a rename re-derived require_pkce — with no type change the flag must be left untouched")
+		}
+	})
+}

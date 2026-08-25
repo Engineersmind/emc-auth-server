@@ -290,7 +290,7 @@ func ListAdminReach(ctx context.Context, pool *pgxpool.Pool, userID int64) ([]Ad
 }
 
 // HasAdminGrant reports whether a user holds a live, activated grant in a
-// tenant. This is the authorization check for /auth/switch-tenant: the requested
+// tenant. This is the authorization check for /auth/tenant-context: the requested
 // tenant comes from the request body, so it must be verified against grants
 // rather than trusted.
 func HasAdminGrant(ctx context.Context, pool *pgxpool.Pool, userID, tenantID int64) (bool, string, error) {

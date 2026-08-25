@@ -298,7 +298,7 @@ func TestAdminGrants_OwnerGrantWinsOverApplicationGrants(t *testing.T) {
 }
 
 // TestAdminGrants_HasGrantAndDefaultTenant covers the two lookups the login and
-// switch-tenant paths depend on.
+// tenant-context paths depend on.
 func TestAdminGrants_HasGrantAndDefaultTenant(t *testing.T) {
 	e := newGrantsEnv(t)
 	user := e.seedAdminUser(t, e.tenantB, "default")
@@ -318,11 +318,11 @@ func TestAdminGrants_HasGrantAndDefaultTenant(t *testing.T) {
 		t.Errorf("HasAdminGrant(B) = (%t, %q), want (true, %q)", ok, role, auth.AdminRoleCoOwner)
 	}
 	// A tenant they do not administer must not be enterable — this is the check
-	// that stops /auth/switch-tenant trusting a tenant id from the request body.
+	// that stops /auth/tenant-context trusting a tenant id from the request body.
 	if ok, _, err = auth.HasAdminGrant(e.ctx, e.pool, user, e.tenantA); err != nil {
 		t.Fatalf("HasAdminGrant(A): %v", err)
 	} else if ok {
-		t.Error("HasAdminGrant(A) = true for a tenant with no grant — switch-tenant would admit it")
+		t.Error("HasAdminGrant(A) = true for a tenant with no grant — tenant-context would admit it")
 	}
 
 	// Now also owner of A. The default prefers the owned tenant, because landing

@@ -62,6 +62,25 @@ var (
 // session continues; only the tenant written into the claims changes. Reusing the
 // session keeps the audit trail continuous — a switch shows up as one identity
 // moving between tenants rather than as an unexplained new sign-in.
+//
+// Four to five sequential round trips (tenant-active, grant, account-usable,
+// permissions, and the claim role for a platform admin) rather than one joined
+// query, on purpose, and worth naming so the cost is a known trade:
+//
+//   - The order is a security property, not an accident. Tenant liveness is
+//     checked BEFORE the grant so a deactivated tenant is unreachable even by an
+//     administrator who still holds one, and the account block is checked after
+//     authorization so switching can never be a way around it. A single joined
+//     query decides all three at once, which makes that ordering unexpressible.
+//   - ErrSwitchAccountUnusable has to stay separable from ErrNoGrantInTenant: a
+//     blocked administrator must be told their account is the problem, while a
+//     missing grant and a dead tenant deliberately collapse into one answer so
+//     probing for tenant ids is no cheaper than not probing.
+//
+// This is a once-per-switch human action rather than a hot path, and every lookup
+// is a primary-key or indexed hit. If it ever shows under load, the tenant and
+// user rows are the pair that could merge into one query — the grant check is the
+// one that must stay separate, since it is what the ordering above turns on.
 func (s *AuthService) SwitchTenantContext(ctx context.Context, userID, currentTenantID, targetTenantID int64, platformAdmin bool, sess sessionContext) (*AuthResult, error) {
 	if targetTenantID == currentTenantID {
 		return nil, ErrSameTenant
@@ -245,9 +264,21 @@ func ListReachableTenants(ctx context.Context, pool interface {
 		       MAX(CASE WHEN g.admin_role = 'owner' THEN 1 ELSE 0 END) AS is_owner,
 		       -- Applications named by co-owner grants. NULL-application owner
 		       -- rows contribute nothing, which is what "absence means all" means.
-		       COALESCE(array_agg(g.application_id) FILTER (WHERE g.application_id IS NOT NULL), '{}') AS apps,
+		       --
+		       -- ORDER BY inside the aggregate: without it the array order is
+		       -- planner-dependent, so two identical calls could report the same
+		       -- co-owner's applications in different orders.
+		       COALESCE(array_agg(g.application_id ORDER BY g.application_id) FILTER (WHERE g.application_id IS NOT NULL), '{}') AS apps,
 		       -- Total applications in the tenant, for an owner's count.
-		       (SELECT COUNT(*) FROM oauth_clients oc WHERE oc.tenant_id = g.tenant_id) AS tenant_apps,
+		       --
+		       -- deleted_at IS NULL to match admin.ListOwnedTenants' app_count.
+		       -- Without it a soft-deleted application still counted here, so the
+		       -- same tenant reported one number in the switcher and a smaller one
+		       -- in the tenant table. Suspended (is_active = false) applications
+		       -- ARE counted, by both: they still exist and are administrable,
+		       -- unlike deleted ones.
+		       (SELECT COUNT(*) FROM oauth_clients oc
+		         WHERE oc.tenant_id = g.tenant_id AND oc.deleted_at IS NULL) AS tenant_apps,
 		       bool_or(t.primary_admin_grant_id = g.id) AS is_primary
 		FROM admin_grants g
 		JOIN tenants t ON t.id = g.tenant_id
@@ -359,7 +390,12 @@ func (s *AuthService) AllTenantsForPlatformAdmin(ctx context.Context, limit, off
 		SELECT t.id,
 		       COALESCE(NULLIF(t.display_name, ''), t.name),
 		       t.slug,
-		       (SELECT COUNT(*) FROM oauth_clients oc WHERE oc.tenant_id = t.id)
+		       -- deleted_at IS NULL for the same reason as ListReachableTenants
+		       -- above: every application count in the product excludes
+		       -- soft-deleted rows, and a platform administrator must not be the
+		       -- one listing that disagrees.
+		       (SELECT COUNT(*) FROM oauth_clients oc
+		         WHERE oc.tenant_id = t.id AND oc.deleted_at IS NULL)
 		FROM tenants t
 		WHERE t.deleted_at IS NULL AND t.is_active
 		-- Alphabetical, matching ListReachableTenants above: a platform admin sees
