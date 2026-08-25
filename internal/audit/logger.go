@@ -88,7 +88,7 @@ const (
 	ActionAdminApplicationDeleted       = "admin.application_deleted"
 	ActionAdminApplicationSecretRotated = "admin.application_secret_rotated"
 
-	// Admin — multi-tenant administrative grants (migration 00071).
+	// Admin — multi-tenant administrative grants (migration 00078).
 	//
 	// Granting cross-tenant administrative access is among the most
 	// security-sensitive events in the system, so each entry records the actor,

@@ -75,7 +75,7 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	); err != nil {
 		return fmt.Errorf("activate admin grant: %w", err)
 	}
-	// Mirror the activation into admin_grants (00071), inside this transaction.
+	// Mirror the activation into admin_grants (00078), inside this transaction.
 	//
 	// This is the write that confers authority, so the two models must not
 	// disagree on it: a mirror left pending would deny a legitimately activated

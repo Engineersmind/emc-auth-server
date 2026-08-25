@@ -9,7 +9,7 @@
 --
 -- where $2 is the tenant the invitation grants administration of. But
 -- users.tenant_id is the account's HOME tenant — where its credentials live —
--- and migration 00071 established that the two are different axes. For a
+-- and migration 00078 established that the two are different axes. For a
 -- cross-tenant invitation they differ, so the predicate matched zero rows: the
 -- link was consumed, the administrative grant activated, and email_verified was
 -- silently left false.

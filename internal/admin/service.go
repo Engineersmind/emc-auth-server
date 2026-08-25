@@ -509,7 +509,7 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// address already administers somewhere.
 	//
 	// The lookup is deliberately NOT scoped to this tenant. One administrator may
-	// administer several tenants (migration 00071), so creating a second tenant for
+	// administer several tenants (migration 00078), so creating a second tenant for
 	// someone who already has an account must GRANT that account rather than mint a
 	// parallel one.
 	//
@@ -584,7 +584,7 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 		return nil, fmt.Errorf("set primary admin: %w", err)
 	}
 
-	// Mirror the seeded owner into admin_grants (00071), and point the new
+	// Mirror the seeded owner into admin_grants (00078), and point the new
 	// grant-shaped primary-admin column at it. Both columns are maintained until
 	// tenant_admins is dropped, so ADMIN_GRANTS_ENABLED can be flipped either way.
 	if err = mirrorAdminGrants(ctx, tx, tenantID, userID); err != nil {

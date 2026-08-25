@@ -162,7 +162,7 @@ ON CONFLICT DO NOTHING;
 -- unrenderable. Enforced in the database as well as in Go because the column is
 -- also reachable by hand during support work.
 --
--- Added here rather than in 00071 so a database that already ran the spike
+-- Added here rather than in 00078 so a database that already ran the spike
 -- migration picks it up.
 ALTER TABLE webauthn_credentials
     DROP CONSTRAINT IF EXISTS webauthn_credentials_name_length;
