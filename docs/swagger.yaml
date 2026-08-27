@@ -254,8 +254,6 @@ definitions:
         type: array
       created_at:
         type: string
-      description:
-        type: string
       display_name:
         type: string
       domain:
@@ -546,6 +544,14 @@ definitions:
   audit.StatsResult:
     properties:
       active_users_week:
+        description: |-
+          ActiveUsersWeek counts distinct users who SIGNED IN over the last 7 days.
+
+          Deliberately not "users who produced any audit event": that counted a
+          failed login, a password-reset request, or an admin acting ON the user as
+          activity, so a tenant with nobody able to get in still reported active
+          users. The number a tile labelled "Active Users" has to mean is people who
+          actually reached the product.
         type: integer
       failed_logins_today:
         type: integer
@@ -554,6 +560,22 @@ definitions:
       logouts_today:
         type: integer
       recent_events:
+        description: |-
+          RecentEvents is OPT-IN via ?include=recent, and empty otherwise.
+
+          It used to be returned unconditionally: ten fully-hydrated audit rows,
+          carrying IP addresses, full user agents, request ids and response bodies,
+          on an endpoint a dashboard polls. No client reads it — the audit page has
+          its own paginated endpoint with its own guard — so the default was several
+          kilobytes of the most sensitive rows in the system, sent repeatedly to
+          satisfy nobody.
+
+          Kept rather than deleted because the field is published API and something
+          outside this repository may parse it. omitempty so a caller that does not
+          ask sees no key at all, which is the honest shape for "not requested".
+
+          Deprecated: query /audit-logs instead. This exists for compatibility and
+          will be removed once no caller passes include=recent.
         items:
           $ref: '#/definitions/audit.LogEntry'
         type: array
@@ -688,12 +710,27 @@ definitions:
         type: string
       created_at:
         type: string
+      display_name:
+        description: |-
+          DisplayName is the optional end-user-facing label. Empty means fall back to
+          Name, which is what every read does — so a consumer can render DisplayName
+          or Name without checking which is set.
+        type: string
       first_party:
         description: |-
           FirstParty false means a consent screen is required before a code may be
           issued. No consent screen exists yet, so /oauth/authorize refuses such a
           client outright rather than skipping consent silently.
         type: boolean
+      grant_types:
+        description: |-
+          GrantTypes is derived from AppType, never set directly: /oauth/token
+          enforces it, so it is the field that decides whether the application can get
+          a token at all. Exposed read-only because an operator debugging a refused
+          token request has no other way to see it.
+        items:
+          type: string
+        type: array
       id:
         type: string
       is_active:
@@ -867,8 +904,31 @@ definitions:
     type: object
   auth.InvitationPreview:
     properties:
+      admin_role:
+        description: |-
+          AdminRole is "owner" or "co_owner" for an administrative invitation, and
+          empty otherwise. The two confer very different reach, and the page should
+          not describe them identically.
+        type: string
       email:
         type: string
+      existing_tenants:
+        description: |-
+          ExistingTenants names the tenants this account ALREADY administers, so the
+          page can say "you already administer Acme; this adds Bolt" rather than
+          implying a fresh account is being created.
+
+          This is what makes a cross-tenant invitation legible. Since one identity may
+          now administer several tenants (migration 00078), an invitation to a
+          second one looks identical to a first-time invitation unless the page says
+          otherwise — and a recipient who is told to "set a password" for an account
+          they have used for months will reasonably assume something is wrong.
+
+          Empty for a brand-new account, which is exactly the signal the page needs to
+          switch between the onboarding and confirmation wordings.
+        items:
+          type: string
+        type: array
       grants_admin:
         description: |-
           GrantsAdmin reports that accepting will also activate a pending
@@ -876,6 +936,12 @@ definitions:
         type: boolean
       requires_password:
         type: boolean
+      tenant_name:
+        description: |-
+          TenantName is the tenant this invitation is FOR. Named because a recipient
+          who administers several tenants cannot otherwise tell which one they are
+          being asked to confirm.
+        type: string
     type: object
   auth.MFAPolicy:
     properties:
@@ -1272,8 +1338,6 @@ definitions:
     type: object
   handlers.CreateTenantRequest:
     properties:
-      description:
-        type: string
       display_name:
         type: string
       domain:
@@ -1410,6 +1474,21 @@ definitions:
       token:
         type: string
     type: object
+  handlers.MyTenantsResponse:
+    properties:
+      can_create_tenant:
+        description: |-
+          CanCreateTenant is server-supplied rather than inferred by the client from a
+          role name. Only a platform administrator may create tenants — asserted in
+          middleware and covered by TestRequirePermission_TenantCreationIsPlatformAdminOnly.
+        type: boolean
+      tenants:
+        items:
+          $ref: '#/definitions/handlers.ReachableTenantResponse'
+        type: array
+      total:
+        type: integer
+    type: object
   handlers.OAuthExchangeRequest:
     properties:
       client_id:
@@ -1491,6 +1570,44 @@ definitions:
           type: string
         type: array
       userinfo_endpoint:
+        type: string
+    type: object
+  handlers.ReachableTenantCapabilities:
+    properties:
+      create_application:
+        type: boolean
+      manage_admins:
+        type: boolean
+      manage_roles:
+        type: boolean
+      manage_users:
+        type: boolean
+    type: object
+  handlers.ReachableTenantResponse:
+    properties:
+      app_count:
+        type: integer
+      applications:
+        items:
+          type: string
+        type: array
+      can:
+        allOf:
+        - $ref: '#/definitions/handlers.ReachableTenantCapabilities'
+        description: |-
+          Can carries the capability flags the UI must branch on instead of comparing
+          role names. Server-derived so a button and the route guarding it share one
+          source of truth.
+      is_primary:
+        type: boolean
+      name:
+        type: string
+      role:
+        description: Role is "owner", "co_owner", or "platform_admin".
+        type: string
+      slug:
+        type: string
+      tenant_id:
         type: string
     type: object
   handlers.RefreshRequest:
@@ -1663,6 +1780,11 @@ definitions:
       code:
         type: string
     type: object
+  handlers.TenantContextRequest:
+    properties:
+      tenant_id:
+        type: string
+    type: object
   handlers.TokenRequest:
     properties:
       grant_type:
@@ -1711,7 +1833,16 @@ definitions:
     properties:
       app_type:
         type: string
+      display_name:
+        description: DisplayName empty leaves it unchanged.
+        type: string
       first_party:
+        type: boolean
+      is_active:
+        description: |-
+          IsActive nil leaves the flag unchanged. False suspends the application so
+          its client credentials stop authenticating; the row and its client_id are
+          preserved, unlike DELETE which soft-deletes.
         type: boolean
       name:
         type: string
@@ -1769,8 +1900,6 @@ definitions:
     type: object
   handlers.UpdateTenantRequest:
     properties:
-      description:
-        type: string
       display_name:
         type: string
       domain:
@@ -1936,6 +2065,32 @@ info:
   title: EMC Auth Server
   version: 1.5.0
 paths:
+  /admin/my-tenants:
+    get:
+      description: Returns every tenant the authenticated administrator may reach,
+        with per-tenant capability flags. A platform admin (tenant:manage) gets every
+        tenant, paginated; an owner gets the tenants they own; a co-owner gets the
+        tenants where they hold at least one application grant. An owner's applications
+        array is absent because they administer every application present and future
+        — read it together with role.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.MyTenantsResponse'
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List tenants the caller administers
+      tags:
+      - admin
   /api/v1/administrators:
     get:
       description: Lists owners and co-owners in EVERY tenant, for platform oversight
@@ -2622,6 +2777,12 @@ paths:
             type: object
         "404":
           description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: origin already claimed by another scope
           schema:
             additionalProperties:
               type: string
@@ -5432,6 +5593,12 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "409":
+          description: origin already claimed by another scope
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       security:
       - BearerAuth: []
       summary: Set tenant passkey policy
@@ -5891,8 +6058,18 @@ paths:
       - admin
   /api/v1/stats:
     get:
-      description: Returns audit-log-based activity counts scoped to the caller's
-        tenant. Requires admin:access.
+      description: 'Returns audit-log-based activity counts scoped to the caller''s
+        tenant. Requires admin:access. All windows are ROLLING, not calendar: logins/failed/logouts
+        cover the last 24 hours and active users the last 7 days, which is why the
+        dashboard labels them "(24h)" and "(7d)". active_users_week counts distinct
+        users who actually SIGNED IN, not every user appearing in the log. recent_events
+        is omitted unless include=recent is passed.'
+      parameters:
+      - description: Comma-separated extras. Pass 'recent' to add the deprecated recent_events
+          list; query /audit-logs instead.
+        in: query
+        name: include
+        type: string
       produces:
       - application/json
       responses:
@@ -5914,7 +6091,15 @@ paths:
   /api/v1/stats/system:
     get:
       description: Returns audit-log-based activity counts across all tenants. Requires
-        tenant:manage permission.
+        tenant:manage permission. Windows are rolling (24 hours / 7 days) and active_users_week
+        counts distinct users who signed in. recent_events is omitted unless include=recent
+        is passed.
+      parameters:
+      - description: Comma-separated extras. Pass 'recent' to add the deprecated recent_events
+          list; query /audit-logs instead.
+        in: query
+        name: include
+        type: string
       produces:
       - application/json
       responses:
@@ -6815,12 +7000,19 @@ paths:
   /api/v1/tenants/{tid}/stats:
     get:
       description: Returns audit-log-based activity counts for the specified tenant.
-        Requires tenant:manage (super_admin only).
+        Requires tenant:manage (super_admin only). Windows are rolling (24 hours /
+        7 days) and active_users_week counts distinct users who signed in. recent_events
+        is omitted unless include=recent is passed.
       parameters:
       - description: Target tenant ID
         in: path
         name: tid
         required: true
+        type: string
+      - description: Comma-separated extras. Pass 'recent' to add the deprecated recent_events
+          list; query /audit-logs instead.
+        in: query
+        name: include
         type: string
       produces:
       - application/json
@@ -7477,6 +7669,50 @@ paths:
       summary: Remove a user's passkey
       tags:
       - admin-passkeys
+  /auth/tenant-context:
+    post:
+      consumes:
+      - application/json
+      description: Re-mints the caller's session for another tenant they already administer.
+        NOT re-authentication — the current session authenticates the request, and
+        no password or second factor is involved. Required because an access token
+        names exactly one tenant, so acting in another needs a token for it. The requested
+        tenant is verified against the caller's grants and never trusted from the
+        body. The new token pair is delivered as HttpOnly cookies (emc_access_token
+        / emc_refresh_token) and is deliberately NOT returned in the response body,
+        so it stays unreadable by JavaScript.
+      parameters:
+      - description: Target tenant
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.TenantContextRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Change the active tenant
+      tags:
+      - auth
   /health:
     get:
       produces:

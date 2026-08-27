@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
@@ -2327,6 +2329,41 @@ func errCookieSessionForApps(c echo.Context) error {
 	})
 }
 
+// revokeRejectedSession ends a session whose tokens were minted and then not
+// returned to anybody (issue #116).
+//
+// For the cookie-session endpoints that cannot decide before minting — session
+// refresh, where the app_id is only readable off the freshly rotated token. The
+// endpoints that CAN decide first do that instead and never reach here; see the
+// pre-check in SessionLogin and the refuseApplicationScoped path in
+// LoginWebAuthnForCookieSession.
+//
+// Failure is logged, never surfaced. The caller is being refused either way, and
+// turning a failed cleanup into a different status code would tell them
+// something about our internal state while changing nothing they can do. A
+// persistent failure is visible as sessions accumulating with no holder, which
+// is what the log line is for.
+//
+// Detached from the request context on purpose: the response is about to be
+// written and the caller may drop the connection immediately, which would cancel
+// the revocation mid-statement and leave exactly the orphan this exists to
+// remove.
+// A free function rather than a method because both AuthHandler (session
+// refresh) and WebAuthnHandler (passkey cookie session) need it, and they share
+// no embedding.
+func revokeRejectedSession(c echo.Context, svc *auth.AuthService, logger zerolog.Logger, refreshToken string) {
+	if refreshToken == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request().Context()), 5*time.Second)
+	defer cancel()
+
+	if _, err := svc.RevokeIssuedSession(ctx, refreshToken); err != nil {
+		logger.Error().Err(err).
+			Msg("could not revoke the session minted for a refused cookie-session request — an orphaned session may remain")
+	}
+}
+
 // SessionLogin handles POST /api/v1/auth/session.
 //
 // @Summary      Cookie-based login
@@ -2346,6 +2383,32 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 	}
 	if req.Email == "" || req.Password == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
+	}
+
+	// Refused BEFORE Login runs, not after inspecting the minted token's app_id.
+	//
+	// Login mints on success — a user_sessions row and a refresh_tokens row —
+	// and enforceSessionCap runs inside that same transaction. Rejecting
+	// afterwards would abandon a live session nobody holds AND, because the new
+	// session carries the freshest last_seen_at, would already have evicted the
+	// user's oldest genuine session with revoked_reason = cap_evicted. That
+	// eviction cannot be undone by revoking the orphan afterwards, so the only
+	// fix that holds is to never mint (issue #116).
+	//
+	// Checking the header is exact here rather than approximate: Login derives a
+	// non-empty app_id claim only from VerifiedApp, ClientSecret, or ClientID
+	// (service.go), and this handler passes ClientID alone. So an app-scoped
+	// result is possible if and only if X-Client-ID was sent.
+	//
+	// The consequence is that a request carrying the header is refused before
+	// its credentials are read, so wrong-password now yields this 400 rather
+	// than 401. That is the better order — it reports the misconfiguration
+	// instead of a symptom the caller cannot act on, and it spares an endpoint
+	// that can never succeed a cost-12 bcrypt on every retry. It leaks nothing:
+	// the refusal depends only on a header the caller sent, never on whether the
+	// account exists.
+	if clientIDFromCtx(c) != "" {
+		return errCookieSessionForApps(c)
 	}
 
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
@@ -2380,10 +2443,16 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 
 	tid, uid, appID := claimsFromToken(result.Token.AccessToken)
 
-	// An X-Client-ID header scopes the login to an application, and application
-	// identities never get cookies. Say so rather than returning a cookie-less
-	// 200 the caller cannot distinguish from a working session.
+	// Unreachable via the header pre-check above, and kept deliberately: it is
+	// the assertion that the pre-check and Login's app_id derivation agree. If a
+	// future change gives Login another route to an app-scoped identity — a body
+	// field, a resolved default application — this catches it instead of writing
+	// cookies for an identity that must not have them. Reaching it means the
+	// orphan-session bug is back, so it is logged rather than silently refused.
 	if appID != nil {
+		h.logger.Error().Str("email", req.Email).
+			Msg("session login: app-scoped identity survived the pre-check — tokens were minted and are being revoked")
+		revokeRejectedSession(c, h.svc, h.logger, result.Token.RefreshToken)
 		return errCookieSessionForApps(c)
 	}
 
@@ -2472,8 +2541,17 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 	// token by this point, so the session is over either way — clear the stale
 	// cookies and say why, instead of a 200 "session refreshed" that silently
 	// signed the caller out.
+	//
+	// This is the one cookie-session rejection that genuinely cannot precede the
+	// mint: the app_id is only knowable from the token RefreshWithLock just
+	// signed. So the freshly rotated token is revoked here instead (issue #116).
+	// Without it the session stays live, holding a token the caller was never
+	// given, until idle expiry — and the caller has just been told the session is
+	// over. No cap eviction to worry about on this path, because a rotation
+	// reuses the existing session row rather than inserting one.
 	if appID != nil {
 		clearAuthCookies(c, h.cookieCfg)
+		revokeRejectedSession(c, h.svc, h.logger, result.RefreshToken)
 		return errCookieSessionForApps(c)
 	}
 

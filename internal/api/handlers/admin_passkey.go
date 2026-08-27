@@ -116,6 +116,7 @@ func (h *AdminHandler) GetTenantPasskeyPolicy(c echo.Context) error {
 // @Success      200   {object}  auth.PasskeyPolicyRecord
 // @Failure      400   {object}  map[string]string
 // @Failure      403   {object}  map[string]string
+// @Failure      409   {object}  map[string]string  "origin already claimed by another scope"
 // @Router       /api/v1/passkey-policy [put]
 func (h *AdminHandler) UpdateTenantPasskeyPolicy(c echo.Context) error {
 	svc, ok := h.passkeyPolicySvc(c)
@@ -182,6 +183,7 @@ func (h *AdminHandler) GetApplicationPasskeyPolicy(c echo.Context) error {
 // @Success      200    {object}  auth.PasskeyPolicyRecord
 // @Failure      400    {object}  map[string]string
 // @Failure      404    {object}  map[string]string
+// @Failure      409    {object}  map[string]string  "origin already claimed by another scope"
 // @Router       /api/v1/applications/{appID}/passkey-policy [put]
 func (h *AdminHandler) UpdateApplicationPasskeyPolicy(c echo.Context) error {
 	svc, ok := h.passkeyPolicySvc(c)
@@ -390,6 +392,14 @@ func (h *AdminHandler) passkeyPolicyError(c echo.Context, op string, err error) 
 	switch {
 	case errors.Is(err, auth.ErrInvalidPasskeyPolicy):
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, auth.ErrPasskeyOriginConflict):
+		// 409, not 400: the request is well-formed and would have been accepted
+		// against a different set of rows. The message names the scope holding
+		// the origin, because the fix is a change to that row, not to this one.
+		return c.JSON(http.StatusConflict, map[string]string{
+			"error": err.Error(),
+			"code":  "passkey_origin_conflict",
+		})
 	case errors.Is(err, auth.ErrUserNotFound):
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
 	case errors.Is(err, auth.ErrCredentialNotFound):
