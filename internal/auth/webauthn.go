@@ -66,6 +66,17 @@ var (
 	// configuration, so no ceremony can be started.
 	ErrWebAuthnNotConfigured = errors.New("webauthn is not configured on this server")
 
+	// ErrCookieSessionNotAvailable reports that the verified identity is
+	// application-scoped and so cannot be given a browser cookie session.
+	//
+	// Returned by LoginWebAuthnForCookieSession INSTEAD of issuing tokens, which
+	// is the point of it: the assertion succeeded, and the refusal is about where
+	// the resulting credential may be stored, not about whether the user proved
+	// who they are. Not a WebAuthn error as such — it names a transport
+	// constraint the /auth/passkey/session endpoint has and /login/complete does
+	// not.
+	ErrCookieSessionNotAvailable = errors.New("cookie sessions are not available to application-scoped identities")
+
 	// ErrChallengeExpired is returned when the ceremony state behind a token is
 	// gone. It is deliberately DISTINGUISHABLE from a verification failure: the
 	// frontend re-arms silently on this one, because the usual cause is a login
@@ -1431,6 +1442,36 @@ func (s *AuthService) PasskeyPolicyFor(ctx context.Context, tenantID int64, appI
 // recoverable from an AuthResult — a user with four devices needs their audit
 // trail to name the one that was used.
 func (s *AuthService) LoginWebAuthn(ctx context.Context, token string, r *http.Request) (*AuthResult, *WebAuthnIdentity, error) {
+	return s.loginWebAuthn(ctx, token, r, false)
+}
+
+// LoginWebAuthnForCookieSession is LoginWebAuthn for the cookie-session
+// endpoint, refusing an application-scoped identity BEFORE it mints (issue
+// #116).
+//
+// A separate entry point rather than a parameter on LoginWebAuthn: the caller
+// distinction is the whole content of the flag, every existing call site means
+// false, and threading it through them would only create places for a future
+// change to pass the wrong one.
+//
+// Returns the verified identity alongside ErrCookieSessionNotAvailable. The
+// identity is real — the assertion verified — so the caller can audit the
+// refusal against an actual account and passkey rather than logging an anonymous
+// failure.
+//
+// Why the refusal has to live here and not in the handler: the account is not
+// known until the assertion verifies, because a discoverable credential carries
+// its own identity, and issueTokenPair follows immediately. The handler only
+// ever sees the far side of the mint. By then a user_sessions row exists, and
+// enforceSessionCap has already run inside that transaction and evicted the
+// user's least-recently-used session — a write no later revocation can undo.
+func (s *AuthService) LoginWebAuthnForCookieSession(ctx context.Context, token string, r *http.Request) (*AuthResult, *WebAuthnIdentity, error) {
+	return s.loginWebAuthn(ctx, token, r, true)
+}
+
+// loginWebAuthn is the shared body. refuseApplicationScoped stops between
+// verifying the assertion and issuing tokens.
+func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.Request, refuseApplicationScoped bool) (*AuthResult, *WebAuthnIdentity, error) {
 	if s.webauthnSvc == nil {
 		return nil, nil, ErrWebAuthnNotConfigured
 	}
@@ -1446,6 +1487,17 @@ func (s *AuthService) LoginWebAuthn(ctx context.Context, token string, r *http.R
 			s.revokeAllAfterClone(ctx, cloned)
 		}
 		return nil, nil, err
+	}
+
+	// Before any minting, and deliberately before loadPermissions too: there is
+	// nothing to load permissions for.
+	//
+	// The credential's sign count and backup flags have already been advanced by
+	// LoginComplete above, and that is correct — the assertion was genuine, so
+	// the counter must move whatever we do with the identity. Not advancing it
+	// would make the next legitimate assertion look like a replayed one.
+	if refuseApplicationScoped && id.AppID != "" {
+		return nil, id, ErrCookieSessionNotAvailable
 	}
 
 	perms, err := s.loadPermissions(ctx, id.UserID, id.TenantID)

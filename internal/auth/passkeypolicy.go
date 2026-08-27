@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
@@ -348,6 +349,16 @@ type PasskeyPolicyRecord struct {
 // name.
 var ErrInvalidPasskeyPolicy = errors.New("origins may only be set together with rp_id, and max_credentials_per_user must be 1-100")
 
+// ErrPasskeyOriginConflict is returned when a policy write claims an origin that
+// another scope, not on the same resolution chain, already claims (issue #116).
+//
+// Distinct from ErrInvalidPasskeyPolicy, and mapped to 409 rather than 400,
+// because the request is not malformed: every field is legal and the write would
+// have been accepted a moment earlier. It collides with the state of another
+// resource, which is what 409 is for — and it is the one passkey-policy error
+// whose fix is to go and change a DIFFERENT row.
+var ErrPasskeyOriginConflict = errors.New("passkey origin is already claimed by another scope")
+
 // PasskeyPolicyUpdate is a partial write. Nil fields keep their stored value, so
 // an admin toggling one switch cannot silently reset the RP ID they never sent.
 type PasskeyPolicyUpdate struct {
@@ -496,6 +507,16 @@ func (s *PasskeyPolicyService) SetPolicy(ctx context.Context, tenantID *int64, a
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Inside the transaction, so the check and the write cannot be separated by a
+	// concurrent claim on the same origin. The trigger from migration 00080 is the
+	// backstop for the race this still loses (two transactions checking before
+	// either commits) and for writes that never come through here at all.
+	if origins != nil && len(*origins) > 0 {
+		if err := checkOriginConflicts(ctx, tx, tenantID, applicationID, *origins); err != nil {
+			return nil, err
+		}
+	}
+
 	tag, err := tx.Exec(ctx, `
 		UPDATE passkey_policies SET
 			allow_passkeys            = COALESCE($3::BOOLEAN, allow_passkeys),
@@ -514,6 +535,9 @@ func (s *PasskeyPolicyService) SetPolicy(ctx context.Context, tenantID *int64, a
 		upd.RequireUserVerification, upd.RPID, upd.RPDisplayName, origins,
 		upd.MaxCredentialsPerUser)
 	if err != nil {
+		if isOriginOverlapViolation(err) {
+			return nil, originOverlapFromDB(err)
+		}
 		return nil, fmt.Errorf("update passkey policy: %w", err)
 	}
 
@@ -537,6 +561,13 @@ func (s *PasskeyPolicyService) SetPolicy(ctx context.Context, tenantID *int64, a
 		`, tenantID, applicationID, upd.AllowPasskeys, upd.AllowPasswordless,
 			upd.RequireUserVerification, upd.RPID, upd.RPDisplayName, origins,
 			upd.MaxCredentialsPerUser); err != nil {
+			// Checked BEFORE isUniqueViolation. The origin trigger raises
+			// exclusion_violation precisely so the two cannot be confused — a
+			// conflict answered with "please retry" would be advice for a write
+			// that can never succeed.
+			if isOriginOverlapViolation(err) {
+				return nil, originOverlapFromDB(err)
+			}
 			if isUniqueViolation(err) {
 				// Another writer created the row between our UPDATE and our
 				// INSERT. Reported rather than retried: the caller's own write
@@ -578,6 +609,111 @@ func (s *PasskeyPolicyService) DeletePolicy(ctx context.Context, tenantID *int64
 	}
 	s.InvalidateCache()
 	return tag.RowsAffected() > 0, nil
+}
+
+// checkOriginConflicts refuses an origin already claimed by a scope that does
+// not sit on the same resolution chain (issue #116).
+//
+// THE RULE, and why it is not "same specificity". Resolution by origin walks
+// application → tenant → platform default, so an ancestor and its descendant
+// sharing an origin is meaningful and supported: an application overriding its
+// own tenant's origin is exactly what most-specific-wins is for, and
+// TestPasskeyPolicyMostSpecificWins depends on it. What has no interpretation is
+// two scopes on DIFFERENT chains claiming one origin — two tenants, two
+// applications of one tenant, or one tenant's application against another
+// tenant. There is no rule that picks between them, so loadByOrigin's LIMIT 1
+// picked by lowest application_id, which is to say arbitrarily.
+//
+// Stating it as "different chains" rather than "same specificity" also catches a
+// case the narrower reading misses: application (t1, a) against tenant (t2), a
+// cross-tenant collision at two different specificities.
+//
+// Rejected at WRITE time rather than resolved at read time because two unrelated
+// scopes claiming one origin is a misconfiguration, and the read path has no
+// honest way to resolve it — picking one silently sends users into a ceremony
+// their authenticator cannot answer, and aggregating the two would let a laxer
+// row soften a stricter one.
+//
+// The platform row conflicts with nothing: it is the ancestor of every chain.
+func checkOriginConflicts(ctx context.Context, tx pgx.Tx, tenantID, applicationID *int64, origins []string) error {
+	var (
+		otherTenant *int64
+		otherApp    *int64
+		overlap     []string
+	)
+	// NOT (same chain): the other row shares this tenant AND either row is the
+	// tenant-level one (so one is the other's ancestor) or both name the same
+	// application (so it IS this row).
+	//
+	// tenant_id IS NOT NULL excludes the platform row. With $1 NULL — a write to
+	// the platform row itself — `tenant_id = $1` is NULL, the NOT(...) is NULL,
+	// and no row is returned, which is the right answer: nothing can conflict
+	// with the row every chain inherits from.
+	err := tx.QueryRow(ctx, `
+		SELECT tenant_id, application_id,
+		       ARRAY(SELECT unnest(origins) INTERSECT SELECT unnest($3::TEXT[]))
+		FROM passkey_policies
+		WHERE origins && $3::TEXT[]
+		  AND tenant_id IS NOT NULL
+		  AND NOT (tenant_id = $1 AND (application_id IS NULL
+		                               OR $2::BIGINT IS NULL
+		                               OR application_id = $2))
+		ORDER BY tenant_id, application_id NULLS FIRST
+		LIMIT 1
+	`, tenantID, applicationID, origins).Scan(&otherTenant, &otherApp, &overlap)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("check passkey origin conflicts: %w", err)
+	}
+
+	// The conflicting scope is named in full — ids, not just "another tenant".
+	// An operator who cannot see WHICH row holds the origin has to go reading the
+	// table by hand, and this whole class of bug is expensive precisely because it
+	// gives nobody anything to search for.
+	return fmt.Errorf("%w: origin %s is already claimed by the %s passkey policy",
+		ErrPasskeyOriginConflict, strings.Join(overlap, ", "), scopeDescription(otherTenant, otherApp))
+}
+
+// isOriginOverlapViolation reports whether an error is the origin-overlap
+// trigger from migration 00080 firing.
+//
+// 23P01 is exclusion_violation. The trigger uses it rather than unique_violation
+// so this table's genuine unique violations — the partial per-scope indexes from
+// 00072, which mean "another writer got there first" — stay distinguishable from
+// an origin conflict, which means "go and change a different row".
+func isOriginOverlapViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23P01"
+}
+
+// originOverlapFromDB converts the trigger's exception into the package
+// sentinel, keeping the database's own message.
+//
+// Reached only when the Go-level check in checkOriginConflicts did not catch the
+// conflict first — a concurrent writer, or a future caller that reaches the table
+// another way. The message is the trigger's rather than a reconstruction, because
+// at that point the trigger is the thing that knows which row it collided with.
+func originOverlapFromDB(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Errorf("%w: %s", ErrPasskeyOriginConflict, pgErr.Message)
+	}
+	return ErrPasskeyOriginConflict
+}
+
+// scopeDescription names a scope with its ids, for error messages an operator has
+// to act on. scopeName gives the bare kind, which is right for logs and wrong here.
+func scopeDescription(tenantID, applicationID *int64) string {
+	switch {
+	case applicationID != nil && tenantID != nil:
+		return fmt.Sprintf("application %d (tenant %d)", *applicationID, *tenantID)
+	case tenantID != nil:
+		return fmt.Sprintf("tenant %d", *tenantID)
+	default:
+		return "platform default"
+	}
 }
 
 func scopeName(tenantID, applicationID *int64) string {
@@ -653,25 +789,89 @@ func (s *PasskeyPolicyService) loadByScope(ctx context.Context, tenantID int64, 
 
 // loadByOrigin finds the most specific row that claims the given origin. An
 // empty source means no row claimed it, which is not an error.
+// Most-specific-wins is unchanged; what is new is that an ambiguous tie is
+// LOGGED rather than resolved in silence (issue #116). Migration 00080 stops new
+// ties being written, but a database that predates it can already hold one, and
+// this is the code path where that shows up — as a user whose authenticator
+// offers nothing and a server log saying only "verification failed".
+//
+// Two rows are fetched to see whether a second exists at the winner's
+// specificity. The extra row is nearly free (the origins GIN index from 00080
+// serves the lookup) and it is the only place the condition is observable.
 func (s *PasskeyPolicyService) loadByOrigin(ctx context.Context, origin string) (policyRow, string, error) {
 	var row policyRow
 	var source string
-	err := scanPolicyRow(s.pool.QueryRow(ctx, `
+
+	rows, err := s.pool.Query(ctx, `
 		SELECT `+passkeyPolicyColumns+`,
 		       CASE WHEN application_id IS NOT NULL THEN 'application'
-		            ELSE 'tenant' END
+		            ELSE 'tenant' END,
+		       tenant_id, application_id
 		FROM passkey_policies
 		WHERE $1 = ANY(origins)
 		ORDER BY application_id NULLS LAST, tenant_id NULLS LAST
-		LIMIT 1
-	`, origin), &row, &source)
+		LIMIT 2
+	`, origin)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return row, "", nil
-		}
 		return row, "", fmt.Errorf("load passkey policy by origin: %w", err)
 	}
+	defer rows.Close()
+
+	var (
+		winnerTenant, winnerApp *int64
+		runnerTenant, runnerApp *int64
+		runnerSource            string
+		n                       int
+	)
+	for rows.Next() {
+		if n == 0 {
+			if err := scanPolicyRow(rows, &row, &source, &winnerTenant, &winnerApp); err != nil {
+				return row, "", fmt.Errorf("load passkey policy by origin: %w", err)
+			}
+		} else {
+			var discard policyRow
+			if err := scanPolicyRow(rows, &discard, &runnerSource, &runnerTenant, &runnerApp); err != nil {
+				return row, "", fmt.Errorf("load passkey policy by origin: %w", err)
+			}
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return row, "", fmt.Errorf("load passkey policy by origin: %w", err)
+	}
+	if n == 0 {
+		return row, "", nil
+	}
+
+	// Only a tie at the SAME specificity is ambiguous. An application row beating
+	// its tenant row is the intended ordering, not a conflict — see
+	// checkOriginConflicts for the full rule.
+	if n > 1 && source == runnerSource && !sameChain(winnerTenant, winnerApp, runnerTenant, runnerApp) {
+		s.logger.Error().
+			Str("origin", origin).
+			Str("chosen", scopeDescription(winnerTenant, winnerApp)).
+			Str("also_claimed_by", scopeDescription(runnerTenant, runnerApp)).
+			Msg("passkey policy: two scopes claim this origin — the relying party for a ceremony started here is arbitrary, and users of the other scope will be offered no credential. Remove the origin from one of them.")
+	}
+
 	return row, source, nil
+}
+
+// sameChain reports whether two scopes sit on one resolution chain, so that one
+// legitimately overrides the other rather than colliding with it.
+func sameChain(aTenant, aApp, bTenant, bApp *int64) bool {
+	if aTenant == nil || bTenant == nil {
+		// The platform row is every chain's ancestor.
+		return true
+	}
+	if *aTenant != *bTenant {
+		return false
+	}
+	if aApp == nil || bApp == nil {
+		// A tenant row and one of its own application rows.
+		return true
+	}
+	return *aApp == *bApp
 }
 
 // availabilityOnServerRP reports whether ANY scope running under the SERVER's

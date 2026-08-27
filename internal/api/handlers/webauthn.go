@@ -245,17 +245,43 @@ func (h *WebAuthnHandler) LoginComplete(c echo.Context) error {
 // @Failure      403  {object}  map[string]string
 // @Router       /api/v1/auth/passkey/session [post]
 func (h *WebAuthnHandler) SessionLoginComplete(c echo.Context) error {
-	result, id, err := h.authSvc.LoginWebAuthn(c.Request().Context(), c.QueryParam("ceremony_token"), c.Request())
+	// LoginWebAuthnForCookieSession, not LoginWebAuthn: an application-scoped
+	// identity never gets cookies, and the refusal has to happen before tokens
+	// are issued rather than after inspecting them (issue #116). Rejecting on the
+	// far side of the mint left a live session nobody held, and — because that
+	// session carried the freshest last_seen_at — had already evicted one of the
+	// user's real sessions under revoked_reason = cap_evicted, signing them out
+	// of another device behind a response that read as a clean 400.
+	result, id, err := h.authSvc.LoginWebAuthnForCookieSession(
+		c.Request().Context(), c.QueryParam("ceremony_token"), c.Request())
 	if err != nil {
+		// Audited as a refusal, not as a sign-in: the assertion verified, so the
+		// account and the passkey are known and belong in the trail, but no
+		// session exists. Kept out of loginFailure because this is not an
+		// authentication failure and must not be reported as one — the bodies
+		// loginFailure keeps identical are identical for a security reason that
+		// does not apply here.
+		if errors.Is(err, auth.ErrCookieSessionNotAvailable) {
+			if id != nil {
+				h.auditPasskey(c, id.TenantID, id.UserID, id.Email,
+					audit.ActionAuthPasskeyLoginFailed,
+					strconv.FormatInt(id.CredentialRowID, 10), map[string]any{
+						"passkey_name": id.CredentialLabel,
+						"reason":       "cookie_session_not_available_for_applications",
+					})
+			}
+			return errCookieSessionForApps(c)
+		}
 		return h.loginFailure(c, err)
 	}
 
-	// An application-scoped identity never gets cookies. setAuthCookies enforces
-	// that itself by silently declining, which would leave the caller holding a
-	// 200 that looks like a session and is not — so refuse explicitly instead,
-	// exactly as SessionLogin does. Reachable whenever a passkey was registered
-	// through an application rather than at tenant level.
+	// Unreachable now that the refusal happens inside the service, and kept as
+	// the assertion that the two agree: reaching it would mean an app-scoped
+	// identity produced a token without tripping the check above, which is the
+	// orphan bug returning by another route.
 	if _, _, appID := claimsFromToken(result.AccessToken); appID != nil {
+		h.logger.Error().Msg("passkey cookie session: app-scoped identity survived the service-level refusal — revoking the minted session")
+		revokeRejectedSession(c, h.authSvc, h.logger, result.RefreshToken)
 		return errCookieSessionForApps(c)
 	}
 

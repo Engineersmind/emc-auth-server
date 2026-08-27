@@ -97,6 +97,17 @@ const (
 	// reused, this one says a hardware-backed key was copied, and the second is
 	// the more serious finding of the two.
 	RevokeReasonPasskeyCloned = "passkey_cloned"
+	// RevokeReasonSessionRejected — tokens were minted and then the request that
+	// minted them was refused, so the session was never handed to anybody. The
+	// cookie-session endpoints refusing an application-scoped identity are the
+	// case that motivated it (issue #116).
+	//
+	// Worth its own reason precisely because the alternative was reading as
+	// cap_evicted: the orphan held the freshest last_seen_at, survived the cap,
+	// and pushed genuine sessions out under a reason that looks like ordinary
+	// session pressure. An operator debugging "why was I signed out of my other
+	// devices" must be able to see this instead.
+	RevokeReasonSessionRejected = "session_rejected"
 )
 
 // ---------------------------------------------------------------------------
@@ -583,6 +594,33 @@ func revokedBefore(raw any, issuedAt int64) bool {
 // logout idempotent and total, whichever token in the chain the client happens to
 // still be holding.
 func (s *AuthService) LogoutSession(ctx context.Context, rawRefreshToken string) (int64, error) {
+	return s.revokeSessionByRefreshToken(ctx, rawRefreshToken, RevokeReasonLogout)
+}
+
+// RevokeIssuedSession ends a session that was just minted and then refused
+// before its tokens reached the caller.
+//
+// Exists for the cookie-session endpoints (issue #116). Those mint through
+// Login/LoginWebAuthn/Refresh and only afterwards discover the identity may not
+// have cookies; the tokens are then dropped on the floor, leaving a live session
+// no client holds. Nothing enforces its absence — the session is perfectly
+// valid, just unreachable — so it lingers until idle expiry, and while it
+// lingers it counts against the concurrent-session cap.
+//
+// A distinct reason rather than reusing logout, because the whole cost of this
+// bug was misattribution: an operator reading revoked_reason needs to see that a
+// rejected cookie-session did this, not a user signing out.
+func (s *AuthService) RevokeIssuedSession(ctx context.Context, rawRefreshToken string) (int64, error) {
+	return s.revokeSessionByRefreshToken(ctx, rawRefreshToken, RevokeReasonSessionRejected)
+}
+
+// revokeSessionByRefreshToken resolves the session a refresh token belongs to
+// and revokes the whole family with the given reason.
+//
+// Shared by LogoutSession and RevokeIssuedSession so both get the same
+// resolve-without-requiring-liveness behaviour; only the recorded reason
+// differs.
+func (s *AuthService) revokeSessionByRefreshToken(ctx context.Context, rawRefreshToken, reason string) (int64, error) {
 	if rawRefreshToken == "" {
 		return 0, nil
 	}
@@ -603,17 +641,17 @@ func (s *AuthService) LogoutSession(ctx context.Context, rawRefreshToken string)
 	`, hash).Scan(&userID, &tenantID, &sessionID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// A token that never existed. Report success: logout is the one
-			// operation where "your credential is not recognised" and "you are
-			// signed out" are the same outcome for the caller, and
-			// distinguishing them would turn logout into an oracle for whether
-			// a given token value was ever issued.
+			// A token that never existed. Report success: for both callers
+			// "your credential is not recognised" and "the session is gone" are
+			// the same outcome — and for logout specifically, distinguishing
+			// them would turn it into an oracle for whether a given token value
+			// was ever issued.
 			return 0, nil
 		}
-		return 0, fmt.Errorf("resolve session for logout: %w", err)
+		return 0, fmt.Errorf("resolve session to revoke: %w", err)
 	}
 
-	return s.revokeSession(ctx, userID, tenantID, sessionID, RevokeReasonLogout)
+	return s.revokeSession(ctx, userID, tenantID, sessionID, reason)
 }
 
 // Logout revokes the session behind a refresh token.

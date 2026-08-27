@@ -21,6 +21,40 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/admin/my-tenants": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns every tenant the authenticated administrator may reach, with per-tenant capability flags. A platform admin (tenant:manage) gets every tenant, paginated; an owner gets the tenants they own; a co-owner gets the tenants where they hold at least one application grant. An owner's applications array is absent because they administer every application present and future — read it together with role.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin"
+                ],
+                "summary": "List tenants the caller administers",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MyTenantsResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/administrators": {
             "get": {
                 "security": [
@@ -1013,6 +1047,15 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "origin already claimed by another scope",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5198,6 +5241,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "409": {
+                        "description": "origin already claimed by another scope",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -5902,7 +5954,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns audit-log-based activity counts scoped to the caller's tenant. Requires admin:access.",
+                "description": "Returns audit-log-based activity counts scoped to the caller's tenant. Requires admin:access. All windows are ROLLING, not calendar: logins/failed/logouts cover the last 24 hours and active users the last 7 days, which is why the dashboard labels them \"(24h)\" and \"(7d)\". active_users_week counts distinct users who actually SIGNED IN, not every user appearing in the log. recent_events is omitted unless include=recent is passed.",
                 "produces": [
                     "application/json"
                 ],
@@ -5910,6 +5962,14 @@ const docTemplate = `{
                     "admin-audit"
                 ],
                 "summary": "Tenant activity stats",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Comma-separated extras. Pass 'recent' to add the deprecated recent_events list; query /audit-logs instead.",
+                        "name": "include",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -5936,7 +5996,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns audit-log-based activity counts across all tenants. Requires tenant:manage permission.",
+                "description": "Returns audit-log-based activity counts across all tenants. Requires tenant:manage permission. Windows are rolling (24 hours / 7 days) and active_users_week counts distinct users who signed in. recent_events is omitted unless include=recent is passed.",
                 "produces": [
                     "application/json"
                 ],
@@ -5944,6 +6004,14 @@ const docTemplate = `{
                     "admin-audit"
                 ],
                 "summary": "System-wide activity stats",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Comma-separated extras. Pass 'recent' to add the deprecated recent_events list; query /audit-logs instead.",
+                        "name": "include",
+                        "in": "query"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -7322,7 +7390,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns audit-log-based activity counts for the specified tenant. Requires tenant:manage (super_admin only).",
+                "description": "Returns audit-log-based activity counts for the specified tenant. Requires tenant:manage (super_admin only). Windows are rolling (24 hours / 7 days) and active_users_week counts distinct users who signed in. recent_events is omitted unless include=recent is passed.",
                 "produces": [
                     "application/json"
                 ],
@@ -7337,6 +7405,12 @@ const docTemplate = `{
                         "name": "tid",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Comma-separated extras. Pass 'recent' to add the deprecated recent_events list; query /audit-logs instead.",
+                        "name": "include",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -8244,6 +8318,64 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/tenant-context": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Re-mints the caller's session for another tenant they already administer. NOT re-authentication — the current session authenticates the request, and no password or second factor is involved. Required because an access token names exactly one tenant, so acting in another needs a token for it. The requested tenant is verified against the caller's grants and never trusted from the body. The new token pair is delivered as HttpOnly cookies (emc_access_token / emc_refresh_token) and is deliberately NOT returned in the response body, so it stays unreadable by JavaScript.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth"
+                ],
+                "summary": "Change the active tenant",
+                "parameters": [
+                    {
+                        "description": "Target tenant",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.TenantContextRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -9185,9 +9317,6 @@ const docTemplate = `{
                 "created_at": {
                     "type": "string"
                 },
-                "description": {
-                    "type": "string"
-                },
                 "display_name": {
                     "type": "string"
                 },
@@ -9560,6 +9689,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "active_users_week": {
+                    "description": "ActiveUsersWeek counts distinct users who SIGNED IN over the last 7 days.\n\nDeliberately not \"users who produced any audit event\": that counted a\nfailed login, a password-reset request, or an admin acting ON the user as\nactivity, so a tenant with nobody able to get in still reported active\nusers. The number a tile labelled \"Active Users\" has to mean is people who\nactually reached the product.",
                     "type": "integer"
                 },
                 "failed_logins_today": {
@@ -9572,6 +9702,7 @@ const docTemplate = `{
                     "type": "integer"
                 },
                 "recent_events": {
+                    "description": "RecentEvents is OPT-IN via ?include=recent, and empty otherwise.\n\nIt used to be returned unconditionally: ten fully-hydrated audit rows,\ncarrying IP addresses, full user agents, request ids and response bodies,\non an endpoint a dashboard polls. No client reads it — the audit page has\nits own paginated endpoint with its own guard — so the default was several\nkilobytes of the most sensitive rows in the system, sent repeatedly to\nsatisfy nobody.\n\nKept rather than deleted because the field is published API and something\noutside this repository may parse it. omitempty so a caller that does not\nask sees no key at all, which is the honest shape for \"not requested\".\n\nDeprecated: query /audit-logs instead. This exists for compatibility and\nwill be removed once no caller passes include=recent.",
                     "type": "array",
                     "items": {
                         "$ref": "#/definitions/audit.LogEntry"
@@ -9769,9 +9900,20 @@ const docTemplate = `{
                 "created_at": {
                     "type": "string"
                 },
+                "display_name": {
+                    "description": "DisplayName is the optional end-user-facing label. Empty means fall back to\nName, which is what every read does — so a consumer can render DisplayName\nor Name without checking which is set.",
+                    "type": "string"
+                },
                 "first_party": {
                     "description": "FirstParty false means a consent screen is required before a code may be\nissued. No consent screen exists yet, so /oauth/authorize refuses such a\nclient outright rather than skipping consent silently.",
                     "type": "boolean"
+                },
+                "grant_types": {
+                    "description": "GrantTypes is derived from AppType, never set directly: /oauth/token\nenforces it, so it is the field that decides whether the application can get\na token at all. Exposed read-only because an operator debugging a refused\ntoken request has no other way to see it.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "id": {
                     "type": "string"
@@ -10026,8 +10168,19 @@ const docTemplate = `{
         "auth.InvitationPreview": {
             "type": "object",
             "properties": {
+                "admin_role": {
+                    "description": "AdminRole is \"owner\" or \"co_owner\" for an administrative invitation, and\nempty otherwise. The two confer very different reach, and the page should\nnot describe them identically.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
+                },
+                "existing_tenants": {
+                    "description": "ExistingTenants names the tenants this account ALREADY administers, so the\npage can say \"you already administer Acme; this adds Bolt\" rather than\nimplying a fresh account is being created.\n\nThis is what makes a cross-tenant invitation legible. Since one identity may\nnow administer several tenants (migration 00078), an invitation to a\nsecond one looks identical to a first-time invitation unless the page says\notherwise — and a recipient who is told to \"set a password\" for an account\nthey have used for months will reasonably assume something is wrong.\n\nEmpty for a brand-new account, which is exactly the signal the page needs to\nswitch between the onboarding and confirmation wordings.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "grants_admin": {
                     "description": "GrantsAdmin reports that accepting will also activate a pending\nadministrative grant, so the page can say what is being confirmed.",
@@ -10035,6 +10188,10 @@ const docTemplate = `{
                 },
                 "requires_password": {
                     "type": "boolean"
+                },
+                "tenant_name": {
+                    "description": "TenantName is the tenant this invitation is FOR. Named because a recipient\nwho administers several tenants cannot otherwise tell which one they are\nbeing asked to confirm.",
+                    "type": "string"
                 }
             }
         },
@@ -10551,9 +10708,6 @@ const docTemplate = `{
         "handlers.CreateTenantRequest": {
             "type": "object",
             "properties": {
-                "description": {
-                    "type": "string"
-                },
                 "display_name": {
                     "type": "string"
                 },
@@ -10744,6 +10898,24 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.MyTenantsResponse": {
+            "type": "object",
+            "properties": {
+                "can_create_tenant": {
+                    "description": "CanCreateTenant is server-supplied rather than inferred by the client from a\nrole name. Only a platform administrator may create tenants — asserted in\nmiddleware and covered by TestRequirePermission_TenantCreationIsPlatformAdminOnly.",
+                    "type": "boolean"
+                },
+                "tenants": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.ReachableTenantResponse"
+                    }
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
         "handlers.OAuthExchangeRequest": {
             "type": "object",
             "properties": {
@@ -10841,6 +11013,61 @@ const docTemplate = `{
                     }
                 },
                 "userinfo_endpoint": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.ReachableTenantCapabilities": {
+            "type": "object",
+            "properties": {
+                "create_application": {
+                    "type": "boolean"
+                },
+                "manage_admins": {
+                    "type": "boolean"
+                },
+                "manage_roles": {
+                    "type": "boolean"
+                },
+                "manage_users": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "handlers.ReachableTenantResponse": {
+            "type": "object",
+            "properties": {
+                "app_count": {
+                    "type": "integer"
+                },
+                "applications": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "can": {
+                    "description": "Can carries the capability flags the UI must branch on instead of comparing\nrole names. Server-derived so a button and the route guarding it share one\nsource of truth.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/handlers.ReachableTenantCapabilities"
+                        }
+                    ]
+                },
+                "is_primary": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "role": {
+                    "description": "Role is \"owner\", \"co_owner\", or \"platform_admin\".",
+                    "type": "string"
+                },
+                "slug": {
+                    "type": "string"
+                },
+                "tenant_id": {
                     "type": "string"
                 }
             }
@@ -11072,6 +11299,14 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.TenantContextRequest": {
+            "type": "object",
+            "properties": {
+                "tenant_id": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.TokenRequest": {
             "type": "object",
             "properties": {
@@ -11132,7 +11367,15 @@ const docTemplate = `{
                 "app_type": {
                     "type": "string"
                 },
+                "display_name": {
+                    "description": "DisplayName empty leaves it unchanged.",
+                    "type": "string"
+                },
                 "first_party": {
+                    "type": "boolean"
+                },
+                "is_active": {
+                    "description": "IsActive nil leaves the flag unchanged. False suspends the application so\nits client credentials stop authenticating; the row and its client_id are\npreserved, unlike DELETE which soft-deletes.",
                     "type": "boolean"
                 },
                 "name": {
@@ -11213,9 +11456,6 @@ const docTemplate = `{
         "handlers.UpdateTenantRequest": {
             "type": "object",
             "properties": {
-                "description": {
-                    "type": "string"
-                },
                 "display_name": {
                     "type": "string"
                 },
