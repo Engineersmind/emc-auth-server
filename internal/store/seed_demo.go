@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/engineersmind/emc-auth-server/internal/password"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // Demo seed — recognisable tenants + users for local dev and QA.
@@ -76,7 +76,7 @@ var demoTenants = []demoTenant{
 
 // RunDemoSeed seeds 3 demo tenants with recognisable users, roles, and permissions.
 func RunDemoSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) error {
-	hash, err := bcrypt.GenerateFromPassword([]byte(demoPassword), 12)
+	hash, err := password.NewHasher(password.DefaultParams()).Hash(ctx, demoPassword)
 	if err != nil {
 		return fmt.Errorf("hash demo password: %w", err)
 	}

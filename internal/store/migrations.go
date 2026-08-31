@@ -40,10 +40,10 @@ func CheckSchemaCompatibility(ctx context.Context, pool *pgxpool.Pool) error {
 
 	if dataType == "uuid" {
 		return fmt.Errorf(
-			"schema incompatibility: tenants.id is type 'uuid' but this release requires 'bigint identity'. "+
-				"This branch rewrites the schema from scratch and cannot upgrade a UUID-schema database in-place. "+
-				"Provision a fresh PostgreSQL database (or export, drop, recreate, and re-import all data) "+
-				"then restart the server. "+
+			"schema incompatibility: tenants.id is type 'uuid' but this release requires 'bigint identity'. " +
+				"This branch rewrites the schema from scratch and cannot upgrade a UUID-schema database in-place. " +
+				"Provision a fresh PostgreSQL database (or export, drop, recreate, and re-import all data) " +
+				"then restart the server. " +
 				"See docs/DEPLOYMENT.md §'Upgrading from UUID Schema' for the full procedure",
 		)
 	}

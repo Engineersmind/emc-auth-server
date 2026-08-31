@@ -195,28 +195,45 @@ func (s *VerificationService) VerifyEmail(ctx context.Context, rawToken string) 
 // ResendVerification re-issues a verification link for a tenant-level user.
 // ALWAYS returns nil to prevent email enumeration, mirroring ForgotPassword.
 // Already-verified or unknown emails silently succeed.
-func (s *VerificationService) ResendVerification(ctx context.Context, tenantSlug, email string) error {
+func (s *VerificationService) ResendVerification(ctx context.Context, email string) error {
 	email = emailaddr.Normalize(email)
 
-	var tenantID int64
-	err := s.pool.QueryRow(ctx,
-		`SELECT id FROM tenants WHERE slug = $1 AND is_active = true`, tenantSlug,
-	).Scan(&tenantID)
+	// Resolved from the email alone, exactly as Login does.
+	//
+	// This used to require the caller to supply their tenant's slug. That asked a
+	// person who did not receive an email to know an internal identifier they have
+	// most likely never seen — the admin console had a form field for it — while
+	// Login, the flow immediately before this one, already resolves a tenant from
+	// an address with no such help. The slug is the OIDC issuer identifier; it is
+	// not an input a human should ever be asked for.
+	//
+	// A tenant-level email may match accounts in more than one tenant, which is
+	// why this takes the FIRST unverified one rather than requiring uniqueness.
+	// Sending to one of them is the right behaviour: the message goes to an
+	// address the person controls, and the token inside it names the account.
+	// Refusing because the address is ambiguous would leave them stuck with no
+	// way to resolve it.
+	//
+	// Ordered by id so repeated calls are deterministic — the same account each
+	// time, rather than whichever row the planner happened to return.
+	var (
+		tenantID int64
+		userID   int64
+	)
+	err := s.pool.QueryRow(ctx, `
+		SELECT u.id, u.tenant_id
+		FROM users u
+		JOIN tenants t ON t.id = u.tenant_id
+		WHERE u.email = $1 AND u.application_id IS NULL
+		  AND u.is_active = true AND u.deleted_at IS NULL AND u.email_verified = false
+		  AND t.is_active = true AND t.deleted_at IS NULL
+		ORDER BY u.id
+		LIMIT 1
+	`, email).Scan(&userID, &tenantID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
-		}
-		return fmt.Errorf("resolve tenant for resend-verification: %w", err)
-	}
-
-	var userID int64
-	err = s.pool.QueryRow(ctx, `
-		SELECT id FROM users
-		WHERE tenant_id = $1 AND email = $2 AND application_id IS NULL
-		  AND is_active = true AND deleted_at IS NULL AND email_verified = false
-	`, tenantID, email).Scan(&userID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
+			// Enumeration-safe: the handler answers 200 either way, so an absent
+			// or already-verified account is indistinguishable from a sent mail.
 			s.logger.Debug().Str("email", email).Msg("resend-verification: no unverified user, silently succeeding")
 			return nil
 		}

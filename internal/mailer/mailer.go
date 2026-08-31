@@ -157,6 +157,25 @@ type BlockedAccountEmail struct {
 	AppName    string
 	Reason     string
 	TTLMinutes int
+	// RetryMinutes is how long until an automatic lock lifts on its own (issue
+	// #72). Zero when the lock does not expire, which suppresses the "or just
+	// wait" wording rather than promising a release that never comes.
+	RetryMinutes int
+}
+
+// TenantLockoutAlertEmail warns a tenant's administrators that many accounts
+// locked inside one window — the credential-stuffing signal (issue #72).
+//
+// Count and WindowMinutes are the whole message: the individual accounts are
+// deliberately not listed, because the recipient's next step is the filtered
+// users page (Link), not a list in an email that is stale by the time it arrives.
+type TenantLockoutAlertEmail struct {
+	To            string
+	Link          string
+	TenantName    string
+	AppName       string
+	Count         int
+	WindowMinutes int
 }
 
 // PasswordBreachEmail warns that the user's password appears in a known breach.
@@ -216,6 +235,7 @@ type Mailer interface {
 	SendChangeEmail(ctx context.Context, sender *SMTPConfig, tmpl *Template, email ChangeEmailEmail) error
 	SendBlockedAccount(ctx context.Context, sender *SMTPConfig, tmpl *Template, email BlockedAccountEmail) error
 	SendPasswordBreach(ctx context.Context, sender *SMTPConfig, tmpl *Template, email PasswordBreachEmail) error
+	SendTenantLockoutAlert(ctx context.Context, sender *SMTPConfig, tmpl *Template, email TenantLockoutAlertEmail) error
 	SendAdminActivity(ctx context.Context, sender *SMTPConfig, tmpl *Template, email AdminActivityEmail) error
 	SendAccessChanged(ctx context.Context, sender *SMTPConfig, tmpl *Template, email AccessChangedEmail) error
 	// SendTest renders the given template type with sample data and delivers it to
@@ -416,9 +436,22 @@ func (m *mailerImpl) SendChangeEmail(ctx context.Context, sender *SMTPConfig, tm
 func (m *mailerImpl) SendBlockedAccount(ctx context.Context, sender *SMTPConfig, tmpl *Template, e BlockedAccountEmail) error {
 	err := m.dispatch(ctx, sender, tmpl, TemplateBlockedAccount, e.To, TemplateData{
 		Link: e.Link, AppName: e.AppName, Reason: e.Reason, TTLMinutes: e.TTLMinutes,
+		RetryMinutes: e.RetryMinutes,
 	})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Str("reason", e.Reason).Msg("blocked-account email sent")
+	}
+	return err
+}
+
+func (m *mailerImpl) SendTenantLockoutAlert(ctx context.Context, sender *SMTPConfig, tmpl *Template, e TenantLockoutAlertEmail) error {
+	err := m.dispatch(ctx, sender, tmpl, TemplateTenantLockoutAlert, e.To, TemplateData{
+		Link: e.Link, TenantName: e.TenantName, AppName: e.AppName,
+		Count: e.Count, TTLMinutes: e.WindowMinutes,
+	})
+	if err == nil {
+		m.logger.Warn().Str("to", e.To).Int("accounts", e.Count).
+			Msg("tenant lockout spike alert sent")
 	}
 	return err
 }

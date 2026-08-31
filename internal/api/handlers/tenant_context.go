@@ -217,6 +217,9 @@ func (h *AuthHandler) TenantContext(c echo.Context) error {
 		// what this log is for. The response is deliberately identical for "no
 		// grant" and "no such tenant", so probing is not cheaper than not probing.
 		h.auditEvent(c, audit.Event{
+			TenantID:     &currentTenant,
+			UserID:       &userID,
+			ActorEmail:   claims.Email,
 			Action:       audit.ActionAdminGrantDenied,
 			ResourceType: "tenant",
 			ResourceID:   req.TenantID,
@@ -240,7 +243,14 @@ func (h *AuthHandler) TenantContext(c echo.Context) error {
 	// The only record that one identity acted across a tenant boundary.
 	// Reconstructing a multi-tenant administrator's session is impossible without
 	// it, so both ends of the move are recorded.
+	// Attributed to the tenant being LEFT, not the one being entered. The event
+	// records a move, and the actor was still in the source tenant when they made
+	// it — filing it under the destination would make the log read as though they
+	// were already there.
 	h.auditEvent(c, audit.Event{
+		TenantID:     &currentTenant,
+		UserID:       &userID,
+		ActorEmail:   claims.Email,
 		Action:       audit.ActionAdminTenantSwitched,
 		ResourceType: "tenant",
 		ResourceID:   req.TenantID,

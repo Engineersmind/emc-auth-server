@@ -110,14 +110,22 @@ type ResendVerificationRequest struct {
 }
 
 // ResendVerification handles POST /api/v1/auth/resend-verification. The tenant
-// comes from the X-Tenant-Slug header. Enumeration-safe: always 200.
+// is resolved from the email, as in Login. Enumeration-safe: always 200.
+//
+// X-Tenant-Slug is no longer read. It was required until this change, which
+// meant a person who had not received their verification email was asked to
+// supply their tenant's slug — an internal identifier they have most likely
+// never seen, and which the admin console rendered as a form field. Login,
+// the step immediately before this one, has never needed it.
+//
+// The header is ignored rather than rejected, so a client still sending it
+// keeps working.
 //
 // @Summary      Resend verification email
-// @Description  Re-sends the email-verification link for an unverified tenant-level user. Always returns 200 to prevent account enumeration.
+// @Description  Re-sends the email-verification link for an unverified tenant-level user. The tenant is resolved from the email address. Always returns 200 to prevent account enumeration.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
-// @Param        X-Tenant-Slug  header    string                     true  "Tenant slug"
 // @Param        body           body      ResendVerificationRequest  true  "Email to resend to"
 // @Success      200            {object}  map[string]string
 // @Router       /api/v1/auth/resend-verification [post]
@@ -125,15 +133,14 @@ func (h *AuthHandler) ResendVerification(c echo.Context) error {
 	if h.verifSvc == nil {
 		return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email verification is not configured"})
 	}
-	tenantSlug := c.Request().Header.Get("X-Tenant-Slug")
 	var req ResendVerificationRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
-	if tenantSlug == "" || req.Email == "" {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "tenant slug and email are required"})
+	if req.Email == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email is required"})
 	}
-	if err := h.verifSvc.ResendVerification(c.Request().Context(), tenantSlug, req.Email); err != nil {
+	if err := h.verifSvc.ResendVerification(c.Request().Context(), req.Email); err != nil {
 		h.logger.Error().Err(err).Msg("auth: resend verification failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to process request"})
 	}
@@ -243,14 +250,6 @@ type LoginRequest struct {
 	RememberMe bool `json:"remember_me"`
 }
 
-// tenantSlugFromCtx extracts the X-Tenant-Slug header.
-// Returns the slug and whether it was explicitly provided.
-// For login/session endpoints the slug is optional — defaults to "emc".
-func tenantSlugFromCtx(c echo.Context) (string, bool) {
-	slug := c.Request().Header.Get("X-Tenant-Slug")
-	return slug, slug != ""
-}
-
 // Register handles POST /api/v1/auth/register.
 //
 // @Summary      Register a new user
@@ -258,7 +257,6 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
-// @Param        X-Tenant-Slug  header    string          true  "Tenant slug (e.g. emc)"
 // @Param        body           body      RegisterRequest true  "Registration payload"
 // @Success      201            {object}  auth.RegisterResult
 // @Failure      400            {object}  map[string]string
@@ -266,11 +264,6 @@ func tenantSlugFromCtx(c echo.Context) (string, bool) {
 // @Failure      409            {object}  map[string]string  "Email already registered"
 // @Router       /api/v1/auth/register [post]
 func (h *AuthHandler) Register(c echo.Context) error {
-	slug, ok := tenantSlugFromCtx(c)
-	if !ok {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "X-Tenant-Slug header is required — for application-authenticated registration use POST /api/v1/auth/apps/register"})
-	}
-
 	var req RegisterRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
@@ -283,12 +276,11 @@ func (h *AuthHandler) Register(c echo.Context) error {
 	}
 
 	result, err := h.svc.Register(c.Request().Context(), auth.RegisterInput{
-		TenantSlug: slug,
-		ClientID:   clientIDFromCtx(c), // legacy X-Client-ID tagging only — no secret, no auth
-		Email:      req.Email,
-		Password:   req.Password,
-		FirstName:  req.FirstName,
-		LastName:   req.LastName,
+		ClientID:  clientIDFromCtx(c), // legacy X-Client-ID tagging only — no secret, no auth
+		Email:     req.Email,
+		Password:  req.Password,
+		FirstName: req.FirstName,
+		LastName:  req.LastName,
 	})
 	if err != nil {
 		h.logger.Error().Err(err).Str("email", req.Email).Msg("register failed")
@@ -318,6 +310,43 @@ func (h *AuthHandler) Register(c echo.Context) error {
 	// No cookies and no token pair: creating an account does not start a session.
 	// The client signs in afterwards, which is what our own portal already did.
 	return c.JSON(http.StatusCreated, result)
+}
+
+// invalidCredentials renders the one response every credential failure gets, and
+// attaches Retry-After when the failure was a soft lock (issue #72).
+//
+// One helper for all three password-login handlers so the three cannot drift: the
+// body must be byte-identical whether the account does not exist, the password was
+// wrong, the account is soft-locked, or it is hard-locked. Anything that varies
+// between those cases is an account-enumeration oracle.
+//
+// The header is the single intentional exception, and it leaks nothing new: a soft
+// lock is only ever reachable by an attempt that already failed, so an attacker
+// who sees Retry-After has learnt nothing the refusal did not already tell them —
+// while a legitimate user learns when to come back instead of guessing.
+func invalidCredentials(c echo.Context, err error) error {
+	var soft *auth.SoftLockError
+	if errors.As(err, &soft) {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(soft.RetryAfterSeconds()))
+	}
+	return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+}
+
+// softLockMeta tags a login-failure audit event that was refused by a soft lock,
+// so the feed distinguishes "wrong password" from "correct password, but locked"
+// without the RESPONSE distinguishing them. Returns nil when the error is not a
+// soft lock, which leaves existing metadata untouched.
+func softLockMeta(err error, base map[string]any) map[string]any {
+	var soft *auth.SoftLockError
+	if !errors.As(err, &soft) {
+		return base
+	}
+	if base == nil {
+		base = map[string]any{}
+	}
+	base["soft_locked"] = true
+	base["retry_after_seconds"] = soft.RetryAfterSeconds()
+	return base
 }
 
 // Login handles POST /api/v1/auth/login.
@@ -356,9 +385,10 @@ func (h *AuthHandler) Login(c echo.Context) error {
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
+			Metadata:     softLockMeta(err, nil),
 		}, err)
 		if containsMsg(err, "invalid credentials") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return invalidCredentials(c, err)
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
@@ -541,6 +571,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
+			Metadata:     softLockMeta(err, nil),
 		}
 		attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
 		h.auditFailure(c, ev, err)
@@ -548,7 +579,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 		}
 		if containsMsg(err, "invalid credentials") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return invalidCredentials(c, err)
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
@@ -2426,10 +2457,10 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 			ResourceType: "user",
 			IPAddress:    c.RealIP(),
 			UserAgent:    c.Request().UserAgent(),
-			Metadata:     map[string]any{"flow": "session"},
+			Metadata:     softLockMeta(err, map[string]any{"flow": "session"}),
 		}, err)
 		if containsMsg(err, "invalid credentials") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return invalidCredentials(c, err)
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}

@@ -77,6 +77,9 @@ func (m *captureMailer) SendBlockedAccount(context.Context, *mailer.SMTPConfig, 
 func (m *captureMailer) SendPasswordBreach(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.PasswordBreachEmail) error {
 	return nil
 }
+func (m *captureMailer) SendTenantLockoutAlert(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.TenantLockoutAlertEmail) error {
+	return nil
+}
 func (m *captureMailer) SendTest(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.TemplateType, string) error {
 	return nil
 }

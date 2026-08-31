@@ -149,6 +149,14 @@ var riskActions = map[string]bool{
 	ActionAuthReplayDetected:     true,
 	ActionAuthMFALockedOut:       true,
 	ActionAuthTokenRefreshFailed: true,
+
+	// Lockout tiers (issue #72). Each one is a credential-verification outcome
+	// where the geo/device signals are exactly what tells a locked-out traveller
+	// apart from a distributed guessing attack.
+	ActionAuthAccountSoftLocked:    true,
+	ActionAuthLoginFailedThreshold: true,
+	ActionAuthAccountBlocked:       true,
+	ActionAuthTenantLockoutSpike:   true,
 }
 
 // assessRisk merges security signals into the metadata for login-type events

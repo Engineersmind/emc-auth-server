@@ -173,6 +173,7 @@ func ResetStoresForTest() {
 	authorizeStore.store.Range(func(k, _ any) bool { authorizeStore.store.Delete(k); return true })
 	oauthTokenStore.store.Range(func(k, _ any) bool { oauthTokenStore.store.Delete(k); return true })
 	revokeStore.store.Range(func(k, _ any) bool { revokeStore.store.Delete(k); return true })
+	passkeyBeginStore.store.Range(func(k, _ any) bool { passkeyBeginStore.store.Delete(k); return true })
 }
 
 // defaultAuditMaintRate is the per-tenant per-minute cap on the expensive audit
@@ -204,7 +205,8 @@ func AuditMaintenanceRateLimiter(perMinute int) echo.MiddlewareFunc {
 				}
 				key += "ip:" + ip
 			}
-			if !auditMaintStore.getOrCreate(key, perMinute).Allow() {
+			if !allowVia(c.Request().Context(), auditMaintStore, "audit_maint", key, perMinute) {
+				metrics.RateLimitHits.WithLabelValues("audit_maint").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many audit compliance requests — slow down",
@@ -245,9 +247,15 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				ip = c.Request().RemoteAddr
 			}
 
-			// Per-IP rate check.
-			ipLimiter := ipStore.getOrCreate("ip:"+ip, cfg.PerIPRate)
-			if !ipLimiter.Allow() {
+			// Per-IP rate check. Key is prefixed per surface ("login-ip:") so the
+			// login, token, and social-OAuth limiters hold independent budgets —
+			// they previously shared the key "ip:"+ip, which meant a client's
+			// token refreshes silently consumed its login allowance (and vice
+			// versa), making the effective limit on each surface unpredictable
+			// and well below the documented 5/min. OTPRateLimiter already keyed
+			// its own prefix for exactly this reason.
+			if !allowVia(c.Request().Context(), ipStore, "login_ip", "login-ip:"+ip, cfg.PerIPRate) {
+				metrics.RateLimitHits.WithLabelValues("login_ip").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many login attempts from your IP address",
@@ -270,20 +278,26 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 			// here — a coarser, tenant-aware limiter applied after resolution
 			// would need to live in the service layer, not this middleware.
 			//
-			// Malformed/non-JSON bodies also share one "unknown-account" bucket
-			// across every caller — a body-parse failure from one client can
-			// count against unrelated callers hitting that same fallback key
-			// within the window. Low severity: still bounded by the per-IP limit,
-			// and only triggers when a client fails to send parseable JSON.
+			// Malformed/non-JSON bodies fall back to a per-IP bucket (see below),
+			// so a body-parse failure from one client cannot spend the budget of
+			// unrelated callers, while still not offering a way to bypass the
+			// per-account limit by sending an unparseable body.
 			email := loginEmailFromBody(c)
 			if email == "" {
-				email = "unknown-account"
+				// Scope the fallback to the caller's IP rather than one global
+				// "unknown-account" key. The fallback itself must stay — without
+				// it, sending a malformed body would bypass the per-account limit
+				// entirely — but a single shared bucket lets one client's broken
+				// JSON spend the budget of every other client sending broken
+				// JSON. Per-IP keeps the anti-bypass property while isolating
+				// callers from each other.
+				email = "unparseable-body:" + ip
 			}
 			if len(email) > maxRateLimitEmailLen {
 				email = email[:maxRateLimitEmailLen]
 			}
-			accountLimiter := tenantStore.getOrCreate("account:"+email, cfg.PerTenantRate)
-			if !accountLimiter.Allow() {
+			if !allowVia(c.Request().Context(), tenantStore, "login_account", "account:"+email, cfg.PerTenantRate) {
+				metrics.RateLimitHits.WithLabelValues("login_account").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many login attempts for this account",
@@ -317,8 +331,10 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				ip = c.Request().RemoteAddr
 			}
 
-			ipLimiter := ipStore.getOrCreate("ip:"+ip, cfg.PerIPRate)
-			if !ipLimiter.Allow() {
+			// Own key prefix: token traffic must not spend the login budget for
+			// the same IP (see the note in LoginRateLimiter).
+			if !allowVia(c.Request().Context(), ipStore, "token_ip", "token-ip:"+ip, cfg.PerIPRate) {
+				metrics.RateLimitHits.WithLabelValues("token_ip").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many token requests from your IP address",
@@ -330,8 +346,8 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				if len(clientID) > maxRateLimitEmailLen {
 					clientID = clientID[:maxRateLimitEmailLen]
 				}
-				clientLimiter := tenantStore.getOrCreate("client:"+clientID, cfg.PerTenantRate)
-				if !clientLimiter.Allow() {
+				if !allowVia(c.Request().Context(), tenantStore, "token_client", "client:"+clientID, cfg.PerTenantRate) {
+					metrics.RateLimitHits.WithLabelValues("token_client").Inc()
 					c.Response().Header().Set("Retry-After", "60")
 					return c.JSON(http.StatusTooManyRequests, map[string]string{
 						"error":       "too many token requests for this client",
@@ -369,8 +385,8 @@ func OTPRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				ip = c.Request().RemoteAddr
 			}
 
-			ipLimiter := ipStore.getOrCreate("otp-ip:"+ip, cfg.PerIPRate*2)
-			if !ipLimiter.Allow() {
+			if !allowVia(c.Request().Context(), ipStore, "otp_ip", "otp-ip:"+ip, cfg.PerIPRate*2) {
+				metrics.RateLimitHits.WithLabelValues("otp_ip").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many OTP attempts from your IP address",
@@ -382,8 +398,8 @@ func OTPRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				if len(token) > maxRateLimitEmailLen {
 					token = token[:maxRateLimitEmailLen]
 				}
-				sessLimiter := tenantStore.getOrCreate("otpsess:"+token, cfg.PerTenantRate)
-				if !sessLimiter.Allow() {
+				if !allowVia(c.Request().Context(), tenantStore, "otp_session", "otpsess:"+token, cfg.PerTenantRate) {
+					metrics.RateLimitHits.WithLabelValues("otp_session").Inc()
 					c.Response().Header().Set("Retry-After", "60")
 					return c.JSON(http.StatusTooManyRequests, map[string]string{
 						"error":       "too many OTP attempts for this session",
@@ -414,8 +430,10 @@ func OAuthRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				ip = c.Request().RemoteAddr
 			}
 
-			ipLimiter := ipStore.getOrCreate("ip:"+ip, cfg.PerIPRate)
-			if !ipLimiter.Allow() {
+			// Own key prefix: a browser social-login redirect must not spend the
+			// same IP's password-login budget (see the note in LoginRateLimiter).
+			if !allowVia(c.Request().Context(), ipStore, "oauth_ip", "oauth-ip:"+ip, cfg.PerIPRate) {
+				metrics.RateLimitHits.WithLabelValues("oauth_ip").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many login attempts from your IP address",
@@ -427,8 +445,8 @@ func OAuthRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				if len(clientID) > maxRateLimitEmailLen {
 					clientID = clientID[:maxRateLimitEmailLen]
 				}
-				clientLimiter := oauthClientStore.getOrCreate(clientID, cfg.PerTenantRate)
-				if !clientLimiter.Allow() {
+				if !allowVia(c.Request().Context(), oauthClientStore, "oauth_client", "oauth-client:"+clientID, cfg.PerTenantRate) {
+					metrics.RateLimitHits.WithLabelValues("oauth_client").Inc()
 					c.Response().Header().Set("Retry-After", "60")
 					return c.JSON(http.StatusTooManyRequests, map[string]string{
 						"error":       "too many login attempts for this application",
@@ -559,11 +577,61 @@ var jwksStore = &limiterStore{}
 // The response is also cheap and cacheable: a few hundred bytes of public key
 // material served from an in-memory cache, with an ETag so well-behaved clients
 // mostly get 304s. There is little to protect and much to break.
-const JWKSPerIPRate = 120
+//
+// Sized from a load test rather than intuition. At 120/min the endpoint failed
+// exactly as the paragraph above warns: 32 concurrent verifiers got 20 requests
+// through and 55,260 rejections; at 128 concurrent, ZERO succeeded — every
+// caller was locked out of token verification. Meanwhile the same box served
+// ~11,900 req/s on a comparably cheap endpoint, so 120/min was protecting
+// nothing and breaking everything.
+//
+// 2000/min is ~33/sec per IP: comfortably above a large deployment's
+// cache-expiry stampede (the realistic burst — N pods refetching at once when
+// their cached key set expires together), and still orders of magnitude below
+// what the endpoint can actually serve, so it remains a genuine abuse clamp
+// rather than a capacity limit. Revisit if a tenant legitimately exceeds it;
+// the fix then is a longer client-side cache TTL, not a lower limit here.
+const JWKSPerIPRate = 2000
 
 // userInfoStore holds the per-user buckets for the OIDC UserInfo endpoint, kept
 // separate from every other store for the same reason jwksStore is: UserInfo and
 // login have different legitimate volumes and must not exhaust each other.
+// passkeyBeginStore holds the per-IP buckets for the passkey assertion-challenge
+// endpoint, kept separate for the same reason jwksStore is: its legitimate volume
+// is nothing like a login's, and sharing a bucket makes the two starve each other.
+var passkeyBeginStore = &limiterStore{}
+
+// PasskeyBeginPerIPRate is the per-minute, per-IP allowance for
+// POST /auth/passkey/login/begin.
+//
+// This endpoint looks like an authentication attempt and is not one. It is hit
+// ONCE PER LOGIN-PAGE VIEW BY EVERY VISITOR, passkey or not, because
+// conditional-mediation autofill needs the challenge in hand before the user
+// touches the page (see WebAuthnService.LoginBegin). Its traffic therefore tracks
+// page views, not sign-ins.
+//
+// It previously shared TokenRateLimiter's 5/min. Measured: five requests
+// succeeded and the next seven returned 429. Five page views per minute from one
+// address is nothing — a corporate NAT, a mobile carrier, or an application
+// backend proxying its users exhausts it immediately, and the failure is silent:
+// the console simply stops showing the passkey button, with no error a user could
+// report. That is the JWKS failure over again, a limit sized for an
+// authentication attempt applied to something that behaves like a static asset.
+//
+// What the request actually costs: no user lookup at all (allowCredentials is
+// empty by design, so there is no account oracle to abuse and nothing to search),
+// one policy resolve served from an in-memory cache, and one short-TTL ceremony
+// row. No password hashing, no signature verification — that work lives in
+// /login/complete, which keeps the tighter limit because it IS an authentication
+// attempt.
+//
+// 300/min is 5/sec per IP: far above any plausible human rate of loading a login
+// page, comfortably above a shared egress address serving a large office, and
+// still low enough to clamp a client scripting challenge generation. Sized below
+// JWKS's 2000 because this one does write a row per call, so it is not free the
+// way serving a cached public key is.
+const PasskeyBeginPerIPRate = 300
+
 var userInfoStore = &limiterStore{}
 
 // UserInfoPerSubjectRate is the per-minute allowance for /oauth/userinfo, keyed
@@ -607,11 +675,40 @@ func UserInfoRateLimiter() echo.MiddlewareFunc {
 				key = "userinfo:ip:" + ip
 			}
 
-			if !userInfoStore.getOrCreate(key, UserInfoPerSubjectRate).Allow() {
+			if !allowVia(c.Request().Context(), userInfoStore, "userinfo", key, UserInfoPerSubjectRate) {
 				metrics.RateLimitHits.WithLabelValues("userinfo").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many userinfo requests",
+					"retry_after": "60",
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
+// PasskeyBeginRateLimiter bounds the passkey assertion-challenge endpoint per
+// client IP. See PasskeyBeginPerIPRate for why this is not TokenRateLimiter.
+//
+// Its own store as well as its own rate: a shared store would let this endpoint's
+// page-view-rate traffic evict the buckets of surfaces whose limits actually
+// matter for abuse.
+func PasskeyBeginRateLimiter() echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			if !allowVia(c.Request().Context(), passkeyBeginStore, "passkey_begin", "passkey-begin:"+ip, PasskeyBeginPerIPRate) {
+				metrics.RateLimitHits.WithLabelValues("passkey_begin").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many passkey challenge requests",
 					"retry_after": "60",
 				})
 			}
@@ -630,6 +727,16 @@ func UserInfoRateLimiter() echo.MiddlewareFunc {
 // revalidating a cached key set is the behaviour we want to encourage, and charging
 // it against the same budget as a full fetch would punish the well-behaved clients
 // hardest — precisely the ones whose caches expire in lockstep across many pods.
+//
+// Conditional requests are also admitted when the bucket is ALREADY empty. The
+// refund below only helps a request that got a token in the first place, so
+// without this a client holding a valid ETag was still refused once the budget
+// ran out — the exact caller the refund exists to protect, turned away at the
+// moment contention is highest. A revalidation cannot be the thing overloading
+// us: on a hit it does no key-material work and returns an empty body, and a
+// forged If-None-Match merely yields a full 200 that IS charged (the refund is
+// conditional on the handler actually answering 304). Serving them keeps every
+// correctly-behaving verifier able to confirm its keys under any load.
 func JWKSRateLimiter() echo.MiddlewareFunc {
 	startCleanup()
 
@@ -645,9 +752,28 @@ func JWKSRateLimiter() echo.MiddlewareFunc {
 			// Reserve rather than Allow so the token can be handed back below.
 			// A reservation that cannot proceed immediately means the bucket is
 			// empty, which is the same condition Allow() reports as false.
+			//
+			// This limiter stays per-process while the others moved to Redis
+			// (see ratelimit_distributed.go). The refund below is why: redis_rate
+			// has no reserve-then-cancel, so a distributed version would either
+			// charge every revalidation — defeating the ETag optimisation this
+			// endpoint depends on — or need a second round trip to give the token
+			// back, doubling the Redis cost of the highest-volume endpoint here.
+			//
+			// The multiplication that makes per-process buckets wrong elsewhere is
+			// tolerable here for once: 2000/min is already an abuse clamp far above
+			// legitimate use, so N instances granting N x 2000 is still nowhere near
+			// what the endpoint can serve, and the failure it guards against is a
+			// scraper rather than credential stuffing. Revisit if the limit is ever
+			// tightened toward the legitimate rate.
 			res := limiter.ReserveN(time.Now(), 1)
 			if !res.OK() || res.Delay() > 0 {
 				res.Cancel()
+				// Let a revalidation through on an empty bucket (see above). It
+				// is not counted either way: it had no token to refund.
+				if c.Request().Header.Get("If-None-Match") != "" {
+					return next(c)
+				}
 				metrics.RateLimitHits.WithLabelValues("jwks_ip").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
@@ -716,9 +842,11 @@ func SigningKeyRotationRateLimiter() echo.MiddlewareFunc {
 				key += "ip:" + ip
 			}
 
-			limiter := signingKeyRotationStore.getOrCreateEvery(
-				key, signingKeyRotationInterval, signingKeyRotationBurst)
-			if !limiter.Allow() {
+			// Distributed: a rotation retires the outgoing key for every instance,
+			// so a per-process budget would let N instances perform N rotations and
+			// invalidate tokens the runbook expects to stay valid.
+			if !allowViaEvery(c.Request().Context(), signingKeyRotationStore, "signing_key_rotation",
+				key, signingKeyRotationInterval, signingKeyRotationBurst) {
 				metrics.RateLimitHits.WithLabelValues("signing_key_rotation").Inc()
 				c.Response().Header().Set("Retry-After", "600")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
@@ -784,7 +912,7 @@ func AuthorizeRateLimiter() echo.MiddlewareFunc {
 			if ip == "" {
 				ip = c.Request().RemoteAddr
 			}
-			if !authorizeStore.getOrCreate("authorize:ip:"+ip, AuthorizePerIPRate).Allow() {
+			if !allowVia(c.Request().Context(), authorizeStore, "authorize", "authorize:ip:"+ip, AuthorizePerIPRate) {
 				metrics.RateLimitHits.WithLabelValues("authorize").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.HTML(http.StatusTooManyRequests,
@@ -822,7 +950,7 @@ func OAuthTokenRateLimiter() echo.MiddlewareFunc {
 				key = "oauth_token:ip:" + ip
 			}
 
-			if !oauthTokenStore.getOrCreate(key, OAuthTokenPerClientRate).Allow() {
+			if !allowVia(c.Request().Context(), oauthTokenStore, "oauth_token", key, OAuthTokenPerClientRate) {
 				metrics.RateLimitHits.WithLabelValues("oauth_token").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				// RFC 6749 §5.2 shape, so a client library parses this the same
@@ -847,7 +975,7 @@ func RevokeRateLimiter() echo.MiddlewareFunc {
 			if ip == "" {
 				ip = c.Request().RemoteAddr
 			}
-			if !revokeStore.getOrCreate("revoke:ip:"+ip, RevokePerIPRate).Allow() {
+			if !allowVia(c.Request().Context(), revokeStore, "revoke", "revoke:ip:"+ip, RevokePerIPRate) {
 				metrics.RateLimitHits.WithLabelValues("revoke").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{

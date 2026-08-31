@@ -62,11 +62,10 @@ func grace409FixtureScoped(t *testing.T, appScoped bool) (*AuthHandler, string) 
 
 	email := fmt.Sprintf("grace-409-%d@test.example.com", time.Now().UnixNano())
 	in := auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "Password123!",
-		FirstName:  "Grace",
-		LastName:   "Hit",
+		Email:     email,
+		Password:  "Password123!",
+		FirstName: "Grace",
+		LastName:  "Hit",
 	}
 	if appScoped {
 		var tenantID int64
@@ -79,7 +78,6 @@ func grace409FixtureScoped(t *testing.T, appScoped bool) (*AuthHandler, string) 
 		if err != nil {
 			t.Fatalf("CreateApplication() error = %v", err)
 		}
-		in.TenantSlug = ""
 		in.ClientID = app.ClientID
 		in.ClientSecret = app.ClientSecret
 	}

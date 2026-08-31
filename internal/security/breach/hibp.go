@@ -9,14 +9,15 @@
 //
 // SHA-1 is not a security choice here: it is the hash the Pwned Passwords corpus
 // is indexed by, and it is used purely as a lookup key, never to protect a
-// secret. Password storage remains bcrypt (see auth.BcryptCost).
+// secret. Password storage is argon2id (see internal/password).
 package breach
 
 import (
 	"bufio"
 	"context"
 	// #nosec G505 -- SHA-1 is the index of the Pwned Passwords corpus, used here
-	// only as a lookup key. Nothing is protected by it; password storage is bcrypt.
+	// only as a lookup key. Nothing is protected by it; password storage is argon2id
+	// (see internal/password).
 	"crypto/sha1" //nolint:gosec // G505: see the #nosec justification above
 	"encoding/hex"
 	"fmt"

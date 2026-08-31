@@ -37,8 +37,8 @@ type SPMetadata struct {
 
 // SPSSODescriptor describes the SP SSO capabilities.
 type SPSSODescriptor struct {
-	AuthnRequestsSigned  bool       `xml:"AuthnRequestsSigned,attr"`
-	WantAssertionsSigned bool       `xml:"WantAssertionsSigned,attr"`
+	AuthnRequestsSigned      bool       `xml:"AuthnRequestsSigned,attr"`
+	WantAssertionsSigned     bool       `xml:"WantAssertionsSigned,attr"`
 	AssertionConsumerService ACSService `xml:"AssertionConsumerService"`
 }
 

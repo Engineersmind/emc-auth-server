@@ -326,3 +326,95 @@ func TestSigningKeyRotationRateLimiter_BoundsRotationsPerTenant(t *testing.T) {
 		t.Errorf("other tenant = %d, want 200 — the bucket leaked across tenants", code)
 	}
 }
+
+// passkeyBeginRequest drives one POST through PasskeyBeginRateLimiter and
+// returns the status.
+func passkeyBeginRequest(t *testing.T, mw echo.MiddlewareFunc, remoteAddr string) int {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/passkey/login/begin",
+		strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = remoteAddr + ":12345"
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	handler := mw(func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+	_ = handler(c)
+	return rec.Code
+}
+
+// TestPasskeyBeginRateLimiter_SurvivesPageViewTraffic is the regression test for
+// the defect this limiter exists to fix.
+//
+// /passkey/login/begin is hit once per login-page VIEW by every visitor, passkey
+// or not, because conditional-mediation autofill needs the challenge before the
+// user interacts with the page. It previously shared TokenRateLimiter's 5/min,
+// and measured five successes followed by 429 — locking out any shared egress
+// address (a corporate NAT, a mobile carrier, an application backend proxying
+// its users) after five page loads, silently: the console just stops offering
+// the passkey button.
+//
+// Twenty requests is well beyond the old ceiling and still an unremarkable
+// number of page views for one office.
+func TestPasskeyBeginRateLimiter_SurvivesPageViewTraffic(t *testing.T) {
+	middleware.ResetStoresForTest()
+	mw := middleware.PasskeyBeginRateLimiter()
+
+	for i := 1; i <= 20; i++ {
+		if got := passkeyBeginRequest(t, mw, "203.0.113.10"); got != http.StatusOK {
+			t.Fatalf("request %d returned %d, want 200 — a shared address is being "+
+				"locked out of passkeys by ordinary page-view traffic", i, got)
+		}
+	}
+}
+
+// TestPasskeyBeginRateLimiter_StillClampsAbuse confirms the limit is a real
+// clamp and not effectively disabled: a client scripting challenge generation
+// past the configured rate is still refused.
+func TestPasskeyBeginRateLimiter_StillClampsAbuse(t *testing.T) {
+	middleware.ResetStoresForTest()
+	mw := middleware.PasskeyBeginRateLimiter()
+
+	// Drain the bucket.
+	for i := 0; i < middleware.PasskeyBeginPerIPRate; i++ {
+		if got := passkeyBeginRequest(t, mw, "203.0.113.11"); got != http.StatusOK {
+			t.Fatalf("request %d of the allowance returned %d, want 200", i+1, got)
+		}
+	}
+	if got := passkeyBeginRequest(t, mw, "203.0.113.11"); got != http.StatusTooManyRequests {
+		t.Fatalf("request past the allowance returned %d, want 429 — the limit is "+
+			"not clamping abuse", got)
+	}
+}
+
+// TestPasskeyBeginRateLimiter_IsolatesIPs confirms one address exhausting its
+// bucket cannot deny the endpoint to anyone else.
+func TestPasskeyBeginRateLimiter_IsolatesIPs(t *testing.T) {
+	middleware.ResetStoresForTest()
+	mw := middleware.PasskeyBeginRateLimiter()
+
+	for i := 0; i < middleware.PasskeyBeginPerIPRate; i++ {
+		_ = passkeyBeginRequest(t, mw, "203.0.113.12")
+	}
+	if got := passkeyBeginRequest(t, mw, "203.0.113.12"); got != http.StatusTooManyRequests {
+		t.Fatalf("exhausted IP returned %d, want 429", got)
+	}
+	if got := passkeyBeginRequest(t, mw, "203.0.113.13"); got != http.StatusOK {
+		t.Fatalf("a different IP returned %d, want 200 — buckets are not isolated", got)
+	}
+}
+
+// TestPasskeyBeginPerIPRate_ExceedsLoginRate pins the relationship the fix is
+// about: the challenge endpoint must be allowed materially more traffic than a
+// login attempt, because it is not one. Equalising them silently reintroduces
+// the lockout.
+func TestPasskeyBeginPerIPRate_ExceedsLoginRate(t *testing.T) {
+	loginRate := middleware.DefaultRateLimitConfig().PerIPRate
+	if middleware.PasskeyBeginPerIPRate <= loginRate*10 {
+		t.Fatalf("PasskeyBeginPerIPRate is %d against a login rate of %d — the "+
+			"challenge endpoint tracks page views, not sign-ins, and needs a "+
+			"materially higher allowance", middleware.PasskeyBeginPerIPRate, loginRate)
+	}
+}

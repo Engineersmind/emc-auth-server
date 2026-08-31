@@ -95,11 +95,29 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	// bumps it too, but this function is the one that changes what the account
 	// may do, so the invalidation belongs with the change: any future caller
 	// gets it without having to know to ask.
-	if _, err = tx.Exec(ctx,
+	//
+	// Keyed on the user alone. It previously carried `AND tenant_id = $3`, where
+	// $3 is the tenant being ADMINISTERED — but users.tenant_id is the account's
+	// HOME tenant, and 00078 established those as separate axes. For a
+	// cross-tenant grant they differ, so the predicate matched zero rows: the
+	// grant activated while role_id stayed NULL, and login's loadPermissions
+	// joins through role_id, so the account minted tokens carrying no
+	// permissions at all. Every permission-gated page then 403'd. This is the
+	// same defect migration 00077 repaired for email_verified, one column over.
+	//
+	// Dropping the tenant predicate is safe: userID comes from the tenant_admins
+	// row read at the top of this transaction, so it is already the right account.
+	res, err := tx.Exec(ctx,
 		`UPDATE users SET role_id = $1, token_version = token_version + 1, updated_at = NOW()
-		 WHERE id = $2 AND tenant_id = $3`, roleID, userID, tenantID,
-	); err != nil {
+		 WHERE id = $2 AND deleted_at IS NULL`, roleID, userID,
+	)
+	if err != nil {
 		return fmt.Errorf("attach administrative role: %w", err)
+	}
+	// A grant that activates without attaching its role is the exact silent
+	// failure above, so refuse rather than commit a half-applied activation.
+	if res.RowsAffected() == 0 {
+		return fmt.Errorf("attach administrative role: user %d not found", userID)
 	}
 	// Every live session ends when a grant activates, and unlike the password
 	// branch in Accept this is unconditional.

@@ -25,6 +25,8 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
+	"github.com/engineersmind/emc-auth-server/internal/password"
 	samlsvc "github.com/engineersmind/emc-auth-server/internal/saml"
 	"github.com/engineersmind/emc-auth-server/internal/security/breach"
 	"github.com/engineersmind/emc-auth-server/internal/security/risk"
@@ -48,6 +50,13 @@ type RoutesConfig struct {
 	JWTIssuer string
 	// Env is "development" or "production" — controls HTTPS enforcement behaviour.
 	Env string
+	// MetricsToken optionally gates GET /metrics behind a bearer token. Empty
+	// leaves it open, relying on the reverse proxy / network policy as before.
+	MetricsToken string
+	// PasswordHashMaxConcurrent caps simultaneous Argon2id derivations, bounding
+	// worst-case hashing memory. 0 means NumCPU (floored at 2). See
+	// config.Config.PasswordHashMaxConcurrent.
+	PasswordHashMaxConcurrent int
 	// AppBaseURL is prepended to the reset token link in emails.
 	AppBaseURL string
 	// DashboardBaseURL is the admin console origin, used for emailed links whose
@@ -281,9 +290,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/health", handlers.HealthHandler)
 
 	// Prometheus metrics — internal observability endpoint (07-05).
-	// Bind to 127.0.0.1 in production via reverse proxy; no auth by design
-	// (Prometheus scrapes this; protect via network policy).
-	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
+	//
+	// Primary control remains network-level: bind to 127.0.0.1 and restrict the
+	// path at the reverse proxy. METRICS_TOKEN adds defence in depth for when
+	// that is missing — a catch-all `location /` in nginx publishes this
+	// endpoint alongside the API, and the registry exposes tenant identifiers,
+	// login/token volumes, lockout and risk-signal counts, and the route table.
+	// Unset (the default) preserves the previous open behaviour so enabling the
+	// guard is a deliberate act that cannot silently break an existing scrape.
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()), mw.MetricsAuth(deps.Config.MetricsToken))
 
 	// Swagger UI — available at /swagger/index.html
 	// Override CSP for Swagger: its bundled JS uses inline scripts that require
@@ -328,7 +343,25 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		Str("issuer_base_url", issuerResolver.BaseURL()).
 		Bool("legacy_issuer_accepted", deps.Config.JWTAllowLegacyIssuer).
 		Msg("per-tenant OIDC issuers enabled (issue #7)")
-	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger)
+	// One password hasher for the whole process, shared by every service that
+	// writes or verifies a credential.
+	//
+	// Shared, not per-service, because the hasher owns the concurrency semaphore
+	// that bounds Argon2id memory. Two hashers means two semaphores and twice the
+	// permitted concurrent derivations — the memory ceiling silently doubles, and
+	// the instance meets it as an OOM kill under a login spike rather than as
+	// queueing.
+	passwordHasher := password.NewHasherWithConcurrency(
+		password.DefaultParams(),
+		deps.Config.PasswordHashMaxConcurrent,
+	).WithObserver(metrics.NewPasswordObserver())
+
+	deps.Logger.Info().
+		Str("hasher", passwordHasher.String()).
+		Msg("password hashing configured")
+
+	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger).
+		WithHasher(passwordHasher)
 
 	// TOTP service — requires encryption key; logs warning in dev if missing.
 	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Logger)
@@ -363,7 +396,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		FromName:       deps.Config.EmailFromName,
 		Logger:         deps.Logger,
 	})
-	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger)
+	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
+		WithHasher(passwordHasher)
 
 	// White-label email senders (issue #63 follow-on) — transactional emails
 	// resolve their sender application → tenant → global. Providers: SMTP or SendGrid.
@@ -411,15 +445,28 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// the same sender + template resolvers, so their mail is branded per scope
 	// and can be customized or disabled per application like every other type.
 	invSvc := auth.NewInvitationService(deps.Pool, m, deps.Config.DashboardBaseURL, deps.Logger).
+		WithHasher(passwordHasher).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
+	// One lockout-policy resolver shared by the login path, the account-block
+	// service, and the admin write path that invalidates it — so an operator's
+	// change is seen by every reader at once rather than by each one's own cache
+	// whenever it happens to expire.
+	lockoutPolicySvc := authSvc.LockoutPolicy()
+
 	blockSvc := auth.NewAccountBlockService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc).
-		WithRiskAssessor(risk.New(deps.Pool, deps.Config.UntrustedIPCIDRs, deps.Logger))
+		WithRiskAssessor(risk.New(deps.Pool, deps.Config.UntrustedIPCIDRs, deps.Logger)).
+		// Redis carries the soft-lock tier, the once-per-window warning marker and
+		// the spike counter. Nil is tolerated: the hard tier is pure Postgres and
+		// keeps working, which is the degradation this design deliberately chose.
+		WithRedis(deps.Redis).
+		WithLockoutPolicy(lockoutPolicySvc).
+		WithDashboardURL(deps.Config.DashboardBaseURL)
 	// A disabled checker yields a service whose Notify is a no-op.
 	breachSvc := auth.NewBreachService(deps.Pool,
 		breach.New(deps.Config.BreachDetectionEnabled, deps.Logger),
@@ -493,6 +540,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// invitation acceptance). See auth.RegisterSessionDenier for why it is
 	// process-wide rather than injected into each one.
 	auth.RegisterSessionDenier(deps.Redis)
+
+	// Share the rate-limiter buckets across instances.
+	//
+	// Without this every limiter counts in its own process, so N instances behind
+	// a load balancer grant N times the intended allowance — a client only has to
+	// have its requests land on different instances. At the AUTH-07 login limit of
+	// 5/min, three instances is 15/min, and the protection weakens in proportion
+	// to how well the service scales.
+	//
+	// Called before any route is registered, and process-wide for the same reason
+	// RegisterSessionDenier is: the limiters are package-level middleware
+	// constructors with no injection point of their own.
+	//
+	// A nil client leaves them on their in-process buckets, which is correct for a
+	// single instance and for tests.
+	mw.ConfigureDistributedRateLimiting(deps.Redis, deps.Logger)
 
 	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
 	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
@@ -697,7 +760,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// SessionCSRF guards against cross-site form-POST attacks when SameSite=None is
 	// active (staging/production); it is a no-op in development (SameSite=Lax).
 	sessionCSRF := mw.SessionCSRF(cookieCfg)
-	authGroup.POST("/session", authHandler.SessionLogin, sessionCSRF)
+	// LoginRateLimiter for the same reason /login carries it: this is a
+	// password-verifying endpoint, and the per-account lockout counter is
+	// documented as the BACKSTOP behind a per-IP limiter (see
+	// auth.MaxFailedLogins). Without it this path had no first line of defence,
+	// which mattered doubly because the admin console signs in here.
+	authGroup.POST("/session", authHandler.SessionLogin, mw.LoginRateLimiter(rlCfg), sessionCSRF)
 	authGroup.POST("/session/refresh", authHandler.SessionRefresh, sessionCSRF)
 	authGroup.POST("/session/logout", authHandler.SessionLogout, sessionCSRF)
 
@@ -852,16 +920,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 		// Passwordless sign-in: pre-auth, so no JWT middleware.
 		//
-		// TokenRateLimiter (per IP) rather than the per-account limiter, because
-		// at /login/begin there is no account yet — the authenticator has not told
-		// us who the user is. The IP is the only subject available to limit on,
-		// and it stays the only one at /login/complete too: the account is not
-		// known until the assertion verifies, by which point the work is done.
+		// Both limiters are per IP rather than per account, because at neither
+		// step is the account known: /login/begin sends an empty allowCredentials
+		// on purpose, and /login/complete does not learn who the user is until the
+		// assertion verifies, by which point the work is already done.
 		//
-		// Note the load shape: /login/begin is hit once per login-page view by
-		// every visitor, passkey or not, because conditional-mediation autofill
-		// requires the challenge before the user interacts with the page.
-		authGroup.POST("/passkey/login/begin", webauthnHandler.LoginBegin, mw.TokenRateLimiter(rlCfg))
+		// The two carry DIFFERENT limits, because only one of them is an
+		// authentication attempt. /login/begin is hit once per login-page view by
+		// every visitor, passkey or not — conditional-mediation autofill needs the
+		// challenge before the user interacts with the page — so its traffic
+		// tracks page views and 5/min locked out any shared address. It gets
+		// PasskeyBeginRateLimiter; see PasskeyBeginPerIPRate for the sizing.
+		// /login/complete verifies a signature and mints a session, so it keeps
+		// the tighter TokenRateLimiter.
+		authGroup.POST("/passkey/login/begin", webauthnHandler.LoginBegin, mw.PasskeyBeginRateLimiter())
 		authGroup.POST("/passkey/login/complete", webauthnHandler.LoginComplete, mw.TokenRateLimiter(rlCfg))
 
 		// Cookie-session variant for browser clients (the admin console), which
@@ -1005,6 +1077,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/session-policy", adminHandler.UpdateSessionPolicy, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/session-policy", adminHandler.DeleteSessionPolicy, appAppsWrite)
 
+	// Account-lockout policy (issue #72). Guarded with users:* rather than apps:*
+	// like the session policy above: these thresholds govern whether USERS can sign
+	// in, so the permission that gates blocking and unblocking a user is the one
+	// that should gate the policy deciding it automatically.
+	adminGroup.GET("/tenants/:tid/lockout-policy", adminHandler.GetLockoutPolicy, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/lockout-policy", adminHandler.UpdateLockoutPolicy, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/lockout-policy", adminHandler.DeleteLockoutPolicy, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.GetLockoutPolicy, appUsersRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.UpdateLockoutPolicy, appUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.DeleteLockoutPolicy, appUsersWrite)
+
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
 	adminGroup.PUT("/tenants/:tid/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
@@ -1023,6 +1106,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/tenants/:tid/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
 	adminGroup.GET("/tenants/:tid/users/:uid/detail", adminHandler.GetAdminUserDetail, tidUsersRead)
 	adminGroup.PUT("/tenants/:tid/users/:uid/status", adminHandler.SetUserStatus, tidUsersWrite)
+	// Unlock is separate from the status toggle above (issue #72): it also clears
+	// the failure counter and the temporary soft lock, and unlike a status change
+	// it is permitted on your own account — see UnlockUser for why.
+	adminGroup.POST("/tenants/:tid/users/:uid/unlock", adminHandler.UnlockUser, tidUsersWrite)
 	adminGroup.GET("/tenants/:tid/users/:uid/sessions", adminHandler.ListUserSessions, tidUsersRead)
 	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions", adminHandler.RevokeAllUserSessions, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, tidUsersWrite)
@@ -1122,6 +1209,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, appUsersWrite)
 	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, appUsersRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/unlock", adminHandler.UnlockUser, appUsersWrite)
 	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, appUsersRead)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, appUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/sessions/:familyID", adminHandler.RevokeUserSession, appUsersWrite)
@@ -1185,6 +1273,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
 	adminGroup.GET("/users/:id/detail", adminHandler.GetAdminUserDetail, usersRead)
 	adminGroup.PUT("/users/:id/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.POST("/users/:id/unlock", adminHandler.UnlockUser, usersWrite)
 	adminGroup.GET("/users/:id/sessions", adminHandler.ListUserSessions, usersRead)
 	adminGroup.DELETE("/users/:id/sessions", adminHandler.RevokeAllUserSessions, usersWrite)
 	adminGroup.DELETE("/users/:id/sessions/:familyID", adminHandler.RevokeUserSession, usersWrite)
@@ -1289,6 +1378,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.DELETE("/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, usersWrite)
 	adminGroup.GET("/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, usersRead)
 	adminGroup.PUT("/applications/:appID/users/:uid/status", adminHandler.SetUserStatus, usersWrite)
+	adminGroup.POST("/applications/:appID/users/:uid/unlock", adminHandler.UnlockUser, usersWrite)
 	// Slug-less session-policy variants — the caller's own tenant, resolved from
 	// their token. Same handlers; tenantFromClaimsOrPath supplies the tenant.
 	adminGroup.GET("/session-policy", adminHandler.GetSessionPolicy, appsRead)
@@ -1297,6 +1387,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications/:appID/session-policy", adminHandler.GetSessionPolicy, appsRead)
 	adminGroup.PUT("/applications/:appID/session-policy", adminHandler.UpdateSessionPolicy, appsWrite)
 	adminGroup.DELETE("/applications/:appID/session-policy", adminHandler.DeleteSessionPolicy, appsWrite)
+
+	// Slug-less lockout-policy variants — the caller's own tenant, from their token.
+	adminGroup.GET("/lockout-policy", adminHandler.GetLockoutPolicy, usersRead)
+	adminGroup.PUT("/lockout-policy", adminHandler.UpdateLockoutPolicy, usersWrite)
+	adminGroup.DELETE("/lockout-policy", adminHandler.DeleteLockoutPolicy, usersWrite)
+	adminGroup.GET("/applications/:appID/lockout-policy", adminHandler.GetLockoutPolicy, usersRead)
+	adminGroup.PUT("/applications/:appID/lockout-policy", adminHandler.UpdateLockoutPolicy, usersWrite)
+	adminGroup.DELETE("/applications/:appID/lockout-policy", adminHandler.DeleteLockoutPolicy, usersWrite)
 
 	adminGroup.GET("/applications/:appID/users/:uid/sessions", adminHandler.ListUserSessions, usersRead)
 	adminGroup.DELETE("/applications/:appID/users/:uid/sessions", adminHandler.RevokeAllUserSessions, usersWrite)

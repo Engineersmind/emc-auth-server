@@ -76,3 +76,71 @@ func TestIsNewDevice_SilentWithoutABaseline(t *testing.T) {
 		t.Error("a genuinely unseen device was not flagged once a baseline existed")
 	}
 }
+
+// A first LOGIN is not a first APPEARANCE. Registration, an accepted invitation
+// and a social sign-in all prove which device the user was on, so any of them is a
+// valid baseline.
+//
+// Reported from production: a user registered in their browser, signed in from that
+// same browser moments later, and was emailed "unusual sign-in detected". The
+// baseline query only matched action = 'auth.login', so the auth.register row
+// recording that very browser was invisible and the sign-in looked like it came
+// from a device the user had never used.
+func TestIsNewDevice_RegistrationEstablishesTheBaseline(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	testhelper.CleanupTables(t, pool)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc'`).Scan(&tenantID); err != nil {
+		t.Fatalf("tenant id: %v", err)
+	}
+
+	const chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	const firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+	a := New(pool, nil, logger)
+
+	for _, tc := range []struct {
+		name   string
+		action string
+	}{
+		{"registration", audit.ActionAuthRegister},
+		{"accepted invitation", audit.ActionAuthInvitationAccepted},
+		{"social sign-in", audit.ActionAuthGoogleLogin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var userID int64
+			if err := pool.QueryRow(ctx, `
+				INSERT INTO users (tenant_id, email, first_name, last_name, is_active)
+				VALUES ($1, $2, 'B', 'L', true) RETURNING id
+			`, tenantID, tc.name+"-baseline@example.com").Scan(&userID); err != nil {
+				t.Fatalf("seed user: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO audit_logs (tenant_id, user_id, action, status, user_agent, created_at)
+				VALUES ($1, $2, $3, 'success', $4, NOW())
+			`, tenantID, userID, tc.action, chrome); err != nil {
+				t.Fatalf("seed %s history: %v", tc.action, err)
+			}
+
+			in := audit.RiskInput{
+				UserID: &userID, TenantID: &tenantID,
+				Action: audit.ActionAuthLogin, UserAgent: chrome,
+			}
+			if a.isNewDevice(ctx, in) {
+				t.Errorf("signing in from the same browser as the %s was flagged as a new device", tc.name)
+			}
+
+			// The signal must still work — this is a baseline, not a blanket silence.
+			other := in
+			other.UserAgent = firefox
+			if !a.isNewDevice(ctx, other) {
+				t.Errorf("a different device was not flagged against the %s baseline", tc.name)
+			}
+		})
+	}
+}

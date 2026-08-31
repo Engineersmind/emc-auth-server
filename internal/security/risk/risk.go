@@ -110,6 +110,24 @@ func (a *Assessor) isUntrustedIP(ipStr string) bool {
 // scanning unbounded history.
 const deviceScanLimit = 200
 
+// deviceBaselineActions are the audited events that establish what device a user
+// signs in from. Any of them proves the person was present on that device, so any
+// of them is a valid baseline for "has their device changed?".
+//
+// Deliberately broader than auth.login: an account's first login is otherwise
+// compared against an empty history even when the account was just created from
+// the same browser, which made the new-device signal fire on every new user. See
+// isNewDevice for the full reasoning.
+//
+// Social logins are matched by prefix at query time rather than enumerated here,
+// because SocialLoginAction mints one action per provider.
+var deviceBaselineActions = []string{
+	audit.ActionAuthLogin,
+	audit.ActionAuthRegister,
+	audit.ActionAuthInvitationAccepted,
+	audit.ActionAuthGoogleLogin,
+}
+
 // isNewDevice reports whether this user has NOT successfully logged in from a
 // device with the same browser + OS family within the lookback window. Matching
 // on the parsed (browser, OS) family rather than the exact User-Agent string
@@ -125,13 +143,37 @@ func (a *Assessor) isNewDevice(ctx context.Context, in audit.RiskInput) bool {
 	if curBrowser == "" && curOS == "" {
 		return false // unparseable UA — cannot judge, so don't flag
 	}
+	// Every action that proves the user was present on a device, not just
+	// auth.login.
+	//
+	// Filtering on auth.login alone made the FIRST login of any account look like a
+	// new device even though the account had just been created from that very
+	// browser: registration is audited as auth.register, an invited user's first
+	// appearance as auth.invitation_accepted, and a social sign-in under its own
+	// provider action — none of which matched, so the baseline was empty and the
+	// alert fired on a device the user had demonstrably just used. The signal is
+	// "did this person's device change", and any of these establishes what their
+	// device was.
+	//
+	// The current login's own row is deliberately NOT excluded by time.
+	//
+	// It may or may not be visible yet — the audit writer is asynchronous — but
+	// either way the answer is right: if it is visible, its UA equals the one being
+	// assessed and the loop below returns "not new" on the match; if it is not, the
+	// history is judged without it. A time-based exclusion window was tried here and
+	// is wrong, because it also hides a legitimate baseline established moments
+	// earlier (registering and then signing in) and would blind the signal exactly
+	// when a real attacker follows a compromise straight into a session.
 	rows, err := a.pool.Query(ctx, `
 		SELECT DISTINCT user_agent FROM audit_logs
-		WHERE user_id = $1 AND action = $2 AND status = 'success'
-		  AND user_agent <> '' AND created_at > $3
+		WHERE user_id = $1
+		  AND action = ANY($2)
+		  AND status = 'success'
+		  AND user_agent <> ''
+		  AND created_at > $3
 		ORDER BY user_agent
 		LIMIT $4`,
-		*in.UserID, audit.ActionAuthLogin, time.Now().Add(-lookback), deviceScanLimit,
+		*in.UserID, deviceBaselineActions, time.Now().Add(-lookback), deviceScanLimit,
 	)
 	if err != nil {
 		a.logger.Debug().Err(err).Msg("risk: new-device lookup failed")

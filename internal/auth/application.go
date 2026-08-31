@@ -257,15 +257,15 @@ type AppSummary struct {
 
 // AppDetail is the full public representation of one application — no secret.
 type AppDetail struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 	// DisplayName is the optional end-user-facing label. Empty means fall back to
 	// Name, which is what every read does — so a consumer can render DisplayName
 	// or Name without checking which is set.
-	DisplayName string `json:"display_name"`
-	AppType  string   `json:"app_type"`
-	ClientID string   `json:"client_id"`
-	Scopes   []string `json:"scopes"`
+	DisplayName string   `json:"display_name"`
+	AppType     string   `json:"app_type"`
+	ClientID    string   `json:"client_id"`
+	Scopes      []string `json:"scopes"`
 	// RedirectURIs is the exact-match allow-list for GET /oauth/authorize
 	// (issue #6). Empty means the application cannot use the authorization
 	// code flow at all — which is the correct default for the m2m app_type.

@@ -35,9 +35,27 @@ type PlatformAdminResult struct {
 	ID     string `json:"id"`
 	UserID string `json:"user_id"`
 
+	// TenantID is the tenant this row ADMINISTERS. Use it for grant-scoped
+	// operations: role changes, revocation, resending the invitation.
 	TenantID   string `json:"tenant_id"`
 	TenantName string `json:"tenant_name"`
 	TenantSlug string `json:"tenant_slug"`
+
+	// HomeTenantID is where the ACCOUNT lives — users.tenant_id, the tenant
+	// holding its credentials. Use it for account-scoped operations: the user
+	// detail, session and passkey endpoints, which resolve a user within their
+	// own tenant.
+	//
+	// These two were always equal until migration 00078 let one administrator
+	// reach several tenants. A caller that assumes they still are gets a 404 for
+	// every cross-tenant administrator, which is exactly what the admin console's
+	// detail drawer did: it built /tenants/{administered}/users/{id}/detail and
+	// none of them resolved.
+	//
+	// Both are returned because the drawer legitimately needs both, and deriving
+	// one from the other at the call site is how the confusion returns.
+	HomeTenantID   string `json:"home_tenant_id"`
+	HomeTenantName string `json:"home_tenant_name"`
 
 	Email string `json:"email"`
 	Name  string `json:"name"`
@@ -99,6 +117,10 @@ type PlatformAdminStats struct {
 const platformAdminSelect = `
 	SELECT ta.id, ta.user_id, ta.tenant_id,
 	       COALESCE(NULLIF(t.display_name, ''), t.name), t.slug,
+	       -- The account's HOME tenant, distinct from the administered one since
+	       -- migration 00078. See PlatformAdminResult.HomeTenantID.
+	       u.tenant_id,
+	       COALESCE(NULLIF(ht.display_name, ''), ht.name),
 	       u.email, TRIM(CONCAT(u.first_name, ' ', u.last_name)), ta.admin_role,
 	       COALESCE((
 	           SELECT array_agg(oc.name ORDER BY oc.name)
@@ -136,8 +158,12 @@ const platformAdminSelect = `
 	        WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id AND al.action = 'auth.login'),
 	       ta.created_at
 	FROM tenant_admins ta
-	JOIN users u   ON u.id = ta.user_id
-	JOIN tenants t ON t.id = ta.tenant_id
+	JOIN users u    ON u.id = ta.user_id
+	JOIN tenants t  ON t.id = ta.tenant_id
+	-- The home tenant. LEFT because it must never drop a row: if an account's
+	-- home tenant is missing the administrator should still appear in the
+	-- directory, with an empty home tenant, rather than vanish from it.
+	LEFT JOIN tenants ht ON ht.id = u.tenant_id
 `
 
 // platformAdminWhere is shared by the count and the page so the total can never
@@ -218,12 +244,15 @@ func (s *Service) ListPlatformAdministrators(ctx context.Context, f PlatformAdmi
 	out := []PlatformAdminResult{}
 	for rows.Next() {
 		var r PlatformAdminResult
-		var id, userID, tenantID int64
+		var id, userID, tenantID, homeTenantID int64
+		// Nullable because the home tenant is LEFT JOINed — see the query.
+		var homeTenantName *string
 		var isPrimary *bool
 		var activated, blocked, isActive bool
 		if err := rows.Scan(
 			&id, &userID, &tenantID,
 			&r.TenantName, &r.TenantSlug,
+			&homeTenantID, &homeTenantName,
 			&r.Email, &r.Name, &r.Role,
 			&r.Applications, &isPrimary,
 			&activated, &blocked, &isActive, &r.EmailVerified, &r.MFAEnabled,
@@ -234,6 +263,10 @@ func (s *Service) ListPlatformAdministrators(ctx context.Context, f PlatformAdmi
 		r.ID = strconv.FormatInt(id, 10)
 		r.UserID = strconv.FormatInt(userID, 10)
 		r.TenantID = strconv.FormatInt(tenantID, 10)
+		r.HomeTenantID = strconv.FormatInt(homeTenantID, 10)
+		if homeTenantName != nil {
+			r.HomeTenantName = *homeTenantName
+		}
 		r.IsPrimary = isPrimary != nil && *isPrimary
 		r.Status = platformAdminStatus(activated, blocked, isActive)
 		out = append(out, r)

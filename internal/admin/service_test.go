@@ -458,7 +458,7 @@ func TestRolesOneDefaultPerApp_UniqueIndex(t *testing.T) {
 // TestUpdateTenantIsPatchNotReplace pins the patch semantics of UpdateTenant.
 //
 // It used to be replace-style: every column was assigned unconditionally, so a
-// caller updating only the name blanked domain and region, and wrote plan = ''
+// caller updating only the name blanked domain and region, and wrote plan = ”
 // into a NOT NULL column that has no CHECK constraint — leaving a tenant on a
 // plan outside free/pro/enterprise. An edit form that exposes just name and
 // display_name is exactly such a caller, which is why this is pinned.

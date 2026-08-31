@@ -225,13 +225,16 @@ definitions:
   admin.TenantDashboardDelta:
     properties:
       active_tenants_pct:
-        type: number
+        type: integer
       total_applications_pct:
-        type: number
+        type: integer
       total_tenants_pct:
-        type: number
+        description: |-
+          Month-over-month change, as a whole percent. Integer rather than float:
+          see momPct for why the extra precision was misleading as well as ugly.
+        type: integer
       total_users_pct:
-        type: number
+        type: integer
     type: object
   admin.TenantDashboardStats:
     properties:
@@ -4930,11 +4933,6 @@ paths:
         user in — no session is created and no tokens are returned; call /auth/session
         or /auth/login afterwards.
       parameters:
-      - description: Tenant slug (e.g. emc)
-        in: header
-        name: X-Tenant-Slug
-        required: true
-        type: string
       - description: Registration payload
         in: body
         name: body
@@ -4974,13 +4972,9 @@ paths:
       consumes:
       - application/json
       description: Re-sends the email-verification link for an unverified tenant-level
-        user. Always returns 200 to prevent account enumeration.
+        user. The tenant is resolved from the email address. Always returns 200 to
+        prevent account enumeration.
       parameters:
-      - description: Tenant slug
-        in: header
-        name: X-Tenant-Slug
-        required: true
-        type: string
       - description: Email to resend to
         in: body
         name: body

@@ -4270,13 +4270,6 @@ const docTemplate = `{
                 "summary": "Register a new user",
                 "parameters": [
                     {
-                        "type": "string",
-                        "description": "Tenant slug (e.g. emc)",
-                        "name": "X-Tenant-Slug",
-                        "in": "header",
-                        "required": true
-                    },
-                    {
                         "description": "Registration payload",
                         "name": "body",
                         "in": "body",
@@ -4325,7 +4318,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/resend-verification": {
             "post": {
-                "description": "Re-sends the email-verification link for an unverified tenant-level user. Always returns 200 to prevent account enumeration.",
+                "description": "Re-sends the email-verification link for an unverified tenant-level user. The tenant is resolved from the email address. Always returns 200 to prevent account enumeration.",
                 "consumes": [
                     "application/json"
                 ],
@@ -4337,13 +4330,6 @@ const docTemplate = `{
                 ],
                 "summary": "Resend verification email",
                 "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Tenant slug",
-                        "name": "X-Tenant-Slug",
-                        "in": "header",
-                        "required": true
-                    },
                     {
                         "description": "Email to resend to",
                         "name": "body",
@@ -9272,16 +9258,17 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "active_tenants_pct": {
-                    "type": "number"
+                    "type": "integer"
                 },
                 "total_applications_pct": {
-                    "type": "number"
+                    "type": "integer"
                 },
                 "total_tenants_pct": {
-                    "type": "number"
+                    "description": "Month-over-month change, as a whole percent. Integer rather than float:\nsee momPct for why the extra precision was misleading as well as ugly.",
+                    "type": "integer"
                 },
                 "total_users_pct": {
-                    "type": "number"
+                    "type": "integer"
                 }
             }
         },

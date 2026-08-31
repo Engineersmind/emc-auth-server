@@ -134,11 +134,10 @@ func (f *orphanFixture) tenantUser(t *testing.T) (string, int64) {
 
 	email := fmt.Sprintf("orphan-portal-%d@test.example.com", time.Now().UnixNano())
 	if _, err := f.svc.Register(f.ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "Password123!",
-		FirstName:  "Orphan",
-		LastName:   "Portal",
+		Email:     email,
+		Password:  "Password123!",
+		FirstName: "Orphan",
+		LastName:  "Portal",
 	}); err != nil {
 		t.Fatalf("Register(tenant slug) error = %v", err)
 	}

@@ -60,11 +60,10 @@ func insertTOTPTestUser(t *testing.T, ctx context.Context, pool *pgxpool.Pool, e
 	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
 	_, err := authSvc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "TestPass123!",
-		FirstName:  "TOTP",
-		LastName:   "Test",
+		Email:     email,
+		Password:  "TestPass123!",
+		FirstName: "TOTP",
+		LastName:  "Test",
 	})
 	if err != nil {
 		t.Fatalf("insertTOTPTestUser Register(%q): %v", email, err)

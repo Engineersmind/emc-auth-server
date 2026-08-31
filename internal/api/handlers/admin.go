@@ -1609,6 +1609,48 @@ func (h *AdminHandler) SetUserStatus(c echo.Context) error {
 	return c.JSON(http.StatusOK, result)
 }
 
+// UnlockUser handles POST .../users/:id/unlock.
+//
+// @Summary      Unlock a locked-out user
+// @Description  Clears every account-lockout tier: the failed-attempt counter, an automatic or administrative block, and the temporary (soft) lock. Idempotent — unlocking an account that is not locked succeeds. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {object}  admin.UserResult
+// @Failure      403  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/unlock [post]
+func (h *AdminHandler) UnlockUser(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	// Note the absence of SetUserStatus's self-action guard. That guard exists so
+	// an operator cannot disable themselves; unlocking yourself takes nothing away,
+	// and an administrator who has just been brute-forced into a lockout is exactly
+	// the person who most needs to be able to clear it.
+	result, err := h.svc.UnlockUser(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		if errors.Is(err, admin.ErrNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: unlock user failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to unlock user"})
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminAccountUnlocked, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, result)
+}
+
 // ListUserSessions handles GET .../users/:id/sessions.
 //
 // @Summary      List a user's active sessions
@@ -2225,7 +2267,8 @@ func (h *AdminHandler) UpdateTenantCORSOrigins(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 
-	if err := h.svc.UpdateTenantCORSOrigins(c.Request().Context(), tenantID, req.Origins); err != nil {
+	updated, err := h.svc.UpdateTenantCORSOrigins(c.Request().Context(), tenantID, req.Origins)
+	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
 		}
@@ -2233,11 +2276,21 @@ func (h *AdminHandler) UpdateTenantCORSOrigins(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to update CORS origins"})
 	}
 
-	// Invalidate CORS cache for the tenant slug so changes take effect immediately.
-	if h.corsSvc != nil && claims != nil {
-		if slug := c.QueryParam("slug"); slug != "" {
-			h.corsSvc.InvalidateCache(c.Request().Context(), slug)
-		}
+	// Drop the cached CORS decisions so the change takes effect immediately
+	// rather than after the 60s TTL.
+	//
+	// Both caches, and both the old and new origin lists. The origin-keyed cache
+	// answers "does any tenant permit this origin", so an origin being REMOVED
+	// needs clearing just as much as one being added — otherwise a revoked origin
+	// keeps working for up to a minute, which is the wrong direction to be slow
+	// in. The old list is read before the update for exactly that reason.
+	//
+	// Previously this fired only when the caller happened to pass ?slug=, which
+	// no client is required to send and the console does not, so the
+	// invalidation silently never ran.
+	if h.corsSvc != nil {
+		ctx := c.Request().Context()
+		h.corsSvc.InvalidateOriginCache(ctx, append(updated.PreviousOrigins, req.Origins...)...)
 	}
 
 	h.auditAdmin(c, claims, audit.ActionAdminCORSUpdated, "tenant", strconv.FormatInt(tenantID, 10))
@@ -2288,14 +2341,14 @@ func (h *AdminHandler) ListAppLimits(c echo.Context) error {
 // is set (the app then runs at the server default).
 //
 // @Summary      Get an application's rate limit
-// @Description  Returns the custom per-minute limit for the application. Requires apps:read.
+// @Description  Returns which rate limit applies to the application. Always 200 when the application exists: `configured` reports whether it has a custom limit, `source` is "application" or "default", and `limit` is null when running at the server default. 404 means the application itself was not found. Requires apps:read.
 // @Tags         admin-rate-limits
 // @Produce      json
 // @Security     BearerAuth
 // @Param        appID  path      string  true   "Application ID"
 // @Param        tid    path      string  false  "Tenant ID (super_admin cross-tenant mirror)"
-// @Success      200    {object}  auth.AppRateLimit
-// @Failure      404    {object}  map[string]string
+// @Success      200    {object}  auth.AppRateLimitResolution
+// @Failure      404    {object}  map[string]string  "Application not found"
 // @Router       /api/v1/applications/{appID}/rate-limit [get]
 // @Router       /api/v1/tenants/{tid}/applications/{appID}/rate-limit [get]
 func (h *AdminHandler) GetAppLimit(c echo.Context) error {
@@ -2310,13 +2363,24 @@ func (h *AdminHandler) GetAppLimit(c echo.Context) error {
 
 	limit, err := h.appLimitSvc.GetAppLimit(c.Request().Context(), tenantID, appID)
 	if err != nil {
+		// No custom limit is a valid state, not a missing resource: the
+		// application runs at the server default. The 404 this used to return
+		// collided with applicationOwnedByTenant's genuine not-found above.
 		if errors.Is(err, auth.ErrAppLimitNotFound) {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "no custom rate limit set for this application"})
+			return c.JSON(http.StatusOK, auth.AppRateLimitResolution{
+				Configured: false,
+				Source:     "default",
+				Limit:      nil,
+			})
 		}
 		h.logger.Error().Err(err).Msg("admin: get app limit failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get app rate limit"})
 	}
-	return c.JSON(http.StatusOK, limit)
+	return c.JSON(http.StatusOK, auth.AppRateLimitResolution{
+		Configured: true,
+		Source:     "application",
+		Limit:      limit,
+	})
 }
 
 // SetAppLimit handles PUT /api/v1/applications/:appID/rate-limit and its
@@ -3165,13 +3229,13 @@ func senderResource(tenantID int64, appRowID *int64) (resourceType, resourceID s
 // GET /api/v1/tenants/:tid/applications/:appID/email-settings and flat aliases.
 //
 // @Summary      Get email sender settings
-// @Description  Returns the white-label sender configured for the tenant (or one application). The SMTP password is never returned — has_password reports whether one is stored. 404 = no sender at this scope (the global server sender applies).
+// @Description  Returns which email sender applies at this scope. Always 200 when the scope exists: `configured` reports whether this scope has its own sender, `source` names where the effective one comes from ("application" | "tenant" | "global"), and `settings` is null when inheriting. The SMTP password is never returned — has_password reports whether one is stored. 404 means the tenant or application itself was not found.
 // @Tags         admin-email-senders
 // @Produce      json
 // @Security     BearerAuth
-// @Success      200  {object}  auth.EmailSenderSettings
+// @Success      200  {object}  auth.EmailSenderResolution
 // @Failure      403  {object}  map[string]string
-// @Failure      404  {object}  map[string]string  "No sender configured at this scope"
+// @Failure      404  {object}  map[string]string  "Tenant or application not found"
 // @Router       /api/v1/email-settings [get]
 func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 	tenantID, appRowID, _, ok := h.emailSenderScope(c)
@@ -3181,13 +3245,35 @@ func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 
 	settings, err := h.senderSvc.Get(c.Request().Context(), tenantID, appRowID)
 	if err != nil {
+		// Not an error condition: this scope simply has no sender of its own, so
+		// the next level up applies. Reported as a 200 with configured=false —
+		// see auth.EmailSenderResolution for why this stopped being a 404.
 		if errors.Is(err, auth.ErrSenderNotFound) {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "no email sender configured at this scope — the global sender applies"})
+			source := "global"
+			if appRowID != nil {
+				// An application without its own row falls back to its tenant,
+				// which may or may not have one — but "tenant" is the level that
+				// answers for it either way.
+				source = "tenant"
+			}
+			return c.JSON(http.StatusOK, auth.EmailSenderResolution{
+				Configured: false,
+				Source:     source,
+				Settings:   nil,
+			})
 		}
 		h.logger.Error().Err(err).Msg("admin: get email sender failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get email sender settings"})
 	}
-	return c.JSON(http.StatusOK, settings)
+	source := "tenant"
+	if appRowID != nil {
+		source = "application"
+	}
+	return c.JSON(http.StatusOK, auth.EmailSenderResolution{
+		Configured: true,
+		Source:     source,
+		Settings:   settings,
+	})
 }
 
 // UpsertEmailSender handles PUT /api/v1/tenants/:tid/email-settings,

@@ -9,10 +9,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	"github.com/engineersmind/emc-auth-server/internal/password"
 )
 
 // ---------------------------------------------------------------------------
@@ -53,7 +53,11 @@ type InvitationService struct {
 	// cannot serve a browser GET — it answers "authorization required" — because
 	// the token alone is not enough to complete the flow.
 	dashboardBaseURL string
-	logger           zerolog.Logger
+	// hasher writes the credential when an invitation is accepted. Defaulted by
+	// the constructor so a caller that forgets WithHasher still writes a correctly
+	// hashed password rather than panicking or, worse, storing plaintext.
+	hasher *password.Hasher
+	logger zerolog.Logger
 }
 
 // NewInvitationService creates an InvitationService. dashboardBaseURL is the
@@ -63,8 +67,21 @@ func NewInvitationService(pool *pgxpool.Pool, m mailer.Mailer, dashboardBaseURL 
 		pool:             pool,
 		notify:           EmailNotifier{mailer: m, logger: logger},
 		dashboardBaseURL: dashboardBaseURL,
+		hasher:           password.NewHasher(password.DefaultParams()),
 		logger:           logger,
 	}
+}
+
+// WithHasher shares the process-wide hasher, so a credential written when an
+// invitation is accepted uses the same parameters as every other credential —
+// and, critically, counts against the same concurrency cap. Without this each
+// service would hold its own semaphore and the process could run several times
+// the intended number of concurrent derivations.
+func (s *InvitationService) WithHasher(h *password.Hasher) *InvitationService {
+	if h != nil {
+		s.hasher = h
+	}
+	return s
 }
 
 // WithSenders wires the white-label sender resolver.
@@ -340,7 +357,7 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 		if opts.CurrentPassword == "" {
 			return nil, ErrCurrentPasswordMismatch
 		}
-		if bcrypt.CompareHashAndPassword([]byte(*existingHash), []byte(opts.CurrentPassword)) != nil {
+		if s.hasher.Verify(ctx, opts.CurrentPassword, *existingHash) != nil {
 			return nil, ErrCurrentPasswordMismatch
 		}
 	}
@@ -364,7 +381,7 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 	}
 
 	if setPassword {
-		hash, hashErr := bcrypt.GenerateFromPassword([]byte(opts.NewPassword), BcryptCost)
+		hash, hashErr := s.hasher.Hash(ctx, opts.NewPassword)
 		if hashErr != nil {
 			return nil, fmt.Errorf("hash invitation password: %w", hashErr)
 		}
