@@ -72,11 +72,10 @@ func TestReplayAttack_RefreshToken(t *testing.T) {
 	// Registration does not issue tokens — it creates an account without starting a
 	// session — so the sign-in is a separate call.
 	if _, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "SecPass123!",
-		FirstName:  "R",
-		LastName:   "T",
+		Email:     email,
+		Password:  "SecPass123!",
+		FirstName: "R",
+		LastName:  "T",
 	}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -133,11 +132,10 @@ func TestEmailEnumeration_ForgotPassword(t *testing.T) {
 
 	// Register a real user so the "registered email" path is exercised.
 	_, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      registeredEmail,
-		Password:   "SecPass123!",
-		FirstName:  "Reg",
-		LastName:   "User",
+		Email:     registeredEmail,
+		Password:  "SecPass123!",
+		FirstName: "Reg",
+		LastName:  "User",
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)
@@ -200,11 +198,10 @@ func TestTOTPBypass_InvalidCode(t *testing.T) {
 
 	// Register the user.
 	_, err = svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "SecPass123!",
-		FirstName:  "TOTP",
-		LastName:   "Bypass",
+		Email:     email,
+		Password:  "SecPass123!",
+		FirstName: "TOTP",
+		LastName:  "Bypass",
 	})
 	if err != nil {
 		t.Fatalf("Register: %v", err)

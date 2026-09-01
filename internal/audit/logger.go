@@ -158,6 +158,42 @@ const (
 	ActionAuthAccountUnblocked    = "auth.account_unblocked"
 	ActionAuthPasswordBreachFound = "auth.password_breach_detected"
 
+	// Lockout escalation tiers below the hard block (issue #72).
+	//
+	// ActionAuthAccountBlocked above remains the HARD lock — deliberately not
+	// renamed to auth.account_hard_locked as issue #72 proposed. The existing
+	// value is already in audit history, in operator dashboards, and in the
+	// riskActions map; renaming it would break continuity of the one event most
+	// likely to be queried during an incident, in exchange for a tidier name.
+	//
+	// ActionAuthAccountSoftLocked is a TEMPORARY refusal held in Redis. No
+	// account state changed, and it lifts on its own — an operator seeing this in
+	// the feed should not go looking for an account to unlock.
+	ActionAuthAccountSoftLocked = "auth.account_soft_locked"
+	// ActionAuthLoginFailedThreshold is the point at which the account owner was
+	// emailed about repeated failures. Distinct from auth.login_failed, which
+	// records every individual attempt: this one fires once per window and marks
+	// "the user was told".
+	ActionAuthLoginFailedThreshold = "auth.login_failed_threshold"
+	// ActionAuthHardLockExpired is an automatic lock lifting on its own. Recorded
+	// so a re-enabled account is never a silent state change — "why is this
+	// account active again?" needs an answer that is not "we assume it timed out".
+	ActionAuthHardLockExpired = "auth.hard_lock_expired"
+	// ActionAuthTenantLockoutSpike is many accounts locking inside one window —
+	// the credential-stuffing signal. Per-account locks are noise at volume; this
+	// is the event worth paging on.
+	ActionAuthTenantLockoutSpike = "auth.tenant_lockout_spike"
+	// ActionAdminAccountUnlocked is an operator clearing lockout state through the
+	// dedicated unlock endpoint. Distinct from admin.user_unblocked (the status
+	// toggle) so "who lifted a lockout?" is answerable without also matching every
+	// routine enable/disable.
+	ActionAdminAccountUnlocked = "admin.account_unlocked"
+	// Lockout policy changes. Audited because raising a threshold or making locks
+	// permanent weakens or strengthens a security control for an entire tenant, and
+	// "who changed the lockout policy, and to what?" must be answerable afterwards.
+	ActionAdminLockoutPolicySet   = "admin.lockout_policy_set"
+	ActionAdminLockoutPolicyReset = "admin.lockout_policy_reset"
+
 	// Admin — a privileged route refused the caller. Recorded because a refusal
 	// is a security signal in its own right: somebody probing for access they do
 	// not have leaves no other trace, since the handler never runs.

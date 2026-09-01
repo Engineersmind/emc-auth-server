@@ -2,25 +2,37 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/engineersmind/emc-auth-server/internal/metrics"
+	"github.com/engineersmind/emc-auth-server/internal/password"
 	"github.com/engineersmind/emc-auth-server/internal/requestctx"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 )
 
-// BcryptCost is the work factor for password hashing (AUTH-02).
-const BcryptCost = 12
+// Password hashing lives in internal/password (AUTH-02).
+//
+// The BcryptCost constant this replaces is deliberately gone rather than
+// deprecated: while it existed, any caller could reach past the abstraction and
+// hash at its own work factor, which is how the seed path came to write
+// credentials at a cost the rest of the system had moved off. There is now one
+// way to hash a password, and it is password.Hasher.
+//
+// Bcrypt credentials written before the switch still verify — see
+// password.Verify — and upgrade to Argon2id on their owner's next sign-in via
+// rehashIfStale.
 
 // AuthService implements the business logic for registration, login, and profile lookup.
 type AuthService struct {
@@ -41,18 +53,59 @@ type AuthService struct {
 	// forgot to wire it silently reverted to unbounded sessions, so the
 	// constructor always installs one.
 	policySvc *SessionPolicyService
-	logger    zerolog.Logger
+	// hasher hashes and verifies passwords. Never nil after NewAuthService — a nil
+	// check on every credential path would be one missed branch away from writing
+	// an unhashed password, so the constructor always installs one.
+	hasher *password.Hasher
+	// lockoutSvc resolves per-tenant lockout policy. Never nil after
+	// NewAuthService, for the same reason as policySvc: a nil here would mean the
+	// login path silently used a zero HardLockDuration, which reads as "no
+	// expiry" and would quietly reinstate permanent lockouts.
+	lockoutSvc *LockoutPolicyService
+	logger     zerolog.Logger
 }
 
 // NewAuthService creates an AuthService.
 func NewAuthService(pool *pgxpool.Pool, jwtSvc *JWTService, logger zerolog.Logger) *AuthService {
 	return &AuthService{
-		pool:      pool,
-		jwtSvc:    jwtSvc,
-		policySvc: NewSessionPolicyService(pool, logger),
-		logger:    logger,
+		pool:       pool,
+		jwtSvc:     jwtSvc,
+		policySvc:  NewSessionPolicyService(pool, logger),
+		lockoutSvc: NewLockoutPolicyService(pool, logger),
+		hasher:     password.NewHasher(password.DefaultParams()),
+		logger:     logger,
 	}
 }
+
+// WithHasher replaces the password hasher, so a deployment can tune Argon2id
+// parameters and the concurrency cap to its instance size. Optional —
+// NewAuthService installs OWASP defaults. A nil argument is ignored rather than
+// accepted, because a nil hasher would panic on the first login.
+func (s *AuthService) WithHasher(h *password.Hasher) *AuthService {
+	if h != nil {
+		s.hasher = h
+	}
+	return s
+}
+
+// WithLockoutPolicy replaces the lockout policy resolver so the process can share
+// one cache between the login path, the account-block service, and the admin write
+// path that invalidates it. Optional — NewAuthService installs a working resolver.
+func (s *AuthService) WithLockoutPolicy(svc *LockoutPolicyService) *AuthService {
+	if svc != nil {
+		s.lockoutSvc = svc
+	}
+	return s
+}
+
+// Hasher exposes the configured hasher for startup logging and for the sibling
+// services (admin, invitation, reset) that must write credentials under exactly
+// the same parameters.
+func (s *AuthService) Hasher() *password.Hasher { return s.hasher }
+
+// LockoutPolicy exposes the resolver so the admin API validates against the same
+// thresholds the login path enforces, rather than a second copy of them.
+func (s *AuthService) LockoutPolicy() *LockoutPolicyService { return s.lockoutSvc }
 
 // WithSessionPolicy replaces the session policy resolver, so the process can
 // share one cache between the auth service and the admin write path that
@@ -120,14 +173,15 @@ func (s *AuthService) WithBreachDetection(brchSvc *BreachService) *AuthService {
 // Two application-identification modes are supported:
 //   - ClientID + ClientSecret (server-to-server integrations): the application
 //     is fully AUTHENTICATED — the secret is verified against its hash and the
-//     tenant is derived from the application, so TenantSlug becomes optional.
+//     tenant is derived from the application.
 //   - ClientID alone (legacy X-Client-ID header): the id is only validated to
-//     exist within the slug-resolved tenant and stamped into the JWT for audit.
+//     exist within the platform tenant and stamped into the JWT for audit.
+//
+// There is no tenant slug. Registration resolves its tenant from the
+// authenticated application, or from the platform tenant when there is none —
+// never from a caller-supplied identifier. The slug is the tenant's OIDC issuer
+// path and has no business in a registration request.
 type RegisterInput struct {
-	// TenantSlug is required unless ClientSecret is provided (the tenant is
-	// then derived from the authenticated application). When both are present
-	// the slug must resolve to the application's own tenant.
-	TenantSlug string
 	// ClientID is the application identifier (body field for integrations, or
 	// the legacy X-Client-ID header). See the struct comment for the two modes.
 	ClientID string
@@ -268,20 +322,42 @@ type MeResult struct {
 	AdminApps  []string `json:"admin_apps,omitempty"`
 }
 
-// resolveTenant fetches the tenant id by slug. Returns pgx.ErrNoRows if not found.
+// resolveRegistrationTenant returns the tenant a first-party registration lands
+// in: the platform tenant.
 //
-// It used to also SELECT jwt_secret, which both call sites discarded with `_`
-// (issue #95). Nothing leaked, but pulling signing authority into memory for no
-// reason is exactly the kind of gratuitous handling that turns into a leak the
-// day someone adds a log line or an error message that includes the row.
-// Signing now goes through JWTService, which fetches the key it needs itself.
-func (s *AuthService) resolveTenant(ctx context.Context, slug string) (id int64, err error) {
-	err = s.pool.QueryRow(ctx,
-		`SELECT id FROM tenants WHERE slug = $1 AND is_active = true`,
-		slug,
-	).Scan(&id)
+// The platform tenant is identified as the one holding the tenant:manage
+// permission — the tier that administers every other tenant — rather than by a
+// hardcoded "emc" slug or by lowest id. Both of those are true of the seeded
+// install and neither is guaranteed: the seed slug is configurable and ids are
+// assignment order. The permission is what actually defines the tier, so it is
+// what the lookup asks about.
+//
+// Deliberately NOT falling back to "any active tenant". If the platform tenant
+// cannot be identified, the caller gets pgx.ErrNoRows and Register answers
+// "tenant not found" — an account created in an arbitrary tenant is far worse
+// than a registration that fails, because nothing about it looks wrong until
+// somebody notices the user is in the wrong place.
+func (s *AuthService) resolveRegistrationTenant(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT t.id
+		FROM tenants t
+		WHERE t.is_active = true AND t.deleted_at IS NULL
+		  AND EXISTS (
+		      SELECT 1
+		      FROM roles r
+		      JOIN role_permissions rp ON rp.role_id = r.id
+		      JOIN permissions p       ON p.id = rp.permission_id
+		      WHERE r.tenant_id = t.id
+		        AND r.application_id IS NULL
+		        AND r.deleted_at IS NULL
+		        AND p.name = 'tenant:manage'
+		  )
+		ORDER BY t.id
+		LIMIT 1
+	`).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("resolve tenant %q: %w", slug, err)
+		return 0, fmt.Errorf("resolve platform tenant for registration: %w", err)
 	}
 	return id, nil
 }
@@ -564,7 +640,7 @@ func (s *AuthService) authenticateApp(ctx context.Context, clientID, clientSecre
 }
 
 // Register creates a new user. The target tenant comes either from an
-// authenticated application (ClientID + ClientSecret) or from TenantSlug.
+// authenticated application (ClientID + ClientSecret), or the platform tenant.
 func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*RegisterResult, error) {
 	in.Email = emailaddr.Normalize(in.Email)
 
@@ -582,19 +658,28 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		if err != nil {
 			return nil, err
 		}
-		// A slug supplied alongside app credentials must agree with the
-		// application's own tenant (confused-deputy guard). Same error as a
-		// bad secret so responses don't map app credentials to tenants.
-		if in.TenantSlug != "" {
-			slugTenantID, err := s.resolveTenant(ctx, in.TenantSlug)
-			if err != nil || slugTenantID != tid {
-				return nil, ErrInvalidClient
-			}
-		}
+		// No confused-deputy guard is needed any more: the caller cannot name a
+		// tenant at all, so there is nothing to disagree with the application's
+		// own. The guard that used to sit here existed only because a slug could
+		// arrive alongside app credentials and had to be checked against them.
 		tenantID, appRowID = tid, &aid
 		appID = strconv.FormatInt(aid, 10)
 	} else {
-		tid, err := s.resolveTenant(ctx, in.TenantSlug)
+		// First-party registration lands in the platform tenant.
+		//
+		// The caller has no say in this. A slug used to be required, which broke
+		// the admin console's own sign-up page — RegisterPayload has never carried
+		// one and the client never sent the header, so every submission returned
+		// 400 — and asked a person creating their first account for the tenant's
+		// OIDC issuer identifier, a machine-facing value they have no way to know.
+		//
+		// Making it optional would have been enough to fix the page, but leaving
+		// the input accepted keeps a caller-supplied tenant selector on an
+		// unauthenticated endpoint for no benefit: nothing sends it, and an
+		// integration that genuinely means a specific tenant authenticates as an
+		// application instead, which pins the tenant from credentials rather than
+		// from a guessable string.
+		tid, err := s.resolveRegistrationTenant(ctx)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, fmt.Errorf("tenant not found")
@@ -614,7 +699,7 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		}
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), BcryptCost)
+	hash, err := s.hasher.Hash(ctx, in.Password)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
@@ -698,19 +783,200 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 	}, nil
 }
 
-// dummyPasswordHash has no known matching plaintext. Login pads every attempt
-// with compares against this hash up to loginCompareFloor, so "zero candidate
-// accounts" and "a handful of candidate accounts" take roughly the same time —
-// otherwise response latency alone would reveal whether an email exists, and
-// (since bcrypt compares scale with candidate count) roughly how many tenants
-// it belongs to. This bounds the leak up to the floor; an email with more real
-// candidates than the floor still takes proportionally longer.
-var dummyPasswordHash = []byte("$2a$12$CwTycUXWue0Thq9StjUM0uJ8fVWy9j9G2sQm.a5S0KgP4Us0Qwv2u")
+// dummyPasswordHash has no known matching plaintext. The zero-candidate login
+// path compares against it so an unknown email still performs real bcrypt work
+// rather than returning immediately; uniform total latency is then enforced by
+// the deadline in settleLoginTiming, not by matching comparison counts.
+//
+// Generated at the CURRENT parameters rather than written as a literal. A pinned
+// literal silently decouples from the configuration: a hash frozen at one cost
+// while the live parameters are another makes the unknown-email path do
+// measurably different work from a real login — the exact asymmetry this hash
+// exists to remove.
+//
+// The plaintext is random, so nothing can match it, and it is discarded.
+var dummyPasswordHash = mustGenerateDummyHash()
 
-// loginCompareFloor is the minimum number of bcrypt comparisons Login performs
-// per attempt, real candidates plus dummy padding, to reduce how precisely
-// response timing can reveal an email's tenant-account count for the common case.
-const loginCompareFloor = 5
+func mustGenerateDummyHash() string {
+	var secret [32]byte
+	if _, err := rand.Read(secret[:]); err != nil {
+		panic("auth: cannot read randomness for dummy password hash: " + err.Error())
+	}
+	h, err := password.NewHasher(password.DefaultParams()).Hash(context.Background(), string(secret[:]))
+	if err != nil {
+		panic("auth: cannot generate dummy password hash: " + err.Error())
+	}
+	return h
+}
+
+// Login timing-uniformity budget.
+//
+// The property being defended: response latency must not reveal whether an email
+// exists, nor how many tenant accounts hold it. Bcrypt dominates login latency,
+// so the number of comparisons performed is directly observable from the wire.
+//
+// The previous approach padded every attempt with dummy comparisons up to a
+// floor of 5. That bought uniformity at 5x the CPU of the single comparison that
+// actually authenticates — and only up to the floor: an email held by more
+// accounts than the floor still took proportionally longer, so the leak it
+// existed to close reappeared exactly for the multi-tenant emails most worth
+// probing. Measured: 0 candidates 915ms, 1 candidate 914ms, 8 candidates 1510ms.
+//
+// This replaces it with a fixed wall-clock deadline, which needs three parts
+// together — any one alone is not sufficient:
+//
+//  1. loginMaxRealCompares caps how many real comparisons run, so worst-case
+//     bcrypt time is bounded and cannot overrun the deadline.
+//  2. The match loop runs a bounded number of comparisons regardless of outcome
+//     (see Login — it deliberately does not stop at the first match, so that an
+//     ambiguous password is refused rather than signing the user into whichever
+//     account came first). Cost is therefore independent of whether a hit occurs.
+//  3. Every return path sleeps to loginTimingBudget, making total latency
+//     constant regardless of candidate count.
+//
+// Measured with all three: 401ms for 0, 1, 3, and 8 candidates alike, matching
+// or hitting the deadline in every case — uniform where the old code leaked, at
+// roughly a fifth of the CPU. A sleeping goroutine holds no CPU, so concurrent
+// login throughput rose 4-5x (1.03 -> 4.08 logins/sec at 1 CPU).
+const (
+	// loginMaxRealCompares bounds real bcrypt comparisons per attempt. An email
+	// with more candidate accounts than this cannot be fully checked; the
+	// surplus accounts simply do not authenticate on this request.
+	//
+	// One, not three. A tenant-level email is meant to identify exactly one
+	// account: migration 00079 makes InviteTenantAdmin reuse an existing
+	// tenant-level account across tenants rather than creating a second row, so
+	// the multi-account case this cap existed to bound is no longer reachable for
+	// new data. Rows predating that fix are collapsed by
+	// scripts/phase0_merge_duplicate_admin.sql.
+	//
+	// The cap is what bounds worst-case cost, and every comparison it permits is
+	// paid on EVERY login — including the overwhelmingly common single-account
+	// one, because the loop deliberately does not stop at the first match (see
+	// Login). Three therefore tripled the cost of every sign-in to tolerate a
+	// state that should not exist. Surplus accounts are reported by
+	// loginSurplusCandidates so the misconfiguration is visible rather than
+	// silently absorbed.
+	loginMaxRealCompares = 1
+
+	// loginBudgetSafetyFactor multiplies measured worst-case derivation work to
+	// set the timing budget. The margin absorbs scheduler jitter, a loaded CPU,
+	// and the credit-exhausted state of a burstable instance — all of which slow
+	// a derivation without warning. Below the budget the settle sleeps; above it,
+	// uniformity is lost, so the margin errs high.
+	//
+	// 2, not 3. Every point of this factor is paid by every user on every login,
+	// so it is bought with real latency and should be no larger than the variance
+	// it has to cover. Argon2id's cost is dominated by sequential passes over a
+	// fixed 46MiB, which is far steadier than bcrypt's cost was — measured spread
+	// across runs is single-digit milliseconds on a 58ms derivation. Doubling
+	// covers that comfortably; tripling was sized for bcrypt and, once the
+	// algorithm changed, silently became 13x the actual work.
+	loginBudgetSafetyFactor = 2
+
+	// loginBudgetCalibrationSamples is how many probes the calibration takes.
+	//
+	// More than one because the probe runs during process start, when the machine
+	// is at its busiest — migrations have just finished, pools are filling, and
+	// the scheduler is contended. A single sample taken then reads high and
+	// permanently inflates the budget for the life of the process. The median of
+	// several discards that startup noise without needing a warm-up delay.
+	loginBudgetCalibrationSamples = 5
+
+	// loginBudgetFloor is the minimum budget regardless of measurement, so an
+	// implausibly fast calibration (an idle machine, an aggressive optimiser)
+	// cannot produce a budget too tight to absorb later variance.
+	loginBudgetFloor = 150 * time.Millisecond
+
+	// loginBudgetCeiling caps the budget so a pathologically slow calibration —
+	// a machine under heavy load at startup — cannot make every login take
+	// minutes. Exceeding this means the hashing parameters are wrong for the
+	// hardware, which is a deployment error to fix rather than to pad around.
+	loginBudgetCeiling = 3 * time.Second
+)
+
+// loginTimingBudget is the constant wall-clock floor for every login attempt.
+//
+// It MUST exceed worst-case real work — loginMaxRealCompares comparisons at
+// the configured parameters — or attempts that overrun it become distinguishable and the
+// uniformity property is lost.
+//
+// Calibrated at startup rather than hardcoded. A compile-time constant cannot be
+// correct on a developer laptop, in CI, and on the production instance at once:
+// the value this replaced was sized at "~190ms per comparison, measured" and the
+// same cost 12 measures 352ms on a 13th-gen i7 and slower again on EC2, so real
+// work exceeded the budget and the settle never slept. The uniformity guarantee
+// silently stopped binding on the hardware that mattered, which is precisely the
+// failure a constant invites — it encodes one machine's measurement as though it
+// were a property of the algorithm.
+//
+// LOGIN_TIMING_BUDGET_MS overrides the measurement when an operator needs a
+// fixed, auditable value (a compliance floor, or a deliberately uniform figure
+// across a heterogeneous fleet).
+var loginTimingBudget = calibrateLoginTimingBudget()
+
+// calibrateLoginTimingBudget measures password verification at the configured
+// parameters on this host and derives the budget from the median.
+//
+// Median of loginBudgetCalibrationSamples rather than a single reading. The
+// probe runs during process start, the busiest moment in the process's life, and
+// one sample taken there reads high — then inflates every login for the life of
+// the process, because the budget is a floor that all logins are padded up to.
+// The median discards those outliers without a warm-up delay.
+//
+// Probes run against a hash whose plaintext is deliberately wrong so the
+// derivation executes in full.
+func calibrateLoginTimingBudget() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("LOGIN_TIMING_BUDGET_MS")); raw != "" {
+		if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+
+	// Probes the SAME hasher the login path uses, against a hash written with the
+	// live parameters, so the budget tracks whatever is actually configured —
+	// including a later parameter change — rather than a figure baked in at
+	// authoring time.
+	probe := password.NewHasher(password.DefaultParams())
+	samples := make([]time.Duration, 0, loginBudgetCalibrationSamples)
+	for i := 0; i < loginBudgetCalibrationSamples; i++ {
+		start := time.Now()
+		_ = probe.Verify(context.Background(), "calibration-probe", dummyPasswordHash)
+		samples = append(samples, time.Since(start))
+	}
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	perCompare := samples[len(samples)/2]
+
+	budget := time.Duration(loginMaxRealCompares*loginBudgetSafetyFactor) * perCompare
+	if budget < loginBudgetFloor {
+		budget = loginBudgetFloor
+	}
+	if budget > loginBudgetCeiling {
+		budget = loginBudgetCeiling
+	}
+	return budget
+}
+
+// LoginTimingBudget exposes the calibrated budget for startup logging and tests.
+func LoginTimingBudget() time.Duration { return loginTimingBudget }
+
+// settleLoginTiming blocks until start+loginTimingBudget has elapsed, so every
+// login attempt takes the same observable time regardless of how much real work
+// it did. Call it on EVERY path that returns a credential verdict — a single
+// early return that skips it reintroduces the timing signal for that case.
+//
+// It respects context cancellation so a client that hangs up, or a shutdown, is
+// not held for the remainder of the budget.
+func settleLoginTiming(ctx context.Context, start time.Time) {
+	remaining := loginTimingBudget - time.Since(start)
+	if remaining <= 0 {
+		return
+	}
+	select {
+	case <-time.After(remaining):
+	case <-ctx.Done():
+	}
+}
 
 // loginCandidate is one (tenant, user) row whose email matches a login attempt.
 type loginCandidate struct {
@@ -719,6 +985,11 @@ type loginCandidate struct {
 	email        string
 	passwordHash string
 	roleName     string
+	// isActive is false for an account admitted by the auto-expiry predicate: the
+	// lock has elapsed but the row still says disabled. Carried through so the
+	// match path can lift the lock properly instead of issuing tokens against an
+	// account the database still considers blocked.
+	isActive bool
 }
 
 // Login authenticates a user by email and password. Without application
@@ -728,6 +999,17 @@ type loginCandidate struct {
 // one to find the single tenant it belongs to. With ClientID + ClientSecret
 // the application is authenticated first and the search is pinned to its tenant.
 func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
+	// Timing-uniformity clock. Every return path below settles against this so
+	// latency does not reveal whether the email exists, how many accounts hold
+	// it, or whether the password was correct. See loginTimingBudget.
+	//
+	// Deferred rather than called at each return: this function has many exits
+	// (credential failures, the MFA gate, client_id validation, token issue) and
+	// one that skipped the settle would leak precisely the case it took. The
+	// defer covers exits added later too.
+	loginStart := time.Now()
+	defer func() { settleLoginTiming(ctx, loginStart) }()
+
 	in.Email = emailaddr.Normalize(in.Email)
 
 	// Application-authenticated mode: verify the app before touching any user
@@ -754,17 +1036,75 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// User-base isolation: app-authenticated logins only see that application's
 	// own users; generic logins only see tenant-level users (application_id IS
 	// NULL) — an app-scoped account can never authenticate outside its app.
+	// The is_active test admits one extra class of account: one that an AUTOMATIC
+	// lockout disabled and whose lock has since expired (issue #72). Without this,
+	// hard_lock_duration_seconds could not work at all — an expired account would
+	// stay invisible to login and the lock would be permanent in practice however
+	// the policy was configured.
+	//
+	// Deliberately narrow. block_reason = 'failed_attempts' means an
+	// administrator's block (block_reason = 'admin') is never lifted by the clock,
+	// and the interval is computed in SQL from the policy so a locked account
+	// becomes visible at exactly the moment it should. Accounts admitted this way
+	// are re-checked below and unlocked properly before any token is issued —
+	// matching a candidate here is not the same as authenticating it.
+	// Resolved at the app's scope when one authenticated, and at platform scope
+	// otherwise. In generic mode the tenant is genuinely not known yet — that is
+	// what the candidate query is about to determine — so a tenant-scoped
+	// hard_lock_duration cannot be applied here. It is re-resolved against the real
+	// tenant below, before anything is unlocked, so the tenant's own setting still
+	// governs the decision that matters; this predicate only widens what the query
+	// is allowed to see.
+	var lockoutScope *int64
+	if appRowID != 0 {
+		lockoutScope = &appRowID
+	}
+	lockoutPolicy := s.lockoutSvc.Resolve(ctx, appTenantID, lockoutScope)
+
+	// The window used to ADMIT a locked row for re-checking.
+	//
+	// In generic mode the policy above is the PLATFORM default, because which
+	// tenant this email belongs to is exactly what the candidate query is about to
+	// determine. A tenant that configured a SHORTER expiry than the platform would
+	// then never have its accounts admitted — they would stay locked past their own
+	// deadline, silently ignoring the tenant's setting.
+	//
+	// So admit on the SMALLEST expiry any scope could plausibly set, which is the
+	// floor the CHECK constraint in migration 00070 allows. Being admitted here
+	// grants nothing: the row is still marked disabled, and ExpireHardLock
+	// re-validates the elapsed time in SQL against the tenant's real policy before
+	// anything is unlocked. Widening this predicate cannot let an account in early;
+	// it only lets the authoritative check run.
+	autoExpirySecs := minHardLockDurationSeconds
+	if lockoutPolicy.HardLockDuration > 0 {
+		if d := int(lockoutPolicy.HardLockDuration.Seconds()); d < autoExpirySecs {
+			autoExpirySecs = d
+		}
+	}
+
 	candidateQuery := `
-		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, '')
+		SELECT u.id, u.tenant_id, u.email, uc.password_hash, COALESCE(r.name, ''),
+		       u.is_active
 		FROM users u
 		JOIN user_credentials uc ON uc.user_id = u.id
 		JOIN tenants t ON t.id = u.tenant_id
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.email = $1 AND u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
+		WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
+		  AND (
+		        u.is_active = true
+		    OR (
+		        $2::INTEGER > 0
+		        AND u.block_reason = 'failed_attempts'
+		        AND u.blocked_at IS NOT NULL
+		        AND u.blocked_at < NOW() - make_interval(secs => $2::INTEGER)
+		    )
+		  )
 	`
-	args := []any{in.Email}
+	// $2 is bound unconditionally so the app-scoped branch can keep appending
+	// from $3 without the two placeholder sets colliding.
+	args := []any{in.Email, autoExpirySecs}
 	if appRowID != 0 {
-		candidateQuery += ` AND u.tenant_id = $2 AND u.application_id = $3`
+		candidateQuery += ` AND u.tenant_id = $3 AND u.application_id = $4`
 		args = append(args, appTenantID, appRowID)
 	} else {
 		candidateQuery += ` AND u.application_id IS NULL`
@@ -777,7 +1117,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	var candidates []loginCandidate
 	for rows.Next() {
 		var c loginCandidate
-		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName); err != nil {
+		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName, &c.isActive); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan login candidate: %w", err)
 		}
@@ -789,22 +1129,48 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	}
 
 	if len(candidates) == 0 {
-		for i := 0; i < loginCompareFloor; i++ {
-			_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(in.Password))
-		}
+		// One real-cost comparison against a hash with no known plaintext, so
+		// this path does comparable work to a genuine attempt rather than
+		// returning early, then settle to the shared deadline.
+		_ = s.hasher.Verify(ctx, in.Password, dummyPasswordHash)
 		return nil, fmt.Errorf("invalid credentials")
 	}
 
+	// Check at most loginMaxRealCompares candidates, so worst-case bcrypt work
+	// stays inside loginTimingBudget and one request cannot be made to cost an
+	// unbounded number of comparisons. Uniform latency comes from
+	// settleLoginTiming below, not from doing a constant amount of work here.
+	//
+	// Deliberately NOT short-circuiting on the first match: the ambiguity check
+	// below needs to know whether the password is valid for more than one of
+	// this email's accounts, and stopping early would sign the user into
+	// whichever account happened to be first instead of refusing. The cap is
+	// what bounds the cost; the loop still examines every candidate up to it.
 	var matched *loginCandidate
 	matchCount := 0
+	checked := 0
+
+	// A tenant-level email resolving to several accounts is the duplicate-identity
+	// state migration 00079 prevents and phase0_merge_duplicate_admin.sql repairs.
+	// The cap silently leaves the surplus unauthenticated, which presents to the
+	// operator as "the password works sometimes" — so say so plainly. Logged, not
+	// failed: refusing the login would lock out an account that predates the fix.
+	if len(candidates) > loginMaxRealCompares {
+		s.logger.Warn().
+			Int("candidates", len(candidates)).
+			Int("checked", loginMaxRealCompares).
+			Msg("login: email resolves to multiple tenant-level accounts; surplus not checked — merge the duplicate identities")
+	}
+
 	for i := range candidates {
-		if bcrypt.CompareHashAndPassword([]byte(candidates[i].passwordHash), []byte(in.Password)) == nil {
+		if checked >= loginMaxRealCompares {
+			break
+		}
+		checked++
+		if s.hasher.Verify(ctx, in.Password, candidates[i].passwordHash) == nil {
 			matchCount++
 			matched = &candidates[i]
 		}
-	}
-	for i := len(candidates); i < loginCompareFloor; i++ {
-		_ = bcrypt.CompareHashAndPassword(dummyPasswordHash, []byte(in.Password))
 	}
 
 	if matchCount == 0 {
@@ -815,6 +1181,20 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		// was attacked". The per-IP limiter remains the first line of defence.
 		for i := range candidates {
 			s.blockSvc.RecordFailedLogin(ctx, candidates[i].tenantID, candidates[i].userID)
+		}
+		// Report the soft lock so the caller can send Retry-After, telling a
+		// legitimate user when to come back. Only ever consulted after the attempt
+		// has already failed, so it discloses nothing about whether the account
+		// exists that the attempt itself did not: every branch here returns the
+		// same "invalid credentials" body.
+		//
+		// Single candidate only. With several accounts sharing this email across
+		// tenants, whose retry window would it even be? — and answering that would
+		// leak that the address has accounts in more than one tenant.
+		if len(candidates) == 1 {
+			if retryAfter, locked := s.blockSvc.SoftLockedFor(ctx, candidates[0].tenantID, candidates[0].userID); locked {
+				return nil, &SoftLockError{RetryAfter: retryAfter}
+			}
 		}
 		return nil, fmt.Errorf("invalid credentials")
 	}
@@ -828,7 +1208,59 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		return nil, fmt.Errorf("invalid credentials")
 	}
 
+	// Opportunistic rehash. Bcrypt encodes its cost in the hash, so a stored hash
+	// keeps verifying under whatever parameters wrote it.
+	// Without this, a change to the constant applies only to passwords set after
+	// it, and the fleet stays split indefinitely: lowering it would leave existing
+	// users paying the old latency, and raising it would leave them at the old
+	// strength, which is the dangerous direction.
+	//
+	// Runs only on a verified password, because that is the one moment the
+	// plaintext is available to re-hash. Best-effort: a failure here must never
+	// fail a login that has already succeeded, so it is logged and ignored.
+	s.rehashIfStale(ctx, matched.userID, matched.passwordHash, in.Password)
+
 	userID, tenantID, email, roleName := matched.userID, matched.tenantID, matched.email, matched.roleName
+
+	// Now that the tenant is known, re-resolve: in generic mode the policy read
+	// before the candidate query was the PLATFORM default, because which tenant
+	// this email belongs to is exactly what that query just answered. This is the
+	// authoritative reading, and it is the one the unlock decision below uses.
+	if appRowID == 0 {
+		lockoutPolicy = s.lockoutSvc.Resolve(ctx, tenantID, nil)
+	}
+
+	// An account admitted by the auto-expiry predicate is still marked disabled.
+	// Lift the lock properly now — inside its own guarded UPDATE, which re-checks
+	// the elapsed interval in SQL against the policy resolved just above — before
+	// anything issues a token. If the lift does not take (a concurrent admin block,
+	// a tenant policy longer than the admit-window floor, a policy tightened between
+	// the two queries), refuse: a correct password must not be enough to
+	// authenticate an account the database still considers blocked.
+	if !matched.isActive {
+		if !s.blockSvc.ExpireHardLock(ctx, tenantID, userID, lockoutPolicy.HardLockDuration) {
+			s.logger.Warn().Int64("user_id", userID).
+				Msg("login: lock expiry did not apply; refusing")
+			return nil, fmt.Errorf("invalid credentials")
+		}
+	}
+
+	// Soft lock is checked HERE — after the bcrypt comparisons, and on the path
+	// where the password was CORRECT.
+	//
+	// After bcrypt so a soft-locked account takes the same time to refuse as a
+	// wrong password; checking first would make the lock detectable by timing.
+	//
+	// On the success path because a soft lock that a correct password lifts is not
+	// a lock at all: an attacker who guesses right on the attempt after the
+	// threshold would walk straight in, and the tier would exist only to
+	// inconvenience the legitimate owner. This is the check that makes the soft
+	// tier a real control.
+	if retryAfter, locked := s.blockSvc.SoftLockedFor(ctx, tenantID, userID); locked {
+		s.logger.Info().Int64("user_id", userID).Dur("retry_after", retryAfter).
+			Msg("login refused: account soft-locked")
+		return nil, &SoftLockError{RetryAfter: retryAfter}
+	}
 
 	// The password is now proven correct, so the lockout counter is cleared here
 	// rather than after the MFA gate: a user who holds the right password should
@@ -1932,4 +2364,54 @@ func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID
 	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms,
 		sessionContext{amr: []string{AMRPassword}}, appID,
 		strings.Join(scopes, " "))
+}
+
+// rehashIfStale re-hashes a verified password whose stored hash does not match
+// the current algorithm and parameters.
+//
+// This is the entire migration mechanism. Bcrypt credentials are not converted
+// by a batch job — they cannot be, because a hash is one-way and the plaintext
+// exists only for the instant a user signs in. Instead each account upgrades
+// itself the next time its owner logs in, and the corpus drains from bcrypt to
+// Argon2id at the rate people actually use the system. Accounts that never log
+// in stay on bcrypt indefinitely and keep working, which is correct: they are no
+// weaker than they were, and forcing a reset on a dormant account to satisfy a
+// migration would be worse for the user than leaving it.
+//
+// Called only after a successful verification — the sole point at which the
+// plaintext is available. Best effort throughout: this runs after the credential
+// has already been accepted, so no failure here may turn a good login into a bad
+// one. Every error path logs and returns.
+//
+// Rehashing on a parameter DECREASE is deliberate, not just on an increase.
+// Leaving old hashes at the higher setting would mean a latency change never
+// reaches existing accounts, which is most of them.
+func (s *AuthService) rehashIfStale(ctx context.Context, userID int64, storedHash, plaintext string) {
+	if !s.hasher.NeedsRehash(storedHash) {
+		return
+	}
+	from := password.Identify(storedHash)
+
+	newHash, err := s.hasher.Hash(ctx, plaintext)
+	if err != nil {
+		s.logger.Warn().Err(err).Int64("user_id", userID).
+			Msg("login: rehash failed; credential left at previous parameters")
+		return
+	}
+
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE user_credentials SET password_hash = $1, updated_at = NOW() WHERE user_id = $2`,
+		newHash, userID,
+	); err != nil {
+		s.logger.Warn().Err(err).Int64("user_id", userID).
+			Msg("login: rehash write failed; credential left at previous parameters")
+		return
+	}
+
+	metrics.PasswordRehashTotal.WithLabelValues(string(from)).Inc()
+
+	s.logger.Info().Int64("user_id", userID).
+		Str("from", string(from)).
+		Str("to", string(password.AlgorithmArgon2id)).
+		Msg("login: credential upgraded to current password hashing parameters")
 }

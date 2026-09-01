@@ -39,6 +39,23 @@ type AppRateLimit struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+// AppRateLimitResolution is what GET rate-limit returns.
+//
+// An application with no custom limit is not a missing resource — it runs at the
+// server default, which is a real and knowable answer. This was a 404 saying so
+// in an `error` field, indistinguishable on the same route from an application
+// that genuinely does not exist or belongs to another tenant. See
+// EmailSenderResolution; the two endpoints share the shape deliberately.
+type AppRateLimitResolution struct {
+	// Configured reports whether this application has its own limit.
+	Configured bool `json:"configured"`
+	// Source is "application" when configured, "default" when the server-wide
+	// policy applies.
+	Source string `json:"source"`
+	// Limit is the application's own limit, or null when running at the default.
+	Limit *AppRateLimit `json:"limit"`
+}
+
 // AppRateLimitService manages per-application rate limit configurations.
 type AppRateLimitService struct {
 	pool     *pgxpool.Pool

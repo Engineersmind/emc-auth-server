@@ -63,6 +63,28 @@ type EmailSenderSettings struct {
 	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
 }
 
+// EmailSenderResolution is what GET email-settings returns.
+//
+// "Nothing configured at this scope" is an ANSWER, not a failure: the caller
+// asked which sender applies here and the server knows — the global one does.
+// This used to be a 404 carrying that sentence in an `error` field, which
+// conflated it with the genuinely-missing cases on the same route (an
+// application that does not exist, or belongs to another tenant). A client could
+// not tell a normal inherit from a bad request, and neither could anyone reading
+// the network tab.
+//
+// 404 now means only what it should: the addressed resource is not there.
+type EmailSenderResolution struct {
+	// Configured reports whether THIS scope has its own sender row.
+	Configured bool `json:"configured"`
+	// Source is where the effective sender comes from: "application", "tenant"
+	// or "global". Named rather than boolean so a third inheriting level does
+	// not require a wire change.
+	Source string `json:"source"`
+	// Settings is the sender row at this scope, or null when inheriting.
+	Settings *EmailSenderSettings `json:"settings"`
+}
+
 // UpsertSenderInput is the write payload for sender settings.
 type UpsertSenderInput struct {
 	// Provider selects the transport ("smtp" | "sendgrid"); empty defaults to "smtp".

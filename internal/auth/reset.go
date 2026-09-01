@@ -12,10 +12,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	"github.com/engineersmind/emc-auth-server/internal/password"
 )
 
 // ResetTokenTTL is the expiry window for password reset tokens (RESET-01: 15 minutes).
@@ -29,7 +29,11 @@ type ResetService struct {
 	tmplSvc    *EmailTemplateService
 	audit      *audit.Logger
 	appBaseURL string
-	logger     zerolog.Logger
+	// hasher writes the new credential on a completed reset. Defaulted by the
+	// constructor so a caller that forgets WithHasher still writes a correctly
+	// hashed password.
+	hasher *password.Hasher
+	logger zerolog.Logger
 }
 
 // NewResetService creates a ResetService.
@@ -38,8 +42,19 @@ func NewResetService(pool *pgxpool.Pool, m mailer.Mailer, appBaseURL string, log
 		pool:       pool,
 		mailer:     m,
 		appBaseURL: appBaseURL,
+		hasher:     password.NewHasher(password.DefaultParams()),
 		logger:     logger,
 	}
+}
+
+// WithHasher shares the process-wide hasher so a reset writes the credential
+// under the same parameters, and against the same concurrency cap, as every
+// other credential path.
+func (s *ResetService) WithHasher(h *password.Hasher) *ResetService {
+	if h != nil {
+		s.hasher = h
+	}
+	return s
 }
 
 // WithSenders wires the white-label sender resolver so reset emails use the
@@ -211,7 +226,7 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 		return fmt.Errorf("lookup reset token: %w", err)
 	}
 
-	newHash, err := bcrypt.GenerateFromPassword([]byte(in.NewPassword), BcryptCost)
+	newHash, err := s.hasher.Hash(ctx, in.NewPassword)
 	if err != nil {
 		return fmt.Errorf("hash new password: %w", err)
 	}

@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -16,23 +15,21 @@ import (
 )
 
 const (
-	// TenantCORSCacheTTL is how long allowed origins are cached per tenant slug.
-	// Admin updates take effect within this window.
+	// TenantCORSCacheTTL is how long a per-origin CORS decision is cached.
+	// Admin updates take effect within this window, and the admin write path
+	// clears the affected entries so the usual case is immediate.
 	TenantCORSCacheTTL = 60 * time.Second
-
-	// tenantSlugHeader matches what tenantSlugFromCtx in handlers reads.
-	tenantSlugHeader = "X-Tenant-Slug"
 )
 
-// TenantCORSService loads per-tenant CORS allowed origins from DB (Redis-cached).
+// TenantCORSService answers whether a browser origin is permitted, from the
+// tenants table (Redis-cached).
 type TenantCORSService struct {
 	pool     *pgxpool.Pool
 	redisCli *redis.Client
 	logger   zerolog.Logger
 
-	// globalOrigins are the allowed origins for slug-less requests (e.g.
-	// /auth/login), which have no tenant to look up a per-tenant list by.
-	// Set via WithGlobalOrigins.
+	// globalOrigins are deployment-wide allowed origins, consulted before any
+	// database lookup. Set via WithGlobalOrigins.
 	globalOrigins []string
 }
 
@@ -52,68 +49,93 @@ func NewTenantCORSService(pool *pgxpool.Pool, redisCli *redis.Client, logger zer
 	return &TenantCORSService{pool: pool, redisCli: redisCli, logger: logger}
 }
 
-// WithGlobalOrigins sets the allowed origins used for requests that carry no
-// X-Tenant-Slug header (the tenant isn't known yet, so no per-tenant list applies).
-// An empty list is valid but means every slug-less endpoint (e.g. /auth/login)
-// will send no CORS headers at all — browser-based cross-origin calls to those
-// endpoints will be blocked client-side even though server-to-server calls are
-// unaffected. Logged loudly here so that isn't a silent deployment surprise.
+// WithGlobalOrigins sets the deployment-wide allowed origins, consulted before
+// any per-tenant list.
+// An empty list is valid: an origin can still be permitted by a tenant's own
+// cors_origins. It is logged because a deployment with neither configured sends
+// no CORS headers at all, blocking every browser-based cross-origin call while
+// server-to-server calls keep working — a confusing failure to debug.
 func (s *TenantCORSService) WithGlobalOrigins(origins []string) *TenantCORSService {
 	s.globalOrigins = origins
 	if len(origins) == 0 {
-		s.logger.Warn().Msg("GLOBAL_CORS_ORIGINS is empty — slug-less endpoints (e.g. /auth/login) will send no CORS headers, so browser-based cross-origin calls to them will be blocked")
+		s.logger.Warn().Msg("GLOBAL_CORS_ORIGINS is empty — only origins listed in a tenant's cors_origins will be allowed")
 	}
 	return s
 }
 
-// GetOrigins returns the allowed CORS origins for a tenant slug.
-// Returns nil (no CORS restriction applied) if the slug is empty or not found.
-func (s *TenantCORSService) GetOrigins(ctx context.Context, tenantSlug string) []string {
-	if tenantSlug == "" {
-		return nil
+// IsOriginAllowed reports whether any active tenant permits this browser origin.
+//
+// This is the question CORS actually asks, and it needs no tenant identifier
+// from the caller. The middleware previously read X-Tenant-Slug to pick a
+// tenant's origin list, which put a machine-facing identifier — the tenant's
+// OIDC issuer path — into the contract of every browser request. Worse, a
+// preflight OPTIONS carries no body and no credentials, so the header was the
+// only thing a browser could send, and any client that forgot it silently fell
+// back to the global list.
+//
+// Resolving from the Origin removes that entirely: the browser already sends the
+// one value the decision depends on.
+//
+// The check deliberately does not identify WHICH tenant matched. CORS decides
+// only whether a browser origin may talk to this server at all; which tenant the
+// caller belongs to is settled later by the token or client credentials, and is
+// enforced by every handler independently. Two tenants sharing a staging domain
+// is therefore not a conflict — both permit the origin, and neither gains access
+// to the other's data by saying so.
+//
+// Per-application origins are the planned direction: those will be scoped to a
+// client_id rather than a tenant, and will resolve the same way — ask whether
+// the origin is permitted, not who is asking. The signature is shaped for that,
+// taking the origin alone.
+func (s *TenantCORSService) IsOriginAllowed(ctx context.Context, origin string) bool {
+	if origin == "" {
+		return false
 	}
 
-	cacheKey := "cors:tenant:" + tenantSlug
-	if data, err := s.redisCli.Get(ctx, cacheKey).Bytes(); err == nil {
-		var origins []string
-		if json.Unmarshal(data, &origins) == nil {
-			return origins
-		}
+	cacheKey := "cors:origin:" + origin
+	if v, err := s.redisCli.Get(ctx, cacheKey).Result(); err == nil {
+		return v == "1"
 	}
 
-	// Cache miss — query DB.
-	var origins []string
+	// cors_origins is a text[]; @> is the containment operator, which a GIN
+	// index on that column can answer directly.
+	var allowed bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT cors_origins FROM tenants WHERE slug = $1 AND is_active = true
-	`, tenantSlug).Scan(&origins)
+		SELECT EXISTS (
+		    SELECT 1 FROM tenants
+		    WHERE is_active = true AND deleted_at IS NULL
+		      AND cors_origins @> ARRAY[$1]::text[]
+		)
+	`, origin).Scan(&allowed)
 	if err != nil {
-		// Not found or DB error — no CORS.
-		return nil
+		// Fail closed on a database error: a CORS decision made without data is
+		// not a decision, and wrongly allowing an origin is the harmful
+		// direction. The global allow-list still applies at the call site, so a
+		// configured deployment keeps working through a brief outage.
+		s.logger.Warn().Err(err).Str("origin", origin).
+			Msg("cors: origin lookup failed — treating as not tenant-allowed")
+		return false
 	}
 
-	// Populate cache.
-	if payload, err := json.Marshal(origins); err == nil {
-		s.redisCli.Set(ctx, cacheKey, payload, TenantCORSCacheTTL) //nolint:errcheck
+	val := "0"
+	if allowed {
+		val = "1"
 	}
-	return origins
+	s.redisCli.Set(ctx, cacheKey, val, TenantCORSCacheTTL) //nolint:errcheck
+	return allowed
 }
 
-// InvalidateCache removes the cached origins for a tenant slug.
-func (s *TenantCORSService) InvalidateCache(ctx context.Context, tenantSlug string) {
-	if err := s.redisCli.Del(ctx, "cors:tenant:"+tenantSlug).Err(); err != nil {
-		s.logger.Warn().Err(err).Str("slug", tenantSlug).Msg("failed to invalidate CORS cache")
-	}
-}
-
-// headerListContains reports whether name (case-insensitive) appears in a
-// comma-separated header list, e.g. the value of Access-Control-Request-Headers.
-func headerListContains(list, name string) bool {
-	for _, h := range strings.Split(list, ",") {
-		if strings.EqualFold(strings.TrimSpace(h), name) {
-			return true
+// InvalidateOriginCache clears the cached decision for one origin. Called when a
+// tenant's origin list changes.
+func (s *TenantCORSService) InvalidateOriginCache(ctx context.Context, origins ...string) {
+	for _, o := range origins {
+		if o == "" {
+			continue
+		}
+		if err := s.redisCli.Del(ctx, "cors:origin:"+o).Err(); err != nil {
+			s.logger.Warn().Err(err).Str("origin", o).Msg("failed to invalidate CORS origin cache")
 		}
 	}
-	return false
 }
 
 // isPublicCORSExempt reports whether a path serves public, credential-free
@@ -142,20 +164,20 @@ func isPublicCORSExempt(path string) bool {
 
 // TenantCORS returns middleware that applies per-tenant CORS headers.
 //
-// CORS origins are loaded from the tenant's cors_origins DB column (Redis-cached).
-// The tenant is identified by the X-Tenant-Slug request header, when present.
+// The decision is made from the request's Origin, which is the only thing it
+// depends on and the one value a browser always sends.
+//
+// This replaced a lookup keyed on the X-Tenant-Slug header. That was wrong twice
+// over: it put the tenant's OIDC issuer identifier into the contract of every
+// browser request, and a preflight OPTIONS carries only a header's NAME, never
+// its value — so the slug was unavoidably empty on exactly the request that had
+// to be answered first. An entire branch existed to reflect the origin
+// permissively for such preflights, which is the shape of a workaround for a key
+// that should not have been required.
 //
 // Behaviour:
-//   - X-Tenant-Slug present → that tenant's configured cors_origins apply.
-//   - X-Tenant-Slug absent (e.g. /auth/login, which resolves its tenant
-//     internally from email/password and never sends this header) → the
-//     service's global allow-list applies instead (see WithGlobalOrigins).
-//   - Preflight (OPTIONS) that announces X-Tenant-Slug via
-//     Access-Control-Request-Headers → browsers never send a custom header's
-//     *value* during preflight, only its name, so slug is unavoidably empty
-//     here even for a tenant-scoped call. Reflect the origin permissively for
-//     this preflight response only; the real request (which does carry the
-//     header) still gets strict per-tenant origin enforcement below.
+//   - Origin permitted by the global allow-list → allowed, no database round trip.
+//   - Otherwise, if any active tenant lists it in cors_origins → allowed.
 //   - No origins resolved either way → no CORS headers set (pass through).
 //   - Valid Origin present in the resolved list → standard CORS headers applied.
 //   - Preflight (OPTIONS) → 204 with CORS headers; request chain stops.
@@ -184,34 +206,37 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 				return next(c)
 			}
 
-			isPreflight := req.Method == http.MethodOptions
-			slug := req.Header.Get(tenantSlugHeader)
 			requestOrigin := req.Header.Get("Origin")
 
-			announcesTenantSlug := isPreflight &&
-				headerListContains(req.Header.Get("Access-Control-Request-Headers"), tenantSlugHeader)
-
-			if slug == "" && announcesTenantSlug {
-				if requestOrigin == "" {
-					return next(c)
-				}
-				h := c.Response().Header()
-				h.Set("Access-Control-Allow-Origin", requestOrigin)
-				h.Set("Access-Control-Allow-Credentials", "true")
-				h.Set("Vary", "Origin")
-				h.Set("Access-Control-Allow-Methods", corsAllowedMethods)
-				if reqHeaders := req.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
-					h.Set("Access-Control-Allow-Headers", reqHeaders)
-				}
-				h.Set("Access-Control-Max-Age", "86400")
-				return c.NoContent(http.StatusNoContent)
-			}
-
-			var origins []string
-			if slug == "" {
-				origins = svc.globalOrigins
-			} else {
-				origins = svc.GetOrigins(req.Context(), slug)
+			// Resolved from the Origin, not from X-Tenant-Slug.
+			//
+			// The header used to select which tenant's origin list to consult,
+			// which was wrong twice over. It put the tenant's OIDC issuer
+			// identifier into the contract of every browser request; and a
+			// preflight OPTIONS carries no body and no credentials, so a client
+			// that did not send it silently fell back to the global list — the
+			// per-tenant configuration quietly did nothing. An entire branch
+			// existed here to paper over preflights that merely ANNOUNCED the
+			// header without a value, which is the shape of a workaround for a
+			// key that should never have been required.
+			//
+			// The browser already sends the one value the decision depends on.
+			//
+			// Global origins are still consulted first: they are deployment-wide
+			// configuration and answer without a database round trip. The
+			// per-tenant lookup runs only when the global list does not already
+			// permit the origin.
+			//
+			// Planned: per-application origins scoped to a client_id will resolve
+			// the same way — ask whether the origin is permitted, never who is
+			// asking. Tenant identity is settled by the token or client
+			// credentials afterwards, and enforced by every handler on its own.
+			origins := svc.globalOrigins
+			if requestOrigin != "" && !originListAllows(origins, requestOrigin) &&
+				svc.IsOriginAllowed(req.Context(), requestOrigin) {
+				// A tenant permits it; treat it as allowed for the rest of this
+				// decision without needing to know which tenant.
+				origins = append(append([]string{}, origins...), requestOrigin)
 			}
 
 			// No configured origins — skip CORS handling entirely.
@@ -274,4 +299,19 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 			return next(c)
 		}
 	}
+}
+
+// originListAllows reports whether a configured origin list already permits an
+// origin, treating "*" as permitting everything.
+//
+// Used to skip the per-tenant lookup when the global list has already answered:
+// the global list is deployment configuration held in memory, so consulting it
+// first keeps the common case free of a database round trip.
+func originListAllows(origins []string, origin string) bool {
+	for _, o := range origins {
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
 }

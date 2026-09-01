@@ -231,12 +231,12 @@ func (s *AuthService) loadAdminPermissionsForTenant(ctx context.Context, userID,
 
 // AdminTenantSummary is one tenant in the "tenants I can reach" listing.
 type AdminTenantSummary struct {
-	TenantID    int64
-	Name        string
-	Slug        string
-	Role        string
-	AppCount    int
-	IsPrimary   bool
+	TenantID     int64
+	Name         string
+	Slug         string
+	Role         string
+	AppCount     int
+	IsPrimary    bool
 	Applications []int64
 }
 

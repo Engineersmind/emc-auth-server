@@ -152,11 +152,10 @@ func (f *refreshScopeFixture) firstPartyLogin(t *testing.T) *auth.AuthResult {
 
 	email := fmt.Sprintf("portal-refresh-%d@test.example.com", time.Now().UnixNano())
 	if _, err := f.svc.Register(f.ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "Password123!",
-		FirstName:  "First",
-		LastName:   "Party",
+		Email:     email,
+		Password:  "Password123!",
+		FirstName: "First",
+		LastName:  "Party",
 	}); err != nil {
 		t.Fatalf("Register(tenant slug) error = %v", err)
 	}

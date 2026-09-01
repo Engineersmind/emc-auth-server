@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // AppRateLimiter returns middleware that enforces per-application rate limits.
@@ -45,12 +46,14 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, log
 			// invisible.
 			appID, err := strconv.ParseInt(claims.AppID, 10, 64)
 			if err != nil || appID <= 0 {
+				metrics.RateLimitFailOpen.WithLabelValues("app", "malformed_app_id").Inc()
 				logger.Warn().Str("app_id", claims.AppID).
 					Msg("applimit: skipped — malformed app_id claim (fail-open)")
 				return next(c)
 			}
 			tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
 			if err != nil {
+				metrics.RateLimitFailOpen.WithLabelValues("app", "malformed_tenant_id").Inc()
 				logger.Warn().Str("tenant_id", claims.TenantID).Int64("app_id", appID).
 					Msg("applimit: skipped — malformed tenant_id claim (fail-open)")
 				return next(c)
@@ -102,6 +105,14 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 // headers and returning 429 when the bucket is empty. Redis errors fail open so
 // an outage never blocks all traffic.
 func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.Limiter, logger zerolog.Logger, keyPrefix string, tenantID, appID int64, rpm, burst int) error {
+	// Metric label derived from the bucket namespace so the JWT-authenticated
+	// limiter ("app:") and the pre-auth client_id limiter ("appauth:") stay
+	// distinguishable in metrics, exactly as they are in Redis.
+	limiterLabel := "app"
+	if keyPrefix == "appauth:" {
+		limiterLabel = "app_client"
+	}
+
 	rateKey := keyPrefix + strconv.FormatInt(tenantID, 10) + ":" + strconv.FormatInt(appID, 10)
 	res, err := limiter.Allow(c.Request().Context(), rateKey, redis_rate.Limit{
 		Rate:   rpm,
@@ -109,8 +120,10 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 		Period: time.Minute,
 	})
 	if err != nil {
-		// Redis unavailable — fail open, but log so a silent bypass of all
-		// per-app limits during an outage is observable.
+		// Redis unavailable — fail open, but count and log it. During a Redis
+		// outage every tenant-configured quota silently stops being enforced;
+		// without the counter that state is invisible outside warn-level logs.
+		metrics.RateLimitFailOpen.WithLabelValues(limiterLabel, "redis_error").Inc()
 		logger.Warn().Err(err).Int64("tenant_id", tenantID).Int64("application_id", appID).
 			Msg("applimit: Redis error — allowing request (fail-open)")
 		return next(c)
@@ -120,6 +133,7 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 	c.Response().Header().Set("X-RateLimit-Remaining", strconv.Itoa(res.Remaining))
 
 	if res.Allowed == 0 {
+		metrics.RateLimitHits.WithLabelValues(limiterLabel).Inc()
 		retryAfter := int(res.RetryAfter.Seconds())
 		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		return c.JSON(http.StatusTooManyRequests, map[string]string{

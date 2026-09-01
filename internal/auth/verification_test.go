@@ -3,6 +3,7 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
@@ -39,9 +40,7 @@ func seededVerification(t *testing.T) (*auth.AuthService, *auth.VerificationServ
 func TestRegister_SendsVerification(t *testing.T) {
 	authSvc, _, mail, _, ctx := seededVerification(t)
 	email := uniqueEmail("verify-register")
-	if _, err := authSvc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc", Email: email, Password: "OldPassword123!", FirstName: "V", LastName: "R",
-	}); err != nil {
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{Email: email, Password: "OldPassword123!", FirstName: "V", LastName: "R"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	if len(mail.verifications) != 1 {
@@ -58,9 +57,7 @@ func TestVerifyEmail_FullFlow(t *testing.T) {
 	authSvc, verifSvc, mail, _, ctx := seededVerification(t)
 
 	email := uniqueEmail("verify-full")
-	if _, err := authSvc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc", Email: email, Password: "OldPassword123!", FirstName: "V", LastName: "F",
-	}); err != nil {
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{Email: email, Password: "OldPassword123!", FirstName: "V", LastName: "F"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 
@@ -100,14 +97,78 @@ func TestVerifyEmail_InvalidToken(t *testing.T) {
 	}
 }
 
-// TestResendVerification_EnumerationSafe returns nil for unknown emails/tenants.
+// TestResendVerification_EnumerationSafe returns nil for unknown emails.
 func TestResendVerification_EnumerationSafe(t *testing.T) {
 	_, verifSvc, _, _, ctx := seededVerification(t)
-	if err := verifSvc.ResendVerification(ctx, "emc", "nobody@nope.invalid"); err != nil {
+	if err := verifSvc.ResendVerification(ctx, "nobody@nope.invalid"); err != nil {
 		t.Errorf("resend unknown email = %v, want nil", err)
 	}
-	if err := verifSvc.ResendVerification(ctx, "no-such-tenant", "x@y.z"); err != nil {
-		t.Errorf("resend unknown tenant = %v, want nil", err)
+	if err := verifSvc.ResendVerification(ctx, ""); err != nil {
+		t.Errorf("resend empty email = %v, want nil", err)
+	}
+}
+
+// TestResendVerification_ResolvesTenantFromEmail is the regression test for the
+// change that removed the X-Tenant-Slug requirement.
+//
+// The caller no longer supplies a tenant. A person who did not receive their
+// verification email was previously asked for their tenant's slug — an internal
+// identifier they have most likely never seen — while Login, the step
+// immediately before, has never needed one. This asserts the address alone is
+// enough to find the account and send the mail.
+func TestResendVerification_ResolvesTenantFromEmail(t *testing.T) {
+	authSvc, verifSvc, mail, _, ctx := seededVerification(t)
+
+	const email = "unverified-resend@example.test"
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{
+		Email:    email,
+		Password: "CorrectHorseBattery1",
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	before := len(mail.verifications)
+	if err := verifSvc.ResendVerification(ctx, email); err != nil {
+		t.Fatalf("ResendVerification: %v", err)
+	}
+	if got := len(mail.verifications) - before; got != 1 {
+		t.Fatalf("sent %d verification emails, want 1 — the tenant was not "+
+			"resolved from the address alone", got)
+	}
+	if to := mail.verifications[len(mail.verifications)-1].To; to != email {
+		t.Fatalf("verification sent to %q, want %q", to, email)
+	}
+}
+
+// TestResendVerification_SkipsVerifiedAccounts confirms an account that has
+// already completed verification produces no further mail, so the endpoint
+// cannot be used to repeatedly mail a known address.
+func TestResendVerification_SkipsVerifiedAccounts(t *testing.T) {
+	authSvc, verifSvc, mail, _, ctx := seededVerification(t)
+
+	const email = "already-verified@example.test"
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{
+		Email:    email,
+		Password: "CorrectHorseBattery1",
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Complete verification through the real flow — the token from the mail
+	// registration just sent — rather than writing email_verified directly, so
+	// the test exercises the same state transition production does.
+	link := mail.verifications[len(mail.verifications)-1].Link
+	token := link[strings.LastIndex(link, "=")+1:]
+	if err := verifSvc.VerifyEmail(ctx, token); err != nil {
+		t.Fatalf("VerifyEmail: %v", err)
+	}
+
+	before := len(mail.verifications)
+	if err := verifSvc.ResendVerification(ctx, email); err != nil {
+		t.Fatalf("ResendVerification: %v", err)
+	}
+	if got := len(mail.verifications) - before; got != 0 {
+		t.Fatalf("sent %d emails for an already-verified account, want 0", got)
 	}
 }
 
@@ -203,5 +264,56 @@ func TestSenderProvider_SendGrid(t *testing.T) {
 		// Updating an existing row that already has a key is allowed to omit it —
 		// so this succeeds (keeps stored key). Assert it kept the provider.
 		t.Fatalf("Upsert(sendgrid, omit key on update): %v", err)
+	}
+}
+
+// TestRegister_WithoutTenantSlug is the regression test for a broken sign-up
+// page.
+//
+// /auth/register required an X-Tenant-Slug header, while the admin console's
+// RegisterPayload has never carried a slug and its client never sent the
+// header — so every submission from the console's own sign-up page returned
+// 400. Requiring it also asked a person creating their first account for the
+// tenant's OIDC issuer identifier, which is a machine-facing value they have no
+// way to know.
+//
+// An empty slug now resolves to the platform tenant.
+func TestRegister_WithoutTenantSlug(t *testing.T) {
+	authSvc, _, _, platformTenantID, ctx := seededVerification(t)
+
+	res, err := authSvc.Register(ctx, auth.RegisterInput{
+		Email:    uniqueEmail("no-slug-register"),
+		Password: "CorrectHorseBattery1",
+	})
+	if err != nil {
+		t.Fatalf("Register with no slug: %v — the console sign-up page sends none", err)
+	}
+	if res.TenantID != platformTenantID {
+		t.Fatalf("registered into tenant %d, want the platform tenant %d",
+			res.TenantID, platformTenantID)
+	}
+}
+
+// TestRegister_IsAlwaysPlatformTenant pins the contract: a first-party
+// registration lands in the platform tenant and the caller has no say in it.
+//
+// RegisterInput no longer carries a tenant selector at all, so this is enforced
+// by the type rather than by validation — the test exists so that reintroducing
+// one has to break something visible.
+func TestRegister_IsAlwaysPlatformTenant(t *testing.T) {
+	authSvc, _, _, platformTenantID, ctx := seededVerification(t)
+
+	for i := 0; i < 2; i++ {
+		res, err := authSvc.Register(ctx, auth.RegisterInput{
+			Email:    uniqueEmail("platform-register"),
+			Password: "CorrectHorseBattery1",
+		})
+		if err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+		if res.TenantID != platformTenantID {
+			t.Fatalf("registered into tenant %d, want the platform tenant %d",
+				res.TenantID, platformTenantID)
+		}
 	}
 }

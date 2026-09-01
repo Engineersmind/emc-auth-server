@@ -68,6 +68,9 @@ func (m *recordingMailer) SendBlockedAccount(context.Context, *mailer.SMTPConfig
 func (m *recordingMailer) SendPasswordBreach(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.PasswordBreachEmail) error {
 	return nil
 }
+func (m *recordingMailer) SendTenantLockoutAlert(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.TenantLockoutAlertEmail) error {
+	return nil
+}
 func (m *recordingMailer) SendAdminActivity(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.AdminActivityEmail) error {
 	return nil
 }

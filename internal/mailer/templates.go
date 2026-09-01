@@ -38,6 +38,12 @@ const (
 	// TemplatePasswordBreach warns a user that their password was found in a known
 	// data breach and should be changed.
 	TemplatePasswordBreach TemplateType = "password_breach"
+	// TemplateTenantLockoutAlert warns a tenant's owner and the co-owners of an
+	// affected application that many accounts locked inside one window — the
+	// credential-stuffing signal (issue #72). Addressed to operators, not to the
+	// account holder, and sent only in aggregate: see the template body for why a
+	// per-account version of this email would be self-defeating.
+	TemplateTenantLockoutAlert TemplateType = "tenant_lockout_alert"
 
 	// TemplateProviderTest is the diagnostic email sent by the admin "send test"
 	// action. It is deliberately NOT in AllTemplateTypes: it is not a
@@ -79,6 +85,7 @@ var AllTemplateTypes = []TemplateType{
 	TemplateChangeEmail,
 	TemplateBlockedAccount,
 	TemplatePasswordBreach,
+	TemplateTenantLockoutAlert,
 	TemplateAdminActivity,
 	TemplateAccessChanged,
 }
@@ -146,8 +153,17 @@ type TemplateData struct {
 	IPAddress  string
 	// Count is the number of collapsed occurrences when several identical
 	// actions in quick succession became one email. Zero or one renders as a
-	// single event.
+	// single event. Reused by tenant_lockout_alert for the number of accounts
+	// locked inside the window.
 	Count int
+
+	// RetryMinutes is how long until an automatic lock lifts by itself (issue
+	// #72). Distinct from TTLMinutes, which is how long the emailed link stays
+	// valid: the two are different clocks, and a blocked-account email carries
+	// both — "this link works for 60 minutes" and "or just wait 30". Zero when
+	// the lock does not expire on its own, which is what keeps the "you can also
+	// simply wait" sentence out of a permanent lock's email.
+	RetryMinutes int
 }
 
 // EmailChangeApplied is the TemplateData.Reason value that turns the
@@ -167,6 +183,23 @@ const (
 	// BlockReasonSuspiciousLogin is a high-risk sign-in that succeeded. Nothing
 	// is blocked; this is an alert telling the user to secure the account.
 	BlockReasonSuspiciousLogin = "suspicious_login"
+	// BlockReasonFailedAttemptsWarning is the early warning (issue #72): repeated
+	// failures, nothing locked yet. It exists so a victim hears about an attack
+	// while it is still running rather than once they cannot sign in. The link is
+	// a password reset, since there is nothing to unblock.
+	BlockReasonFailedAttemptsWarning = "failed_attempts_warning"
+	// BlockReasonSoftLocked is a TEMPORARY refusal that lifts on its own. No
+	// account state changed, so the wording must not tell the user to contact an
+	// administrator — there is nothing for an operator to undo, and the advice
+	// would generate support load for an event that resolves itself.
+	BlockReasonSoftLocked = "soft_locked"
+)
+
+// LockoutAlertReasons select the wording of the tenant_lockout_alert email.
+const (
+	// LockoutAlertSpike is many accounts locking inside one window — the
+	// credential-stuffing signal sent to a tenant's owner and affected co-owners.
+	LockoutAlertSpike = "lockout_spike"
 )
 
 // rendered is the output of applying a Template to TemplateData.
@@ -394,16 +427,34 @@ This link is valid for {{.TTLMinutes}} minutes. If you did not request this chan
 {{end}}
 - {{.ProductName}}`,
 	},
-	// One template, three events — selected by .Reason. "suspicious_login" is an
+	// One template, five events — selected by .Reason. "suspicious_login" is an
 	// alert (nothing is blocked), "admin" is an operator action the user cannot
-	// undo (link = password reset), and the default is an automatic lockout the
+	// undo (link = password reset), "failed_attempts_warning" and "soft_locked"
+	// are the pre-block escalation tiers from issue #72 (nothing to unblock, so
+	// the link is a password reset), and the default is an automatic lockout the
 	// user may lift via the emailed single-use link.
+	//
+	// The two #72 tiers deliberately avoid the phrase "contact your administrator":
+	// neither one is an operator-clearable state, and sending users to support for
+	// something that resolves itself in minutes is how a security feature becomes
+	// a helpdesk cost.
 	TemplateBlockedAccount: {
-		Subject: `{{if eq .Reason "suspicious_login"}}Security alert — unusual sign-in to your account{{else}}Your account has been blocked{{end}}`,
+		Subject: `{{if eq .Reason "suspicious_login"}}Security alert — unusual sign-in to your account{{else if eq .Reason "failed_attempts_warning"}}Security alert — failed sign-in attempts on your account{{else if eq .Reason "soft_locked"}}Sign-in temporarily locked{{else}}Your account has been blocked{{end}}`,
 		HTML: shell(`{{if eq .Reason "suspicious_login"}}<h2>Unusual sign-in detected</h2>
 <p>Someone signed in to your account{{if .AppName}} for {{.AppName}}{{end}} from a device or location we have not seen before. Your account has not been blocked.</p>
 <p>If this was you, no action is needed. If it was not, secure your account now by changing your password.</p>
 ` + fmt.Sprintf(button, "Change password") + `
+{{else if eq .Reason "failed_attempts_warning"}}<h2>Failed sign-in attempts on your account</h2>
+<p>There have been several failed attempts to sign in to your account{{if .AppName}} for {{.AppName}}{{end}}. Your account is still active and nothing has been locked.</p>
+<p>If this was you, you can ignore this message — or reset your password below if you have forgotten it.</p>
+` + fmt.Sprintf(button, "Reset password") + `
+<p>If this was not you, someone may be trying to guess your password. We recommend changing it now, and enabling two-factor authentication if you have not already.</p>
+{{else if eq .Reason "soft_locked"}}<h2>Sign-in temporarily locked</h2>
+<p>We have temporarily paused sign-ins to your account{{if .AppName}} for {{.AppName}}{{end}} after too many failed attempts. This is a security measure and your account has not been blocked.</p>
+<p>You can try again in about {{.TTLMinutes}} minutes. No action is needed — the lock lifts on its own.</p>
+<p>If you have forgotten your password, you can reset it now instead of waiting.</p>
+` + fmt.Sprintf(button, "Reset password") + `
+<p>If these attempts were not you, someone may be trying to guess your password — we recommend changing it.</p>
 {{else if eq .Reason "admin"}}<h2>Your account has been blocked</h2>
 <p>An administrator has blocked access to your account{{if .AppName}} for {{.AppName}}{{end}}.</p>
 <p>Contact your administrator to restore access. If you believe your password was compromised, you can reset it using the link below.</p>
@@ -412,11 +463,24 @@ This link is valid for {{.TTLMinutes}} minutes. If you did not request this chan
 <p>We blocked access to your account{{if .AppName}} for {{.AppName}}{{end}} after too many failed sign-in attempts, to keep it secure.</p>
 <p>If this was you, use the link below to unblock your account. This link is valid for {{.TTLMinutes}} minutes and can be used once.</p>
 ` + fmt.Sprintf(button, "Unblock account") + `
+{{if .RetryMinutes}}<p>You can also simply wait: access is restored automatically in about {{.RetryMinutes}} minutes.</p>{{end}}
 <p>If this was not you, someone may be trying to guess your password — we recommend changing it.</p>
 {{end}}`),
 		Text: `{{if eq .Reason "suspicious_login"}}Someone signed in to your account{{if .AppName}} for {{.AppName}}{{end}} from a device or location we have not seen before. Your account has not been blocked.
 
 If this was not you, secure your account by changing your password:
+{{.Link}}
+{{else if eq .Reason "failed_attempts_warning"}}There have been several failed attempts to sign in to your account{{if .AppName}} for {{.AppName}}{{end}}. Your account is still active and nothing has been locked.
+
+If this was you, you can ignore this message. To reset your password:
+{{.Link}}
+
+If this was not you, someone may be trying to guess your password. We recommend changing it, and enabling two-factor authentication.
+{{else if eq .Reason "soft_locked"}}We have temporarily paused sign-ins to your account{{if .AppName}} for {{.AppName}}{{end}} after too many failed attempts. Your account has not been blocked.
+
+You can try again in about {{.TTLMinutes}} minutes. No action is needed — the lock lifts on its own.
+
+If you have forgotten your password, you can reset it now instead of waiting:
 {{.Link}}
 {{else if eq .Reason "admin"}}An administrator has blocked access to your account{{if .AppName}} for {{.AppName}}{{end}}.
 
@@ -427,8 +491,40 @@ Contact your administrator to restore access. To reset your password:
 If this was you, unblock your account here:
 {{.Link}}
 
-This link is valid for {{.TTLMinutes}} minutes and can be used once. If this was not you, change your password.
+This link is valid for {{.TTLMinutes}} minutes and can be used once.{{if .RetryMinutes}} You can also simply wait: access is restored automatically in about {{.RetryMinutes}} minutes.{{end}} If this was not you, change your password.
 {{end}}
+- {{.ProductName}}`,
+	},
+
+	// Tenant-level attack alert (issue #72), sent to a tenant's owner and to the
+	// co-owners of affected applications.
+	//
+	// This is the ONLY lockout email staff receive, and it is deliberately
+	// aggregated. A per-lock notification would, at credential-stuffing volume,
+	// turn this server into a mail flood aimed at its own operators — and worse,
+	// it would train them to filter the sender, so the one alert that mattered
+	// would arrive in a spam folder. One account locking is routine; twenty
+	// locking inside a window is an incident, and only the second is worth an
+	// interrupt.
+	TemplateTenantLockoutAlert: {
+		Subject: `Security alert — {{.Count}} accounts locked{{if .TenantName}} in {{.TenantName}}{{end}}`,
+		HTML: shell(`<h2>Multiple accounts locked</h2>
+<p><strong>{{.Count}} accounts</strong>{{if .TenantName}} in {{.TenantName}}{{end}} were locked after repeated failed sign-in attempts within {{.TTLMinutes}} minutes.</p>
+<p>A cluster this size usually means an automated password-guessing attack rather than users forgetting their passwords. The accounts are protected — each one locked automatically — but it is worth confirming the source.</p>
+{{if .AppName}}<p>Affected application: <strong>{{.AppName}}</strong></p>{{end}}
+` + fmt.Sprintf(button, "Review locked accounts") + `
+<p>Locked accounts are restored automatically once the lock expires, or you can unlock any of them immediately from the users page.</p>`),
+		Text: `{{.Count}} accounts{{if .TenantName}} in {{.TenantName}}{{end}} were locked after repeated failed sign-in attempts within {{.TTLMinutes}} minutes.
+
+A cluster this size usually means an automated password-guessing attack rather than users forgetting their passwords. The accounts are protected — each one locked automatically — but it is worth confirming the source.
+{{if .AppName}}
+Affected application: {{.AppName}}
+{{end}}
+Review locked accounts:
+{{.Link}}
+
+Locked accounts are restored automatically once the lock expires, or you can unlock any of them immediately from the users page.
+
 - {{.ProductName}}`,
 	},
 	TemplatePasswordBreach: {

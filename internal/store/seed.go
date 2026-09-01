@@ -8,9 +8,9 @@ import (
 	"os"
 	"strings"
 
+	"github.com/engineersmind/emc-auth-server/internal/password"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 )
 
 const defaultSeedPassword = "ChangeMe123!"
@@ -129,8 +129,11 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 	}
 	logger.Info().Str("email", "admin@emc.local").Int64("id", userID).Msg("seed user ensured")
 
-	// 4. Seed password for super-admin (bcrypt cost 12 per AUTH-02 requirement).
-	hash, err := bcrypt.GenerateFromPassword([]byte(seedPassword), 12)
+	// 4. Seed password for super-admin, hashed through the same package as every
+	// other credential so the seeded account is never the odd one out — a literal
+	// cost here would silently diverge the moment the parameters move, and the
+	// super-admin is the last account that should be weaker than the rest.
+	hash, err := password.NewHasher(password.DefaultParams()).Hash(ctx, seedPassword)
 	if err != nil {
 		return fmt.Errorf("hash seed password: %w", err)
 	}
@@ -196,6 +199,36 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 		return fmt.Errorf("seed platform session policy: %w", err)
 	}
 	logger.Info().Msg("seed session policy ensured")
+
+	// Platform-default LOCKOUT policy, re-seeded here for exactly the reasons above
+	// (issue #72). Migration 00070 seeds this row, but goose records the migration as
+	// applied and never runs it again — so once the row is gone it stays gone, and
+	// the only way back is a migration from scratch.
+	//
+	// It disappears the same way the session policy did: lockout_policies has a
+	// foreign key to tenants, so `TRUNCATE tenants CASCADE` in the test helper
+	// empties the whole table, platform-default row included. Without this, a
+	// developer who had run the suite would see every login log
+	// "no lockout policy row matched (platform default missing?)" and silently fall
+	// back to compiled-in defaults — which for lockout means the console would show
+	// one policy while the login path enforced another.
+	//
+	// Values match auth.DefaultLockoutPolicy and migration 00086, an agreement
+	// TestDefaultLockoutPolicyMatchesSeed enforces.
+	if _, err = pool.Exec(ctx, `
+		INSERT INTO lockout_policies
+		    (tenant_id, application_id, notify_user_threshold,
+		     soft_lock_threshold, soft_lock_duration_seconds,
+		     hard_lock_threshold, hard_lock_duration_seconds,
+		     failure_window_seconds, tenant_spike_threshold)
+		SELECT NULL, NULL, 3, 5, 900, 10, 1800, 900, 10
+		WHERE NOT EXISTS (
+			SELECT 1 FROM lockout_policies WHERE tenant_id IS NULL AND application_id IS NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("seed platform lockout policy: %w", err)
+	}
+	logger.Info().Msg("seed lockout policy ensured")
 
 	return nil
 }

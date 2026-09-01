@@ -53,11 +53,10 @@ func registerAndLogin(t *testing.T, svc *auth.AuthService, email, password strin
 	t.Helper()
 	ctx := context.Background()
 	if _, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   password,
-		FirstName:  "Test",
-		LastName:   "User",
+		Email:     email,
+		Password:  password,
+		FirstName: "Test",
+		LastName:  "User",
 	}); err != nil {
 		t.Fatalf("Register(%s): %v", email, err)
 	}
@@ -79,11 +78,10 @@ func TestRegister_Success(t *testing.T) {
 	email := uniqueEmail("register-success")
 
 	result, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "Password123!",
-		FirstName:  "New",
-		LastName:   "User",
+		Email:     email,
+		Password:  "Password123!",
+		FirstName: "New",
+		LastName:  "User",
 	})
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
@@ -119,11 +117,10 @@ func TestRegister_DoesNotCreateASession(t *testing.T) {
 	email := uniqueEmail("register-no-session")
 
 	reg, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "Password123!",
-		FirstName:  "No",
-		LastName:   "Session",
+		Email:     email,
+		Password:  "Password123!",
+		FirstName: "No",
+		LastName:  "Session",
 	})
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
@@ -169,22 +166,20 @@ func TestRegister_DuplicateEmail(t *testing.T) {
 	email := uniqueEmail("dup-email")
 
 	_, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "Password123!",
-		FirstName:  "First",
-		LastName:   "User",
+		Email:     email,
+		Password:  "Password123!",
+		FirstName: "First",
+		LastName:  "User",
 	})
 	if err != nil {
 		t.Fatalf("first Register() unexpected error = %v", err)
 	}
 
 	_, err = svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "AnotherPass456!",
-		FirstName:  "Second",
-		LastName:   "User",
+		Email:     email,
+		Password:  "AnotherPass456!",
+		FirstName: "Second",
+		LastName:  "User",
 	})
 	if err == nil {
 		t.Fatal("second Register() expected error for duplicate email, got nil")
@@ -200,11 +195,10 @@ func TestLogin_Success(t *testing.T) {
 	password := "Password123!"
 
 	_, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   password,
-		FirstName:  "Login",
-		LastName:   "Test",
+		Email:     email,
+		Password:  password,
+		FirstName: "Login",
+		LastName:  "Test",
 	})
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
@@ -236,11 +230,10 @@ func TestLogin_WrongPassword(t *testing.T) {
 	email := uniqueEmail("login-wrong-pw")
 
 	_, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "CorrectPassword123!",
-		FirstName:  "Login",
-		LastName:   "WrongPW",
+		Email:     email,
+		Password:  "CorrectPassword123!",
+		FirstName: "Login",
+		LastName:  "WrongPW",
 	})
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
@@ -617,17 +610,11 @@ func TestRegister_WithAppCredentials(t *testing.T) {
 		t.Errorf("Register(wrong secret) error = %v, want ErrInvalidClient", err)
 	}
 
-	// A slug pointing at a different tenant than the app's must be rejected.
-	_, err = svc.Register(ctx, auth.RegisterInput{
-		TenantSlug:   "outreach",
-		ClientID:     app.ClientID,
-		ClientSecret: app.ClientSecret,
-		Email:        uniqueEmail("app-register-mismatch"),
-		Password:     "Password123!",
-	})
-	if !errors.Is(err, auth.ErrInvalidClient) {
-		t.Errorf("Register(slug/tenant mismatch) error = %v, want ErrInvalidClient", err)
-	}
+	// There was a third case here: a slug naming a different tenant than the
+	// app's credentials had to be rejected as a confused deputy. RegisterInput no
+	// longer carries a tenant selector, so the mismatch cannot be expressed and
+	// the guard it tested is gone. The tenant comes from the authenticated
+	// application, full stop.
 }
 
 // TestRegister_AssignsApplicationDefaultRole verifies that an app-scoped
@@ -759,9 +746,8 @@ func TestRegister_LegacyDoesNotInheritSystemRole(t *testing.T) {
 	svc := auth.NewAuthService(pool, jwtSvc, logger)
 
 	result, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      uniqueEmail("legacy-no-role"),
-		Password:   "Password123!",
+		Email:    uniqueEmail("legacy-no-role"),
+		Password: "Password123!",
 	})
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)

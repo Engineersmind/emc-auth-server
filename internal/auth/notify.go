@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/rs/zerolog"
 
@@ -77,6 +78,24 @@ func (n EmailNotifier) auditUserEvent(ctx context.Context, action string, tenant
 		UserID:        &userID,
 		Action:        action,
 		ResourceType:  "user",
+		Metadata:      meta,
+	})
+}
+
+// auditTenantEvent records a security event that belongs to a TENANT rather than
+// to one account — a lockout spike being the case it exists for, where the event
+// is precisely that many separate accounts were affected and naming any single one
+// of them would misrepresent it. Nil-safe and non-blocking.
+func (n EmailNotifier) auditTenantEvent(ctx context.Context, action string, tenantID int64, appRowID *int64, meta map[string]any) {
+	if n.audit == nil {
+		return
+	}
+	n.audit.Log(ctx, audit.Event{
+		TenantID:      &tenantID,
+		ApplicationID: appRowID,
+		Action:        action,
+		ResourceType:  "tenant",
+		ResourceID:    strconv.FormatInt(tenantID, 10),
 		Metadata:      meta,
 	})
 }

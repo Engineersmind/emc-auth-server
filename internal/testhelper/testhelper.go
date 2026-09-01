@@ -110,6 +110,27 @@ func CleanupTables(t *testing.T, pool *pgxpool.Pool) {
 		if err != nil {
 			t.Logf("testhelper.CleanupTables: truncate warning: %v", err)
 		}
+
+		// Policy tables are cleaned by DELETE, not TRUNCATE, and only for
+		// tenant/application scopes. The platform-default rows (tenant_id NULL,
+		// application_id NULL) are seeded by migrations 00067 and 00070 and must
+		// survive: truncating them would leave every subsequent test resolving
+		// policy against an empty table, which silently falls back to compiled-in
+		// defaults and would hide exactly the mismatch
+		// TestDefaultLockoutPolicyMatchesSeed exists to catch.
+		//
+		// Tenant-scoped rows are already removed by the tenants CASCADE above; this
+		// is belt-and-braces for rows whose tenant was deleted by other means.
+		if _, err := pool.Exec(ctx, `
+			DELETE FROM lockout_policies WHERE tenant_id IS NOT NULL OR application_id IS NOT NULL
+		`); err != nil {
+			t.Logf("testhelper.CleanupTables: lockout_policies cleanup warning: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `
+			DELETE FROM session_policies WHERE tenant_id IS NOT NULL OR application_id IS NOT NULL
+		`); err != nil {
+			t.Logf("testhelper.CleanupTables: session_policies cleanup warning: %v", err)
+		}
 	})
 }
 

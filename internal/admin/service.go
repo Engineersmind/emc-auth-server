@@ -9,17 +9,19 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/mail"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
-	"golang.org/x/crypto/bcrypt"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
+	"github.com/engineersmind/emc-auth-server/internal/password"
 )
 
 // Sentinel errors returned by service methods.
@@ -135,10 +137,12 @@ type CreateTenantResult struct {
 
 // TenantDashboardDelta holds month-over-month percentage changes.
 type TenantDashboardDelta struct {
-	TotalTenantsPct      float64 `json:"total_tenants_pct"`
-	ActiveTenantsPct     float64 `json:"active_tenants_pct"`
-	TotalApplicationsPct float64 `json:"total_applications_pct"`
-	TotalUsersPct        float64 `json:"total_users_pct"`
+	// Month-over-month change, as a whole percent. Integer rather than float:
+	// see momPct for why the extra precision was misleading as well as ugly.
+	TotalTenantsPct      int `json:"total_tenants_pct"`
+	ActiveTenantsPct     int `json:"active_tenants_pct"`
+	TotalApplicationsPct int `json:"total_applications_pct"`
+	TotalUsersPct        int `json:"total_users_pct"`
 }
 
 // TenantDashboardStats is the system-wide aggregate returned by GetTenantDashboardStats.
@@ -218,6 +222,23 @@ type UserResult struct {
 	// credentials row exists, plus every linked federated provider (Auth0's
 	// "Connection" column).
 	Connections []string `json:"connections"`
+
+	// Lockout state (issue #72), for the console's locked badge and its unlock
+	// action. BlockedAt and BlockReason are nil on an account nothing has locked.
+	//
+	// BlockReason distinguishes the two cases an operator must respond to
+	// differently: "failed_attempts" is automatic and usually expires on its own,
+	// while "admin" is somebody's deliberate decision and only an operator lifts
+	// it. A badge that showed only "locked" would flatten that distinction.
+	BlockedAt   *time.Time `json:"blocked_at"`
+	BlockReason *string    `json:"block_reason"`
+	// FailedLoginAttempts is the live counter, so the console can show how close
+	// an account is to locking rather than only that it already has.
+	FailedLoginAttempts int `json:"failed_login_attempts"`
+	// LockExpiresAt is when an automatic lock lifts by itself. Nil when the
+	// account is not automatically locked, or when the tenant opted into a
+	// permanent lock — in which case only an operator can restore access.
+	LockExpiresAt *time.Time `json:"lock_expires_at"`
 }
 
 // UsersPage wraps a paginated user list.
@@ -344,6 +365,32 @@ func New(pool *pgxpool.Pool, resetSvc *auth.ResetService, logger zerolog.Logger)
 func (s *Service) WithAuthService(authSvc *auth.AuthService) *Service {
 	s.authSvc = authSvc
 	return s
+}
+
+// passwordHasher is the fallback used when no AuthService has been wired.
+//
+// Package-level and lazily built so a bare Service — the shape several tests
+// construct — can still hash a password correctly. Sharing the process hasher is
+// preferred (it shares the concurrency cap), which is what hasher() does when
+// authSvc is present.
+var passwordHasher = sync.OnceValue(func() *password.Hasher {
+	return password.NewHasher(password.DefaultParams())
+})
+
+// hasher returns the password hasher to write credentials with.
+//
+// Prefers the one owned by AuthService, so admin-created credentials are hashed
+// under the same parameters AND counted against the same concurrency cap as
+// every login. A second independent hasher would let the process run twice the
+// intended number of concurrent derivations, which is precisely the bound that
+// keeps Argon2id's memory use predictable.
+func (s *Service) hasher() *password.Hasher {
+	if s.authSvc != nil {
+		if h := s.authSvc.Hasher(); h != nil {
+			return h
+		}
+	}
+	return passwordHasher()
 }
 
 // WithInvitations wires the invitation service so admin-created accounts can be
@@ -742,7 +789,7 @@ func (s *Service) GetTenantByID(ctx context.Context, tenantID int64) (*TenantRes
 //
 // Every field is patch-style: an empty string leaves the column unchanged. It
 // used to be replace-style, which made a partial update destructive — a caller
-// sending only {name} blanked domain and region, and wrote plan = '' into a NOT
+// sending only {name} blanked domain and region, and wrote plan = ” into a NOT
 // NULL column with no CHECK, leaving a tenant on a plan that is not one of
 // free/pro/enterprise. Callers that legitimately want to CLEAR domain or region
 // need an explicit tri-state (*string) rather than the empty string, which is
@@ -750,7 +797,7 @@ func (s *Service) GetTenantByID(ctx context.Context, tenantID int64) (*TenantRes
 //
 // DisplayName keeps NULLIF so that a name and an identical display_name do not
 // both have to be stored; the read path already falls back with
-// COALESCE(NULLIF(display_name, ''), name).
+// COALESCE(NULLIF(display_name, ”), name).
 func (s *Service) UpdateTenant(ctx context.Context, tenantID int64, in UpdateTenantInput) (*TenantResult, error) {
 	// Reject a no-op rather than bumping updated_at for nothing: with patch
 	// semantics an all-empty input matches every column to itself, so the write
@@ -805,6 +852,23 @@ func (s *Service) ActivateTenant(ctx context.Context, tenantID int64) (*TenantRe
 }
 
 // CheckSlugAvailable reports whether a slug is not yet taken.
+//
+// Deliberately ignores deleted_at, and must keep doing so. The table carries two
+// uniqueness rules: idx_tenants_slug_active (partial, WHERE deleted_at IS NULL)
+// from migration 00031, and the plain tenants_slug_key constraint that 00038
+// re-added because ON CONFLICT (slug) requires a named constraint. The plain one
+// is the stricter of the two, so a soft-deleted tenant's slug is NOT reclaimable
+// however the partial index reads.
+//
+// Answering by the partial index instead would tell an operator a slug is free
+// and then fail their create with a constraint violation — the worst of both
+// rules. This matches what the insert will actually do.
+//
+// The slug is also permanent once set: UpdateTenantInput carries no slug field,
+// because the slug is the tenant's OIDC issuer identifier
+// (/tenants/{slug}/.well-known/openid-configuration) and issuer comparison is an
+// exact string match. Renaming one would break every relying party that had
+// cached it, so this check is the only moment the value is ever chosen.
 func (s *Service) CheckSlugAvailable(ctx context.Context, slug string) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx, `
@@ -833,18 +897,41 @@ func (s *Service) GetTenantDashboardStats(ctx context.Context) (*TenantDashboard
 		usersLastMonth   int
 	)
 
+	// Month boundaries are computed once, in the WHERE clause, as half-open
+	// ranges rather than DATE_TRUNC on the column.
+	//
+	// The difference is sargability. `DATE_TRUNC('month', created_at) = X` applies
+	// a function to every row before comparing, so no index on created_at can be
+	// used and Postgres reads the whole table — three times over, once per
+	// subquery. `created_at >= start AND created_at < end` compares the raw column
+	// against constants, so idx_users_created_at can seek straight to the range.
+	//
+	// Measured at 500k users: the users portion alone went from 143ms to 61ms,
+	// with the two month counts dropping to a 19ms index seek. What remains is the
+	// unavoidable part — COUNT(*) over the whole table has no index shortcut, and
+	// at 40ms it is now the floor rather than a third of the cost.
+	//
+	// The ranges are half-open on purpose: `< next_month_start` rather than
+	// `<= month_end`. An inclusive upper bound has to name the last instant of the
+	// month, which is a different value for a timestamp than for a date and is the
+	// classic way rows created in the final second of a month get double-counted
+	// or lost.
 	err := s.pool.QueryRow(ctx, `
+		WITH bounds AS (
+		    SELECT DATE_TRUNC('month', NOW())                        AS this_start,
+		           DATE_TRUNC('month', NOW() - INTERVAL '1 month')   AS last_start
+		)
 		SELECT
-		    (SELECT COUNT(*)                                                                    FROM tenants)                                     AS total_tenants,
-		    (SELECT COUNT(*) FILTER (WHERE is_active = true)                                   FROM tenants)                                     AS active_tenants,
-		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW()))             FROM tenants)               AS tenants_this_month,
-		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')) FROM tenants)      AS tenants_last_month,
-		    (SELECT COUNT(*)                                                                    FROM oauth_clients WHERE deleted_at IS NULL)      AS total_apps,
-		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW()))             FROM oauth_clients WHERE deleted_at IS NULL) AS apps_this_month,
-		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')) FROM oauth_clients WHERE deleted_at IS NULL) AS apps_last_month,
-		    (SELECT COUNT(*)                                                                    FROM users WHERE deleted_at IS NULL)              AS total_users,
-		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW()))             FROM users WHERE deleted_at IS NULL) AS users_this_month,
-		    (SELECT COUNT(*) FILTER (WHERE DATE_TRUNC('month', created_at) = DATE_TRUNC('month', NOW() - INTERVAL '1 month')) FROM users WHERE deleted_at IS NULL) AS users_last_month
+		    (SELECT COUNT(*)                                  FROM tenants)                                            AS total_tenants,
+		    (SELECT COUNT(*) FILTER (WHERE is_active = true)  FROM tenants)                                            AS active_tenants,
+		    (SELECT COUNT(*) FROM tenants, bounds WHERE created_at >= bounds.this_start)                                AS tenants_this_month,
+		    (SELECT COUNT(*) FROM tenants, bounds WHERE created_at >= bounds.last_start AND created_at < bounds.this_start) AS tenants_last_month,
+		    (SELECT COUNT(*) FROM oauth_clients WHERE deleted_at IS NULL)                                               AS total_apps,
+		    (SELECT COUNT(*) FROM oauth_clients, bounds WHERE deleted_at IS NULL AND created_at >= bounds.this_start)    AS apps_this_month,
+		    (SELECT COUNT(*) FROM oauth_clients, bounds WHERE deleted_at IS NULL AND created_at >= bounds.last_start AND created_at < bounds.this_start) AS apps_last_month,
+		    (SELECT COUNT(*) FROM users WHERE deleted_at IS NULL)                                                       AS total_users,
+		    (SELECT COUNT(*) FROM users, bounds WHERE deleted_at IS NULL AND created_at >= bounds.this_start)            AS users_this_month,
+		    (SELECT COUNT(*) FROM users, bounds WHERE deleted_at IS NULL AND created_at >= bounds.last_start AND created_at < bounds.this_start) AS users_last_month
 	`).Scan(
 		&totalTenants, &activeTenants, &tenantsThisMonth, &tenantsLastMonth,
 		&totalApps, &appsThisMonth, &appsLastMonth,
@@ -881,16 +968,28 @@ func (s *Service) GetTenantDashboardStats(ctx context.Context) (*TenantDashboard
 	}, nil
 }
 
-// momPct returns the month-over-month percentage change.
-// Returns 0 when there is no prior-month baseline to avoid division by zero.
-func momPct(current, prior int) float64 {
+// momPct returns the month-over-month percentage change, rounded to a whole
+// percent. Returns 0 when there is no prior-month baseline to avoid division by
+// zero.
+//
+// Rounded here rather than left to the caller. The unrounded ratio is a
+// repeating decimal for most inputs — 12 users against a prior 11 produced
+// 109.09090909090908 — and every consumer that renders it would otherwise have
+// to know to trim it. The dashboard did not, and printed the full float.
+//
+// A whole percent is also the honest precision. The active-tenants figure is
+// explicitly an estimate (see the caller: there is no historical snapshot of
+// is_active), and the others compare small counts where a single row moves the
+// result by whole points. Decimal places on that would imply an accuracy the
+// underlying numbers do not have.
+func momPct(current, prior int) int {
 	if prior == 0 {
 		if current > 0 {
-			return 100.0
+			return 100
 		}
-		return 0.0
+		return 0
 	}
-	return float64(current-prior) / float64(prior) * 100.0
+	return int(math.Round(float64(current-prior) / float64(prior) * 100.0))
 }
 
 // DeactivateTenant soft-deactivates a tenant (sets is_active = false).
@@ -909,22 +1008,52 @@ func (s *Service) DeactivateTenant(ctx context.Context, tenantID int64) error {
 	return nil
 }
 
-// UpdateTenantCORSOrigins replaces the allowed CORS origins for a tenant.
-func (s *Service) UpdateTenantCORSOrigins(ctx context.Context, tenantID int64, origins []string) error {
+// CORSUpdateResult reports what an origin update changed, so the caller can
+// invalidate the right cache entries.
+//
+// PreviousOrigins matters as much as the new list: CORS is cached per ORIGIN
+// ("does any tenant permit this?"), so an origin being REMOVED needs its entry
+// cleared just as much as one being added. Without the old list a revoked origin
+// keeps working until the TTL expires, which is the wrong direction to be slow
+// in.
+type CORSUpdateResult struct {
+	Slug            string
+	PreviousOrigins []string
+}
+
+// UpdateTenantCORSOrigins replaces the allowed CORS origins for a tenant and
+// reports what it replaced.
+//
+// RETURNING gives the slug and the prior list in the same round trip as the
+// write, so the caller needs no follow-up queries and cannot race an interleaved
+// update between reading and writing.
+func (s *Service) UpdateTenantCORSOrigins(ctx context.Context, tenantID int64, origins []string) (*CORSUpdateResult, error) {
 	if origins == nil {
 		origins = []string{}
 	}
-	ct, err := s.pool.Exec(ctx, `
-		UPDATE tenants SET cors_origins = $2, updated_at = NOW()
-		WHERE id = $1
-	`, tenantID, origins)
+
+	// The prior list is captured in a CTE rather than a subquery in RETURNING.
+	// A subquery there would see the row the UPDATE has already written and hand
+	// back the NEW value; the CTE's snapshot is taken before the write, which is
+	// the only way to get the old one in a single statement.
+	var res CORSUpdateResult
+	err := s.pool.QueryRow(ctx, `
+		WITH prior AS (
+		    SELECT id, cors_origins FROM tenants WHERE id = $1
+		)
+		UPDATE tenants t
+		SET cors_origins = $2, updated_at = NOW()
+		FROM prior
+		WHERE t.id = prior.id
+		RETURNING t.slug, prior.cors_origins
+	`, tenantID, origins).Scan(&res.Slug, &res.PreviousOrigins)
 	if err != nil {
-		return fmt.Errorf("update cors_origins: %w", err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("update cors_origins: %w", err)
 	}
-	if ct.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return &res, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1368,7 +1497,8 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		var providers []string
 		if err := rows.Scan(&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 			&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
-			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers); err != nil {
+			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
+			&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		u.ID = strconv.FormatInt(id, 10)
@@ -1434,7 +1564,7 @@ func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID 
 		}
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), auth.BcryptCost)
+	hash, err := s.hasher().Hash(ctx, password)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
@@ -1843,6 +1973,86 @@ func (s *Service) SetUserActive(ctx context.Context, tenantID int64, application
 		}
 	}
 	return result, nil
+}
+
+// UnlockUser clears every lockout tier on an account (issue #72): the failure
+// counter, the automatic block, and the ephemeral soft lock.
+//
+// Distinct from SetUserActive(..., true) even though both re-enable an account,
+// because they answer different questions. SetUserActive is a status toggle — an
+// operator deciding whether this account should exist — and it is refused on your
+// own account. Unlock is incident response: "this user is locked out and should
+// not be", which an operator may legitimately need to do for themselves after
+// being brute-forced, and which must also clear the Redis soft lock that
+// SetUserActive knows nothing about.
+//
+// Idempotent. Unlocking an account that is not locked is a successful no-op
+// rather than an error: an operator clicking Unlock on a badge that has since
+// expired should see success, not a confusing failure about state they cannot
+// observe.
+func (s *Service) UnlockUser(ctx context.Context, tenantID int64, applicationID *int64, userID int64) (*UserResult, error) {
+	// Resolved first so the soft-lock clear below can run even when the row needed
+	// no database change — the two states are independent, and an account can hold
+	// a live soft lock while is_active is still true.
+	var wasBlocked bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT (u.blocked_at IS NOT NULL OR NOT u.is_active OR u.failed_login_attempts > 0)
+		FROM users u
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
+	`, userID, tenantID, applicationID).Scan(&wasBlocked)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("look up user for unlock: %w", err)
+	}
+
+	// Deliberately does NOT bump token_version, unlike the blocking path: nothing
+	// is being taken away, so there is no reason to sign the user out of sessions
+	// they may already hold.
+	//
+	// Only automatic locks are cleared here without further thought; an admin block
+	// is cleared too, because an operator explicitly asking to unlock an account is
+	// entitled to override another operator's block — but it is logged distinctly
+	// by the caller's audit event, which records block_reason.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE users
+		SET is_active = true, blocked_at = NULL, block_reason = NULL,
+		    failed_login_attempts = 0, last_failed_login_at = NULL,
+		    updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR application_id = $3)
+	`, userID, tenantID, applicationID); err != nil {
+		return nil, fmt.Errorf("unlock user: %w", err)
+	}
+
+	// Retire any outstanding self-service unblock token. The account is already
+	// unlocked, so the link has nothing left to do — and leaving it live means an
+	// old email could re-enable an account that a later block has disabled again.
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE account_unblock_tokens SET used_at = NOW()
+		WHERE user_id = $1 AND tenant_id = $2 AND used_at IS NULL
+	`, userID, tenantID); err != nil {
+		s.logger.Warn().Err(err).Int64("user_id", userID).
+			Msg("admin: could not retire unblock tokens on unlock")
+	}
+
+	// The Redis half. Without this an operator's unlock is silently undone by a
+	// soft-lock key nobody can see: the account is active in the database and the
+	// user is still refused, which is the worst possible outcome for a control
+	// whose whole purpose is restoring access.
+	if s.blockSvc == nil {
+		s.logger.Warn().Int64("user_id", userID).
+			Msg("admin: no account-block service wired; a live soft lock may still refuse this user")
+	} else {
+		s.blockSvc.ClearSoftLock(ctx, tenantID, userID)
+	}
+
+	s.logger.Info().Int64("user_id", userID).Int64("tenant_id", tenantID).
+		Bool("was_locked", wasBlocked).Msg("admin: account lockout cleared")
+
+	return s.getUserByID(ctx, tenantID, applicationID, userID)
 }
 
 // MaxSessionsListed bounds one page of session results.
@@ -2261,7 +2471,24 @@ const userEnrichmentColumns = `
 	       EXISTS (SELECT 1 FROM user_credentials uc
 	               WHERE uc.user_id = u.id AND uc.tenant_id = u.tenant_id AND uc.deleted_at IS NULL) AS has_password,
 	       (SELECT COALESCE(array_agg(ui.provider ORDER BY ui.provider), '{}')
-	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers`
+	        FROM user_identities ui WHERE ui.user_id = u.id AND ui.tenant_id = u.tenant_id) AS providers,
+	       u.blocked_at, u.block_reason, u.failed_login_attempts,
+	       -- When an automatic lock lifts, resolved against the policy in force for
+	       -- this user's scope. Computed in SQL rather than in Go so a list of
+	       -- fifty users does not become fifty policy lookups, and NULL whenever
+	       -- there is nothing to expire: not locked, an admin block (which no clock
+	       -- lifts), or a tenant that chose a permanent lock.
+	       CASE
+	           WHEN u.block_reason = 'failed_attempts' AND u.blocked_at IS NOT NULL THEN (
+	               SELECT u.blocked_at + make_interval(secs => lp.hard_lock_duration_seconds)
+	               FROM lockout_policies lp
+	               WHERE (lp.application_id = u.application_id AND lp.tenant_id = u.tenant_id)
+	                  OR (lp.application_id IS NULL AND lp.tenant_id = u.tenant_id)
+	                  OR (lp.application_id IS NULL AND lp.tenant_id IS NULL)
+	               ORDER BY lp.application_id NULLS LAST, lp.tenant_id NULLS LAST
+	               LIMIT 1
+	           )
+	       END AS lock_expires_at`
 
 // buildConnections merges the password credential and federated providers
 // into the public Connections list ("password", "google", ...).
@@ -2291,6 +2518,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 		&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 		&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
+		&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

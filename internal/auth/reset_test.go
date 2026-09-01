@@ -104,9 +104,7 @@ func TestForgotPassword_UsesTenantSender(t *testing.T) {
 	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
 	email := uniqueEmail("reset-sender")
-	if _, err := authSvc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc", Email: email, Password: "OldPassword123!", FirstName: "R", LastName: "S",
-	}); err != nil {
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{Email: email, Password: "OldPassword123!", FirstName: "R", LastName: "S"}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 	var tenantID int64
@@ -157,11 +155,10 @@ func TestResetPassword_ValidToken(t *testing.T) {
 	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
 	email := uniqueEmail("reset-valid")
 	_, err := authSvc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc",
-		Email:      email,
-		Password:   "OldPassword123!",
-		FirstName:  "Reset",
-		LastName:   "Valid",
+		Email:     email,
+		Password:  "OldPassword123!",
+		FirstName: "Reset",
+		LastName:  "Valid",
 	})
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)

@@ -17,6 +17,21 @@ type Config struct {
 	Env         string
 	JWTIssuer   string
 
+	// MetricsToken optionally gates GET /metrics behind a bearer token, set via
+	// METRICS_TOKEN. Empty (the default) leaves the endpoint open, preserving
+	// the original contract: bind it to localhost and restrict it at the
+	// reverse proxy.
+	//
+	// This exists because that network-level control is the ONLY thing standing
+	// between the Prometheus registry and the public internet, and it is easy to
+	// omit — a catch-all `location /` in nginx publishes /metrics along with the
+	// API. The exported series carry tenant identifiers, login and token
+	// volumes, MFA lockout counts, risk-signal counts, and the internal route
+	// table, which is reconnaissance material for an auth server. Setting this
+	// gives defence in depth so a proxy misconfiguration is not immediately a
+	// data leak.
+	MetricsToken string
+
 	// EmailProvider selects the GLOBAL email transport: "sendgrid" or "smtp".
 	// Empty is inferred: "sendgrid" when SENDGRID_API_KEY is set, else "smtp"
 	// when SMTP_HOST is set, else a console log-only dev mailer. Set via EMAIL_PROVIDER.
@@ -222,6 +237,20 @@ type Config struct {
 	// are kept indefinitely. Set via AUDIT_RETENTION_DAYS.
 	AuditRetentionDays int
 
+	// PasswordHashMaxConcurrent caps simultaneous Argon2id derivations.
+	//
+	// Argon2id holds ~46MiB for the whole of each derivation, so this value times
+	// that memory is the process's worst-case hashing footprint. Unbounded, a
+	// login spike is an OOM kill rather than a slowdown — and an attacker who
+	// notices can trigger it with unauthenticated requests.
+	//
+	// 0 (default) means NumCPU, floored at 2: derivation is CPU-saturating as
+	// well as memory-hungry, so exceeding core count buys no throughput while
+	// every queued derivation still holds its full allocation. Raise it only with
+	// the container memory limit raised to match. Set via
+	// PASSWORD_HASH_MAX_CONCURRENT.
+	PasswordHashMaxConcurrent int
+
 	// AuditSIEMWebhookURL, when set, streams every persisted audit event as a
 	// JSON POST to this URL (Datadog/Splunk/S3-proxy/generic webhook). Empty
 	// disables streaming. Must be https and resolve to a public IP — private,
@@ -245,6 +274,7 @@ func Load() *Config {
 		RedisURL:                               getEnv("REDIS_URL", "redis://localhost:6379/0"),
 		LogLevel:                               getEnv("LOG_LEVEL", "info"),
 		Env:                                    getEnv("ENV", "development"),
+		MetricsToken:                           getEnv("METRICS_TOKEN", ""),
 		JWTIssuer:                              getEnv("JWT_ISSUER", "https://auth.emc.local"),
 		EmailProvider:                          getEnv("EMAIL_PROVIDER", ""),
 		SendGridAPIKey:                         getEnv("SENDGRID_API_KEY", ""),
@@ -285,6 +315,7 @@ func Load() *Config {
 		BreachDetectionEnabled:          getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
 		AuditCaptureResponseBody:        getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
 		AuditRetentionDays:              mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
+		PasswordHashMaxConcurrent:       mustAtoi(getEnv("PASSWORD_HASH_MAX_CONCURRENT", "0")),
 		AuditSIEMWebhookURL:             getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
 		AuditSIEMWebhookSecret:          getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
 	}

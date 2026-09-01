@@ -62,15 +62,13 @@ func TestMeSessions_OverHTTP(t *testing.T) {
 	// Two accounts: the subject, and a bystander whose sessions must stay untouched
 	// no matter what the subject asks for.
 	email := "me-sessions@example.com"
-	if _, err := authSvc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc", Email: email, Password: "Password123!",
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{Email: email, Password: "Password123!",
 		FirstName: "Me", LastName: "Sessions",
 	}); err != nil {
 		t.Fatalf("Register subject: %v", err)
 	}
 	otherEmail := "bystander@example.com"
-	if _, err := authSvc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc", Email: otherEmail, Password: "Password123!",
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{Email: otherEmail, Password: "Password123!",
 		FirstName: "By", LastName: "Stander",
 	}); err != nil {
 		t.Fatalf("Register bystander: %v", err)

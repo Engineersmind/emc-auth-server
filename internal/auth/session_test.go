@@ -50,8 +50,7 @@ func newSessionEnv(t *testing.T) sessionEnv {
 	}
 
 	email := uniqueEmail("session")
-	if _, err := svc.Register(ctx, auth.RegisterInput{
-		TenantSlug: "emc", Email: email, Password: "Password123!",
+	if _, err := svc.Register(ctx, auth.RegisterInput{Email: email, Password: "Password123!",
 		FirstName: "Session", LastName: "User",
 	}); err != nil {
 		t.Fatalf("Register: %v", err)

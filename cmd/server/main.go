@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,7 +46,75 @@ import (
 	"github.com/engineersmind/emc-auth-server/migrations"
 )
 
+// healthcheckTimeout bounds the self-check probe. Short: a container healthcheck
+// that hangs is indistinguishable from one that failed, and Docker's own timeout
+// would kill it less informatively.
+const healthcheckTimeout = 3 * time.Second
+
+// runHealthcheck probes this server's own /health endpoint and exits 0 (healthy)
+// or 1 (unhealthy). Invoked as `emc-auth-server -healthcheck`.
+//
+// It exists because the runtime image is distroless (see the Dockerfile): there is
+// no /bin/sh, no wget and no curl, so a `CMD-SHELL` or `CMD ["wget", ...]`
+// healthcheck can never run. Docker reported the container unhealthy forever with
+// `exec: "/bin/sh": no such file or directory` while the server was serving
+// traffic perfectly — which is worse than having no healthcheck at all, because
+// anything waiting on `condition: service_healthy` blocks on a lie.
+//
+// The binary is the only executable in the image, so it has to be its own probe.
+func runHealthcheck() {
+	// Stderr, not the logger: this process is a probe, and its output is read by an
+	// operator running `docker inspect`, not shipped as structured logs. Errors are
+	// discarded because there is no recovery from a failed write to stderr, and the
+	// exit code is the real signal.
+	fail := func(msg string) {
+		_, _ = os.Stderr.WriteString("healthcheck: " + msg + "\n")
+		os.Exit(1)
+	}
+
+	// Validated rather than interpolated verbatim. PORT is deployment-controlled,
+	// but a numeric check costs nothing and keeps the URL provably a loopback
+	// address — otherwise a value like "9090@evil.example.com" would rewrite the
+	// host and turn a health probe into an outbound request to somewhere else.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "9090"
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		fail("PORT is not a valid port number: " + port)
+	}
+
+	client := &http.Client{Timeout: healthcheckTimeout}
+	// Built from the PARSED integer, never from the environment string. Both are
+	// equivalent for any valid input, but this way the URL carries no text
+	// derived from the environment at all: a value like "9090@evil.example.com"
+	// cannot reach the host position even in principle.
+	url := "http://127.0.0.1:" + strconv.Itoa(portNum) + "/health"
+	// #nosec G704 -- the host is the literal 127.0.0.1 and the port is an int
+	// already rejected unless it parses to 1-65535, so nothing caller-controlled
+	// reaches the request. gosec's taint analysis follows portNum back to
+	// os.Getenv and cannot see the validation in between.
+	resp, err := client.Get(url) //nolint:noctx // short-lived container healthcheck probe
+	if err != nil {
+		fail(err.Error())
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		fail("status " + resp.Status)
+	}
+	os.Exit(0)
+}
+
 func main() {
+	// Health probe mode — must be handled before any config load or database
+	// connection, since the probe has to work on a container whose dependencies
+	// are the very thing being reported on.
+	if len(os.Args) > 1 && (os.Args[1] == "-healthcheck" || os.Args[1] == "--healthcheck") {
+		runHealthcheck()
+	}
+
 	// Load .env file if present (non-fatal if absent)
 	_ = godotenv.Load()
 
@@ -120,6 +189,20 @@ func main() {
 	// Seed default tenant and super-admin (idempotent)
 	if err := store.RunSeed(ctx, pool, logger); err != nil {
 		logger.Fatal().Err(err).Msg("seed failed")
+	}
+
+	// Apply LOCKOUT_* overrides onto the platform-default lockout policy row
+	// (issue #72). After migrations, because the row it writes is seeded by
+	// migration 00070, and fatal on error: a deployment that asked for a specific
+	// lockout posture and did not get it should fail to start rather than run with
+	// a policy nobody chose. Per-tenant rows are never touched — the table stays
+	// the source of truth for anything scope-specific.
+	lockoutOverrides, err := auth.LockoutOverridesFromEnv()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("invalid LOCKOUT_* configuration")
+	}
+	if err := auth.ApplyLockoutEnvOverrides(ctx, pool, lockoutOverrides, logger); err != nil {
+		logger.Fatal().Err(err).Msg("could not apply lockout policy overrides")
 	}
 
 	// Seed demo tenants + users when SEED_DEMO_DATA=true (local dev / QA only)
@@ -234,6 +317,8 @@ func main() {
 		Config: api.RoutesConfig{
 			JWTIssuer:                              cfg.JWTIssuer,
 			Env:                                    cfg.Env,
+			MetricsToken:                           cfg.MetricsToken,
+			PasswordHashMaxConcurrent:              cfg.PasswordHashMaxConcurrent,
 			AppBaseURL:                             cfg.AppBaseURL,
 			DashboardBaseURL:                       cfg.DashboardBaseURL,
 			TOTPEncryptionKey:                      cfg.TOTPEncryptionKey,
@@ -290,7 +375,10 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		logger.Info().Str("port", cfg.Port).Msg("server starting")
+		logger.Info().
+			Str("port", cfg.Port).
+			Dur("login_timing_budget", auth.LoginTimingBudget()).
+			Msg("server starting")
 		if err := s.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal().Err(err).Msg("server error")
 		}

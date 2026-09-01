@@ -34,6 +34,7 @@ type captureMailer struct {
 	breaches      []mailer.PasswordBreachEmail
 	adminActivity []mailer.AdminActivityEmail
 	accessChanges []mailer.AccessChangedEmail
+	lockoutAlerts []mailer.TenantLockoutAlertEmail
 	senders       []*mailer.SMTPConfig // parallel to sends; nil = global sender
 }
 
@@ -109,10 +110,51 @@ func (m *captureMailer) SendBlockedAccount(ctx context.Context, sender *mailer.S
 	return nil
 }
 
+// Blocks returns a copy of the blocked-account mail captured so far, read under
+// the mutex.
+//
+// Reading m.blocks directly is a data race: blocked_account sends are DETACHED
+// (see AccountBlockService.sendBlockedAccountAsync — an inline SMTP handshake on
+// the login path is both slow and a timing oracle), so a goroutine may be
+// appending while the test reads. Use awaitBlocks when the test needs to assert on
+// a send that has just been triggered.
+func (m *captureMailer) Blocks() []mailer.BlockedAccountEmail {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]mailer.BlockedAccountEmail(nil), m.blocks...)
+}
+
+// awaitBlocks waits for the detached send goroutines to deliver want messages and
+// returns them, failing the test if they do not arrive.
+//
+// Waits for an exact count rather than "at least one": several of these tests
+// assert that a tier fired ONCE, and a first-match check would not catch a
+// duplicate.
+func (m *captureMailer) awaitBlocks(t *testing.T, want int) []mailer.BlockedAccountEmail {
+	t.Helper()
+	var got []mailer.BlockedAccountEmail
+	for i := 0; i < 100; i++ { // ≤5s; a local fake mailer needs microseconds
+		if got = m.Blocks(); len(got) >= want {
+			return got
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("blocked-account emails = %d after waiting, want %d: %+v", len(got), want, got)
+	return nil
+}
+
 func (m *captureMailer) SendPasswordBreach(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.PasswordBreachEmail) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.breaches = append(m.breaches, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+func (m *captureMailer) SendTenantLockoutAlert(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.TenantLockoutAlertEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lockoutAlerts = append(m.lockoutAlerts, e)
 	m.senders = append(m.senders, sender)
 	return nil
 }

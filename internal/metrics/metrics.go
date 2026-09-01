@@ -32,12 +32,27 @@ import (
 var (
 	// HTTPRequestDuration tracks end-to-end HTTP request latency.
 	// Labels: method (GET/POST/…), path (Echo route template), status (200/401/…).
+	//
+	// Buckets are tuned to this server's measured latency profile rather than
+	// prometheus.DefBuckets, whose lowest bucket (5ms) sits above almost every
+	// endpoint here. Measured p50s: /health 0.55ms, /auth/me 1.6ms, JWKS 1.7ms,
+	// list endpoints 2.5-5.7ms — i.e. DefBuckets lands the entire API in its
+	// first one or two buckets, where no useful quantile can be computed.
+	//
+	// The dense 1ms-10ms range gives real resolution over that band. The
+	// .75/1.5/2/3 steps bracket the bcrypt-bound login path (measured ~1.0s),
+	// which under DefBuckets straddles the 1s boundary — the worst place for it,
+	// since p99 estimates then swing on which side of that single edge samples
+	// land. Keep 10s as the final bucket so timeouts remain visible.
 	HTTPRequestDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace: "emc_auth",
 			Name:      "http_request_duration_seconds",
 			Help:      "HTTP request latency bucketed by method, route, and status code.",
-			Buckets:   prometheus.DefBuckets,
+			Buckets: []float64{
+				0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+				0.75, 1, 1.5, 2, 3, 5, 10,
+			},
 		},
 		[]string{"method", "path", "status"},
 	)
@@ -97,7 +112,18 @@ var (
 	)
 
 	// RateLimitHits counts requests blocked by rate limiting.
-	// Labels: limiter (ip, tenant, app).
+	//
+	// The limiter label names the specific bucket that rejected the request, so
+	// per-surface abuse is distinguishable: login_ip, login_account, token_ip,
+	// token_client, otp_ip, otp_session, oauth_ip, oauth_client, authorize,
+	// oauth_token, revoke, jwks_ip, userinfo, audit_maint,
+	// signing_key_rotation, app, app_client.
+	//
+	// Every limiter must increment this on rejection. A limiter that blocks
+	// silently is indistinguishable from one that never fires, which makes it
+	// impossible to tell "the threshold is protecting us" from "the threshold
+	// is set so high it never engages" — and hides both credential-stuffing
+	// campaigns and legitimate customers being throttled.
 	RateLimitHits = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "emc_auth",
@@ -105,6 +131,31 @@ var (
 			Help:      "Total number of requests rejected by rate limiters.",
 		},
 		[]string{"limiter"},
+	)
+
+	// RateLimitFailOpen counts requests that bypassed a rate limiter because the
+	// limiter itself could not make a decision.
+	//
+	// The per-application limiter fails OPEN by design: a Redis outage must not
+	// take down all authenticated traffic. The cost of that choice is that
+	// during an incident every tenant-configured quota silently stops being
+	// enforced. Without this counter that state is invisible — it appears only
+	// as warn-level log lines, and "all customer quotas are currently
+	// unenforced" is something to alert on within seconds.
+	//
+	// It also compounds: on a Redis outage every request falls through to the
+	// database for its limit lookup, so quotas stopping and DB load spiking
+	// happen together. Alert on any sustained non-zero rate.
+	//
+	// Labels: limiter (which limiter bypassed), reason (redis_error,
+	// malformed_app_id, malformed_tenant_id).
+	RateLimitFailOpen = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "rate_limit_fail_open_total",
+			Help:      "Requests allowed through because a rate limiter could not evaluate them.",
+		},
+		[]string{"limiter", "reason"},
 	)
 
 	// LegacyHS256Verifications counts tokens verified through the legacy
@@ -470,3 +521,68 @@ var (
 func RecordOp(operation, outcome string) {
 	AuthOperations.WithLabelValues(operation, outcome).Inc()
 }
+
+// PasswordRehashTotal counts credentials upgraded to the current password
+// hashing parameters on login, labelled by the algorithm they came from.
+//
+// This is how the bcrypt-to-Argon2id migration is tracked. A one-way hash cannot
+// be converted in a batch job — the plaintext exists only during a sign-in — so
+// the corpus drains as users return, and the only way to know how far along it
+// is, or whether it has stalled, is to count the upgrades as they happen.
+//
+// Read alongside PasswordHashByAlgorithm: this is the rate, that is the level.
+var PasswordRehashTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "emc_auth",
+		Name:      "password_rehash_total",
+		Help:      "Credentials rehashed to current password parameters on login, by previous algorithm.",
+	},
+	[]string{"from"},
+)
+
+// PasswordHashDuration measures how long a password derivation takes, split by
+// algorithm and operation.
+//
+// Argon2id is deliberately expensive, so this is the metric that says whether
+// the configured parameters still suit the hardware. Buckets span 10ms to ~2.5s:
+// the low end catches a misconfiguration that has made hashing too cheap to be
+// protective, the high end catches an instance too slow for the parameters, which
+// presents to users as login latency and to the fleet as saturation.
+var PasswordHashDuration = promauto.NewHistogramVec(
+	prometheus.HistogramOpts{
+		Namespace: "emc_auth",
+		Name:      "password_hash_duration_seconds",
+		Help:      "Password hashing and verification latency.",
+		Buckets:   []float64{0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 1, 2.5},
+	},
+	[]string{"algorithm", "operation"},
+)
+
+// PasswordHashInFlight is the number of Argon2id derivations running now.
+//
+// Each one holds its full memory allocation for its whole duration, so this
+// gauge multiplied by the configured memory is live usage. It saturates at the
+// concurrency cap; sitting at the cap means logins are queueing for a slot, which
+// is the signal to raise the cap (if memory allows) or add instances.
+var PasswordHashInFlight = promauto.NewGauge(
+	prometheus.GaugeOpts{
+		Namespace: "emc_auth",
+		Name:      "password_hash_in_flight",
+		Help:      "Argon2id derivations currently running.",
+	},
+)
+
+// PasswordHashQueueWait measures time spent waiting for a derivation slot.
+//
+// Distinct from PasswordHashDuration on purpose: derivation time is a property
+// of the parameters and is expected to be steady, while queue wait is a property
+// of load. Conflating them would make a capacity problem look like a slow
+// algorithm, and the remedies differ — add instances versus retune parameters.
+var PasswordHashQueueWait = promauto.NewHistogram(
+	prometheus.HistogramOpts{
+		Namespace: "emc_auth",
+		Name:      "password_hash_queue_wait_seconds",
+		Help:      "Time a password derivation waited for a concurrency slot.",
+		Buckets:   []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
+	},
+)

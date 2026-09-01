@@ -32,11 +32,17 @@ linters:
         - name: exported
           disabled: true  # don't require godoc on all exported symbols
 
+  # v2 syntax. These lived under a top-level `issues.exclude-rules` block, which
+  # is v1 — schema version is "2" above, so the whole block was parsed and
+  # silently ignored, and gosec/errcheck had been running against _test.go all
+  # along. Moved here so the exclusions actually apply.
+  exclusions:
+    rules:
+      - path: "_test.go"
+        linters: [gosec, errcheck]
+      - path: "docs/"
+        linters: [errcheck, gosec, govet, staticcheck, revive, misspell]
+
 issues:
-  exclude-rules:
-    - path: "_test.go"
-      linters: [gosec, errcheck]
-    - path: "docs/"
-      linters: [all]
   max-issues-per-linter: 50
   max-same-issues: 10

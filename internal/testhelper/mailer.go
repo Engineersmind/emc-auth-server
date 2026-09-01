@@ -25,6 +25,8 @@ type RecordingMailer struct {
 	invitations []mailer.InvitationEmail
 	activity    []mailer.AdminActivityEmail
 	access      []mailer.AccessChangedEmail
+	blocked     []mailer.BlockedAccountEmail
+	lockout     []mailer.TenantLockoutAlertEmail
 
 	// SendInvitationErr, when non-nil, is returned by SendInvitation instead of
 	// recording it. For exercising the paths that must report an undelivered
@@ -53,12 +55,30 @@ func (m *RecordingMailer) AccessChanges() []mailer.AccessChangedEmail {
 	return append([]mailer.AccessChangedEmail(nil), m.access...)
 }
 
+// BlockedAccounts returns a copy of the blocked-account mail sent so far. The
+// lockout tiers (issue #72) all arrive here, distinguished by Reason — which is
+// what lets a test assert that the warning tier fired exactly once per window
+// rather than on every attempt past the threshold.
+func (m *RecordingMailer) BlockedAccounts() []mailer.BlockedAccountEmail {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]mailer.BlockedAccountEmail(nil), m.blocked...)
+}
+
+// LockoutAlerts returns a copy of the tenant lockout-spike alerts sent so far.
+func (m *RecordingMailer) LockoutAlerts() []mailer.TenantLockoutAlertEmail {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]mailer.TenantLockoutAlertEmail(nil), m.lockout...)
+}
+
 // Reset discards everything recorded so far, so one fixture can be reused
 // across sub-tests without them observing each other's mail.
 func (m *RecordingMailer) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.invitations, m.activity, m.access = nil, nil, nil
+	m.blocked, m.lockout = nil, nil
 }
 
 func (m *RecordingMailer) SendInvitation(_ context.Context, _ *mailer.SMTPConfig, _ *mailer.Template, e mailer.InvitationEmail) error {
@@ -116,7 +136,17 @@ func (m *RecordingMailer) SendChangeEmail(context.Context, *mailer.SMTPConfig, *
 	return nil
 }
 
-func (m *RecordingMailer) SendBlockedAccount(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.BlockedAccountEmail) error {
+func (m *RecordingMailer) SendBlockedAccount(_ context.Context, _ *mailer.SMTPConfig, _ *mailer.Template, e mailer.BlockedAccountEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blocked = append(m.blocked, e)
+	return nil
+}
+
+func (m *RecordingMailer) SendTenantLockoutAlert(_ context.Context, _ *mailer.SMTPConfig, _ *mailer.Template, e mailer.TenantLockoutAlertEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lockout = append(m.lockout, e)
 	return nil
 }
 
