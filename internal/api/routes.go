@@ -715,7 +715,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// a client looping over tenant ids should be bounded by identity, which is what
 	// the limiter keys on once claims are present.
 	authGroup.POST("/tenant-context", authHandler.TenantContext,
-		mw.JWTRequired(jwtSvc, auth.AudienceAPI, auth.AudienceManagement),
+		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
 		mw.TokenRateLimiter(rlCfg))
 
 	// Which tenants may I administer? (plan step 5)
@@ -730,7 +730,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// reachable by an administrator whose current token names a tenant they are
 	// about to leave.
 	authGroup.GET("/my-tenants", authHandler.MyTenants,
-		mw.JWTRequired(jwtSvc, auth.AudienceAPI, auth.AudienceManagement))
+		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...))
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
@@ -962,19 +962,23 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// the rate-limit CRUD routes below — the limiter only ever engages for
 	// application-scoped traffic, never for the admin console's own calls.
 	//
-	// Accepted token types (issue #84): admin/management routes have three
-	// legitimate kinds of caller, so all three audiences are allowed here and
+	// Accepted grants (issues #84, #130): admin/management routes have three
+	// legitimate kinds of caller, so all three grant sets are allowed here and
 	// authorization stays with the RequirePermission guards below —
-	//   - AudienceAPI:        a human operator in the admin SPA
-	//   - AudienceManagement: an API-key integration (POST /auth/management-token)
-	//   - AudienceM2M:        a client_credentials machine client, whose grants
-	//                         come from oauth_clients.scopes
+	//   - HumanGrants:   a human operator in the admin SPA, however they logged in
+	//   - AdminGrants:   an API-key integration (POST /auth/management-token)
+	//   - MachineGrants: a client_credentials machine client, whose grants
+	//                    come from oauth_clients.scopes
 	// Agent tokens are deliberately absent — nothing verifies them yet.
+	//
+	// Declared as the three named sets, never as individual grant names: a ninth
+	// login method is added to auth.HumanGrants once, and every route that admits
+	// humans admits it. Spelling out grants here is how one route comes to be
+	// missed, and a missed route fails CLOSED — a working login method rejected on
+	// a subset of the API, which is the confusing kind of outage.
 	adminGroup := apiV1.Group("", mw.JWTRequired(
 		jwtSvc,
-		auth.AudienceAPI,
-		auth.AudienceManagement,
-		auth.AudienceM2M,
+		mw.Grants(auth.HumanGrants, auth.AdminGrants, auth.MachineGrants)...,
 	), appRateLimit)
 
 	// Ping (smoke test — requires admin:access)
@@ -1477,12 +1481,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// from the path here would mean accepting a tenant selector from the caller on
 	// an authenticated route — exactly what the tenant-isolation rule forbids.
 	//
-	// AudienceAPI only, and stated explicitly rather than inherited: machine,
+	// HumanGrants only, and stated explicitly rather than inherited: machine,
 	// management, and agent tokens stand for no user, so there is no user info to
 	// return for them (issue #84). JWTRequired enforces it before the handler runs.
 	//
 	// GET and POST because OIDC Core §5.3 requires both.
-	userInfoAuth := mw.JWTRequired(jwtSvc, auth.AudienceAPI)
+	userInfoAuth := mw.JWTRequired(jwtSvc, auth.HumanGrants...)
 	e.GET(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
 	e.POST(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
 

@@ -227,7 +227,7 @@ func TestJWKS_ThirdPartyVerificationInSeparateProcess(t *testing.T) {
 		t.Fatalf("fetch seed user: %v", err)
 	}
 
-	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, &auth.Claims{
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, &auth.Claims{
 		UserID:      "1",
 		TenantID:    "1",
 		Email:       "admin@emc.local",

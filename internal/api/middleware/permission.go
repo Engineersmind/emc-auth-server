@@ -24,7 +24,7 @@ import (
 // Usage in routes:
 //
 //	adminGroup.POST("/tenants", handler,
-//	    mw.JWTRequired(jwtSvc, auth.AudienceAPI, auth.AudienceManagement, auth.AudienceM2M),
+//	    mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants, auth.MachineGrants)...),
 //	    mw.RequirePermission("tenant:write"))
 //
 // Permissions are the authorization layer; the audiences passed to JWTRequired

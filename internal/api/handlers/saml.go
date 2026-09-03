@@ -145,8 +145,13 @@ func (h *SAMLHandler) handleACSImpl(c echo.Context) error {
 	}
 
 	// SAML JIT login produces a real user session — same audience as password,
-	// social, and magic-link login (issue #84).
-	accessToken, err := h.jwtSvc.Sign(c.Request().Context(), tenantIDInt, auth.AudienceAPI, claims)
+	// social, and magic-link login (issue #84), and a grant of its own so the
+	// token records that the credential was asserted by an external IdP rather
+	// than presented to us (issue #130).
+	//
+	// This path mints directly rather than through issueTokenPair, so it is the
+	// one mint site that does not inherit its grant from a sessionContext.
+	accessToken, err := h.jwtSvc.Sign(c.Request().Context(), tenantIDInt, auth.AudienceAPI, auth.GrantSAML, claims)
 	if err != nil {
 		h.logger.Error().Err(err).Str("user_id", user.ID).Msg("saml: JWT sign failed")
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to issue token")

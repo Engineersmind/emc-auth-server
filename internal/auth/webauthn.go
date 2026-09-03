@@ -1515,7 +1515,7 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 	}
 
 	result, err := s.issueTokenPair(ctx, id.UserID, id.TenantID, id.Email, id.Role, perms,
-		sessionContext{amr: amr}, id.AppID)
+		sessionContext{amr: amr, grant: GrantPasskey}, id.AppID)
 	if err != nil {
 		return nil, nil, err
 	}

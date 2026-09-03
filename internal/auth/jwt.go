@@ -89,6 +89,20 @@ type Claims struct {
 	// what it lists.
 	Scope string `json:"scope,omitempty"`
 
+	// Gty is the OAuth grant type that minted this token — the same claim name
+	// Auth0 publishes, so an integrator arriving from there already knows it.
+	//
+	// It carries the job "aud" used to do (issue #84's token-type discriminator)
+	// so that "aud" can become a real audience, naming the API a token is FOR,
+	// in issues #131/#132. The two are not interchangeable: "gty" says how a
+	// token was obtained, "aud" says where it may be spent.
+	//
+	// Empty means the token predates this claim. Verification falls back to the
+	// legacy "aud" token-type values in that case and counts the fallback on
+	// metrics.LegacyAudienceVerifications — see VerifyForAudience. Once that
+	// counter reads zero for a full refresh-token lifetime the fallback can go.
+	Gty string `json:"gty,omitempty"`
+
 	jwt.RegisteredClaims
 }
 
@@ -125,6 +139,10 @@ const (
 
 // AgentClaims is the JWT payload for machine-to-machine agent tokens (08-01).
 type AgentClaims struct {
+	// Gty is always GrantAgent. Stamped for symmetry with Claims.Gty and so an
+	// agent token is self-describing in a log; it grants nothing, because
+	// GrantAgent is in no grant set and AgentClaims reaches no verify path.
+	Gty          string   `json:"gty,omitempty"`
 	AgentID      string   `json:"agent_id"`
 	TenantID     string   `json:"tenant_id"`
 	AgentType    string   `json:"agent_type"`
@@ -161,6 +179,122 @@ const (
 	// path consumes these yet — see SignAgent.
 	AudienceAgent = "emc-auth-agent"
 )
+
+// AudienceSelf is the audience identifier reserved for this server's own API.
+//
+// Reserved here, required nowhere yet: issue #131 gives clients a real "aud"
+// and #132 makes it mandatory, at which point the first-party portal flows
+// (POST /auth/session and its refresh, which carry no client_id and therefore
+// cannot supply an audience) are assigned this value server-side.
+//
+// It is reserved NOW, before anything can set an audience, because the whole
+// namespace has to be closed to tenants from the first moment audiences exist.
+// A tenant able to register api://emc-auth would receive a legitimately signed
+// token bearing this server's own management audience — issue #84 reopened in a
+// new form. The refusal itself belongs to #131, where audiences first become
+// settable; what belongs here is that the name is spoken for before then.
+const AudienceSelf = "api://emc-auth"
+
+// ReservedAudiencePrefix is the namespace no tenant may register within.
+// Prefix, not equality: api://emc-auth-anything must be refused too, since a
+// resource server matching on a prefix would be fooled by it.
+const ReservedAudiencePrefix = "api://emc-auth"
+
+// Grant types for the "gty" claim. These are true OAuth grant names, one per
+// flow that can mint a token, rather than the three coarse buckets the legacy
+// "aud" values encoded.
+//
+// The finer granularity is the point. "aud" could only say "some human logged
+// in somehow"; gty says which of eight ways it was, which is what an audit
+// trail, a step-up policy, and an incident response all actually need. Route
+// policy is expressed over the named sets below rather than over individual
+// grants, so adding a ninth login method means editing one set — not auditing
+// every route declaration for an omission that fails open.
+const (
+	// GrantPassword is email + password login, including registration, which
+	// authenticates the credential it has just set.
+	GrantPassword = "password"
+	// GrantAuthorizationCode is the OAuth 2.0 authorization code flow (#6),
+	// including PKCE.
+	GrantAuthorizationCode = "authorization_code"
+	// GrantRefreshToken is a rotation of an existing refresh token.
+	//
+	// It replaces the original grant rather than preserving it: the grant that
+	// began the session is not recorded on the refresh_tokens row, and #130 adds
+	// no schema. A route policy must therefore treat refresh_token as reachable
+	// from any human grant, which is why it sits in HumanGrants. It is NOT in
+	// MachineGrants, and that is safe in both directions — client_credentials
+	// mints no refresh token at all (see IssueServiceToken), so no m2m
+	// session can rotate its way into a human grant.
+	GrantRefreshToken = "refresh_token"
+	// GrantMagicLink is passwordless email-link login.
+	GrantMagicLink = "magic_link"
+	// GrantSocial is a social/OIDC identity-provider callback (Google, #64).
+	GrantSocial = "social"
+	// GrantPasskey is WebAuthn passkey assertion (#112).
+	GrantPasskey = "passkey"
+	// GrantSAML is SAML 2.0 JIT login.
+	GrantSAML = "saml"
+	// GrantTenantSwitch is a token re-minted for a second tenant the caller
+	// already proved they belong to. No credential is presented, so it is named
+	// separately from the grant that authenticated the original session.
+	GrantTenantSwitch = "tenant_switch"
+	// GrantClientCredentials is the RFC 6749 §4.4 machine grant. No user.
+	GrantClientCredentials = "client_credentials"
+	// GrantAPIKey is the API-key exchange at POST /auth/management-token.
+	GrantAPIKey = "api_key"
+	// GrantAgent is minted by SignAgent and verified by nothing — deliberately
+	// absent from every set below, so an agent token remains refused on every
+	// route exactly as it is today (CLAUDE.md deferred #11).
+	GrantAgent = "agent"
+)
+
+// Grant sets. Route policy is declared with these, never with bare grant names.
+//
+// Each set is the exact replacement for one legacy audience, so the boundary
+// issue #84 established is preserved rather than re-derived: a machine token
+// still cannot act as a user, and a user token still cannot act as a machine.
+//
+// Package-level vars rather than constants because Go has no constant slice.
+// They are read-only by convention and must never be appended to at runtime;
+// grantSetsAreDisjoint (see the tests) asserts they stay non-overlapping.
+var (
+	// HumanGrants replaces AudienceAPI: a real person authenticated.
+	HumanGrants = []string{
+		GrantPassword,
+		GrantAuthorizationCode,
+		GrantRefreshToken,
+		GrantMagicLink,
+		GrantSocial,
+		GrantPasskey,
+		GrantSAML,
+		GrantTenantSwitch,
+	}
+
+	// MachineGrants replaces AudienceM2M: no user behind the token.
+	MachineGrants = []string{GrantClientCredentials}
+
+	// AdminGrants replaces AudienceManagement: an API key acting for its tenant.
+	AdminGrants = []string{GrantAPIKey}
+)
+
+// legacyAudienceGrants maps a legacy token-type "aud" to the grants it could
+// have been minted by, for tokens issued before the "gty" claim existed.
+//
+// This is what makes the migration invisible: a token holding aud=emc-auth-api
+// and no gty is accepted on exactly the routes that accept HumanGrants, which is
+// exactly where it was accepted before. The mapping is deliberately widening —
+// the legacy value genuinely does not record which human grant it was — and it
+// is the ONLY place that widening is allowed to happen.
+//
+// AudienceAgent is absent, not mapped to an empty slice, so an agent token
+// resolves to no grants and stays refused everywhere. Its exclusion is the
+// property CLAUDE.md deferred #11 relies on and must not be "fixed" here.
+var legacyAudienceGrants = map[string][]string{
+	AudienceAPI:        HumanGrants,
+	AudienceM2M:        MachineGrants,
+	AudienceManagement: AdminGrants,
+}
 
 // ErrUnexpectedAudience is returned when a token is well-formed and correctly
 // signed but was minted for a different audience than the caller accepts —
@@ -464,13 +598,32 @@ const RefreshTokenTTL = 30 * 24 * time.Hour
 // Short-lived by design — callers must re-exchange the API key to get a new one.
 const ManagementTokenTTL = 15 * time.Minute
 
-// Sign creates and signs a JWT for the given claims using the tenant's HS256 secret.
-func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience string, c *Claims) (string, error) {
+// ErrMissingGrantType is returned by Sign when no grant type is supplied.
+//
+// A programming error, refused at the signer rather than defaulted, because the
+// "gty" claim is what every route policy reads: a token minted without one falls
+// through to the legacy "aud" branch on verification and silently inherits the
+// widest set its audience maps to. Failing here means a mint site added later
+// cannot forget the claim — the compiler catches the argument, and this catches
+// an empty one.
+var ErrMissingGrantType = errors.New("jwt: grant type must not be empty")
+
+// Sign creates and signs a JWT for the given claims using the tenant's key.
+//
+// gty is the grant that minted the token — one of the Grant* constants — and is
+// required. It, not audience, is what verification checks against a route's
+// policy; audience is passed through unchanged and is on its way to becoming a
+// real audience identifier in issues #131/#132.
+func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience, gty string, c *Claims) (string, error) {
+	if gty == "" {
+		return "", ErrMissingGrantType
+	}
 	issuer, err := s.issuerFor(ctx, tenantID)
 	if err != nil {
 		return "", err
 	}
 	now := time.Now().UTC()
+	c.Gty = gty
 	c.RegisteredClaims = jwt.RegisteredClaims{
 		ID:        uuid.New().String(),
 		Issuer:    issuer,
@@ -496,6 +649,7 @@ func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentit
 		TenantID: strconv.FormatInt(identity.TenantID, 10),
 		Email:    identity.Name + "@apikey",
 		Role:     "api_key",
+		Gty:      GrantAPIKey,
 		// An API key belongs to the tenant, not to any one application, and its
 		// permissions were already scoped when the key was issued. Without this
 		// the key would lose access to every per-application admin route the
@@ -531,6 +685,7 @@ func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (st
 	}
 	now := time.Now().UTC()
 	claims := &AgentClaims{
+		Gty:          GrantAgent,
 		AgentID:      identity.AgentID.String(),
 		TenantID:     strconv.FormatInt(identity.TenantID, 10),
 		AgentType:    identity.AgentType,
@@ -547,36 +702,41 @@ func (s *JWTService) SignAgent(ctx context.Context, identity *AgentIdentity) (st
 	return s.signClaims(ctx, identity.TenantID, claims, "agent jwt")
 }
 
-// Verify parses and validates a user/session JWT (AudienceAPI only).
+// Verify parses and validates a user/session JWT (HumanGrants only).
 //
 // It is the strict default: tokens minted for any other audience — M2M service
 // tokens, API-key management tokens, agent tokens — are rejected with
 // ErrUnexpectedAudience. Routes that legitimately accept more than one token
 // type must say so explicitly via VerifyForAudience.
 func (s *JWTService) Verify(ctx context.Context, tokenString string) (*Claims, error) {
-	return s.VerifyForAudience(ctx, tokenString, AudienceAPI)
+	return s.VerifyForAudience(ctx, tokenString, HumanGrants...)
 }
 
 // VerifyM2M parses and validates a client_credentials service token
-// (AudienceM2M only), rejecting user, management, and agent tokens.
+// (MachineGrants only), rejecting user, management, and agent tokens.
 func (s *JWTService) VerifyM2M(ctx context.Context, tokenString string) (*Claims, error) {
-	return s.VerifyForAudience(ctx, tokenString, AudienceM2M)
+	return s.VerifyForAudience(ctx, tokenString, MachineGrants...)
 }
 
-// VerifyForAudience parses and validates a JWT string, accepting it only if its
-// "aud" claim is one of allowed. Key resolution happens inside the keyfunc (see
-// below), and signature, algorithm, issuer, expiry, and audience are all
-// verified before the claims are returned.
+// VerifyForAudience parses and validates a JWT string, accepting it only if the
+// grant that minted it is one of allowed. Key resolution happens inside the
+// keyfunc (see below), and signature, algorithm, issuer, expiry, and grant are
+// all verified before the claims are returned.
 //
-// Audience is checked only after the signature is proven, so an attacker cannot
-// use the audience result to learn anything about an unsigned token.
+// The name is now one migration behind what it does: since issue #130 the check
+// is against the "gty" claim, not "aud". It keeps the name because it is the
+// server's single verification chokepoint and issue #132 gives it a genuine
+// audience check to perform alongside this one.
 //
-// Callers pass the set of token types a route accepts, e.g. admin routes accept
-// {AudienceAPI, AudienceManagement, AudienceM2M} because a human operator, an
-// API-key integration, and a machine client are all legitimate admin callers,
-// whereas user self-service routes accept {AudienceAPI} alone.
-// Passing no audience is a programming error (ErrNoAudienceAllowed) rather than
-// a silent "allow everything".
+// The grant is checked only after the signature is proven, so an attacker cannot
+// use the result to learn anything about an unsigned token.
+//
+// Callers pass the set of grants a route accepts — always as one of the named
+// sets, e.g. admin routes accept HumanGrants + AdminGrants + MachineGrants
+// because a human operator, an API-key integration, and a machine client are all
+// legitimate admin callers, whereas user self-service routes accept HumanGrants
+// alone. Passing nothing is a programming error (ErrNoAudienceAllowed) rather
+// than a silent "allow everything".
 func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, allowed ...string) (*Claims, error) {
 	if len(allowed) == 0 {
 		return nil, ErrNoAudienceAllowed
@@ -640,11 +800,73 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 	if err := s.issuerAllowed(ctx, claims); err != nil {
 		return nil, err
 	}
-	if !audienceAllowed(claims.Audience, allowed) {
-		return nil, fmt.Errorf("verify jwt: got %v, want one of %v: %w",
-			[]string(claims.Audience), allowed, ErrUnexpectedAudience)
+	if !s.grantAllowed(claims, allowed) {
+		return nil, fmt.Errorf("verify jwt: got gty=%q aud=%v, want one of %v: %w",
+			claims.Gty, []string(claims.Audience), allowed, ErrUnexpectedAudience)
 	}
 	return claims, nil
+}
+
+// grantAllowed reports whether the token was minted by a grant the route accepts.
+//
+// Dual-read, and the fallback is the whole reason issue #130 is not a breaking
+// change: a token carrying "gty" is judged on it, and a token minted before the
+// claim existed is judged on the legacy token-type "aud" instead, resolved
+// through legacyAudienceGrants to the grants that audience could have meant.
+//
+// Every fallback is counted. Without the counter the gate before issue #132 —
+// "no legacy tokens remain in circulation" — would be satisfied by a metric that
+// is flat zero because nothing increments it, which is exactly the failure mode
+// CLAUDE.md deferred #12 has been sitting in for months.
+func (s *JWTService) grantAllowed(claims *Claims, allowed []string) bool {
+	if claims.Gty != "" {
+		return containsGrant(allowed, claims.Gty)
+	}
+
+	// Legacy token. The single-value requirement lives here and only here: every
+	// Sign* method minted exactly one token-type audience, so a multi-valued
+	// "aud" did not come from any code path this fallback exists to serve, and
+	// must not satisfy a route by carrying one acceptable value among others.
+	// Tokens minted from #130 onward are judged above, before this runs, so a
+	// real multi-valued audience in #131/#132 is unaffected by the rule.
+	if len(claims.Audience) != 1 {
+		return false
+	}
+	metrics.LegacyAudienceVerifications.WithLabelValues(clientIDLabel(claims.AppID)).Inc()
+
+	// An unknown audience — AudienceAgent included — resolves to no grants and
+	// is refused, which is how agent tokens stay unusable everywhere.
+	for _, grant := range legacyAudienceGrants[claims.Audience[0]] {
+		if containsGrant(allowed, grant) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsGrant is a linear scan, deliberately: every allow-list is one of three
+// named sets of at most eight short strings, so a map would cost more to build
+// per request than the scan it replaces.
+func containsGrant(allowed []string, grant string) bool {
+	for _, want := range allowed {
+		if want == grant {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIDLabel keeps the legacy-verification metric to a bounded label set.
+//
+// The app_id claim is empty on every first-party token, and an empty Prometheus
+// label renders as a blank series that reads like a scrape fault rather than a
+// fact. "none" says the fact out loud: legacy tokens are still in circulation on
+// the first-party flows, which is a different remediation from a named client.
+func clientIDLabel(appID string) string {
+	if appID == "" {
+		return "none"
+	}
+	return appID
 }
 
 // tenantIDFromToken reads the tenant_id claim off a token whose signature is not
@@ -749,23 +971,4 @@ func (s *JWTService) legacyHMACKeyForToken(ctx context.Context, t *jwt.Token) (i
 		return nil, err
 	}
 	return []byte(secret), nil
-}
-
-// audienceAllowed reports whether aud names exactly one audience and that
-// audience is in allowed.
-//
-// The single-value requirement is deliberate: every Sign* method in this package
-// mints exactly one audience, so a multi-valued aud did not come from a current
-// code path and must not be able to satisfy a route by carrying one acceptable
-// value alongside others.
-func audienceAllowed(aud jwt.ClaimStrings, allowed []string) bool {
-	if len(aud) != 1 {
-		return false
-	}
-	for _, want := range allowed {
-		if aud[0] == want {
-			return true
-		}
-	}
-	return false
 }

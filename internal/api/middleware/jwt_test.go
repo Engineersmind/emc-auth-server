@@ -76,7 +76,7 @@ func runWithBearer(mw echo.MiddlewareFunc, token string) (int, string) {
 }
 
 // TestJWTRequired_AudienceGate is the route-level half of issue #84: the
-// audience allow-list a route is mounted with decides which token types may
+// grant allow-list a route is mounted with decides which token types may
 // reach it at all, before any permission check runs.
 //
 // The two rows that matter most: a service (M2M) token is accepted on admin
@@ -97,17 +97,20 @@ func TestJWTRequired_AudienceGate(t *testing.T) {
 		}
 	}
 
-	sign := func(audience string) string {
-		token, err := jwtSvc.Sign(ctx, tenantID, audience, claims())
+	sign := func(grant string) string {
+		token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, grant, claims())
 		if err != nil {
-			t.Fatalf("Sign(%s): %v", audience, err)
+			t.Fatalf("Sign(%s): %v", grant, err)
 		}
 		return token
 	}
 
-	userToken := sign(auth.AudienceAPI)
-	m2mToken := sign(auth.AudienceM2M)
-	legacyToken := sign("emc-auth-server")
+	userToken := sign(auth.GrantPassword)
+	m2mToken := sign(auth.GrantClientCredentials)
+	// An unknown grant, standing in for what "emc-auth-server" used to stand in
+	// for: a validly signed token this server's route policy cannot place. It
+	// must be refused everywhere rather than falling through to a default.
+	legacyToken := sign("emc-auth-unknown-grant")
 
 	mgmtToken, err := jwtSvc.SignManagement(ctx, &auth.APIKeyIdentity{
 		KeyID:       7,
@@ -128,31 +131,33 @@ func TestJWTRequired_AudienceGate(t *testing.T) {
 		t.Fatalf("SignAgent: %v", err)
 	}
 
-	// Mirrors the real wiring in routes.go.
-	adminAudiences := []string{auth.AudienceAPI, auth.AudienceManagement, auth.AudienceM2M}
-	userAudiences := []string{auth.AudienceAPI}
+	// Mirrors the real wiring in routes.go — the same named sets, not a copy of
+	// their contents, so a grant added to auth.HumanGrants is exercised here
+	// automatically instead of drifting out of sync with the routes.
+	adminGrants := middleware.Grants(auth.HumanGrants, auth.AdminGrants, auth.MachineGrants)
+	userGrants := auth.HumanGrants
 
 	tests := []struct {
-		name      string
-		audiences []string
-		token     string
-		wantCode  int
+		name     string
+		grants   []string
+		token    string
+		wantCode int
 	}{
-		{"admin route accepts user token", adminAudiences, userToken, http.StatusOK},
-		{"admin route accepts management token", adminAudiences, mgmtToken, http.StatusOK},
-		{"admin route accepts m2m token", adminAudiences, m2mToken, http.StatusOK},
-		{"admin route rejects agent token", adminAudiences, agentToken, http.StatusUnauthorized},
-		{"admin route rejects legacy audience", adminAudiences, legacyToken, http.StatusUnauthorized},
+		{"admin route accepts user token", adminGrants, userToken, http.StatusOK},
+		{"admin route accepts management token", adminGrants, mgmtToken, http.StatusOK},
+		{"admin route accepts m2m token", adminGrants, m2mToken, http.StatusOK},
+		{"admin route rejects agent token", adminGrants, agentToken, http.StatusUnauthorized},
+		{"admin route rejects unknown grant", adminGrants, legacyToken, http.StatusUnauthorized},
 
-		{"user route accepts user token", userAudiences, userToken, http.StatusOK},
-		{"user route rejects m2m token", userAudiences, m2mToken, http.StatusUnauthorized},
-		{"user route rejects management token", userAudiences, mgmtToken, http.StatusUnauthorized},
-		{"user route rejects agent token", userAudiences, agentToken, http.StatusUnauthorized},
+		{"user route accepts user token", userGrants, userToken, http.StatusOK},
+		{"user route rejects m2m token", userGrants, m2mToken, http.StatusUnauthorized},
+		{"user route rejects management token", userGrants, mgmtToken, http.StatusUnauthorized},
+		{"user route rejects agent token", userGrants, agentToken, http.StatusUnauthorized},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			mw := middleware.JWTRequired(jwtSvc, tc.audiences...)
+			mw := middleware.JWTRequired(jwtSvc, tc.grants...)
 			status, code := runWithBearer(mw, tc.token)
 			if status != tc.wantCode {
 				t.Errorf("status = %d (code %q), want %d", status, code, tc.wantCode)
@@ -173,7 +178,7 @@ func TestJWTRequired_AudienceGate(t *testing.T) {
 func TestAudienceRejection_IsCounted(t *testing.T) {
 	jwtSvc, tenantID, userIDStr := jwtEnv(t)
 
-	m2mToken, err := jwtSvc.Sign(context.Background(), tenantID, auth.AudienceM2M, &auth.Claims{
+	m2mToken, err := jwtSvc.Sign(context.Background(), tenantID, auth.AudienceM2M, auth.GrantClientCredentials, &auth.Claims{
 		UserID:   userIDStr,
 		TenantID: strconv.FormatInt(tenantID, 10),
 		Role:     "service",
@@ -186,7 +191,7 @@ func TestAudienceRejection_IsCounted(t *testing.T) {
 	// refresh-rotation path, so JWTRenew's service/Redis/audit dependencies are
 	// never touched here and can be nil.
 	mws := map[string]echo.MiddlewareFunc{
-		"JWTRequired": middleware.JWTRequired(jwtSvc, auth.AudienceAPI),
+		"JWTRequired": middleware.JWTRequired(jwtSvc, auth.HumanGrants...),
 		"JWTRenew": middleware.JWTRenew(
 			jwtSvc, nil, nil, middleware.CookieConfig{}, nil, testhelper.TestLogger(),
 		),
@@ -195,7 +200,7 @@ func TestAudienceRejection_IsCounted(t *testing.T) {
 	for name, mw := range mws {
 		t.Run(name, func(t *testing.T) {
 			route := "/api/v1/audience-metric-probe/" + name
-			counter := metrics.TokenAudienceRejections.WithLabelValues(auth.AudienceM2M, route)
+			counter := metrics.TokenAudienceRejections.WithLabelValues(auth.GrantClientCredentials, route)
 			before := testutil.ToFloat64(counter)
 
 			status, code := runWithBearerOn(mw, route, m2mToken)
@@ -217,7 +222,7 @@ func TestAudienceRejection_IsCounted(t *testing.T) {
 func TestJWTRequired_NoAudiencesFailsClosed(t *testing.T) {
 	jwtSvc, tenantID, userIDStr := jwtEnv(t)
 
-	token, err := jwtSvc.Sign(context.Background(), tenantID, auth.AudienceAPI, &auth.Claims{
+	token, err := jwtSvc.Sign(context.Background(), tenantID, auth.AudienceAPI, auth.GrantPassword, &auth.Claims{
 		UserID:   userIDStr,
 		TenantID: strconv.FormatInt(tenantID, 10),
 		Email:    "admin@emc.local",
@@ -248,7 +253,7 @@ func TestJWTRequired_EmitsBearerChallenge(t *testing.T) {
 	ctx := context.Background()
 
 	// A machine token: validly signed, wrong audience for a user route.
-	m2m, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceM2M, &auth.Claims{
+	m2m, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceM2M, auth.GrantClientCredentials, &auth.Claims{
 		UserID:   userIDStr,
 		TenantID: strconv.FormatInt(tenantID, 10),
 		Email:    "svc@emc.local",
@@ -263,7 +268,7 @@ func TestJWTRequired_EmitsBearerChallenge(t *testing.T) {
 		e := echo.New()
 		e.GET("/oauth/userinfo", func(c echo.Context) error {
 			return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
-		}, middleware.JWTRequired(jwtSvc, auth.AudienceAPI))
+		}, middleware.JWTRequired(jwtSvc, auth.HumanGrants...))
 
 		req := httptest.NewRequest(http.MethodGet, "/oauth/userinfo", nil)
 		if token != "" {
@@ -338,7 +343,7 @@ func TestJWTRequired_EmitsBearerChallenge(t *testing.T) {
 				e := echo.New()
 				e.GET("/oauth/userinfo", func(c echo.Context) error {
 					return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
-				}, middleware.JWTRequired(jwtSvc, auth.AudienceAPI))
+				}, middleware.JWTRequired(jwtSvc, auth.HumanGrants...))
 
 				req := httptest.NewRequest(http.MethodGet, "/oauth/userinfo", nil)
 				if tc.token != "" {

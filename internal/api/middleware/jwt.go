@@ -30,10 +30,14 @@ const (
 //  3. Stores the validated *auth.Claims in the echo context under key "user".
 //  4. Returns HTTP 401 if no valid token is found in either location.
 //
-// allowedAudiences declares which token types the mounted routes accept
-// (issue #84). It is variadic for call-site readability, but omitting it is a
+// allowedGrants declares which grant types the mounted routes accept (issues
+// #84, #130). It is variadic for call-site readability, but omitting it is a
 // configuration error: auth.VerifyForAudience then fails closed with
 // ErrNoAudienceAllowed rather than accepting every token type.
+//
+// Always pass one of auth's named grant sets — auth.HumanGrants, and Grants()
+// below to combine several — never hand-written grant names. See the adminGroup
+// declaration in routes.go for why.
 //
 // Rejections are deliberately reported as the same generic token_invalid 401 as
 // any other bad token, so a caller cannot use the response to discover that it
@@ -42,7 +46,7 @@ const (
 //
 // Performance note (NFR-01): verification does one DB round-trip to fetch the tenant
 // secret. With pgxpool (MaxConns=25) and the p99 < 2ms DB query target, this adds ≤2ms latency.
-func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.MiddlewareFunc {
+func JWTRequired(jwtSvc *auth.JWTService, allowedGrants ...string) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			tokenString, found := bearerToken(c)
@@ -64,7 +68,7 @@ func JWTRequired(jwtSvc *auth.JWTService, allowedAudiences ...string) echo.Middl
 					`Bearer realm="`+bearerRealm+`"`)
 			}
 
-			claims, err := jwtSvc.VerifyForAudience(c.Request().Context(), tokenString, allowedAudiences...)
+			claims, err := jwtSvc.VerifyForAudience(c.Request().Context(), tokenString, allowedGrants...)
 			if err != nil {
 				// Distinguish expired tokens from invalid ones.
 				// Clients should refresh on token_expired; redirect to login on token_invalid.
@@ -135,22 +139,55 @@ func unauthorized(c echo.Context, code, message, challenge string) error {
 	})
 }
 
-// presentedAudience reads the "aud" claim for metric labelling only.
+// Grants flattens several of auth's named grant sets into one allow-list for
+// JWTRequired.
 //
-// Safe to parse unverified here: this is called solely after
-// VerifyForAudience has already proven the signature and rejected the token on
-// audience alone, so the claim really was minted by this server.
+// It exists so a route that admits more than one kind of caller still names the
+// SETS it admits rather than the grants inside them — append(HumanGrants, ...)
+// at a call site would both read as a list of grants and, worse, risk writing
+// through HumanGrants' own backing array. This copies.
+func Grants(sets ...[]string) []string {
+	n := 0
+	for _, set := range sets {
+		n += len(set)
+	}
+	out := make([]string, 0, n)
+	for _, set := range sets {
+		out = append(out, set...)
+	}
+	return out
+}
+
+// presentedAudience reads a token's type discriminator for metric labelling only.
 //
-// The result is normalized to a known audience (or "other") to keep the metric's
-// label cardinality bounded — Sign() accepts an arbitrary audience string, so an
-// unrecognised value must not become a new time series.
+// Since issue #130 that is the "gty" claim, with "aud" read only for tokens
+// minted before it existed — the same dual-read order verification uses, so the
+// label names the value that actually caused the rejection rather than a legacy
+// claim that no longer decides anything.
+//
+// Safe to parse unverified here: this is called solely after VerifyForAudience
+// has already proven the signature and rejected the token on its grant alone, so
+// the claim really was minted by this server.
+//
+// The result is normalized to a known grant or legacy audience (or "other") to
+// keep the metric's label cardinality bounded — an unrecognised value must not
+// become a new time series.
 func presentedAudience(tokenString string) string {
 	parsed, _, err := gojwt.NewParser().ParseUnverified(tokenString, &auth.Claims{})
 	if err != nil {
 		return "other"
 	}
 	claims, ok := parsed.Claims.(*auth.Claims)
-	if !ok || len(claims.Audience) != 1 {
+	if !ok {
+		return "other"
+	}
+	if claims.Gty != "" {
+		if knownGrant(claims.Gty) {
+			return claims.Gty
+		}
+		return "other"
+	}
+	if len(claims.Audience) != 1 {
 		return "other"
 	}
 	switch claims.Audience[0] {
@@ -159,6 +196,24 @@ func presentedAudience(tokenString string) string {
 	default:
 		return "other"
 	}
+}
+
+// knownGrant reports whether gty is a grant this server mints. GrantAgent is
+// included: agent tokens are refused everywhere, and that rejection is exactly
+// the one an operator would want to see named on the metric rather than folded
+// into "other".
+func knownGrant(gty string) bool {
+	if gty == auth.GrantAgent {
+		return true
+	}
+	for _, set := range [][]string{auth.HumanGrants, auth.AdminGrants, auth.MachineGrants} {
+		for _, grant := range set {
+			if grant == gty {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // bearerToken extracts the token string from "Authorization: Bearer <token>".

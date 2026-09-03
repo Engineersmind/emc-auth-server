@@ -61,7 +61,7 @@ func TestSessionIdentityGuard_OverHTTP(t *testing.T) {
 		Email:    "invited@example.com",
 		Role:     "member",
 	}
-	invitedToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, invited)
+	invitedToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, invited)
 	if err != nil {
 		t.Fatalf("sign invited-user token: %v", err)
 	}
@@ -71,10 +71,10 @@ func TestSessionIdentityGuard_OverHTTP(t *testing.T) {
 	e := echo.New()
 	e.POST("/api/v1/tenants/:tid/users", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"created": "yes"})
-	}, mw.JWTRequired(jwtSvc, auth.AudienceAPI))
+	}, mw.JWTRequired(jwtSvc, auth.HumanGrants...))
 	e.GET("/api/v1/tenants/:tid/users", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, map[string]string{"listed": "yes"})
-	}, mw.JWTRequired(jwtSvc, auth.AudienceAPI))
+	}, mw.JWTRequired(jwtSvc, auth.HumanGrants...))
 
 	// call issues a request carrying the invited user's session cookie — the
 	// state the browser is actually in after the second login.
