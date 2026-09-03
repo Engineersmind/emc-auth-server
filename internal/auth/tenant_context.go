@@ -166,6 +166,13 @@ func (s *AuthService) SwitchTenantContext(ctx context.Context, userID, currentTe
 	// appID is empty: an administrative token is tenant-level, never scoped to one
 	// application, even when the administrator only reaches specific applications
 	// within the tenant. That narrowing is admin_scope's job, not the audience's.
+	// Set here rather than by the caller so every entry point into a tenant switch
+	// gets it, including SwitchTenantContextForClaims. No credential was presented
+	// — the switch re-mints on an existing session — so it is deliberately named
+	// apart from the grant that authenticated that session, matching the reasoning
+	// that keeps amr unstated on this path.
+	sess.grant = GrantTenantSwitch
+
 	return s.issueTokenPair(ctx, userID, targetTenantID, email, claimRole, perms, sess, "")
 }
 

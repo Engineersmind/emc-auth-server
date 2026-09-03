@@ -79,7 +79,7 @@ func TestJWTService_SignAndVerify(t *testing.T) {
 		Permissions: []string{"admin:access"},
 	}
 
-	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, claims)
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, claims)
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
@@ -273,12 +273,46 @@ func userClaims(userIDStr string, tenantID int64) *auth.Claims {
 	}
 }
 
+// mintLegacyShape hand-signs a token in the PRE-#130 shape: a token-type value
+// in "aud" and no "gty" claim at all.
+//
+// Hand-rolled rather than produced by Sign(), for the same reason
+// mintWithIssuer is: Sign now stamps a grant on every token it mints, so it can
+// no longer produce the shape these tests exist to cover. Without a hand-rolled
+// legacy token the dual-read fallback would have no test at all — and the
+// fallback is the entire reason issue #130 is not a breaking change.
+func mintLegacyShape(t *testing.T, jwtSecret, userIDStr string, tenantID int64, audience string) string {
+	t.Helper()
+
+	claims := userClaims(userIDStr, tenantID)
+	claims.RegisteredClaims = jwt.RegisteredClaims{
+		Issuer:    testIssuer,
+		Audience:  jwt.ClaimStrings{audience},
+		Subject:   userIDStr,
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}
+	if claims.Gty != "" {
+		t.Fatalf("mintLegacyShape produced a token carrying gty=%q; the fallback would not be exercised", claims.Gty)
+	}
+
+	signed, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(jwtSecret))
+	if err != nil {
+		t.Fatalf("sign legacy-shape token (aud=%q): %v", audience, err)
+	}
+	return signed
+}
+
 // TestJWTService_Verify_RejectsNonUserAudiences is the core regression guard for
 // issue #84: Verify() is the user/session path, so every other token type this
 // server mints must be refused there — including real management and agent
 // tokens built by their actual Sign* methods, not stand-ins.
+//
+// Since #130 the refusal is decided by "gty" rather than "aud", and the last row
+// covers the legacy shape: an unrecognised audience with no gty maps to no
+// grants and is still refused.
 func TestJWTService_Verify_RejectsNonUserAudiences(t *testing.T) {
-	ctx, jwtSvc, tenantID, userIDStr, _ := audienceFixture(t)
+	ctx, jwtSvc, tenantID, userIDStr, jwtSecret := audienceFixture(t)
 
 	mgmtToken, err := jwtSvc.SignManagement(ctx, &auth.APIKeyIdentity{
 		KeyID:       42,
@@ -301,16 +335,14 @@ func TestJWTService_Verify_RejectsNonUserAudiences(t *testing.T) {
 		t.Fatalf("SignAgent() error = %v", err)
 	}
 
-	m2mToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceM2M, userClaims(userIDStr, tenantID))
+	m2mToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceM2M, auth.GrantClientCredentials, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign(AudienceM2M) error = %v", err)
 	}
 
-	// A token from before this change: correctly signed, unrecognised audience.
-	legacyToken, err := jwtSvc.Sign(ctx, tenantID, "emc-auth-server", userClaims(userIDStr, tenantID))
-	if err != nil {
-		t.Fatalf("Sign(legacy audience) error = %v", err)
-	}
+	// A token from before issue #84: correctly signed, unrecognised audience, and
+	// (being pre-#130) no gty either, so nothing about it names a known grant.
+	legacyToken := mintLegacyShape(t, jwtSecret, userIDStr, tenantID, "emc-auth-server")
 
 	tests := []struct {
 		name  string
@@ -336,7 +368,7 @@ func TestJWTService_Verify_RejectsNonUserAudiences(t *testing.T) {
 func TestJWTService_Verify_AcceptsUserAudience(t *testing.T) {
 	ctx, jwtSvc, tenantID, userIDStr, _ := audienceFixture(t)
 
-	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
@@ -360,7 +392,7 @@ func TestJWTService_VerifyM2M(t *testing.T) {
 	serviceClaims.Role = "service"
 	serviceClaims.Permissions = []string{"users:read"}
 
-	m2mToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceM2M, serviceClaims)
+	m2mToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceM2M, auth.GrantClientCredentials, serviceClaims)
 	if err != nil {
 		t.Fatalf("Sign(AudienceM2M) error = %v", err)
 	}
@@ -375,7 +407,7 @@ func TestJWTService_VerifyM2M(t *testing.T) {
 		t.Errorf("VerifyM2M() Permissions = %v, want [users:read]", verified.Permissions)
 	}
 
-	userToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	userToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign(AudienceAPI) error = %v", err)
 	}
@@ -387,18 +419,25 @@ func TestJWTService_VerifyM2M(t *testing.T) {
 // TestJWTService_VerifyForAudience_MultipleAllowed covers the admin-route
 // wiring: operators, API-key integrations, and machine clients are all valid
 // callers there, while an agent token still is not.
+//
+// Declared as the three grant sets, exactly as routes.go declares them, so the
+// test follows a set that gains a member instead of pinning a hand-written list
+// the route no longer matches.
 func TestJWTService_VerifyForAudience_MultipleAllowed(t *testing.T) {
 	ctx, jwtSvc, tenantID, userIDStr, _ := audienceFixture(t)
 
-	adminAudiences := []string{auth.AudienceAPI, auth.AudienceManagement, auth.AudienceM2M}
+	adminGrants := append(append(append([]string{},
+		auth.HumanGrants...), auth.AdminGrants...), auth.MachineGrants...)
 
-	for _, aud := range adminAudiences {
-		token, err := jwtSvc.Sign(ctx, tenantID, aud, userClaims(userIDStr, tenantID))
+	for _, grant := range adminGrants {
+		// The audience is irrelevant to the decision now; the grant is what is
+		// being exercised. Passing AudienceAPI throughout makes that visible.
+		token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, grant, userClaims(userIDStr, tenantID))
 		if err != nil {
-			t.Fatalf("Sign(%s) error = %v", aud, err)
+			t.Fatalf("Sign(%s) error = %v", grant, err)
 		}
-		if _, err := jwtSvc.VerifyForAudience(ctx, token, adminAudiences...); err != nil {
-			t.Errorf("VerifyForAudience(%s) error = %v, want nil", aud, err)
+		if _, err := jwtSvc.VerifyForAudience(ctx, token, adminGrants...); err != nil {
+			t.Errorf("VerifyForAudience(%s) error = %v, want nil", grant, err)
 		}
 	}
 
@@ -410,7 +449,7 @@ func TestJWTService_VerifyForAudience_MultipleAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SignAgent() error = %v", err)
 	}
-	if _, err := jwtSvc.VerifyForAudience(ctx, agentToken, adminAudiences...); !errors.Is(err, auth.ErrUnexpectedAudience) {
+	if _, err := jwtSvc.VerifyForAudience(ctx, agentToken, adminGrants...); !errors.Is(err, auth.ErrUnexpectedAudience) {
 		t.Errorf("VerifyForAudience(agent token) error = %v, want ErrUnexpectedAudience", err)
 	}
 }
@@ -421,7 +460,7 @@ func TestJWTService_VerifyForAudience_MultipleAllowed(t *testing.T) {
 func TestJWTService_VerifyForAudience_EmptyAllowListFailsClosed(t *testing.T) {
 	ctx, jwtSvc, tenantID, userIDStr, _ := audienceFixture(t)
 
-	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
@@ -522,7 +561,7 @@ func kidOf(t *testing.T, token string) string {
 func TestJWTService_LegacySigningEmitsNoKID(t *testing.T) {
 	ctx, jwtSvc, tenantID, userIDStr, _ := audienceFixture(t)
 
-	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}

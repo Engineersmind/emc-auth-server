@@ -230,7 +230,7 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 	// is the right default. There is no "remember me" to honour — the flow has no
 	// step at which the user could have asked for one.
 	tokens, err := s.issueTokenPair(ctx, sess.UserID, tenantID, email, roleName, perms,
-		sessionContext{amr: []string{AMRMagicLink}}, appID)
+		sessionContext{amr: []string{AMRMagicLink}, grant: GrantMagicLink}, appID)
 	if err != nil {
 		return nil, err
 	}
