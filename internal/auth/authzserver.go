@@ -89,6 +89,13 @@ type AuthzClient struct {
 	GrantTypes   []string
 	RequirePKCE  bool
 	FirstParty   bool
+	// Audience is the client's own immutable audience identifier (issue #131),
+	// empty for a row that has none. It is what an authorize request resolves to
+	// when it names no audience of its own.
+	Audience string
+	// RequireAudience is the per-client enforcement switch. When true a token
+	// with no resolvable audience is refused rather than minted.
+	RequireAudience bool
 	// Confidential reports whether the client holds a secret. Derived from
 	// client_secret_hash being non-empty rather than from app_type, because
 	// app_type is a UI hint an admin can change without rotating credentials,
@@ -119,15 +126,16 @@ func (s *AuthorizationServer) LookupClient(ctx context.Context, clientID string)
 	}
 	var c AuthzClient
 	var secretHash *string
+	var audience *string
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id, client_id, name, app_type,
 		       redirect_uris, scopes, grant_types, require_pkce, first_party,
-		       client_secret_hash
+		       client_secret_hash, audience, require_audience
 		FROM   oauth_clients
 		WHERE  client_id = $1 AND deleted_at IS NULL AND is_active
 	`, clientID).Scan(&c.RowID, &c.TenantID, &c.ClientID, &c.Name, &c.AppType,
 		&c.RedirectURIs, &c.Scopes, &c.GrantTypes, &c.RequirePKCE, &c.FirstParty,
-		&secretHash)
+		&secretHash, &audience, &c.RequireAudience)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrClientNotFound
@@ -135,6 +143,9 @@ func (s *AuthorizationServer) LookupClient(ctx context.Context, clientID string)
 		return nil, fmt.Errorf("lookup oauth client: %w", err)
 	}
 	c.Confidential = secretHash != nil && *secretHash != ""
+	if audience != nil {
+		c.Audience = *audience
+	}
 	return &c, nil
 }
 
@@ -243,6 +254,16 @@ type IssueAuthorizationCodeParams struct {
 	CodeChallenge string
 	Nonce         string
 	AuthTime      time.Time
+	// Audience is the audience this authorization was granted for (issue #131),
+	// already grant-checked at /oauth/authorize. Empty means the request named
+	// none and the client's own audience applies at mint time.
+	//
+	// It MUST be persisted on the code row rather than kept in the parked
+	// authorize request: that request lives in Redis and is consumed when the
+	// code is issued, so the code row is the only thing linking an authorize
+	// request to its later token exchange. Without this column the audience
+	// cannot survive the exchange at all — see the correction on issue #131.
+	Audience string
 }
 
 // IssueAuthorizationCode mints a code and persists only its SHA-256 hash.
@@ -270,11 +291,12 @@ func (s *AuthorizationServer) IssueAuthorizationCode(ctx context.Context, p Issu
 		INSERT INTO oauth_authorization_codes
 		    (tenant_id, client_id, user_id, code_hash, code_challenge,
 		     code_challenge_method, redirect_uri, scopes, nonce, auth_time,
-		     grant_kind, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		     grant_kind, audience, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, p.TenantID, p.ClientID, p.UserID, HashToken(raw), p.CodeChallenge,
 		PKCEMethodS256, p.RedirectURI, scopes, nullIfEmpty(p.Nonce), authTime,
-		GrantKindAuthzCode, time.Now().UTC().Add(AuthorizationCodeTTL))
+		GrantKindAuthzCode, nullIfEmpty(p.Audience),
+		time.Now().UTC().Add(AuthorizationCodeTTL))
 	if err != nil {
 		return "", fmt.Errorf("persist authorization code: %w", err)
 	}
@@ -301,6 +323,12 @@ type RedeemedCode struct {
 	Scopes      []string
 	Nonce       string
 	AuthTime    time.Time
+	// Audience is what the authorize request was granted, read back off the code
+	// row so the token exchange mints for the same audience the user's browser
+	// was redirected for. Never taken from the token request — a client that
+	// could name its own audience at exchange time would make the authorize-time
+	// grant check decorative.
+	Audience string
 }
 
 // RedeemAuthorizationCode consumes a code and returns what it was bound to.
@@ -331,6 +359,7 @@ func (s *AuthorizationServer) RedeemAuthorizationCode(ctx context.Context, clien
 	var challenge, method *string
 	var nonce *string
 	var authTime *time.Time
+	var audience *string
 	err := s.pool.QueryRow(ctx, `
 		UPDATE oauth_authorization_codes
 		SET    used_at = NOW()
@@ -340,10 +369,10 @@ func (s *AuthorizationServer) RedeemAuthorizationCode(ctx context.Context, clien
 		  AND  used_at IS NULL
 		  AND  expires_at > NOW()
 		RETURNING tenant_id, user_id, redirect_uri, scopes,
-		          code_challenge, code_challenge_method, nonce, auth_time
+		          code_challenge, code_challenge_method, nonce, auth_time, audience
 	`, codeHash, clientID, GrantKindAuthzCode).Scan(
 		&r.TenantID, &r.UserID, &r.RedirectURI, &r.Scopes,
-		&challenge, &method, &nonce, &authTime)
+		&challenge, &method, &nonce, &authTime, &audience)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Distinguish replay from unknown/expired for the audit trail. This
@@ -400,6 +429,9 @@ func (s *AuthorizationServer) RedeemAuthorizationCode(ctx context.Context, clien
 	}
 	if authTime != nil {
 		r.AuthTime = *authTime
+	}
+	if audience != nil {
+		r.Audience = *audience
 	}
 	if r.Scopes == nil {
 		r.Scopes = []string{}

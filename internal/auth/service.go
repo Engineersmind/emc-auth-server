@@ -62,19 +62,53 @@ type AuthService struct {
 	// login path silently used a zero HardLockDuration, which reads as "no
 	// expiry" and would quietly reinstate permanent lockouts.
 	lockoutSvc *LockoutPolicyService
-	logger     zerolog.Logger
+	// audienceSvc resolves the per-application audience stamped into every
+	// token (issue #131). Never nil after NewAuthService, for the same reason as
+	// policySvc and lockoutSvc: a nil here would mean every deployment that
+	// forgot to wire it silently minted tokens with no audience, which is
+	// exactly the pre-#131 state this issue exists to leave behind — and it
+	// would be invisible until a resource server refused a token.
+	audienceSvc *AudienceService
+	logger      zerolog.Logger
 }
 
 // NewAuthService creates an AuthService.
 func NewAuthService(pool *pgxpool.Pool, jwtSvc *JWTService, logger zerolog.Logger) *AuthService {
 	return &AuthService{
-		pool:       pool,
-		jwtSvc:     jwtSvc,
-		policySvc:  NewSessionPolicyService(pool, logger),
-		lockoutSvc: NewLockoutPolicyService(pool, logger),
-		hasher:     password.NewHasher(password.DefaultParams()),
-		logger:     logger,
+		pool:        pool,
+		jwtSvc:      jwtSvc,
+		policySvc:   NewSessionPolicyService(pool, logger),
+		lockoutSvc:  NewLockoutPolicyService(pool, logger),
+		audienceSvc: NewAudienceService(pool, logger),
+		hasher:      password.NewHasher(password.DefaultParams()),
+		logger:      logger,
 	}
+}
+
+// WithAudiences replaces the audience resolver so the process shares one
+// service — and therefore one configured AUDIENCE_SCHEME — between token
+// minting, application creation and the admin grant API. Optional:
+// NewAuthService installs one using the default scheme.
+func (s *AuthService) WithAudiences(svc *AudienceService) *AuthService {
+	if svc != nil {
+		s.audienceSvc = svc
+	}
+	return s
+}
+
+// Audiences exposes the audience resolver.
+//
+// Nil-safe on a nil receiver, which is not defensive clutter: handlers are
+// constructed with a nil AuthService in tests that exercise paths not needing
+// it (see the /oauth/authorize nonce fixture), and an accessor that panics
+// there turns "this handler does not use authentication" into a crash. Callers
+// must treat a nil result as "no audience resolution available" and fail
+// CLOSED — refusing a requested audience they cannot check — never open.
+func (s *AuthService) Audiences() *AudienceService {
+	if s == nil {
+		return nil
+	}
+	return s.audienceSvc
 }
 
 // WithHasher replaces the password hasher, so a deployment can tune Argon2id
@@ -434,6 +468,26 @@ type sessionContext struct {
 	// the protocol flow that exchanged them for a token. A password login and an
 	// authorization-code flow can present identical amr.
 	grant string
+
+	// audience is an EXPLICITLY requested audience — the `audience` or RFC 8707
+	// `resource` parameter (issue #131). Empty is the normal case and is not an
+	// error: it means the caller asked for nothing, and the audience is then
+	// resolved from the client's own registration or assigned by the server.
+	// See AudienceService.ResolveMintAudience for the full table.
+	//
+	// A non-empty value is NOT trusted. It is checked against
+	// oauth_client_grants at mint time, so a caller cannot widen its own reach
+	// by naming an audience it was never granted.
+	audience string
+
+	// pinnedAudience is the audience already recorded on this refresh-token
+	// chain, read from the refresh_tokens row on rotation.
+	//
+	// It is what makes a refresh unable to change the audience it was issued
+	// for. Without it, a client could obtain a token for API A, then rotate its
+	// refresh token while naming API B and walk from one grant to another
+	// without ever presenting a credential for B.
+	pinnedAudience string
 }
 
 // issueTokenPair signs a JWT access token and persists a matching refresh token.
@@ -491,6 +545,39 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 		return nil, err
 	}
 	claims.AdminScope, claims.AdminApps = adminScope, adminApps
+
+	// The audience — issue #131. Resolved BEFORE the transaction opens, because
+	// a denial is the caller's error and must not leave a half-written session
+	// behind, and because ErrInvalidTarget has to surface as invalid_target at
+	// the endpoint rather than as a transaction failure.
+	//
+	// appID is the string-encoded oauth_clients.id, or "" when no application
+	// context is present. That distinction IS the resolution rule: no
+	// application means a first-party portal flow (the admin console signing in
+	// at POST /auth/session, which carries no client_id and therefore cannot
+	// supply an audience), and the server assigns its own audience there.
+	aud, err := s.audienceSvc.ResolveMintAudience(ctx, AudienceRequest{
+		AppRowID:  parseAppIDValue(appID),
+		Requested: sess.audience,
+		Pinned:    sess.pinnedAudience,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Grant-level scope narrowing. A grant may permit fewer scopes than the
+	// client is registered for, and a token must never carry a scope the grant
+	// omits — RFC 6749 §3.3's granted-may-be-narrower-than-requested rule
+	// applied to the audience dimension.
+	//
+	// nil GrantedScopes means no grant-level narrowing applies (the client is
+	// using its own audience, or none). That is NOT the same as an empty slice,
+	// which is a real grant permitting nothing — see MintAudience.GrantedScopes.
+	if aud.GrantedScopes != nil && scope != "" {
+		narrowed := FilterScopes(strings.Fields(scope), aud.GrantedScopes)
+		scope = strings.Join(narrowed, " ")
+		claims.Scope = scope
+	}
 
 	rawRefresh, err := GenerateRefreshToken()
 	if err != nil {
@@ -604,11 +691,28 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 		tokenExpiresAt = absoluteExpiresAt
 	}
 
+	// application_id and audience are new in issue #131 and this is the ONE
+	// INSERT INTO refresh_tokens in the codebase, which is why deferred #22's
+	// "every insert path through issueTokenPair" was an overstatement.
+	//
+	// Both are nullable and both are written here:
+	//
+	//   application_id closes deferred #22. /oauth/revoke had no column to
+	//   compare an authenticated client_id against, so two clients inside one
+	//   tenant could revoke each other's refresh tokens. NULLIF keeps a
+	//   first-party token (no application) at NULL rather than 0, so the
+	//   revocation query can tell "no application" from "application zero".
+	//
+	//   audience pins the chain. Read back on every rotation and passed to
+	//   ResolveMintAudience as Pinned, it is what makes a refresh unable to move
+	//   its own audience.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO refresh_tokens
-		    (user_id, tenant_id, token_hash, expires_at, session_id, session_family_id, last_used_at)
-		VALUES ($1, $2, $3, $4, $5, $5, NOW())
-	`, userID, tenantID, refreshHash, tokenExpiresAt, sessionID); err != nil {
+		    (user_id, tenant_id, token_hash, expires_at, session_id, session_family_id,
+		     application_id, audience, last_used_at)
+		VALUES ($1, $2, $3, $4, $5, $5, $6, NULLIF($7, ''), NOW())
+	`, userID, tenantID, refreshHash, tokenExpiresAt, sessionID,
+		parseAppID(appID), aud.Value); err != nil {
 		return nil, fmt.Errorf("persist refresh token: %w", err)
 	}
 
@@ -617,7 +721,16 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	// token carries no session identity and there is no way to invalidate one.
 	claims.SessionID = strconv.FormatInt(sessionID, 10)
 
-	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, sess.grant, claims)
+	// aud.Value replaces the AudienceAPI token-type discriminator that stood
+	// here up to #130. It is a real audience identifier now: api://<tenant>/<app>
+	// for an application token, api://emc-auth for a first-party portal token,
+	// and EMPTY — claim omitted — for a client with no stored audience.
+	//
+	// Nothing in this server reads "aud" to make a decision any more; #130 moved
+	// that job to "gty", and grantAllowed consults "aud" only on the legacy
+	// fallback branch for tokens minted before that claim existed. So changing
+	// this value cannot change which routes accept the token.
+	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, aud.Value, sess.grant, claims)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -1866,16 +1979,22 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	// issued without having to touch those token rows first.
 	var tokenID, userID, tenantID, sessionID int64
 	var carried sessionContext
+	// rt.audience is read alongside the session facts so the rotation can pin
+	// the chain to the audience it was issued for (issue #131). NULL on every
+	// row written before this migration, which resolves to the empty string and
+	// therefore to "no pin" — the pre-#131 behaviour for a chain in flight
+	// across the deploy.
+	var pinnedAudience *string
 	err := s.pool.QueryRow(ctx, `
 		SELECT rt.id, s.user_id, s.tenant_id, s.id,
-		       s.is_persistent, s.auth_time, s.amr
+		       s.is_persistent, s.auth_time, s.amr, rt.audience
 		FROM refresh_tokens rt
 		JOIN user_sessions s ON s.id = rt.session_id
 		WHERE rt.token_hash = $1
 		  AND `+LiveTokenWhere("rt.")+`
 		  AND `+LiveSessionWhere("s."),
 		hash).Scan(&tokenID, &userID, &tenantID, &sessionID,
-		&carried.persistent, &carried.authTime, &carried.amr)
+		&carried.persistent, &carried.authTime, &carried.amr, &pinnedAudience)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken
@@ -1919,6 +2038,9 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	// row and #130 adds no schema, so it cannot be carried forward — which is why
 	// GrantRefreshToken is a member of HumanGrants rather than a passthrough.
 	carried.grant = GrantRefreshToken
+	if pinnedAudience != nil {
+		carried.pinnedAudience = *pinnedAudience
+	}
 
 	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, carried, appIDClaim(applicationID))
 }
@@ -2070,6 +2192,10 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	var expiresAt time.Time
 	var sessionIdleExpires, sessionAbsoluteExpires *time.Time
 	var carried sessionContext
+	// The audience pin, as in Refresh. Read on this path too because the
+	// renewal middleware rotates through here rather than through Refresh, and a
+	// pin enforced on only one of the two rotation paths is not a pin at all.
+	var pinnedAudience *string
 	err := s.pool.QueryRow(ctx, `
 		SELECT rt.id, rt.user_id, rt.tenant_id,
 		       COALESCE(rt.session_id, rt.session_family_id),
@@ -2077,13 +2203,14 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		       COALESCE(s.is_persistent, false),
 		       COALESCE(s.auth_time, rt.created_at),
 		       COALESCE(s.amr, '{}'),
-		       s.revoked_at, s.idle_expires_at, s.absolute_expires_at
+		       s.revoked_at, s.idle_expires_at, s.absolute_expires_at,
+		       rt.audience
 		FROM refresh_tokens rt
 		LEFT JOIN user_sessions s ON s.id = rt.session_id
 		WHERE rt.token_hash = $1
 	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionID, &revokedAt, &expiresAt,
 		&carried.persistent, &carried.authTime, &carried.amr,
-		&sessionRevokedAt, &sessionIdleExpires, &sessionAbsoluteExpires)
+		&sessionRevokedAt, &sessionIdleExpires, &sessionAbsoluteExpires, &pinnedAudience)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, ErrInvalidRefreshToken
@@ -2192,6 +2319,9 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	}
 
 	carried.grant = GrantRefreshToken
+	if pinnedAudience != nil {
+		carried.pinnedAudience = *pinnedAudience
+	}
 
 	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, carried, appIDClaim(applicationID))
 	return result, nil, err
@@ -2205,11 +2335,17 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 // from the oauth_clients.scopes column so downstream permission checks receive
 // the correct grants.
 //
-// The token carries AudienceM2M so it is distinguishable from a user session
-// token (issue #84): it is accepted on admin/management routes, where a machine
-// client is a legitimate caller subject to its scopes, but refused on user
-// self-service routes, which assume a real user behind the token.
-func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int64) (string, int, error) {
+// Machine-ness is carried by gty=client_credentials since issue #130, so
+// changing "aud" from the AudienceM2M token-type value to a real audience
+// (issue #131) does not weaken the boundary issue #84 drew: a service token is
+// still refused on user self-service routes, because grantAllowed reads "gty".
+//
+// requestedAudience is the `audience` / RFC 8707 `resource` parameter, and is
+// EMPTY for every caller that does not ask — which is every caller that exists
+// today. Empty resolves to the client's own audience, so an integrator using
+// client_credentials keeps working with zero changes and simply starts
+// receiving a token whose aud names their own API.
+func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int64, requestedAudience string) (string, int, error) {
 	var clientID string
 	var scopes []string
 	if err := s.pool.QueryRow(ctx,
@@ -2222,6 +2358,28 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 		scopes = []string{}
 	}
 
+	aud, err := s.audienceSvc.ResolveMintAudience(ctx, AudienceRequest{
+		AppRowID:  appID,
+		Requested: requestedAudience,
+	})
+	if err != nil {
+		return "", 0, err
+	}
+
+	// A client_credentials token has no user and no OAuth `scope` claim: the
+	// client's registered scopes become the internal `permissions` array
+	// directly. So the grant's scope list is applied HERE, to permissions,
+	// rather than to a scope claim that does not exist on this path.
+	//
+	// nil means no grant-level narrowing (the client asked for nothing and got
+	// its own audience). A non-nil empty slice is a real grant that permits
+	// nothing, and correctly produces a token that can do nothing — a grant
+	// with no scopes is an explicit administrative decision, not a mistake to
+	// paper over.
+	if aud.GrantedScopes != nil {
+		scopes = FilterScopes(scopes, aud.GrantedScopes)
+	}
+
 	claims := &Claims{
 		UserID:      clientID,
 		TenantID:    strconv.FormatInt(tenantID, 10),
@@ -2229,7 +2387,7 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 		Role:        "service",
 		Permissions: scopes,
 	}
-	token, err := s.jwtSvc.Sign(ctx, tenantID, AudienceM2M, GrantClientCredentials, claims)
+	token, err := s.jwtSvc.Sign(ctx, tenantID, aud.Value, GrantClientCredentials, claims)
 	if err != nil {
 		return "", 0, fmt.Errorf("sign service token: %w", err)
 	}
@@ -2256,18 +2414,36 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 // response would make this endpoint an oracle for whether a captured string is
 // a live token.
 //
-// Per-client ownership is NOT checked, and cannot be: refresh_tokens carries
-// user_id and tenant_id but no application_id (see migrations 00009 / 00026), so
-// there is no column to compare a client_id against. Tenant scoping is the
-// tightest guard available without a schema change — tracked as CLAUDE.md
-// deferred item #22.
-func (s *AuthService) RevokeRefreshTokenForTenant(ctx context.Context, rawRefreshToken string, tenantID int64) (bool, error) {
+// Per-client ownership IS now checked — CLAUDE.md deferred #22, closed by
+// issue #131's migration 00087, which added refresh_tokens.application_id.
+//
+// appRowID is the authenticated client's oauth_clients.id, or 0 for a caller
+// with no application identity. The predicate is deliberately asymmetric:
+//
+//	application_id IS NULL      → a token minted before 00087, or by a
+//	                              first-party portal flow with no application.
+//	                              Still revocable by any authenticated client in
+//	                              the tenant, because there is no ownership
+//	                              recorded to check and refusing would make
+//	                              every pre-existing token unrevocable for the
+//	                              30 days its chain can live.
+//	application_id = $3         → the client owns this token. Revocable.
+//	anything else               → another client's token, inside the same
+//	                              tenant. NOT revocable, which is the gap #22
+//	                              named: two clients in one tenant could
+//	                              previously revoke each other's tokens.
+//
+// The response is STILL 200 whatever happens here — RFC 7009 §2.2 forbids the
+// oracle, and "you may not revoke that" is as much of an oracle as "that token
+// does not exist". The boolean is for the audit row only.
+func (s *AuthService) RevokeRefreshTokenForTenant(ctx context.Context, rawRefreshToken string, tenantID, appRowID int64) (bool, error) {
 	hash := HashToken(rawRefreshToken)
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE refresh_tokens
 		SET    revoked_at = NOW()
 		WHERE  token_hash = $1 AND tenant_id = $2 AND revoked_at IS NULL
-	`, hash, tenantID)
+		  AND  (application_id IS NULL OR $3 = 0 OR application_id = $3)
+	`, hash, tenantID, appRowID)
 	if err != nil {
 		return false, fmt.Errorf("revoke refresh token: %w", err)
 	}
@@ -2324,7 +2500,10 @@ type AuthorizedUser struct {
 // Scoped by application_id as well as tenant_id, matching Login and
 // LookupUserForApp — the code was issued inside one application's user base and
 // must be redeemed against the same one.
-func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenantID, userID, appRowID int64, grantedScopes []string) (*AuthorizedUser, error) {
+// audience is the value the authorization code was issued against (issue
+// #131), carried on the code row so it survives the exchange. Empty means the
+// authorize request named no audience, and the client's own is used.
+func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenantID, userID, appRowID int64, grantedScopes []string, audience string) (*AuthorizedUser, error) {
 	var (
 		email, firstName, lastName, roleName string
 		emailVerified                        bool
@@ -2354,7 +2533,7 @@ func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenan
 	}
 
 	appID := strconv.FormatInt(appRowID, 10)
-	tokens, err := s.issueScopedTokenPair(ctx, userID, tenantID, email, roleName, perms, appID, grantedScopes)
+	tokens, err := s.issueScopedTokenPair(ctx, userID, tenantID, email, roleName, perms, appID, audience, grantedScopes)
 	if err != nil {
 		return nil, err
 	}
@@ -2385,19 +2564,31 @@ func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenan
 //
 // strings.Join of an empty slice is "", so the no-scope case needs no branch:
 // the claim is omitempty and simply does not appear.
-func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, appID string, scopes []string) (*AuthResult, error) {
-	// NOTE (CLAUDE.md deferred #19 / #23): the access token minted here carries
-	// the OAuth `scope` claim AND the full internal `permissions` claim. That is
-	// safe only because /oauth/authorize refuses first_party = false, so every
-	// grant reaching this function belongs to a client the tenant owns. When the
-	// consent screen lands and genuinely third-party clients become possible,
-	// this line becomes a data-leakage path — an external client would receive
-	// internal permission strings it was never shown on a consent page. Filter
-	// perms by grant, or drop them for non-first-party clients, as part of that
-	// work. Read #19 before enabling third-party clients.
+func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, appID, audience string, scopes []string) (*AuthResult, error) {
+	// CLAUDE.md deferred #23, closed here.
+	//
+	// The access token minted on this path carries the OAuth `scope` claim AND
+	// the internal `permissions` array. That was harmless only because
+	// /oauth/authorize refuses first_party = false, so every grant reaching this
+	// function belonged to a client the tenant owns — and the moment the consent
+	// screen lands (deferred #19) and genuinely third-party clients become
+	// possible, shipping the array is a data-leakage path: an external client
+	// would receive internal permission strings that appeared on no consent
+	// screen and describe capabilities it was never granted.
+	//
+	// Fixed now rather than left for #19, so the consent screen cannot ship
+	// without it. A third-party client gets an EMPTY permissions array — see
+	// FilterPermissionsForClient for why an intersection with granted scopes
+	// would be the wrong model.
+	//
+	// This changes nothing today: every client that can reach here is
+	// first_party = true, so IsFirstParty returns true and perms pass through
+	// untouched.
+	perms = FilterPermissionsForClient(perms, s.audienceSvc.IsFirstParty(ctx, parseAppIDValue(appID)))
+
 	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms,
-		sessionContext{amr: []string{AMRPassword}, grant: GrantAuthorizationCode}, appID,
-		strings.Join(scopes, " "))
+		sessionContext{amr: []string{AMRPassword}, grant: GrantAuthorizationCode, audience: audience},
+		appID, strings.Join(scopes, " "))
 }
 
 // rehashIfStale re-hashes a verified password whose stored hash does not match

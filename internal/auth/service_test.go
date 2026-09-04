@@ -414,7 +414,7 @@ func TestIssueServiceToken_SubIsClientID(t *testing.T) {
 		t.Fatalf("AuthenticateClient() error = %v", err)
 	}
 
-	token, expiresIn, err := svc.IssueServiceToken(ctx, tenantID, appID)
+	token, expiresIn, err := svc.IssueServiceToken(ctx, tenantID, appID, "")
 	if err != nil {
 		t.Fatalf("IssueServiceToken() error = %v", err)
 	}
@@ -476,7 +476,7 @@ func TestIssueServiceToken_ScopesBecomePermissions(t *testing.T) {
 		t.Fatalf("AuthenticateClient() error = %v", err)
 	}
 
-	token, _, err := svc.IssueServiceToken(ctx, tenantID, appID)
+	token, _, err := svc.IssueServiceToken(ctx, tenantID, appID, "")
 	if err != nil {
 		t.Fatalf("IssueServiceToken() error = %v", err)
 	}
@@ -492,7 +492,18 @@ func TestIssueServiceToken_ScopesBecomePermissions(t *testing.T) {
 // TestIssueServiceToken_AudienceIsM2M pins the audience of a client_credentials
 // token: it must be distinguishable from a user session token, so a leaked
 // service token cannot be replayed on user self-service routes (issue #84).
-func TestIssueServiceToken_AudienceIsM2M(t *testing.T) {
+// TestIssueServiceToken_AudienceIsTheClientsOwnAPI was
+// TestIssueServiceToken_AudienceIsM2M and asserted aud == "emc-auth-m2m".
+//
+// Issue #131 changes that value on purpose: "aud" now names the API a token may
+// be spent at, and a client that asks for nothing gets its own. The thing the
+// original test was really protecting — that a machine token cannot act as a
+// user — is unchanged and is still asserted at the bottom; since #130 it is
+// carried by "gty", which is why moving "aud" does not weaken it.
+//
+// Renamed rather than edited in place so a reviewer sees the contract changed
+// rather than finding a test whose name no longer describes it.
+func TestIssueServiceToken_AudienceIsTheClientsOwnAPI(t *testing.T) {
 	pool := testhelper.NewTestDB(t)
 	logger := testhelper.TestLogger()
 	ctx := context.Background()
@@ -521,7 +532,7 @@ func TestIssueServiceToken_AudienceIsM2M(t *testing.T) {
 		t.Fatalf("AuthenticateClient() error = %v", err)
 	}
 
-	token, _, err := svc.IssueServiceToken(ctx, tenantID, appID)
+	token, _, err := svc.IssueServiceToken(ctx, tenantID, appID, "")
 	if err != nil {
 		t.Fatalf("IssueServiceToken() error = %v", err)
 	}
@@ -530,11 +541,21 @@ func TestIssueServiceToken_AudienceIsM2M(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyM2M() error = %v", err)
 	}
-	if len(claims.Audience) != 1 || claims.Audience[0] != auth.AudienceM2M {
-		t.Errorf("service token aud = %v, want [%s]", []string(claims.Audience), auth.AudienceM2M)
+	// The client asked for no audience, so it gets its own (issue #131 §7
+	// case 2) — the resolution that keeps existing client_credentials
+	// integrations working with no changes at all.
+	if len(claims.Audience) != 1 || claims.Audience[0] != created.Audience {
+		t.Errorf("service token aud = %v, want [%s] (the client's own audience)",
+			[]string(claims.Audience), created.Audience)
+	}
+	if claims.Gty != auth.GrantClientCredentials {
+		t.Errorf("service token gty = %q, want %q — machine-ness moved to gty in #130 and is what the boundary now rests on",
+			claims.Gty, auth.GrantClientCredentials)
 	}
 
-	// The same token must not authenticate as a user session.
+	// The property issue #84 established, unchanged: the same token must not
+	// authenticate as a user session. It is enforced through "gty" now rather
+	// than through "aud", which is precisely why #131 could repurpose "aud".
 	if _, err := jwtSvc.Verify(ctx, token); !errors.Is(err, auth.ErrUnexpectedAudience) {
 		t.Errorf("Verify(service token) error = %v, want ErrUnexpectedAudience", err)
 	}

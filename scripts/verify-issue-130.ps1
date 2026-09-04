@@ -432,7 +432,11 @@ $adminRefresh = $login.Json.refresh_token
 $adminClaims  = Show-Claims "ADMIN access token" $adminToken
 
 Assert-Equal "gty" "password"     $adminClaims.gty
-Assert-Equal "aud" "emc-auth-api" (($adminClaims.aud) -join ",")
+# aud is api://emc-auth since issue #131, NOT the emc-auth-api token type this
+# script originally pinned. The console login carries no client_id and so cannot
+# supply an audience, which is why the server assigns its own (#131 s7 case 3).
+# gty is what carries the token type now, and it is asserted above.
+Assert-Equal "aud" "api://emc-auth" (($adminClaims.aud) -join ",")
 if ($adminClaims.role)        { Pass ("role present: " + $adminClaims.role) }
 else                          { Fail "role claim" "empty - RBAC data missing" }
 if ($adminClaims.permissions) { Pass ("permissions present: " + $adminClaims.permissions.Count + " entries") }
@@ -532,6 +536,7 @@ Write-Head "PHASE 4 . Machine client (grant: client_credentials)"
 $m2mToken = $null
 $m2mClientId = $null
 $m2mClientSecret = $null
+$m2mAudience = $null
 
 $m2mName = "gty130-m2m-$stamp"
 $createM2M = Invoke-Api -Method POST -Path "/api/v1/applications" -BearerToken $adminToken -Body @{
@@ -545,6 +550,10 @@ if ($createM2M.Status -eq 200 -or $createM2M.Status -eq 201) {
     $m2mClientId     = $createM2M.Json.client_id
     $m2mClientSecret = $createM2M.Json.client_secret
     $m2mAppRowId     = $createM2M.Json.id
+    # Issue #131 returns the application's immutable audience at creation. It is
+    # the value an integrator puts in their resource server's audience: config,
+    # and there is no update path that could hand it to them later.
+    $m2mAudience     = $createM2M.Json.audience
 
     Write-Host ""
     Write-Host "   +-- CREDENTIALS (returned once - copy for Swagger)" -ForegroundColor Magenta
@@ -563,7 +572,16 @@ if ($createM2M.Status -eq 200 -or $createM2M.Status -eq 201) {
         $m2mClaims = Show-Claims "M2M access token" $m2mToken
 
         Assert-Equal "gty"  "client_credentials" $m2mClaims.gty
-        Assert-Equal "aud"  "emc-auth-m2m"       (($m2mClaims.aud) -join ",")
+        # Since issue #131 aud is the client's OWN audience, not the emc-auth-m2m
+        # token type. The client passed no audience parameter, which is the case
+        # that keeps existing integrations working unchanged (#131 s7 case 2).
+        if ($m2mAudience) {
+            Assert-Equal "aud" $m2mAudience (($m2mClaims.aud) -join ",")
+        } elseif ((($m2mClaims.aud) -join ",") -like "api://*") {
+            Pass ("aud is a per-application audience: " + (($m2mClaims.aud) -join ","))
+        } else {
+            Fail "aud" ("expected a per-application api:// audience, got '" + (($m2mClaims.aud) -join ",") + "'")
+        }
         Assert-Equal "role" "service"            $m2mClaims.role
         Assert-SameSet "permissions = registered scopes" @("apps:read", "users:read") $m2mClaims.permissions
         if (-not $m2m.Json.refresh_token) { Pass "no refresh_token (RFC 6749 4.4.3)" }
@@ -772,13 +790,17 @@ if ($createWeb.Status -eq 200 -or $createWeb.Status -eq 201) {
             }
         }
 
-        Write-Step "KNOWN GAP (#131): this app's token reaching another app's API"
-        Write-Info "There is nothing to call here yet - no tenant resource server exists in"
-        Write-Info "this deployment. The point on record is that the token carries"
-        Write-Info "aud=emc-auth-api, byte-identical to every other app's token in this"
-        Write-Info "tenant, so a second app validating aud would ACCEPT it. Only app_id"
-        Write-Info "differs, and no standard library checks app_id. Closed by #131."
-        Warn "per-application audience" "not yet enforced - tracked as issue #131 (expected at this stage)"
+        Write-Step "CLOSED BY #131: this app's token no longer looks like every other's"
+        $appAud = ($userClaims.aud) -join ","
+        if ($appAud -like "api://*/*") {
+            Pass ("per-application audience present: " + $appAud)
+            Write-Info "Before #131 this read aud=emc-auth-api, byte-identical to every other"
+            Write-Info "app's token in the tenant, so a second app validating aud would ACCEPT"
+            Write-Info "it. Only app_id differed, and no standard library checks app_id."
+            Write-Info "scripts/verify-issue-131.ps1 covers the grant enforcement itself."
+        } else {
+            Fail "per-application audience" ("expected api://<tenant>/<app>, got '" + $appAud + "'")
+        }
 
         Write-Step "App-scoped refresh returns the pair IN THE BODY (issue #108)"
         $appRef = Invoke-Api -Method POST -Path "/api/v1/auth/refresh" -Body @{ refresh_token = $appLogin.Json.refresh_token }
@@ -1023,7 +1045,7 @@ if ($m2mToken) {
 
     Write-Step "Rewriting aud, role, and permissions"
     foreach ($case in @(
-        @{ Name = "aud";         Value = "emc-auth-api" },
+        @{ Name = "aud";         Value = "api://emc-auth" },
         @{ Name = "role";        Value = "super_admin" },
         @{ Name = "admin_scope"; Value = "tenant" }
     )) {
