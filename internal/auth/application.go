@@ -224,26 +224,60 @@ func normalizeAppType(appType string) (string, error) {
 type ApplicationService struct {
 	pool   *pgxpool.Pool
 	logger zerolog.Logger
+	// audiences generates and validates the per-application audience identifier
+	// assigned at creation (issue #131).
+	//
+	// Never nil: NewApplicationService constructs one, so every application
+	// created through this service gets an audience whether or not the caller
+	// wired anything. An optional dependency here would mean an embedder that
+	// forgot it silently produced applications with no audience — invisible
+	// until a resource server refused their tokens.
+	audiences *AudienceService
 }
 
 // NewApplicationService constructs an ApplicationService.
 func NewApplicationService(pool *pgxpool.Pool, logger zerolog.Logger) *ApplicationService {
-	return &ApplicationService{pool: pool, logger: logger}
+	return &ApplicationService{
+		pool:      pool,
+		logger:    logger,
+		audiences: NewAudienceService(pool, logger),
+	}
 }
+
+// WithAudiences replaces the audience service, so the configured
+// AUDIENCE_SCHEME reaches application creation.
+func (s *ApplicationService) WithAudiences(svc *AudienceService) *ApplicationService {
+	if svc != nil {
+		s.audiences = svc
+	}
+	return s
+}
+
+// Audiences exposes the audience service for callers wired with only an
+// ApplicationService.
+func (s *ApplicationService) Audiences() *AudienceService { return s.audiences }
 
 // AppResult is returned by CreateApplication and RotateSecret.
 // ClientSecret is shown exactly once and never stored in plaintext.
 type AppResult struct {
-	ID           string    `json:"id"`
-	Name         string    `json:"name"`
-	AppType      string    `json:"app_type"`
-	ClientID     string    `json:"client_id"`
-	ClientSecret string    `json:"client_secret"`
-	Scopes       []string  `json:"scopes"`
-	RedirectURIs []string  `json:"redirect_uris"`
-	RequirePKCE  bool      `json:"require_pkce"`
-	FirstParty   bool      `json:"first_party"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	AppType      string   `json:"app_type"`
+	ClientID     string   `json:"client_id"`
+	ClientSecret string   `json:"client_secret"`
+	Scopes       []string `json:"scopes"`
+	RedirectURIs []string `json:"redirect_uris"`
+	RequirePKCE  bool     `json:"require_pkce"`
+	FirstParty   bool     `json:"first_party"`
+	// Audience is the application's immutable per-application audience
+	// identifier (issue #131). Empty only for a row created before #131 or one
+	// whose name slugified to nothing.
+	//
+	// Returned at creation because it is the value the integrator must paste
+	// into their resource server's `audience:` config, and there is no update
+	// path that could hand it to them later.
+	Audience  string    `json:"audience,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // AppSummary is returned by ListApplications — no secret ever included.
@@ -280,10 +314,23 @@ type AppDetail struct {
 	// enforces it, so it is the field that decides whether the application can get
 	// a token at all. Exposed read-only because an operator debugging a refused
 	// token request has no other way to see it.
-	GrantTypes []string  `json:"grant_types"`
-	IsActive   bool      `json:"is_active"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	GrantTypes []string `json:"grant_types"`
+	// Audience is the immutable per-application audience identifier (issue
+	// #131) — the value an integrator puts in their resource server's
+	// `audience:` config. Read-only: there is no update path, by design.
+	Audience string `json:"audience,omitempty"`
+	// RequireAudience is the per-client ENFORCEMENT switch, and is not the same
+	// thing as Audience above. Audience is immutable; this flag is meant to be
+	// flipped, and flipping it is the #132 rollout.
+	//
+	// False (the default on every client) means a token with no resolvable
+	// audience is still minted, exactly as before #131. True means such a mint
+	// is refused. Rollback of the whole feature is setting it back to false —
+	// configuration, not a deploy.
+	RequireAudience bool      `json:"require_audience"`
+	IsActive        bool      `json:"is_active"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 // AppFilter holds optional filter and pagination params for ListApplicationsPaginated.
@@ -398,18 +445,89 @@ func (s *ApplicationService) CreateApplicationWithOptions(ctx context.Context, t
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// The audience identifier — issue #131.
+	//
+	// Derived from the tenant's slug and the application's name, resolved INSIDE
+	// the transaction so the slug cannot change between the read and the insert.
+	//
+	// It is immutable from this moment: there is no update path anywhere
+	// (AppUpdate deliberately has no Audience field, asserted by a test), for
+	// the same reason rp_id and the tenant slug have none. Every resource server
+	// that validates this value would break if it changed, and they are not ours
+	// to coordinate.
+	//
+	// An empty audience is a legal outcome, not a failure — a name consisting
+	// entirely of punctuation slugifies to nothing. Such an application behaves
+	// exactly as one created before #131: its tokens carry no audience claim,
+	// which stays valid while require_audience is false.
+	var tenantSlug string
+	if err := tx.QueryRow(ctx, `SELECT slug FROM tenants WHERE id = $1`, tenantID).Scan(&tenantSlug); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("tenant %d not found", tenantID)
+		}
+		return nil, fmt.Errorf("load tenant slug for audience: %w", err)
+	}
+	audience, err := s.audiences.GenerateAudience(tenantSlug, name)
+	if err != nil {
+		return nil, err
+	}
+
 	var rowID int64
 	var createdAt time.Time
 	err = tx.QueryRow(ctx, `
 		INSERT INTO oauth_clients
 		    (tenant_id, name, app_type, client_id, client_secret_hash, scopes,
-		     redirect_uris, require_pkce, first_party, grant_types, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+		     redirect_uris, require_pkce, first_party, grant_types, audience,
+		     created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULLIF($11, ''), NOW(), NOW())
 		RETURNING id, created_at
 	`, tenantID, name, normType, clientID, secretHash, scopes,
-		redirectURIs, requirePKCE, firstParty, grantTypesForAppType(normType)).Scan(&rowID, &createdAt)
+		redirectURIs, requirePKCE, firstParty, grantTypesForAppType(normType),
+		audience).Scan(&rowID, &createdAt)
 	if err != nil {
+		// The full unique index on oauth_clients.audience is the backstop, not
+		// the message. Two application names that slugify identically collide
+		// here — "Payroll API" and "payroll-api" are different names and one
+		// slug — and so does a name whose truncated slug matches another's.
+		//
+		// The name's own partial unique index (00035, WHERE deleted_at IS NULL)
+		// reports the same SQLSTATE, so the two are told apart by which
+		// identifier is actually free. Getting this wrong would tell an operator
+		// to rename an application when the real collision is with a DELETED one
+		// whose audience is reserved forever.
+		if isUniqueViolation(err) && audience != "" {
+			if taken, checkErr := s.audienceTaken(ctx, audience); checkErr == nil && taken {
+				return nil, ErrAudienceTaken
+			}
+		}
+		if isCheckViolation(err) {
+			// oauth_clients_audience_not_reserved. Unreachable — GenerateAudience
+			// refuses the reserved namespace first — so reaching here means a new
+			// path to the column exists. Reported as the readable error rather
+			// than as a constraint name.
+			return nil, ErrReservedAudience
+		}
 		return nil, fmt.Errorf("insert application: %w", err)
+	}
+
+	// The self-grant, in the SAME transaction as the client.
+	//
+	// Migration 00087 backfills one for every pre-existing client, and this is
+	// its counterpart for every client created from now on. Without it an
+	// application could not request a token for its OWN api once enforcement is
+	// switched on, and the admin API would show an application holding no grants
+	// at all — a state an operator would reasonably try to "fix" by hand.
+	//
+	// Inside the transaction because the client and its self-grant are one fact.
+	// A client committed without its grant is the broken state this prevents.
+	if audience != "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO oauth_client_grants (tenant_id, client_id, audience)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (client_id, audience) DO NOTHING
+		`, tenantID, rowID, audience); err != nil {
+			return nil, fmt.Errorf("insert self grant: %w", err)
+		}
 	}
 
 	if err = seedSuppressedEmailTemplates(ctx, tx, tenantID, rowID); err != nil {
@@ -430,8 +548,27 @@ func (s *ApplicationService) CreateApplicationWithOptions(ctx context.Context, t
 		RedirectURIs: redirectURIs,
 		RequirePKCE:  requirePKCE,
 		FirstParty:   firstParty,
+		Audience:     audience,
 		CreatedAt:    createdAt,
 	}, nil
+}
+
+// audienceTaken reports whether an audience identifier already exists, live or
+// soft-deleted.
+//
+// Reached only on the unique-violation path, to tell an audience collision apart
+// from a NAME collision — both raise SQLSTATE 23505 on the same INSERT. It reads
+// with no deleted_at filter on purpose: an audience belonging to a soft-deleted
+// application is still taken, forever, which is the entire reason migration
+// 00087's index is full rather than partial.
+func (s *ApplicationService) audienceTaken(ctx context.Context, audience string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM oauth_clients WHERE audience = $1)`, audience).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // ListApplications returns all active applications for a tenant, without secrets.
@@ -559,15 +696,18 @@ func (s *ApplicationService) ListApplicationsPaginated(ctx context.Context, tena
 func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID int64) (*AppDetail, error) {
 	var a AppDetail
 	var id int64
+	var audience *string
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, name, COALESCE(NULLIF(display_name, ''), name) AS display_name,
 		       app_type, client_id, scopes, redirect_uris, require_pkce, first_party,
-		       grant_types, (is_active AND deleted_at IS NULL) AS is_active,
+		       grant_types, audience, require_audience,
+		       (is_active AND deleted_at IS NULL) AS is_active,
 		       created_at, updated_at
 		FROM   oauth_clients
 		WHERE  id = $1 AND tenant_id = $2
 	`, appID, tenantID).Scan(&id, &a.Name, &a.DisplayName, &a.AppType, &a.ClientID, &a.Scopes,
-		&a.RedirectURIs, &a.RequirePKCE, &a.FirstParty, &a.GrantTypes, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+		&a.RedirectURIs, &a.RequirePKCE, &a.FirstParty, &a.GrantTypes, &audience, &a.RequireAudience,
+		&a.IsActive, &a.CreatedAt, &a.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAppNotFound
@@ -579,6 +719,9 @@ func (s *ApplicationService) GetApplication(ctx context.Context, tenantID, appID
 	}
 	if a.RedirectURIs == nil {
 		a.RedirectURIs = []string{}
+	}
+	if audience != nil {
+		a.Audience = *audience
 	}
 	a.ID = strconv.FormatInt(id, 10)
 	return &a, nil
@@ -610,6 +753,18 @@ type AppUpdate struct {
 	// and its audit history are preserved — unlike DeactivateApplication, which
 	// soft-deletes. Reversible by setting it back to true.
 	IsActive *bool
+	// RequireAudience nil leaves the flag unchanged. It is the per-client
+	// enforcement switch from issue #131 and flipping it per client, with EMC
+	// Insurance last, is the #132 rollout.
+	//
+	// THERE IS DELIBERATELY NO Audience FIELD HERE, and a test asserts its
+	// absence. The identifier is immutable: every resource server validating it
+	// would break the moment it changed, and those servers are not ours to
+	// coordinate. Same reasoning as rp_id and the tenant slug. This flag is the
+	// only audience-related thing that may be updated, because changing it
+	// changes what THIS server enforces rather than what somebody else
+	// validates.
+	RequireAudience *bool
 }
 
 // UpdateApplication updates name, app_type and/or scopes only. Retained with
@@ -624,8 +779,8 @@ func (s *ApplicationService) UpdateApplication(ctx context.Context, tenantID, ap
 func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, tenantID, appID int64, name, appType string, scopes []string, upd AppUpdate) (*AppDetail, error) {
 	if name == "" && appType == "" && scopes == nil &&
 		upd.RedirectURIs == nil && upd.RequirePKCE == nil && upd.FirstParty == nil &&
-		upd.IsActive == nil && upd.DisplayName == "" {
-		return nil, fmt.Errorf("nothing to update — provide name, display_name, app_type, scopes, redirect_uris, require_pkce, first_party, and/or is_active")
+		upd.IsActive == nil && upd.DisplayName == "" && upd.RequireAudience == nil {
+		return nil, fmt.Errorf("nothing to update — provide name, display_name, app_type, scopes, redirect_uris, require_pkce, first_party, require_audience, and/or is_active")
 	}
 	if appType != "" {
 		if _, err := normalizeAppType(appType); err != nil {
@@ -684,9 +839,10 @@ func (s *ApplicationService) UpdateApplicationWithOptions(ctx context.Context, t
 		       is_active     = COALESCE($9, is_active),
 		       grant_types   = COALESCE($10, grant_types),
 		       display_name  = COALESCE(NULLIF($11, ''), display_name),
+		       require_audience = COALESCE($12, require_audience),
 		       updated_at    = NOW()
 		WHERE  id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-	`, name, appType, scopes, appID, tenantID, upd.RedirectURIs, pkceOverride, upd.FirstParty, upd.IsActive, newGrantTypes, upd.DisplayName)
+	`, name, appType, scopes, appID, tenantID, upd.RedirectURIs, pkceOverride, upd.FirstParty, upd.IsActive, newGrantTypes, upd.DisplayName, upd.RequireAudience)
 	if err != nil {
 		return nil, fmt.Errorf("update application: %w", err)
 	}

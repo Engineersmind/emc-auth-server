@@ -2654,6 +2654,22 @@ type TokenRequest struct {
 	GrantType    string `json:"grant_type"`
 	ClientID     string `json:"client_id" swaggerignore:"true"`
 	ClientSecret string `json:"client_secret" swaggerignore:"true"`
+	// Audience / Resource request a specific API (issue #131). Both spellings,
+	// for the same reason /oauth/token accepts both: `audience` is Auth0's name
+	// and `resource` is RFC 8707 §2. Omitting them — which every current
+	// consumer of this endpoint does — yields the client's own audience, so
+	// nothing documented in CLIENT_CREDENTIALS_FLOW.md changes.
+	Audience string `json:"audience,omitempty"`
+	Resource string `json:"resource,omitempty"`
+}
+
+// requested returns the audience this token request is asking for, with
+// `audience` winning over `resource` when both are present.
+func (r TokenRequest) requested() string {
+	if r.Audience != "" {
+		return r.Audience
+	}
+	return r.Resource
 }
 
 // errBodyCredentials is the guidance returned when an integrator sends
@@ -2759,8 +2775,19 @@ func (h *AuthHandler) Token(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "authentication failed"})
 	}
 
-	token, expiresIn, err := h.svc.IssueServiceToken(c.Request().Context(), tenantID, appID)
+	token, expiresIn, err := h.svc.IssueServiceToken(c.Request().Context(), tenantID, appID, req.requested())
 	if err != nil {
+		// invalid_target is reported in the RFC 8707 shape even on this JSON
+		// endpoint, and with a description identical to /oauth/token's. This is
+		// the deprecated alias (CLAUDE.md deferred #21) and its consumers are
+		// documented, but a 500 for "you asked for an API you were not granted"
+		// would send an integrator hunting a server fault.
+		if errors.Is(err, auth.ErrInvalidTarget) || errors.Is(err, auth.ErrAudienceRequired) {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error":             "invalid_target",
+				"error_description": "the requested audience is not available to this client",
+			})
+		}
 		h.logger.Error().Err(err).Msg("issue service token failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "token generation failed"})
 	}

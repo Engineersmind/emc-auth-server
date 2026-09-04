@@ -123,6 +123,9 @@ type RoutesConfig struct {
 	BreachDetectionEnabled bool
 	// UntrustedIPCIDRs feeds the risk assessor behind suspicious-sign-in alerts.
 	UntrustedIPCIDRs []string
+	// AudienceScheme prefixes every per-application audience identifier
+	// (issue #131). Empty falls back to auth.AudienceSchemeDefault.
+	AudienceScheme string
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -360,8 +363,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		Str("hasher", passwordHasher.String()).
 		Msg("password hashing configured")
 
+	// Audience service — per-application audiences and their grants (issue
+	// #131). Constructed ONCE and shared, so the configured AUDIENCE_SCHEME
+	// reaches token minting, application creation and the admin grant API
+	// alike. Three services each holding their own copy of the scheme is how
+	// they would come to disagree about what a valid audience looks like.
+	audienceSvc := auth.NewAudienceService(deps.Pool, deps.Logger).
+		WithScheme(deps.Config.AudienceScheme)
+
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger).
-		WithHasher(passwordHasher)
+		WithHasher(passwordHasher).
+		WithAudiences(audienceSvc)
 
 	// TOTP service — requires encryption key; logs warning in dev if missing.
 	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Logger)
@@ -374,7 +386,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	apiKeySvc := auth.NewAPIKeyService(deps.Pool, deps.Logger)
 
 	// Application service — manages OAuth2 clients (client_id + client_secret)
-	appSvc := auth.NewApplicationService(deps.Pool, deps.Logger)
+	appSvc := auth.NewApplicationService(deps.Pool, deps.Logger).
+		WithAudiences(audienceSvc)
 	authSvc.WithApplications(appSvc)
 
 	// Agent service (08-01) — machine-to-machine authentication
@@ -573,7 +586,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithEmailTemplates(tmplSvc).
 		WithMailer(m).
 		WithCORS(corsSvc).
-		WithWebAuthn(webauthnSvc)
+		WithWebAuthn(webauthnSvc).
+		WithAudiences(audienceSvc)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
 	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
@@ -1168,6 +1182,27 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// Changing it is a deployment action, done by migration or by hand.
 	adminGroup.GET("/tenants/:tid/passkey-policy", adminHandler.GetTenantPasskeyPolicy, tidAppsRead)
 	adminGroup.PUT("/tenants/:tid/passkey-policy", adminHandler.UpdateTenantPasskeyPolicy, tidAppsWrite)
+	// Per-application audience grants — issue #131.
+	//
+	// Guarded by apps:read / apps:write rather than a new permission, matching
+	// the session, lockout and passkey policies: this is application
+	// configuration of the same kind, and inventing a permission for it would
+	// mean every existing owner and co-owner silently lost the ability to
+	// manage it until somebody granted the new one.
+	//
+	// The per-application guards (appAppsRead/appAppsWrite) are the important
+	// ones here. A grant decides which API a client's tokens are good for, so a
+	// co-owner scoped to one application must not be able to grant THAT
+	// application access to an audience belonging to an application they do not
+	// administer — RequireAppScope("appID", ...) is the check
+	// RequireTenantSelfOrAny cannot make.
+	adminGroup.GET("/tenants/:tid/applications/:appID/grants", adminHandler.ListApplicationGrants, appAppsRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/grants", adminHandler.CreateApplicationGrant, appAppsWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/grants/:id", adminHandler.UpdateApplicationGrant, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/grants/:id", adminHandler.DeleteApplicationGrant, appAppsWrite)
+	// The audience catalogue is tenant-wide, so it takes the tenant-level guard.
+	adminGroup.GET("/tenants/:tid/audiences", adminHandler.ListAudiences, tidAppsRead)
+
 	adminGroup.GET("/tenants/:tid/applications/:appID/passkey-policy", adminHandler.GetApplicationPasskeyPolicy, appAppsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/passkey-policy", adminHandler.UpdateApplicationPasskeyPolicy, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/passkey-policy", adminHandler.DeleteApplicationPasskeyPolicy, appAppsWrite)
@@ -1342,6 +1377,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// /tenants/:tid/... family (issue #112). Tenant comes from the JWT.
 	adminGroup.GET("/passkey-policy", adminHandler.GetTenantPasskeyPolicy, appsRead)
 	adminGroup.PUT("/passkey-policy", adminHandler.UpdateTenantPasskeyPolicy, appsWrite)
+	// Flat aliases for the audience grant API (issue #131) — the caller's own
+	// tenant, taken from the JWT.
+	adminGroup.GET("/applications/:appID/grants", adminHandler.ListApplicationGrants, appsRead)
+	adminGroup.POST("/applications/:appID/grants", adminHandler.CreateApplicationGrant, appsWrite)
+	adminGroup.PUT("/applications/:appID/grants/:id", adminHandler.UpdateApplicationGrant, appsWrite)
+	adminGroup.DELETE("/applications/:appID/grants/:id", adminHandler.DeleteApplicationGrant, appsWrite)
+	adminGroup.GET("/audiences", adminHandler.ListAudiences, appsRead)
+
 	adminGroup.GET("/applications/:appID/passkey-policy", adminHandler.GetApplicationPasskeyPolicy, appsRead)
 	adminGroup.PUT("/applications/:appID/passkey-policy", adminHandler.UpdateApplicationPasskeyPolicy, appsWrite)
 	adminGroup.DELETE("/applications/:appID/passkey-policy", adminHandler.DeleteApplicationPasskeyPolicy, appsWrite)
