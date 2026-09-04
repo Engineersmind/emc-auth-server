@@ -24,6 +24,70 @@ definitions:
       invite_sent:
         type: boolean
     type: object
+  admin.LockoutPolicyInput:
+    properties:
+      failure_window_seconds:
+        type: integer
+      hard_lock_duration_seconds:
+        description: |-
+          RawHardLockDuration sets how long a hard lock holds. Omitted leaves the
+          current setting alone.
+        type: integer
+      hard_lock_permanent:
+        description: |-
+          HardLockPermanent:true makes hard locks last until an operator intervenes.
+
+          A separate explicit flag rather than a null duration, because this is the
+          most consequential setting in the table — it is what turns ten
+          unauthenticated requests into an account disabled indefinitely — and it must
+          never be reachable by an omitted, misspelled, or null-coerced field. An
+          operator choosing it has to say so.
+        type: boolean
+      hard_lock_threshold:
+        type: integer
+      notify_user_threshold:
+        type: integer
+      soft_lock_duration_seconds:
+        type: integer
+      soft_lock_threshold:
+        type: integer
+      tenant_spike_threshold:
+        type: integer
+    type: object
+  admin.LockoutPolicyView:
+    properties:
+      failure_window_seconds:
+        type: integer
+      hard_lock_duration_seconds:
+        description: |-
+          HardLockDurationSeconds is nil when a hard lock does NOT expire on its own
+          and only an operator can restore access. Nullable rather than zero because
+          "never expires" is a deliberate choice a tenant makes, and encoding it as 0
+          would make it indistinguishable from an unset field.
+        type: integer
+      hard_lock_threshold:
+        type: integer
+      inherited:
+        description: |-
+          Inherited is true when no row exists at the requested scope and these
+          values came from a broader one.
+        type: boolean
+      notify_user_threshold:
+        type: integer
+      scope:
+        description: |-
+          Scope is "platform", "tenant", or "application" — which row actually
+          answered the request. Without it a caller cannot tell a policy they have set
+          from an inherited default, and would have no way to know that editing it
+          creates a new row rather than changing an existing one.
+        type: string
+      soft_lock_duration_seconds:
+        type: integer
+      soft_lock_threshold:
+        type: integer
+      tenant_spike_threshold:
+        type: integer
+    type: object
   admin.OwnerResult:
     properties:
       email:
@@ -70,6 +134,24 @@ definitions:
         type: string
       email_verified:
         type: boolean
+      home_tenant_id:
+        description: |-
+          HomeTenantID is where the ACCOUNT lives — users.tenant_id, the tenant
+          holding its credentials. Use it for account-scoped operations: the user
+          detail, session and passkey endpoints, which resolve a user within their
+          own tenant.
+
+          These two were always equal until migration 00078 let one administrator
+          reach several tenants. A caller that assumes they still are gets a 404 for
+          every cross-tenant administrator, which is exactly what the admin console's
+          detail drawer did: it built /tenants/{administered}/users/{id}/detail and
+          none of them resolved.
+
+          Both are returned because the drawer legitimately needs both, and deriving
+          one from the other at the call site is how the confusion returns.
+        type: string
+      home_tenant_name:
+        type: string
       id:
         description: |-
           ID is the tenant_admins row, which is what the per-tenant management
@@ -96,6 +178,9 @@ definitions:
           holds their grant and regains it the moment the block is lifted.
         type: string
       tenant_id:
+        description: |-
+          TenantID is the tenant this row ADMINISTERS. Use it for grant-scoped
+          operations: role changes, revocation, resending the invitation.
         type: string
       tenant_name:
         type: string
@@ -341,6 +426,12 @@ definitions:
         type: string
       last_name:
         type: string
+      lock_expires_at:
+        description: |-
+          LockExpiresAt is when an automatic lock lifts by itself. Nil when the
+          account is not automatically locked, or when the tenant opted into a
+          permanent lock — in which case only an operator can restore access.
+        type: string
       logins_count:
         description: |-
           LoginsCount is the number of successful logins on record (audit-derived,
@@ -384,6 +475,18 @@ definitions:
     properties:
       application_id:
         type: string
+      block_reason:
+        type: string
+      blocked_at:
+        description: |-
+          Lockout state (issue #72), for the console's locked badge and its unlock
+          action. BlockedAt and BlockReason are nil on an account nothing has locked.
+
+          BlockReason distinguishes the two cases an operator must respond to
+          differently: "failed_attempts" is automatic and usually expires on its own,
+          while "admin" is somebody's deliberate decision and only an operator lifts
+          it. A badge that showed only "locked" would flatten that distinction.
+        type: string
       connections:
         description: |-
           Connections lists how this user can sign in: "password" when a
@@ -396,6 +499,11 @@ definitions:
         type: string
       email:
         type: string
+      failed_login_attempts:
+        description: |-
+          FailedLoginAttempts is the live counter, so the console can show how close
+          an account is to locking rather than only that it already has.
+        type: integer
       first_name:
         type: string
       id:
@@ -407,6 +515,12 @@ definitions:
           Login").
         type: string
       last_name:
+        type: string
+      lock_expires_at:
+        description: |-
+          LockExpiresAt is when an automatic lock lifts by itself. Nil when the
+          account is not automatically locked, or when the tenant opted into a
+          permanent lock — in which case only an operator can restore access.
         type: string
       logins_count:
         description: |-
@@ -709,6 +823,12 @@ definitions:
     properties:
       app_type:
         type: string
+      audience:
+        description: |-
+          Audience is the immutable per-application audience identifier (issue
+          #131) — the value an integrator puts in their resource server's
+          `audience:` config. Read-only: there is no update path, by design.
+        type: string
       client_id:
         type: string
       created_at:
@@ -748,6 +868,17 @@ definitions:
         items:
           type: string
         type: array
+      require_audience:
+        description: |-
+          RequireAudience is the per-client ENFORCEMENT switch, and is not the same
+          thing as Audience above. Audience is immutable; this flag is meant to be
+          flipped, and flipping it is the #132 rollout.
+
+          False (the default on every client) means a token with no resolvable
+          audience is still minted, exactly as before #131. True means such a mint
+          is refused. Rollback of the whole feature is setting it back to false —
+          configuration, not a deploy.
+        type: boolean
       require_pkce:
         description: RequirePKCE defaults true for every client type, confidential
           included.
@@ -776,9 +907,35 @@ definitions:
       updated_at:
         type: string
     type: object
+  auth.AppRateLimitResolution:
+    properties:
+      configured:
+        description: Configured reports whether this application has its own limit.
+        type: boolean
+      limit:
+        allOf:
+        - $ref: '#/definitions/auth.AppRateLimit'
+        description: Limit is the application's own limit, or null when running at
+          the default.
+      source:
+        description: |-
+          Source is "application" when configured, "default" when the server-wide
+          policy applies.
+        type: string
+    type: object
   auth.AppResult:
     properties:
       app_type:
+        type: string
+      audience:
+        description: |-
+          Audience is the application's immutable per-application audience
+          identifier (issue #131). Empty only for a row created before #131 or one
+          whose name slugified to nothing.
+
+          Returned at creation because it is the value the integrator must paste
+          into their resource server's `audience:` config, and there is no update
+          path that could hand it to them later.
         type: string
       client_id:
         type: string
@@ -818,6 +975,21 @@ definitions:
       total_pages:
         type: integer
     type: object
+  auth.AudienceEntry:
+    properties:
+      application_id:
+        type: string
+      audience:
+        type: string
+      name:
+        type: string
+      require_audience:
+        description: |-
+          RequireAudience reports whether that application enforces audiences on
+          its own tokens. Surfaced because it is the switch an operator flips during
+          the #132 rollout and there is otherwise no way to read it back.
+        type: boolean
+    type: object
   auth.AuthResult:
     properties:
       access_token:
@@ -831,6 +1003,47 @@ definitions:
       refresh_token:
         type: string
       token_type:
+        type: string
+    type: object
+  auth.ClientGrant:
+    properties:
+      application_id:
+        description: |-
+          ApplicationID is the grantee — the client that may REQUEST this audience,
+          which is not necessarily the application that owns it.
+        type: string
+      audience:
+        type: string
+      created_at:
+        type: string
+      id:
+        type: string
+      resource_name:
+        description: |-
+          ResourceName is the name of the application that OWNS the audience, for
+          display. Read through the composite key, so it is always populated.
+        type: string
+      scopes:
+        items:
+          type: string
+        type: array
+      updated_at:
+        type: string
+    type: object
+  auth.EmailSenderResolution:
+    properties:
+      configured:
+        description: Configured reports whether THIS scope has its own sender row.
+        type: boolean
+      settings:
+        allOf:
+        - $ref: '#/definitions/auth.EmailSenderSettings'
+        description: Settings is the sender row at this scope, or null when inheriting.
+      source:
+        description: |-
+          Source is where the effective sender comes from: "application", "tenant"
+          or "global". Named rather than boolean so a third inheriting level does
+          not require a wire change.
         type: string
     type: object
   auth.EmailSenderSettings:
@@ -1390,6 +1603,28 @@ definitions:
       email:
         type: string
     type: object
+  handlers.GrantRequest:
+    properties:
+      audience:
+        description: |-
+          Audience is required on create and ignored on update.
+
+          A grant's audience is not editable by design: an operator who wants a
+          client to reach a different API creates that grant and deletes the old
+          one, leaving two explicit decisions in the audit trail rather than one
+          silent re-point of a grant a resource server may already be relying on.
+        type: string
+      scopes:
+        description: |-
+          Scopes narrows what a token for this audience may carry. An empty or
+          absent list means the grant permits no scopes — the fail-closed reading,
+          matching how oauth_clients.scopes already behaves at /oauth/authorize.
+          It is not "unrestricted": that would make a forgotten field the most
+          permissive possible configuration.
+        items:
+          type: string
+        type: array
+    type: object
   handlers.HealthResponse:
     properties:
       service:
@@ -1790,7 +2025,17 @@ definitions:
     type: object
   handlers.TokenRequest:
     properties:
+      audience:
+        description: |-
+          Audience / Resource request a specific API (issue #131). Both spellings,
+          for the same reason /oauth/token accepts both: `audience` is Auth0's name
+          and `resource` is RFC 8707 §2. Omitting them — which every current
+          consumer of this endpoint does — yields the client's own audience, so
+          nothing documented in CLIENT_CREDENTIALS_FLOW.md changes.
+        type: string
       grant_type:
+        type: string
+      resource:
         type: string
     type: object
   handlers.TokenResponse:
@@ -2503,6 +2748,165 @@ paths:
       summary: Create application
       tags:
       - admin-applications
+  /api/v1/applications/{appID}/grants:
+    get:
+      description: Returns the audiences this application is permitted to request
+        tokens for. Requires apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.ClientGrant'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List an application's audience grants
+      tags:
+      - admin-audiences
+    post:
+      consumes:
+      - application/json
+      description: Permits this application to request tokens for an audience owned
+        by another application in the same tenant. Requires apps:write.
+      parameters:
+      - description: Application ID (the grantee)
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Audience and scopes
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.GrantRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.ClientGrant'
+        "400":
+          description: Malformed or reserved audience
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Audience does not exist in this tenant
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Grant already exists
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Grant an application access to an audience
+      tags:
+      - admin-audiences
+  /api/v1/applications/{appID}/grants/{id}:
+    delete:
+      description: Removes the grant. Tokens already issued for that audience remain
+        valid until they expire (15 minutes); the next mint and every refresh are
+        refused. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Grant ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke an audience grant
+      tags:
+      - admin-audiences
+    put:
+      consumes:
+      - application/json
+      description: Replaces the scopes on an existing grant. The audience itself is
+        immutable — delete and recreate to change it. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Grant ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Scopes
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.GrantRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.ClientGrant'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update an audience grant's scopes
+      tags:
+      - admin-audiences
   /api/v1/applications/{appID}/identity-providers:
     get:
       description: Returns provider configs without secrets. Requires apps:read.
@@ -2826,8 +3230,11 @@ paths:
       tags:
       - admin-rate-limits
     get:
-      description: Returns the custom per-minute limit for the application. Requires
-        apps:read.
+      description: 'Returns which rate limit applies to the application. Always 200
+        when the application exists: `configured` reports whether it has a custom
+        limit, `source` is "application" or "default", and `limit` is null when running
+        at the server default. 404 means the application itself was not found. Requires
+        apps:read.'
       parameters:
       - description: Application ID
         in: path
@@ -2840,9 +3247,9 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/auth.AppRateLimit'
+            $ref: '#/definitions/auth.AppRateLimitResolution'
         "404":
-          description: Not Found
+          description: Application not found
           schema:
             additionalProperties:
               type: string
@@ -3270,6 +3677,31 @@ paths:
       summary: Rotate application client secret
       tags:
       - admin-applications
+  /api/v1/audiences:
+    get:
+      description: Returns every audience registered in the tenant, with its owning
+        application. This is the list to pick from when creating a grant. Requires
+        apps:read.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.AudienceEntry'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List the tenant's audiences
+      tags:
+      - admin-audiences
   /api/v1/audit-logs:
     get:
       description: Returns paginated audit events scoped to the caller's tenant. Requires
@@ -5243,16 +5675,19 @@ paths:
       tags:
       - admin-email-senders
     get:
-      description: Returns the white-label sender configured for the tenant (or one
-        application). The SMTP password is never returned — has_password reports whether
-        one is stored. 404 = no sender at this scope (the global server sender applies).
+      description: 'Returns which email sender applies at this scope. Always 200 when
+        the scope exists: `configured` reports whether this scope has its own sender,
+        `source` names where the effective one comes from ("application" | "tenant"
+        | "global"), and `settings` is null when inheriting. The SMTP password is
+        never returned — has_password reports whether one is stored. 404 means the
+        tenant or application itself was not found.'
       produces:
       - application/json
       responses:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/auth.EmailSenderSettings'
+            $ref: '#/definitions/auth.EmailSenderResolution'
         "403":
           description: Forbidden
           schema:
@@ -5260,7 +5695,7 @@ paths:
               type: string
             type: object
         "404":
-          description: No sender configured at this scope
+          description: Tenant or application not found
           schema:
             additionalProperties:
               type: string
@@ -5457,6 +5892,78 @@ paths:
       summary: Set an email template
       tags:
       - admin-email-templates
+  /api/v1/lockout-policy:
+    delete:
+      description: Removes this scope's lockout override so it inherits from the tenant
+        or platform default.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Reset the account lockout policy
+      tags:
+      - admin-security
+    get:
+      description: Returns the lockout thresholds in force for the tenant or application,
+        and whether they are inherited. A null hard_lock_duration_seconds means a
+        hard lock lasts until an administrator lifts it.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.LockoutPolicyView'
+      security:
+      - BearerAuth: []
+      summary: Get the account lockout policy
+      tags:
+      - admin-security
+    put:
+      consumes:
+      - application/json
+      description: Sets the warn/soft-lock/hard-lock thresholds, their durations,
+        the failure window, and the tenant spike-alert threshold. Omitted fields are
+        left unchanged. Send hard_lock_permanent=true to make hard locks last until
+        an administrator lifts them.
+      parameters:
+      - description: Policy fields to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.LockoutPolicyInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.LockoutPolicyView'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update the account lockout policy
+      tags:
+      - admin-security
   /api/v1/me/sessions:
     delete:
       description: Ends every session except the one this request came from.
@@ -6690,6 +7197,181 @@ paths:
       summary: List app rate limits
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/grants:
+    get:
+      description: Returns the audiences this application is permitted to request
+        tokens for. Requires apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.ClientGrant'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List an application's audience grants
+      tags:
+      - admin-audiences
+    post:
+      consumes:
+      - application/json
+      description: Permits this application to request tokens for an audience owned
+        by another application in the same tenant. Requires apps:write.
+      parameters:
+      - description: Application ID (the grantee)
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      - description: Audience and scopes
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.GrantRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.ClientGrant'
+        "400":
+          description: Malformed or reserved audience
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Audience does not exist in this tenant
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Grant already exists
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Grant an application access to an audience
+      tags:
+      - admin-audiences
+  /api/v1/tenants/{tid}/applications/{appID}/grants/{id}:
+    delete:
+      description: Removes the grant. Tokens already issued for that audience remain
+        valid until they expire (15 minutes); the next mint and every refresh are
+        refused. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Grant ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke an audience grant
+      tags:
+      - admin-audiences
+    put:
+      consumes:
+      - application/json
+      description: Replaces the scopes on an existing grant. The audience itself is
+        immutable — delete and recreate to change it. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Grant ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      - description: Scopes
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.GrantRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.ClientGrant'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update an audience grant's scopes
+      tags:
+      - admin-audiences
   /api/v1/tenants/{tid}/applications/{appID}/identity-providers/{provider}/test:
     post:
       description: 'Dry-runs the stored configuration and returns a per-check report:
@@ -6768,8 +7450,11 @@ paths:
       tags:
       - admin-rate-limits
     get:
-      description: Returns the custom per-minute limit for the application. Requires
-        apps:read.
+      description: 'Returns which rate limit applies to the application. Always 200
+        when the application exists: `configured` reports whether it has a custom
+        limit, `source` is "application" or "default", and `limit` is null when running
+        at the server default. 404 means the application itself was not found. Requires
+        apps:read.'
       parameters:
       - description: Application ID
         in: path
@@ -6786,9 +7471,9 @@ paths:
         "200":
           description: OK
           schema:
-            $ref: '#/definitions/auth.AppRateLimit'
+            $ref: '#/definitions/auth.AppRateLimitResolution'
         "404":
-          description: Not Found
+          description: Application not found
           schema:
             additionalProperties:
               type: string
@@ -6837,6 +7522,36 @@ paths:
       summary: Set an application's rate limit
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/audiences:
+    get:
+      description: Returns every audience registered in the tenant, with its owning
+        application. This is the list to pick from when creating a grant. Requires
+        apps:read.
+      parameters:
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.AudienceEntry'
+            type: array
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List the tenant's audiences
+      tags:
+      - admin-audiences
   /api/v1/tenants/{tid}/roles:
     get:
       description: Returns all roles (with permissions) belonging to the specified
@@ -7597,6 +8312,41 @@ paths:
       security:
       - BearerAuth: []
       summary: Block or unblock a user
+      tags:
+      - admin-users
+  /api/v1/users/{id}/unlock:
+    post:
+      description: 'Clears every account-lockout tier: the failed-attempt counter,
+        an automatic or administrative block, and the temporary (soft) lock. Idempotent
+        — unlocking an account that is not locked succeeds. Requires users:write.'
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.UserResult'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Unlock a locked-out user
       tags:
       - admin-users
   /api/v1/users/{uid}/passkeys:
