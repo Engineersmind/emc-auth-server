@@ -670,6 +670,245 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/grants": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the audiences this application is permitted to request tokens for. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "List an application's audience grants",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.ClientGrant"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Permits this application to request tokens for an audience owned by another application in the same tenant. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "Grant an application access to an audience",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID (the grantee)",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Audience and scopes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.GrantRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ClientGrant"
+                        }
+                    },
+                    "400": {
+                        "description": "Malformed or reserved audience",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Audience does not exist in this tenant",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Grant already exists",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/grants/{id}": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the scopes on an existing grant. The audience itself is immutable — delete and recreate to change it. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "Update an audience grant's scopes",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Grant ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Scopes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.GrantRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ClientGrant"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the grant. Tokens already issued for that audience remain valid until they expire (15 minutes); the next mint and every refresh are refused. Requires apps:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "Revoke an audience grant",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Grant ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/identity-providers": {
             "get": {
                 "security": [
@@ -1111,7 +1350,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns the custom per-minute limit for the application. Requires apps:read.",
+                "description": "Returns which rate limit applies to the application. Always 200 when the application exists: ` + "`" + `configured` + "`" + ` reports whether it has a custom limit, ` + "`" + `source` + "`" + ` is \"application\" or \"default\", and ` + "`" + `limit` + "`" + ` is null when running at the server default. 404 means the application itself was not found. Requires apps:read.",
                 "produces": [
                     "application/json"
                 ],
@@ -1132,11 +1371,11 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/auth.AppRateLimit"
+                            "$ref": "#/definitions/auth.AppRateLimitResolution"
                         }
                     },
                     "404": {
-                        "description": "Not Found",
+                        "description": "Application not found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -1810,6 +2049,43 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/audiences": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns every audience registered in the tenant, with its owning application. This is the list to pick from when creating a grant. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "List the tenant's audiences",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.AudienceEntry"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4676,7 +4952,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns the white-label sender configured for the tenant (or one application). The SMTP password is never returned — has_password reports whether one is stored. 404 = no sender at this scope (the global server sender applies).",
+                "description": "Returns which email sender applies at this scope. Always 200 when the scope exists: ` + "`" + `configured` + "`" + ` reports whether this scope has its own sender, ` + "`" + `source` + "`" + ` names where the effective one comes from (\"application\" | \"tenant\" | \"global\"), and ` + "`" + `settings` + "`" + ` is null when inheriting. The SMTP password is never returned — has_password reports whether one is stored. 404 means the tenant or application itself was not found.",
                 "produces": [
                     "application/json"
                 ],
@@ -4688,7 +4964,7 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/auth.EmailSenderSettings"
+                            "$ref": "#/definitions/auth.EmailSenderResolution"
                         }
                     },
                     "403": {
@@ -4701,7 +4977,7 @@ const docTemplate = `{
                         }
                     },
                     "404": {
-                        "description": "No sender configured at this scope",
+                        "description": "Tenant or application not found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5018,6 +5294,112 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "No override configured at this scope",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/lockout-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the lockout thresholds in force for the tenant or application, and whether they are inherited. A null hard_lock_duration_seconds means a hard lock lasts until an administrator lifts it.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Get the account lockout policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.LockoutPolicyView"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets the warn/soft-lock/hard-lock thresholds, their durations, the failure window, and the tenant spike-alert threshold. Omitted fields are left unchanged. Send hard_lock_permanent=true to make hard locks last until an administrator lifts them.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Update the account lockout policy",
+                "parameters": [
+                    {
+                        "description": "Policy fields to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.LockoutPolicyInput"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.LockoutPolicyView"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes this scope's lockout override so it inherits from the tenant or platform default.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Reset the account lockout policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -6917,6 +7299,269 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/grants": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the audiences this application is permitted to request tokens for. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "List an application's audience grants",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.ClientGrant"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Permits this application to request tokens for an audience owned by another application in the same tenant. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "Grant an application access to an audience",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID (the grantee)",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Audience and scopes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.GrantRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ClientGrant"
+                        }
+                    },
+                    "400": {
+                        "description": "Malformed or reserved audience",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Audience does not exist in this tenant",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Grant already exists",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/grants/{id}": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the scopes on an existing grant. The audience itself is immutable — delete and recreate to change it. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "Update an audience grant's scopes",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Grant ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Scopes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.GrantRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ClientGrant"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the grant. Tokens already issued for that audience remain valid until they expire (15 minutes); the next mint and every refresh are refused. Requires apps:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "Revoke an audience grant",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Grant ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/identity-providers/{provider}/test": {
             "post": {
                 "security": [
@@ -6983,7 +7628,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns the custom per-minute limit for the application. Requires apps:read.",
+                "description": "Returns which rate limit applies to the application. Always 200 when the application exists: ` + "`" + `configured` + "`" + ` reports whether it has a custom limit, ` + "`" + `source` + "`" + ` is \"application\" or \"default\", and ` + "`" + `limit` + "`" + ` is null when running at the server default. 404 means the application itself was not found. Requires apps:read.",
                 "produces": [
                     "application/json"
                 ],
@@ -7010,11 +7655,11 @@ const docTemplate = `{
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/auth.AppRateLimit"
+                            "$ref": "#/definitions/auth.AppRateLimitResolution"
                         }
                     },
                     "404": {
-                        "description": "Not Found",
+                        "description": "Application not found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -7124,6 +7769,51 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/audiences": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns every audience registered in the tenant, with its owning application. This is the list to pick from when creating a grant. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-audiences"
+                ],
+                "summary": "List the tenant's audiences",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.AudienceEntry"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -8221,6 +8911,58 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/users/{id}/unlock": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Clears every account-lockout tier: the failed-attempt counter, an automatic or administrative block, and the temporary (soft) lock. Idempotent — unlocking an account that is not locked succeeds. Requires users:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Unlock a locked-out user",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.UserResult"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/users/{uid}/passkeys": {
             "get": {
                 "security": [
@@ -8987,6 +9729,72 @@ const docTemplate = `{
                 }
             }
         },
+        "admin.LockoutPolicyInput": {
+            "type": "object",
+            "properties": {
+                "failure_window_seconds": {
+                    "type": "integer"
+                },
+                "hard_lock_duration_seconds": {
+                    "description": "RawHardLockDuration sets how long a hard lock holds. Omitted leaves the\ncurrent setting alone.",
+                    "type": "integer"
+                },
+                "hard_lock_permanent": {
+                    "description": "HardLockPermanent:true makes hard locks last until an operator intervenes.\n\nA separate explicit flag rather than a null duration, because this is the\nmost consequential setting in the table — it is what turns ten\nunauthenticated requests into an account disabled indefinitely — and it must\nnever be reachable by an omitted, misspelled, or null-coerced field. An\noperator choosing it has to say so.",
+                    "type": "boolean"
+                },
+                "hard_lock_threshold": {
+                    "type": "integer"
+                },
+                "notify_user_threshold": {
+                    "type": "integer"
+                },
+                "soft_lock_duration_seconds": {
+                    "type": "integer"
+                },
+                "soft_lock_threshold": {
+                    "type": "integer"
+                },
+                "tenant_spike_threshold": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admin.LockoutPolicyView": {
+            "type": "object",
+            "properties": {
+                "failure_window_seconds": {
+                    "type": "integer"
+                },
+                "hard_lock_duration_seconds": {
+                    "description": "HardLockDurationSeconds is nil when a hard lock does NOT expire on its own\nand only an operator can restore access. Nullable rather than zero because\n\"never expires\" is a deliberate choice a tenant makes, and encoding it as 0\nwould make it indistinguishable from an unset field.",
+                    "type": "integer"
+                },
+                "hard_lock_threshold": {
+                    "type": "integer"
+                },
+                "inherited": {
+                    "description": "Inherited is true when no row exists at the requested scope and these\nvalues came from a broader one.",
+                    "type": "boolean"
+                },
+                "notify_user_threshold": {
+                    "type": "integer"
+                },
+                "scope": {
+                    "description": "Scope is \"platform\", \"tenant\", or \"application\" — which row actually\nanswered the request. Without it a caller cannot tell a policy they have set\nfrom an inherited default, and would have no way to know that editing it\ncreates a new row rather than changing an existing one.",
+                    "type": "string"
+                },
+                "soft_lock_duration_seconds": {
+                    "type": "integer"
+                },
+                "soft_lock_threshold": {
+                    "type": "integer"
+                },
+                "tenant_spike_threshold": {
+                    "type": "integer"
+                }
+            }
+        },
         "admin.OwnerResult": {
             "type": "object",
             "properties": {
@@ -9052,6 +9860,13 @@ const docTemplate = `{
                 "email_verified": {
                     "type": "boolean"
                 },
+                "home_tenant_id": {
+                    "description": "HomeTenantID is where the ACCOUNT lives — users.tenant_id, the tenant\nholding its credentials. Use it for account-scoped operations: the user\ndetail, session and passkey endpoints, which resolve a user within their\nown tenant.\n\nThese two were always equal until migration 00078 let one administrator\nreach several tenants. A caller that assumes they still are gets a 404 for\nevery cross-tenant administrator, which is exactly what the admin console's\ndetail drawer did: it built /tenants/{administered}/users/{id}/detail and\nnone of them resolved.\n\nBoth are returned because the drawer legitimately needs both, and deriving\none from the other at the call site is how the confusion returns.",
+                    "type": "string"
+                },
+                "home_tenant_name": {
+                    "type": "string"
+                },
                 "id": {
                     "description": "ID is the tenant_admins row, which is what the per-tenant management\nendpoints take. UserID is the account behind it, for the user-detail and\nsession endpoints.",
                     "type": "string"
@@ -9080,6 +9895,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "tenant_id": {
+                    "description": "TenantID is the tenant this row ADMINISTERS. Use it for grant-scoped\noperations: role changes, revocation, resending the invitation.",
                     "type": "string"
                 },
                 "tenant_name": {
@@ -9414,6 +10230,10 @@ const docTemplate = `{
                 "last_name": {
                     "type": "string"
                 },
+                "lock_expires_at": {
+                    "description": "LockExpiresAt is when an automatic lock lifts by itself. Nil when the\naccount is not automatically locked, or when the tenant opted into a\npermanent lock — in which case only an operator can restore access.",
+                    "type": "string"
+                },
                 "logins_count": {
                     "description": "LoginsCount is the number of successful logins on record (audit-derived,\nAuth0's stats.loginsCount equivalent).",
                     "type": "integer"
@@ -9473,6 +10293,13 @@ const docTemplate = `{
                 "application_id": {
                     "type": "string"
                 },
+                "block_reason": {
+                    "type": "string"
+                },
+                "blocked_at": {
+                    "description": "Lockout state (issue #72), for the console's locked badge and its unlock\naction. BlockedAt and BlockReason are nil on an account nothing has locked.\n\nBlockReason distinguishes the two cases an operator must respond to\ndifferently: \"failed_attempts\" is automatic and usually expires on its own,\nwhile \"admin\" is somebody's deliberate decision and only an operator lifts\nit. A badge that showed only \"locked\" would flatten that distinction.",
+                    "type": "string"
+                },
                 "connections": {
                     "description": "Connections lists how this user can sign in: \"password\" when a\ncredentials row exists, plus every linked federated provider (Auth0's\n\"Connection\" column).",
                     "type": "array",
@@ -9485,6 +10312,10 @@ const docTemplate = `{
                 },
                 "email": {
                     "type": "string"
+                },
+                "failed_login_attempts": {
+                    "description": "FailedLoginAttempts is the live counter, so the console can show how close\nan account is to locking rather than only that it already has.",
+                    "type": "integer"
                 },
                 "first_name": {
                     "type": "string"
@@ -9500,6 +10331,10 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "last_name": {
+                    "type": "string"
+                },
+                "lock_expires_at": {
+                    "description": "LockExpiresAt is when an automatic lock lifts by itself. Nil when the\naccount is not automatically locked, or when the tenant opted into a\npermanent lock — in which case only an operator can restore access.",
                     "type": "string"
                 },
                 "logins_count": {
@@ -9881,6 +10716,10 @@ const docTemplate = `{
                 "app_type": {
                     "type": "string"
                 },
+                "audience": {
+                    "description": "Audience is the immutable per-application audience identifier (issue\n#131) — the value an integrator puts in their resource server's\n` + "`" + `audience:` + "`" + ` config. Read-only: there is no update path, by design.",
+                    "type": "string"
+                },
                 "client_id": {
                     "type": "string"
                 },
@@ -9917,6 +10756,10 @@ const docTemplate = `{
                     "items": {
                         "type": "string"
                     }
+                },
+                "require_audience": {
+                    "description": "RequireAudience is the per-client ENFORCEMENT switch, and is not the same\nthing as Audience above. Audience is immutable; this flag is meant to be\nflipped, and flipping it is the #132 rollout.\n\nFalse (the default on every client) means a token with no resolvable\naudience is still minted, exactly as before #131. True means such a mint\nis refused. Rollback of the whole feature is setting it back to false —\nconfiguration, not a deploy.",
+                    "type": "boolean"
                 },
                 "require_pkce": {
                     "description": "RequirePKCE defaults true for every client type, confidential included.",
@@ -9959,10 +10802,35 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AppRateLimitResolution": {
+            "type": "object",
+            "properties": {
+                "configured": {
+                    "description": "Configured reports whether this application has its own limit.",
+                    "type": "boolean"
+                },
+                "limit": {
+                    "description": "Limit is the application's own limit, or null when running at the default.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/auth.AppRateLimit"
+                        }
+                    ]
+                },
+                "source": {
+                    "description": "Source is \"application\" when configured, \"default\" when the server-wide\npolicy applies.",
+                    "type": "string"
+                }
+            }
+        },
         "auth.AppResult": {
             "type": "object",
             "properties": {
                 "app_type": {
+                    "type": "string"
+                },
+                "audience": {
+                    "description": "Audience is the application's immutable per-application audience\nidentifier (issue #131). Empty only for a row created before #131 or one\nwhose name slugified to nothing.\n\nReturned at creation because it is the value the integrator must paste\ninto their resource server's ` + "`" + `audience:` + "`" + ` config, and there is no update\npath that could hand it to them later.",
                     "type": "string"
                 },
                 "client_id": {
@@ -10023,6 +10891,24 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AudienceEntry": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string"
+                },
+                "audience": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "require_audience": {
+                    "description": "RequireAudience reports whether that application enforces audiences on\nits own tokens. Surfaced because it is the switch an operator flips during\nthe #132 rollout and there is otherwise no way to read it back.",
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.AuthResult": {
             "type": "object",
             "properties": {
@@ -10041,6 +10927,58 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "token_type": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.ClientGrant": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "description": "ApplicationID is the grantee — the client that may REQUEST this audience,\nwhich is not necessarily the application that owns it.",
+                    "type": "string"
+                },
+                "audience": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "resource_name": {
+                    "description": "ResourceName is the name of the application that OWNS the audience, for\ndisplay. Read through the composite key, so it is always populated.",
+                    "type": "string"
+                },
+                "scopes": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.EmailSenderResolution": {
+            "type": "object",
+            "properties": {
+                "configured": {
+                    "description": "Configured reports whether THIS scope has its own sender row.",
+                    "type": "boolean"
+                },
+                "settings": {
+                    "description": "Settings is the sender row at this scope, or null when inheriting.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/auth.EmailSenderSettings"
+                        }
+                    ]
+                },
+                "source": {
+                    "description": "Source is where the effective sender comes from: \"application\", \"tenant\"\nor \"global\". Named rather than boolean so a third inheriting level does\nnot require a wire change.",
                     "type": "string"
                 }
             }
@@ -10766,6 +11704,22 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.GrantRequest": {
+            "type": "object",
+            "properties": {
+                "audience": {
+                    "description": "Audience is required on create and ignored on update.\n\nA grant's audience is not editable by design: an operator who wants a\nclient to reach a different API creates that grant and deletes the old\none, leaving two explicit decisions in the audit trail rather than one\nsilent re-point of a grant a resource server may already be relying on.",
+                    "type": "string"
+                },
+                "scopes": {
+                    "description": "Scopes narrows what a token for this audience may carry. An empty or\nabsent list means the grant permits no scopes — the fail-closed reading,\nmatching how oauth_clients.scopes already behaves at /oauth/authorize.\nIt is not \"unrestricted\": that would make a forgotten field the most\npermissive possible configuration.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
         "handlers.HealthResponse": {
             "type": "object",
             "properties": {
@@ -11297,7 +12251,14 @@ const docTemplate = `{
         "handlers.TokenRequest": {
             "type": "object",
             "properties": {
+                "audience": {
+                    "description": "Audience / Resource request a specific API (issue #131). Both spellings,\nfor the same reason /oauth/token accepts both: ` + "`" + `audience` + "`" + ` is Auth0's name\nand ` + "`" + `resource` + "`" + ` is RFC 8707 §2. Omitting them — which every current\nconsumer of this endpoint does — yields the client's own audience, so\nnothing documented in CLIENT_CREDENTIALS_FLOW.md changes.",
+                    "type": "string"
+                },
                 "grant_type": {
+                    "type": "string"
+                },
+                "resource": {
                     "type": "string"
                 }
             }
