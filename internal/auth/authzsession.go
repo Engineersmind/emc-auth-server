@@ -97,6 +97,22 @@ type AuthzRequest struct {
 	Nonce         string   `json:"nonce"`
 	CodeChallenge string   `json:"code_challenge"`
 
+	// Audience is the audience this authorization request was validated for
+	// (issue #131) — the `audience` or RFC 8707 `resource` parameter, already
+	// checked against oauth_client_grants at /oauth/authorize. Empty means the
+	// request named none.
+	//
+	// `omitempty` matters here and is not cosmetic: this struct is JSON in
+	// Redis, so a request parked by the previous binary and resumed by this one
+	// unmarshals with an absent field rather than failing. Every hosted login in
+	// flight across the deploy therefore completes normally.
+	//
+	// Read back from HERE and never from the login form the browser posts, like
+	// every other field in this struct: a form that carried its own audience
+	// would let anyone who can render a page at our origin choose which API the
+	// resulting code is good for.
+	Audience string `json:"audience,omitempty"`
+
 	// AppName is the client's display name, captured from the same LookupClient
 	// call that validated the client at /oauth/authorize.
 	//

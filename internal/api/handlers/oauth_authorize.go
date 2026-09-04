@@ -50,6 +50,10 @@ const (
 	errInvalidScope            = "invalid_scope"
 	errServerError             = "server_error"
 	errConsentRequired         = "consent_required"
+	// errInvalidTarget is RFC 8707 §2 — the requested resource/audience is not
+	// one this client may have. Defined here alongside the RFC 6749 codes
+	// because both endpoints report it and the value must be identical on each.
+	errInvalidTarget = "invalid_target"
 )
 
 // Outcome labels for metrics.OAuthAuthorizeRequests. Named constants rather than
@@ -68,6 +72,7 @@ const (
 	authzOutcomeMFAEnrollment      = "mfa_enrollment_required"
 	authzOutcomeLoginFailed        = "login_failed"
 	authzOutcomeRequestExpired     = "request_expired"
+	authzOutcomeInvalidTarget      = "invalid_target"
 	// authzOutcomeNonceReplayed is worth its own label rather than folding into
 	// invalid_request: a rise in it is either a client reusing nonces (an
 	// integration bug to report) or a replay attempt, and neither is visible if
@@ -112,9 +117,13 @@ type OAuthAuthorizeHandler struct {
 	authz    *auth.AuthorizationServer
 	sessions *auth.AuthzSessionStore
 	authSvc  *auth.AuthService
-	audit    *audit.Logger
-	logger   zerolog.Logger
-	secure   bool
+	// audiences grant-checks the `audience` / `resource` parameter before the
+	// browser is redirected (issue #131). Taken from authSvc rather than
+	// injected separately so both share one configured scheme.
+	audiences *auth.AudienceService
+	audit     *audit.Logger
+	logger    zerolog.Logger
+	secure    bool
 }
 
 // NewOAuthAuthorizeHandler builds the handler. secure controls the Secure flag
@@ -129,7 +138,8 @@ func NewOAuthAuthorizeHandler(
 ) *OAuthAuthorizeHandler {
 	return &OAuthAuthorizeHandler{
 		authz: authz, sessions: sessions, authSvc: authSvc,
-		audit: auditLog, logger: logger, secure: secure,
+		audiences: authSvc.Audiences(),
+		audit:     auditLog, logger: logger, secure: secure,
 	}
 }
 
@@ -270,6 +280,57 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 			"none of the requested scopes are registered for this client")
 	}
 
+	// The requested audience — issue #131.
+	//
+	// Both spellings are accepted: `audience` (what Auth0 uses, and what every
+	// integrator arriving from there will send) and `resource` (RFC 8707 §2,
+	// what a conformant library sends). `audience` wins when both are present
+	// and disagree, rather than erroring: a client sending both is confused, not
+	// hostile, and picking the vendor-compatible one keeps the behaviour
+	// predictable for the population that actually sends two.
+	//
+	// RFC 8707 permits `resource` to REPEAT. Only the first is honoured, because
+	// a token here carries exactly one audience — multi-valued `aud` is legal
+	// JWT but means "valid at all of these", which is precisely the shared
+	// audience this issue exists to abolish.
+	requestedAudience := q.Get("audience")
+	if requestedAudience == "" {
+		requestedAudience = q.Get("resource")
+	}
+
+	// Validated HERE, at the authorize endpoint, and not at the exchange.
+	//
+	// This is the only point in the flow where the request can still be refused
+	// to the CLIENT rather than to the user: after this the browser has been
+	// redirected, the user has typed a password, and a refusal at exchange time
+	// would surface as a broken sign-in with no way to explain itself. The
+	// grant-checked value is then persisted on the code row, so the exchange
+	// re-mints for exactly this audience and cannot name another.
+	if requestedAudience != "" {
+		// A nil resolver means this handler was constructed without audience
+		// support. Refuse rather than skip: skipping would honour an audience
+		// nothing checked a grant for, which is the fail-open reading and would
+		// make the whole grant mechanism bypassable by whichever wiring path
+		// forgot the service.
+		if h.audiences == nil {
+			countAuthorize(authzOutcomeInvalidTarget)
+			return h.redirectError(c, redirectURI, state, errInvalidTarget,
+				"the requested audience is not available to this client")
+		}
+		if _, err := h.audiences.ResolveMintAudience(ctx, auth.AudienceRequest{
+			AppRowID:  client.RowID,
+			Requested: requestedAudience,
+		}); err != nil {
+			countAuthorize(authzOutcomeInvalidTarget)
+			// The description is deliberately generic and identical for every
+			// reason — not granted, does not exist, malformed, another tenant's.
+			// Two distinguishable answers would let any client with a registered
+			// redirect_uri enumerate the deployment's API inventory.
+			return h.redirectError(c, redirectURI, state, errInvalidTarget,
+				"the requested audience is not available to this client")
+		}
+	}
+
 	req := &auth.AuthzRequest{
 		ClientID:      client.ClientID,
 		TenantID:      client.TenantID,
@@ -279,6 +340,7 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 		State:         state,
 		Nonce:         q.Get("nonce"),
 		CodeChallenge: challenge,
+		Audience:      requestedAudience,
 		// Captured from the LookupClient above so the login and MFA pages never
 		// re-query for a display name.
 		AppName: client.Name,
@@ -518,6 +580,9 @@ func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle stri
 		CodeChallenge: req.CodeChallenge,
 		Nonce:         req.Nonce,
 		AuthTime:      sess.AuthTime,
+		// Read off the parked request, which captured it at authorize time after
+		// the grant check — never off the login form.
+		Audience: req.Audience,
 	})
 	if err != nil {
 		// No code was minted, so the nonce was not really consumed. Give it back,

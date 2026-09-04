@@ -916,3 +916,17 @@ func parseAppID(appID string) *int64 {
 	}
 	return &id
 }
+
+// parseAppIDValue is parseAppID for callers that want a plain int64, with 0
+// meaning "no application".
+//
+// Zero is a safe sentinel here and not a real row: oauth_clients.id is
+// GENERATED ALWAYS AS IDENTITY, which starts at 1. AudienceService treats 0 as
+// "no client identity on this request", which is the first case of the
+// resolution table and the one that must not be confused with a lookup miss.
+func parseAppIDValue(appID string) int64 {
+	if id := parseAppID(appID); id != nil {
+		return *id
+	}
+	return 0
+}

@@ -34,6 +34,10 @@ type AdminHandler struct {
 	// when WEBAUTHN_RP_ID is unset, which makes those routes answer 501 rather
 	// than panicking — the same shape as the other optional services here.
 	webauthnSvc *auth.WebAuthnService
+	// audienceSvc backs the per-application audience grant API (issue #131).
+	// nil makes those routes answer 503 rather than panicking, matching the
+	// shape of the other optional services here.
+	audienceSvc *auth.AudienceService
 	audit       *audit.Logger
 	logger      zerolog.Logger
 }
@@ -68,6 +72,12 @@ func (h *AdminHandler) WithTOTP(svc *auth.TOTPService) *AdminHandler {
 }
 
 // WithWebAuthn attaches the passkey service for policy and credential handlers.
+// WithAudiences wires the audience grant service (issue #131).
+func (h *AdminHandler) WithAudiences(svc *auth.AudienceService) *AdminHandler {
+	h.audienceSvc = svc
+	return h
+}
+
 func (h *AdminHandler) WithWebAuthn(svc *auth.WebAuthnService) *AdminHandler {
 	h.webauthnSvc = svc
 	return h
@@ -2775,8 +2785,27 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 		})
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidAppType) || errors.Is(err, auth.ErrInvalidScope) ||
-			errors.Is(err, auth.ErrInvalidClientRedirectURI) {
+			errors.Is(err, auth.ErrInvalidClientRedirectURI) ||
+			errors.Is(err, auth.ErrInvalidAudienceFormat) || errors.Is(err, auth.ErrReservedAudience) {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		}
+		// The audience collision is its own answer, and NOT "an application with
+		// this name already exists" (issue #131).
+		//
+		// It is reached most often by recreating an application whose name was
+		// freed by a soft delete: the name index is partial on deleted_at, so the
+		// NAME is genuinely available again, while the audience is reserved
+		// forever by a full unique index. Telling an operator the name is taken
+		// would send them looking for a live application that is not there.
+		//
+		// Matched by sentinel and listed BEFORE the generic duplicate check,
+		// which keys off the words "duplicate"/"unique" that this message does
+		// not contain — without this branch the error fell through to a 500.
+		if errors.Is(err, auth.ErrAudienceTaken) {
+			return c.JSON(http.StatusConflict, map[string]string{
+				"error": "that name maps to an audience identifier already in use, possibly by a deleted application. " +
+					"Audience identifiers are never reused, so choose a different name.",
+			})
 		}
 		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
 			return c.JSON(http.StatusConflict, map[string]string{"error": "an application with this name already exists"})

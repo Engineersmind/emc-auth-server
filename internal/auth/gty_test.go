@@ -138,7 +138,7 @@ func TestMintSites_EmitGty(t *testing.T) {
 		jwtSvc := newTestJWTService(t, pool, testIssuer)
 		svc := auth.NewAuthService(pool, jwtSvc, logger)
 
-		token, _, err := svc.IssueServiceToken(ctx, tenantID, appID)
+		token, _, err := svc.IssueServiceToken(ctx, tenantID, appID, "")
 		if err != nil {
 			t.Fatalf("IssueServiceToken: %v", err)
 		}

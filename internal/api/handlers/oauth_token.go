@@ -133,6 +133,27 @@ func clientCredentialsFromRequest(c echo.Context) (clientID, clientSecret string
 	return c.FormValue("client_id"), c.FormValue("client_secret")
 }
 
+// requestedAudience reads the audience the caller is asking for, accepting both
+// spellings (issue #131).
+//
+// `audience` is Auth0's parameter name and is what an integrator arriving from
+// there will send; `resource` is RFC 8707 §2 and is what a conformant library
+// sends. Both are supported because both populations are real, and `audience`
+// wins when they disagree — a client sending two different values is confused
+// rather than hostile, and honouring the vendor-compatible one keeps the
+// behaviour predictable for exactly the callers who send both.
+//
+// Only ONE value is honoured even though RFC 8707 permits `resource` to repeat:
+// a token minted here carries exactly one audience. Multi-valued `aud` is legal
+// JWT but means "valid at every one of these", which is the shared audience
+// issue #131 exists to abolish.
+func requestedAudience(c echo.Context) string {
+	if v := c.FormValue("audience"); v != "" {
+		return v
+	}
+	return c.FormValue("resource")
+}
+
 // authenticateClient resolves and, where required, authenticates the client.
 //
 // A confidential client (one with a stored secret) must present it. A public
@@ -226,8 +247,25 @@ func (h *OAuthTokenHandler) authorizationCodeGrant(c echo.Context) error {
 			"authorization code is invalid or expired")
 	}
 
+	// A caller that names an audience at exchange time is refused rather than
+	// ignored (issue #131).
+	//
+	// The audience was fixed at /oauth/authorize, grant-checked there and
+	// persisted on the code row, because that is the only point where a refusal
+	// can still reach the CLIENT rather than a user who has already typed a
+	// password. Silently ignoring a mismatched parameter here would leave a
+	// client believing it had obtained a token for API B when the code was
+	// granted for API A — a discrepancy it would discover only when the resource
+	// server refused the token. An equal value is accepted so a client that
+	// echoes its own request on both legs is not punished for it.
+	if want := requestedAudience(c); want != "" && want != redeemed.Audience {
+		metrics.OAuthGrants.WithLabelValues("authorization_code", "invalid_target").Inc()
+		return h.fail(c, http.StatusBadRequest, errInvalidTarget,
+			"the requested audience does not match the one this authorization code was issued for")
+	}
+
 	issued, err := h.authSvc.IssueTokensForAuthorizationCode(
-		ctx, redeemed.TenantID, redeemed.UserID, client.RowID, redeemed.Scopes)
+		ctx, redeemed.TenantID, redeemed.UserID, client.RowID, redeemed.Scopes, redeemed.Audience)
 	if err != nil {
 		// The most likely cause is a user deactivated or deleted between the
 		// authorize redirect and this exchange — 60 seconds is short but not
@@ -326,6 +364,14 @@ func (h *OAuthTokenHandler) refreshTokenGrant(c echo.Context) error {
 
 	result, err := h.authSvc.Refresh(ctx, raw)
 	if err != nil {
+		if errors.Is(err, auth.ErrInvalidTarget) || errors.Is(err, auth.ErrAudienceRequired) {
+			// A rotation cannot change the audience its chain was issued for, and
+			// a grant revoked since the last rotation stops the chain here rather
+			// than at the next fresh login (issue #131).
+			metrics.OAuthGrants.WithLabelValues("refresh_token", "invalid_target").Inc()
+			return h.fail(c, http.StatusBadRequest, errInvalidTarget,
+				"the requested audience is not available to this client")
+		}
 		if errors.Is(err, auth.ErrTokenReplay) {
 			metrics.OAuthGrants.WithLabelValues("refresh_token", "replayed").Inc()
 			return h.fail(c, http.StatusBadRequest, errInvalidGrant,
@@ -372,8 +418,24 @@ func (h *OAuthTokenHandler) clientCredentialsGrant(c echo.Context) error {
 			"this client is not permitted to use the client_credentials grant")
 	}
 
-	token, expiresIn, err := h.authSvc.IssueServiceToken(ctx, tenantID, appRowID)
+	// The audience parameter is honoured on this grant, unlike on
+	// authorization_code where it is fixed by the code. There is no user and no
+	// prior leg here: the client authenticates and asks in the same request, so
+	// this IS the point of decision. Empty — every caller that exists today —
+	// resolves to the client's own audience, which is what keeps a live
+	// client_credentials integration working with no changes at all.
+	token, expiresIn, err := h.authSvc.IssueServiceToken(ctx, tenantID, appRowID, requestedAudience(c))
 	if err != nil {
+		if errors.Is(err, auth.ErrInvalidTarget) || errors.Is(err, auth.ErrAudienceRequired) {
+			// invalid_target for both, byte-identical. ErrAudienceRequired means
+			// this client has require_audience = true and nothing resolved, which
+			// is a configuration fault on our side of the boundary — but reporting
+			// it distinctly would tell a caller which clients have enforcement
+			// switched on, and that is a map of the #132 rollout.
+			metrics.OAuthGrants.WithLabelValues("client_credentials", "invalid_target").Inc()
+			return h.fail(c, http.StatusBadRequest, errInvalidTarget,
+				"the requested audience is not available to this client")
+		}
 		h.logger.Error().Err(err).Msg("token: service token issuance failed")
 		metrics.OAuthGrants.WithLabelValues("client_credentials", "error").Inc()
 		return h.fail(c, http.StatusInternalServerError, errServerError, "internal error")
@@ -440,7 +502,11 @@ func (h *OAuthTokenHandler) Revoke(c echo.Context) error {
 	// server-side record, and it expires in 15 minutes. Revoking the refresh
 	// token stops the session continuing past that, which is the meaningful
 	// action. token_type_hint is accepted and ignored for the same reason.
-	revoked, err := h.authSvc.RevokeRefreshTokenForTenant(ctx, token, client.TenantID)
+	// client.RowID scopes the revocation to the tokens this client actually
+	// minted — CLAUDE.md deferred #22, now that refresh_tokens carries
+	// application_id (migration 00087). Tenant scoping alone let two clients in
+	// one tenant revoke each other's tokens.
+	revoked, err := h.authSvc.RevokeRefreshTokenForTenant(ctx, token, client.TenantID, client.RowID)
 	if err != nil {
 		// A storage fault is ours, not the caller's, and still must not change
 		// the response: a 500 here for a token that happens to exist would be

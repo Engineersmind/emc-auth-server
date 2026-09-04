@@ -612,8 +612,19 @@ var ErrMissingGrantType = errors.New("jwt: grant type must not be empty")
 //
 // gty is the grant that minted the token — one of the Grant* constants — and is
 // required. It, not audience, is what verification checks against a route's
-// policy; audience is passed through unchanged and is on its way to becoming a
-// real audience identifier in issues #131/#132.
+// policy.
+//
+// Since issue #131 `audience` is a REAL audience identifier — the API a token
+// may be spent at, resolved by AudienceService.ResolveMintAudience — rather
+// than the token-type discriminator it carried up to #130.
+//
+// An EMPTY audience omits the claim entirely rather than signing aud: [""].
+// That is the pre-#131 shape for a client with no stored audience (issue #131
+// §7 case 4) and stays valid while require_audience is false. The distinction
+// matters to a verifier: an absent aud means "this token names no audience", so
+// a library configured with an expected audience refuses it, whereas aud: [""]
+// is a token asserting membership of an audience nobody can be configured for —
+// a claim that would read as data corruption at the far end.
 func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience, gty string, c *Claims) (string, error) {
 	if gty == "" {
 		return "", ErrMissingGrantType
@@ -627,10 +638,12 @@ func (s *JWTService) Sign(ctx context.Context, tenantID int64, audience, gty str
 	c.RegisteredClaims = jwt.RegisteredClaims{
 		ID:        uuid.New().String(),
 		Issuer:    issuer,
-		Audience:  jwt.ClaimStrings{audience},
 		Subject:   c.UserID,
 		IssuedAt:  jwt.NewNumericDate(now),
 		ExpiresAt: jwt.NewNumericDate(now.Add(AccessTokenTTL)),
+	}
+	if audience != "" {
+		c.Audience = jwt.ClaimStrings{audience}
 	}
 	return s.signClaims(ctx, tenantID, c, "jwt")
 }
