@@ -702,16 +702,165 @@ func TestAudienceGrantDenials_IsActuallyIncremented(t *testing.T) {
 	}
 	clientID, _ := strconv.ParseInt(client.ID, 10, 64)
 
-	before := testutil.CollectAndCount(metrics.AudienceGrantDenials)
+	// Asserts the VALUE of the specific series, not the number of series.
+	//
+	// Series count was the original instrument, and B1's bucketing makes it the
+	// wrong one: a denial for an unknown audience now lands on a label that
+	// usually already exists, so a counter that had stopped incrementing entirely
+	// would still show a stable series count and pass. The value cannot be
+	// satisfied that way.
+	counter := metrics.AudienceGrantDenials.WithLabelValues(client.ClientID, "unknown")
+	before := testutil.ToFloat64(counter)
+
 	if _, err := env.audSvc.ResolveMintAudience(env.ctx, auth.AudienceRequest{
 		AppRowID:  clientID,
 		Requested: "api://emc/" + uniqueAppName("denied"),
 	}); !errors.Is(err, auth.ErrInvalidTarget) {
 		t.Fatalf("expected ErrInvalidTarget, got %v", err)
 	}
-	if after := testutil.CollectAndCount(metrics.AudienceGrantDenials); after <= before {
-		t.Errorf("emc_auth_audience_grant_denials_total series count = %d, was %d: the denial counter did not move. "+
-			"Without it a refusal is invisible, because the client is told invalid_target either way", after, before)
+
+	if after := testutil.ToFloat64(counter); after != before+1 {
+		t.Errorf("emc_auth_audience_grant_denials_total{client_id=%q,audience=\"unknown\"} = %v, want %v: "+
+			"the denial counter did not move. Without it a refusal is invisible, because the "+
+			"client is told invalid_target either way", client.ClientID, after, before+1)
+	}
+}
+
+// TestAudienceGrantDenials_LabelCardinalityIsBounded is the regression test for
+// PR #134 review item B1.
+//
+// The requested audience is caller-controlled, and an authenticated client can
+// post a different one on every request. Written straight into a Prometheus
+// label, that grows the process's series set without limit for as long as it
+// runs, and a format check does not help: every value below is well-formed and
+// unreserved, which is the easy case to generate.
+//
+// So the property is not "the counter moves" but "the counter's label set does
+// not grow with the caller's imagination". Twenty-five distinct audiences that
+// name nothing must collapse into ONE series.
+func TestAudienceGrantDenials_LabelCardinalityIsBounded(t *testing.T) {
+	env := newAudienceEnv(t)
+
+	client, err := env.appSvc.CreateApplication(env.ctx, env.tenantID, uniqueAppName("aud131-cardinality"), "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	clientID, _ := strconv.ParseInt(client.ID, 10, 64)
+
+	const probes = 25
+	bucket := metrics.AudienceGrantDenials.WithLabelValues(client.ClientID, "unknown")
+	seriesBefore := testutil.CollectAndCount(metrics.AudienceGrantDenials)
+	bucketBefore := testutil.ToFloat64(bucket)
+
+	for i := 0; i < probes; i++ {
+		// Well-formed, unreserved, and naming no application anywhere.
+		probe := fmt.Sprintf("api://emc/probe-%d-%d", i, time.Now().UnixNano())
+		if _, err := env.audSvc.ResolveMintAudience(env.ctx, auth.AudienceRequest{
+			AppRowID:  clientID,
+			Requested: probe,
+		}); !errors.Is(err, auth.ErrInvalidTarget) {
+			t.Fatalf("probe %d: expected ErrInvalidTarget, got %v", i, err)
+		}
+	}
+
+	// Exactly one new series: {client_id, "unknown"}.
+	if grew := testutil.CollectAndCount(metrics.AudienceGrantDenials) - seriesBefore; grew > 1 {
+		t.Errorf("%d distinct requested audiences created %d new series, want at most 1. "+
+			"A caller-supplied value is reaching the label unbucketed, so any authenticated "+
+			"client can grow this metric without bound", probes, grew)
+	}
+
+	// And every probe still counted, so bounding the label did not cost the signal.
+	if got, want := testutil.ToFloat64(bucket), bucketBefore+probes; got != want {
+		t.Errorf("unknown-audience bucket = %v, want %v: probes were bucketed but not counted", got, want)
+	}
+}
+
+// A denial for an audience the deployment DOES own must keep the real value in
+// the label. That is the case the counter exists for — an integrator with the
+// wrong audience in their config, or a client reaching for an API it was never
+// granted — and bucketing everything would have thrown it away to fix B1.
+//
+// Bounded because it can only ever be an audience some application here holds.
+func TestAudienceGrantDenials_KeepsRealAudienceValues(t *testing.T) {
+	env := newAudienceEnv(t)
+
+	caller, err := env.appSvc.CreateApplication(env.ctx, env.tenantID, uniqueAppName("aud131-caller"), "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication(caller): %v", err)
+	}
+	target, err := env.appSvc.CreateApplication(env.ctx, env.tenantID, uniqueAppName("aud131-target"), "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication(target): %v", err)
+	}
+	callerRowID, _ := strconv.ParseInt(caller.ID, 10, 64)
+
+	// The target's audience is real, but the caller holds no grant for it.
+	counter := metrics.AudienceGrantDenials.WithLabelValues(caller.ClientID, target.Audience)
+	before := testutil.ToFloat64(counter)
+
+	if _, err := env.audSvc.ResolveMintAudience(env.ctx, auth.AudienceRequest{
+		AppRowID:  callerRowID,
+		Requested: target.Audience,
+	}); !errors.Is(err, auth.ErrInvalidTarget) {
+		t.Fatalf("expected ErrInvalidTarget, got %v", err)
+	}
+
+	if after := testutil.ToFloat64(counter); after != before+1 {
+		t.Errorf("denial for the real audience %q was not recorded under its own label (%v -> %v). "+
+			"Bucketing an audience this deployment owns would discard the only diagnostic "+
+			"the counter was written for", target.Audience, before, after)
+	}
+}
+
+// A malformed or reserved value must never reach the label either. Malformed
+// input is the one string here that has passed no validation at all, so it is
+// unbounded in length and charset as well as in count.
+func TestAudienceGrantDenials_MalformedAndReservedAreBucketed(t *testing.T) {
+	env := newAudienceEnv(t)
+
+	client, err := env.appSvc.CreateApplication(env.ctx, env.tenantID, uniqueAppName("aud131-buckets"), "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	clientID, _ := strconv.ParseInt(client.ID, 10, 64)
+
+	cases := []struct {
+		name      string
+		requested string
+		bucket    string
+	}{
+		{"malformed", "NOT AN AUDIENCE " + strings.Repeat("x", 300), "malformed"},
+
+		// Well-formed AND reserved: matches the identifier pattern, so only the
+		// reserved check can catch it.
+		{"reserved namespace", auth.ReservedAudiencePrefix + "/management", "reserved"},
+
+		// Reserved but NOT well-formed. These are the values that matter most —
+		// a caller asking for this server's own token-type audience is issue
+		// #84's probe — and they must land under "reserved" rather than being
+		// filed as a typo, which is what a format-first ordering would do.
+		{"server self audience", auth.AudienceSelf, "reserved"},
+		{"legacy token-type audience", auth.AudienceAPI, "reserved"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			counter := metrics.AudienceGrantDenials.WithLabelValues(client.ClientID, tc.bucket)
+			before := testutil.ToFloat64(counter)
+
+			if _, err := env.audSvc.ResolveMintAudience(env.ctx, auth.AudienceRequest{
+				AppRowID:  clientID,
+				Requested: tc.requested,
+			}); !errors.Is(err, auth.ErrInvalidTarget) {
+				t.Fatalf("expected ErrInvalidTarget, got %v", err)
+			}
+
+			if after := testutil.ToFloat64(counter); after != before+1 {
+				t.Errorf("%s value was not counted under the %q bucket (%v -> %v)",
+					tc.name, tc.bucket, before, after)
+			}
+		})
 	}
 }
 

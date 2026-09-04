@@ -380,8 +380,22 @@ var (
 	// was written.
 	//
 	// Labels: client_id (the public client_id, or "none" when the request
-	// carried no client identity), audience (the value REQUESTED, not the one
-	// granted).
+	// carried no client identity), audience — the value REQUESTED, but only when
+	// that value names an application this deployment actually has. Otherwise one
+	// of four buckets: "none", "malformed", "reserved", "unknown".
+	//
+	// The buckets exist because the requested value is caller-controlled and a
+	// client can post a fresh one per request (PR #134 review, B1). Writing it
+	// straight into a label grows this series set without limit for the life of
+	// the process, and a format check does not help — api-aaaa/x, api-aaab/x and
+	// so on all pass it. Bounding the label by "is this one of ours" caps the
+	// series at the number of applications while keeping the answer to the
+	// question the counter exists for: which of OUR audiences is refused to whom.
+	//
+	// A rising "unknown" is the probe signal. The raw value it stood in for is
+	// logged at warn by AudienceService.denialLabel, so the "integrator pasted
+	// the wrong audience" case is still one grep away — bounded by log retention
+	// rather than by cardinality.
 	AudienceGrantDenials = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "emc_auth",
