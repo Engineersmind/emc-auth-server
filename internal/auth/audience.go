@@ -389,6 +389,21 @@ func (s *AudienceService) CreateGrant(ctx context.Context, tenantID, appRowID in
 		scopes = []string{}
 	}
 
+	// The count and the INSERT below are NOT serialised, and that is accepted
+	// rather than overlooked (PR #134 review, B2).
+	//
+	// Two concurrent CreateGrant calls for one client can both read count = 49
+	// and both insert, leaving 51. Do not reach for SELECT ... FOR UPDATE or an
+	// advisory lock here: maxGrantsPerClient is a resource governor, not an access
+	// control. Every grant is explicit and administrator-created, so the worst
+	// case is an administrator racing themselves into one or two rows over a soft
+	// ceiling, visible in the next ListGrants and removable with a DELETE.
+	//
+	// A lock would serialise every grant write in the deployment to buy exactness
+	// on a number chosen for being comfortably large. The invariants that DO need
+	// to hold under concurrency — audience uniqueness, tenant containment,
+	// immutability — are enforced by the unique index and the composite foreign
+	// key in migration 00087, not by this check.
 	var count int
 	if err := s.pool.QueryRow(ctx,
 		`SELECT COUNT(*) FROM oauth_client_grants WHERE client_id = $1`, appRowID).Scan(&count); err != nil {
@@ -569,7 +584,7 @@ func (s *AudienceService) ResolveMintAudience(ctx context.Context, req AudienceR
 			// A caller with no client identity asking for a tenant's audience.
 			// There is no client to hold a grant, so there is nothing that could
 			// permit it. Refused with the same sentinel as every other denial.
-			s.countDenial("none", req.Requested)
+			s.countDenial(ctx, "none", req.Requested)
 			return MintAudience{}, ErrInvalidTarget
 		}
 		return MintAudience{Value: AudienceSelf, Source: AudienceSourceServer}, nil
@@ -594,7 +609,7 @@ func (s *AudienceService) ResolveMintAudience(ctx context.Context, req AudienceR
 			// API, and letting a rotation move it would make the audience a
 			// property of the last request rather than of the grant, which is
 			// exactly the boundary #131 exists to draw.
-			s.countDenial(client.clientID, req.Requested)
+			s.countDenial(ctx, client.clientID, req.Requested)
 			return MintAudience{}, ErrInvalidTarget
 		}
 		scopes, err := s.resolveTargetGrant(ctx, req.AppRowID, client.clientID, requested)
@@ -679,7 +694,7 @@ func (s *AudienceService) resolveTargetGrant(ctx context.Context, appRowID int64
 		// one. Telling a caller "that is malformed" versus "that is not yours"
 		// is itself a distinguishable answer, and the format is documented, so
 		// a legitimate client learns nothing here it could not read in the docs.
-		s.countDenial(clientID, audience)
+		s.countDenial(ctx, clientID, audience)
 		return nil, ErrInvalidTarget
 	}
 	var scopes []string
@@ -693,7 +708,7 @@ func (s *AudienceService) resolveTargetGrant(ctx context.Context, appRowID int64
 	`, appRowID, audience).Scan(&scopes)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			s.countDenial(clientID, audience)
+			s.countDenial(ctx, clientID, audience)
 			return nil, ErrInvalidTarget
 		}
 		return nil, fmt.Errorf("resolve audience grant: %w", err)
@@ -704,22 +719,99 @@ func (s *AudienceService) resolveTargetGrant(ctx context.Context, appRowID int64
 	return scopes, nil
 }
 
-// countDenial increments the grant-denial counter.
+// Bucket labels used in place of a caller-supplied audience value. Each is
+// deliberately not a legal audience — every real one contains "/" — so a bucket
+// can never be confused with a value a client actually asked for.
+const (
+	denialLabelNone      = "none"
+	denialLabelMalformed = "malformed"
+	denialLabelReserved  = "reserved"
+	denialLabelUnknown   = "unknown"
+)
+
+// countDenial increments the grant-denial counter with a BOUNDED audience label
+// (PR #134 review, B1).
 //
-// The audience label carries the REQUESTED value, which is caller-controlled.
-// That is a deliberate, bounded risk: Prometheus label cardinality is the cost,
-// and without the value the counter cannot answer the only question worth
-// asking of it — which audience is being refused to whom. The value is format-
-// checked before most denials reach here, and an unbounded-cardinality attack
-// on this series is visible in the same scrape it pollutes.
-func (s *AudienceService) countDenial(clientID, audience string) {
+// The requested value is caller-controlled, and an authenticated client can post
+// a fresh one per request. Written straight into a Prometheus label that grows
+// the process's series set without limit, for the lifetime of the process, and
+// no format check prevents it: a well-formed value is the easy case to generate,
+// since api-aaaa/x, api-aaab/x and so on all pass.
+//
+// So the label is only ever the real value when that value names an application
+// this deployment actually has, which bounds the series by the number of
+// applications. Everything else collapses into one of four buckets. The counter
+// still answers the question it exists for — which of OUR audiences is being
+// refused to whom — and the buckets answer the other one, "is somebody probing",
+// without paying cardinality for the probe's imagination.
+//
+// Bucketing on format alone is not enough, which is why this does a lookup: it
+// is the well-formed-but-nonexistent case that is both unbounded AND the one an
+// attacker reaches for. The lookup is a single indexed hit on the unique index
+// over oauth_clients.audience, on a path that is already abnormal, and it is
+// what lets the granted-but-refused case keep its value.
+//
+// The raw value is logged instead. Log volume is bounded by retention rather
+// than by cardinality, so the "integrator pasted the wrong audience" diagnostic
+// survives — that is the case this counter was written to catch, and it is still
+// one grep away.
+func (s *AudienceService) countDenial(ctx context.Context, clientID, audience string) {
 	if clientID == "" {
-		clientID = "none"
+		clientID = denialLabelNone
 	}
-	if audience == "" {
-		audience = "none"
+	metrics.AudienceGrantDenials.WithLabelValues(clientID, s.denialLabel(ctx, clientID, audience)).Inc()
+}
+
+// denialLabel classifies a refused audience into a bounded label.
+func (s *AudienceService) denialLabel(ctx context.Context, clientID, audience string) string {
+	switch {
+	case audience == "":
+		return denialLabelNone
+
+	// Reserved is tested BEFORE the format check, and the order matters.
+	//
+	// Several reserved values do not match the identifier pattern at all — the
+	// token-type audiences are bare strings like "emc-auth-api", and AudienceSelf
+	// is "api://emc-auth" with no second label. Checking the format first would
+	// file every one of them under "malformed", which is true but useless: a
+	// caller asking for this server's own management audience is the probe that
+	// issue #84 was about, and it deserves to be visible as a reserved-namespace
+	// attempt rather than lost among typos.
+	case IsReservedAudience(audience), audience == AudienceSelf,
+		strings.HasPrefix(audience, "emc-auth"):
+		return denialLabelReserved
+
+	case !s.pattern.MatchString(audience):
+		// The value is deliberately NOT logged here: malformed input is the one
+		// string on this path that has passed no validation at all, so it is
+		// unbounded in length and charset.
+		return denialLabelMalformed
 	}
-	metrics.AudienceGrantDenials.WithLabelValues(clientID, audience).Inc()
+
+	// Well-formed and not reserved. Only a value this deployment owns may become
+	// a label.
+	var exists bool
+	err := s.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM oauth_clients WHERE audience = $1)`, audience).Scan(&exists)
+	if err != nil {
+		// Fail closed on cardinality, not on the request: the caller's token
+		// request is already refused, and this is only a label. Attributing it to
+		// the bounded bucket is strictly better than letting a database blip
+		// become the path that admits arbitrary series.
+		s.logger.Warn().Err(err).Str("client_id", clientID).
+			Msg("audience denial: existence check failed, bucketing the label")
+		return denialLabelUnknown
+	}
+	if !exists {
+		// Bounded in length by the format check, so safe to log verbatim. This is
+		// the line an operator greps when an integrator reports invalid_target.
+		s.logger.Warn().
+			Str("client_id", clientID).
+			Str("requested_audience", audience).
+			Msg("audience denied: no such audience in this deployment")
+		return denialLabelUnknown
+	}
+	return audience
 }
 
 // FilterPermissionsForClient narrows the internal permissions array for a
