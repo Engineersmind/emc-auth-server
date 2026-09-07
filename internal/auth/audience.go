@@ -168,11 +168,21 @@ func (s *AudienceService) WithScheme(scheme string) *AudienceService {
 // Scheme returns the configured identifier scheme.
 func (s *AudienceService) Scheme() string { return s.scheme }
 
+// schemePattern is the format check for AUDIENCE_SCHEME, compiled once.
+//
+// Package level rather than inside validAudienceScheme (PR #134 review): the
+// only caller today is WithScheme at startup, so compiling per call costs
+// nothing measurable — but a config-reload path would call it per reload, and a
+// pattern that never varies has no reason to be rebuilt at all. Contrast
+// audiencePattern below, which is parameterised on the scheme and therefore
+// cannot be hoisted the same way; it is built once per AudienceService instead.
+var schemePattern = regexp.MustCompile(`^[a-z][a-z0-9+.-]{0,15}://$`)
+
 // validAudienceScheme accepts only a lowercase alphanumeric scheme followed by
 // "://" — the shape that cannot be confused with a path, a bare hostname, or a
 // permission scope.
 func validAudienceScheme(scheme string) bool {
-	return regexp.MustCompile(`^[a-z][a-z0-9+.-]{0,15}://$`).MatchString(scheme)
+	return schemePattern.MatchString(scheme)
 }
 
 // audiencePattern builds the format check for one scheme.
@@ -404,9 +414,17 @@ func (s *AudienceService) CreateGrant(ctx context.Context, tenantID, appRowID in
 	// to hold under concurrency — audience uniqueness, tenant containment,
 	// immutability — are enforced by the unique index and the composite foreign
 	// key in migration 00087, not by this check.
+	//
+	// tenant_id is in the predicate for the project's app-scoping convention,
+	// not because the count would otherwise be wrong: oauth_clients.id is a
+	// BIGINT GENERATED ALWAYS AS IDENTITY, so client_id alone already selects
+	// exactly one tenant's rows. It is carried so that every query in this file
+	// reads the same way and nobody has to re-derive that argument (PR #134
+	// review).
 	var count int
 	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM oauth_client_grants WHERE client_id = $1`, appRowID).Scan(&count); err != nil {
+		`SELECT COUNT(*) FROM oauth_client_grants WHERE client_id = $1 AND tenant_id = $2`,
+		appRowID, tenantID).Scan(&count); err != nil {
 		return nil, fmt.Errorf("count client grants: %w", err)
 	}
 	if count >= maxGrantsPerClient {
@@ -515,6 +533,19 @@ type MintAudience struct {
 	// Source records which case of the resolution table applied, for logs and
 	// for the tests that assert the table is actually implemented.
 	Source AudienceSource
+	// FirstParty is the resolved client's oauth_clients.first_party, and is what
+	// FilterPermissionsForClient consumes (deferred #23).
+	//
+	// It rides on this struct because resolving the audience already reads the
+	// row it comes from. Before PR #134's review it was fetched by a separate
+	// IsFirstParty call on the token-mint path, which meant two round-trips to
+	// the same indexed row for every authorization-code and refresh mint.
+	//
+	// True when there is no client at all (case 3): a first-party portal flow is
+	// the one case where a full permissions array is correct. That matches
+	// IsFirstParty's own answer for appRowID == 0, so nothing changed by moving
+	// the read here.
+	FirstParty bool
 }
 
 // AudienceSource enumerates the four resolution cases. See ResolveMintAudience.
@@ -587,7 +618,7 @@ func (s *AudienceService) ResolveMintAudience(ctx context.Context, req AudienceR
 			s.countDenial(ctx, "none", req.Requested)
 			return MintAudience{}, ErrInvalidTarget
 		}
-		return MintAudience{Value: AudienceSelf, Source: AudienceSourceServer}, nil
+		return MintAudience{Value: AudienceSelf, Source: AudienceSourceServer, FirstParty: true}, nil
 	}
 
 	client, err := s.loadClientAudience(ctx, req.AppRowID)
@@ -620,7 +651,8 @@ func (s *AudienceService) ResolveMintAudience(ctx context.Context, req AudienceR
 		if req.Requested == "" {
 			source = AudienceSourcePinned
 		}
-		return MintAudience{Value: requested, GrantedScopes: scopes, Source: source}, nil
+		return MintAudience{Value: requested, GrantedScopes: scopes, Source: source,
+			FirstParty: client.firstParty}, nil
 	}
 
 	// Case 2 — the client's own audience. No grant lookup: the self-grant that
@@ -629,7 +661,8 @@ func (s *AudienceService) ResolveMintAudience(ctx context.Context, req AudienceR
 	// could no longer authenticate to its own API, which is a foot-gun with no
 	// upside.
 	if client.audience != "" {
-		return MintAudience{Value: client.audience, Source: AudienceSourceClientSelf}, nil
+		return MintAudience{Value: client.audience, Source: AudienceSourceClientSelf,
+			FirstParty: client.firstParty}, nil
 	}
 
 	// Case 4 — nothing to put in the claim. Enforced only if the client asked
@@ -637,7 +670,7 @@ func (s *AudienceService) ResolveMintAudience(ctx context.Context, req AudienceR
 	if client.requireAudience {
 		return MintAudience{}, ErrAudienceRequired
 	}
-	return MintAudience{Source: AudienceSourceNone}, nil
+	return MintAudience{Source: AudienceSourceNone, FirstParty: client.firstParty}, nil
 }
 
 // clientAudience is the audience-relevant part of an oauth_clients row.
@@ -751,6 +784,19 @@ const (
 // over oauth_clients.audience, on a path that is already abnormal, and it is
 // what lets the granted-but-refused case keep its value.
 //
+// That lookup is a real DB round-trip on every well-formed, unreserved denial,
+// and it is an accepted cost at current scale rather than an oversight (PR #134
+// review). One misconfigured integrator retrying a wrong audience doubles the
+// query count for its own failing calls; a fleet of them after a bad rollout
+// multiplies that by the fleet. Deliberately NOT cached: a TTL cache would have
+// to be invalidated on every application create and delete to avoid labelling a
+// real audience "unknown", which is real invalidation logic added to a
+// telemetry path — and the alternative to the round-trip is not a cache but
+// dropping the value, which is what the whole fix exists to avoid. Revisit if
+// denials ever become common enough to show up in query volume; the shape to
+// reach for then is a bounded LRU of bool keyed on audience, populated here and
+// cleared wherever oauth_clients.audience is written.
+//
 // The raw value is logged instead. Log volume is bounded by retention rather
 // than by cardinality, so the "integrator pasted the wrong audience" diagnostic
 // survives — that is the case this counter was written to catch, and it is still
@@ -862,20 +908,11 @@ func isCheckViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23514"
 }
 
-// IsFirstParty reports whether a client is first-party, for callers that hold
-// only a row id. Errs towards FALSE — the narrower answer — on any failure, so
-// a lookup fault strips permissions rather than leaking them.
-func (s *AudienceService) IsFirstParty(ctx context.Context, appRowID int64) bool {
-	if appRowID == 0 {
-		// No client at all is a first-party portal flow, which is the one case
-		// where a full permissions array is correct.
-		return true
-	}
-	c, err := s.loadClientAudience(ctx, appRowID)
-	if err != nil {
-		s.logger.Warn().Err(err).Int64("app_row_id", appRowID).
-			Msg("audience: first-party lookup failed, treating client as third-party")
-		return false
-	}
-	return c.firstParty
-}
+// There is deliberately no IsFirstParty helper on this service (PR #134
+// review). One existed and had exactly one caller, on the token-mint path,
+// where it re-read the oauth_clients row that ResolveMintAudience had just
+// read. The fact now travels on MintAudience.FirstParty, so the mint path gets
+// it for free and there is no second entry point to drift from it. If a caller
+// ever genuinely needs first_party WITHOUT resolving an audience, add it back
+// reading loadClientAudience and erring towards FALSE — the narrower answer —
+// on any failure, so a lookup fault strips permissions rather than leaking them.

@@ -1120,3 +1120,170 @@ func TestAppScopedLogin_CarriesTheClientsAudience(t *testing.T) {
 		t.Errorf("rotated app-scoped aud = %q, want %q", got, app.Audience)
 	}
 }
+
+// TestResolveMintAudience_CarriesFirstParty pins the fact that closed the
+// double-read finding in PR #134's review.
+//
+// FilterPermissionsForClient (deferred #23) needs oauth_clients.first_party on
+// every OAuth mint. It used to come from a separate IsFirstParty lookup, which
+// re-read the row ResolveMintAudience had just read; the flag now rides on
+// MintAudience. This test exists because that is a silent failure mode: if
+// FirstParty were left at its zero value the resolution would still return the
+// right audience, the tests above would still pass, and every first-party
+// client would quietly stop receiving its permissions array.
+//
+// The three cases are exactly the three answers the deleted helper gave.
+func TestResolveMintAudience_CarriesFirstParty(t *testing.T) {
+	env := newAudienceEnv(t)
+
+	app, err := env.appSvc.CreateApplication(env.ctx, env.tenantID, uniqueAppName("aud131-fp"), "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	appRowID, _ := strconv.ParseInt(app.ID, 10, 64)
+
+	t.Run("no client identity is first-party", func(t *testing.T) {
+		// Case 3, the admin console. There is no row to read, and a portal flow
+		// is the one case where the full permissions array is correct — so this
+		// must be true by construction, not by lookup.
+		got, err := env.audSvc.ResolveMintAudience(env.ctx, auth.AudienceRequest{})
+		if err != nil {
+			t.Fatalf("ResolveMintAudience: %v", err)
+		}
+		if !got.FirstParty {
+			t.Error("FirstParty = false for a request with no client identity, want true")
+		}
+	})
+
+	t.Run("a first-party client reads true", func(t *testing.T) {
+		got, err := env.audSvc.ResolveMintAudience(env.ctx, auth.AudienceRequest{AppRowID: appRowID})
+		if err != nil {
+			t.Fatalf("ResolveMintAudience: %v", err)
+		}
+		if !got.FirstParty {
+			t.Error("FirstParty = false for a first_party = true client, want true")
+		}
+	})
+
+	t.Run("a third-party client reads false", func(t *testing.T) {
+		// first_party is set by SQL because there is no API that sets it to
+		// false today — /oauth/authorize refuses such a client outright. The
+		// column exists for the consent screen (deferred #19), and this
+		// assertion is what makes sure the plumbing is already correct when it
+		// lands rather than being discovered by an external client receiving
+		// internal permission strings.
+		if _, err := env.pool.Exec(env.ctx,
+			`UPDATE oauth_clients SET first_party = false WHERE id = $1`, appRowID); err != nil {
+			t.Fatalf("set first_party = false: %v", err)
+		}
+		got, err := env.audSvc.ResolveMintAudience(env.ctx, auth.AudienceRequest{AppRowID: appRowID})
+		if err != nil {
+			t.Fatalf("ResolveMintAudience: %v", err)
+		}
+		if got.FirstParty {
+			t.Error("FirstParty = true for a first_party = false client, want false")
+		}
+		if got.Value != app.Audience {
+			t.Errorf("audience = %q, want the client's own %q — resolution must not change", got.Value, app.Audience)
+		}
+	})
+}
+
+// TestRevoke_ZeroAppRowIDCannotRevokeOwnedTokens covers the predicate change
+// from PR #134's review: "application_id IS NULL OR $3 = 0 OR application_id =
+// $3" let a caller with NO application identity match every row in the tenant,
+// including tokens a real client owns.
+//
+// Not reachable through HTTP today — /oauth/revoke authenticates the client
+// before it reads the token parameter and passes an IDENTITY value that is
+// never 0 — so this asserts at the service boundary, which is where the next
+// caller will arrive. TestRevoke_CannotCrossClientsWithinATenant covers the
+// client-versus-client half; this one covers zero-versus-client.
+func TestRevoke_ZeroAppRowIDCannotRevokeOwnedTokens(t *testing.T) {
+	env := newAudienceEnv(t)
+
+	owner, err := env.appSvc.CreateApplication(env.ctx, env.tenantID, uniqueAppName("aud131-zero"), "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	ownerID, _ := strconv.ParseInt(owner.ID, 10, 64)
+
+	email := uniqueEmail("aud131-zero-revoke")
+	if _, err := env.authSvc.Register(env.ctx, auth.RegisterInput{
+		Email: email, Password: "Password123!", FirstName: "T", LastName: "U",
+		ClientID: owner.ClientID, ClientSecret: owner.ClientSecret,
+	}); err != nil {
+		t.Fatalf("Register(app-scoped): %v", err)
+	}
+	login, err := env.authSvc.Login(env.ctx, auth.LoginInput{
+		Email: email, Password: "Password123!",
+		ClientID: owner.ClientID, ClientSecret: owner.ClientSecret,
+	})
+	if err != nil || login.Token == nil {
+		t.Fatalf("Login(app-scoped): %v", err)
+	}
+
+	revoked, err := env.authSvc.RevokeRefreshTokenForTenant(env.ctx, login.Token.RefreshToken, env.tenantID, 0)
+	if err != nil {
+		t.Fatalf("RevokeRefreshTokenForTenant(appRowID = 0): %v", err)
+	}
+	if revoked {
+		t.Error("a caller with no application identity revoked a client-owned refresh token")
+	}
+
+	// The owning client still can — the tightened predicate must not have
+	// broken the case the column was added for.
+	revoked, err = env.authSvc.RevokeRefreshTokenForTenant(env.ctx, login.Token.RefreshToken, env.tenantID, ownerID)
+	if err != nil {
+		t.Fatalf("RevokeRefreshTokenForTenant(owner): %v", err)
+	}
+	if !revoked {
+		t.Error("the owning client could not revoke its own refresh token")
+	}
+}
+
+// TestRevoke_PreExistingTokensStayRevocable is the other direction, and the
+// reason the predicate keeps an application_id IS NULL branch at all.
+//
+// A refresh token minted before migration 00087 has no application_id, so there
+// is no ownership recorded to check. Refusing those would make every token
+// issued before the upgrade unrevocable for the thirty days its chain can live
+// — a worse outcome than the gap #22 named. NULLIF must not have narrowed this.
+func TestRevoke_PreExistingTokensStayRevocable(t *testing.T) {
+	env := newAudienceEnv(t)
+
+	owner, err := env.appSvc.CreateApplication(env.ctx, env.tenantID, uniqueAppName("aud131-prexist"), "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	ownerID, _ := strconv.ParseInt(owner.ID, 10, 64)
+
+	email := uniqueEmail("aud131-prexist")
+	if _, err := env.authSvc.Register(env.ctx, auth.RegisterInput{
+		Email: email, Password: "Password123!", FirstName: "T", LastName: "U",
+		ClientID: owner.ClientID, ClientSecret: owner.ClientSecret,
+	}); err != nil {
+		t.Fatalf("Register(app-scoped): %v", err)
+	}
+	login, err := env.authSvc.Login(env.ctx, auth.LoginInput{
+		Email: email, Password: "Password123!",
+		ClientID: owner.ClientID, ClientSecret: owner.ClientSecret,
+	})
+	if err != nil || login.Token == nil {
+		t.Fatalf("Login(app-scoped): %v", err)
+	}
+
+	// Reproduce a pre-00087 row: the column exists, the value does not.
+	if _, err := env.pool.Exec(env.ctx,
+		`UPDATE refresh_tokens SET application_id = NULL WHERE tenant_id = $1`, env.tenantID); err != nil {
+		t.Fatalf("clear application_id: %v", err)
+	}
+
+	revoked, err := env.authSvc.RevokeRefreshTokenForTenant(env.ctx, login.Token.RefreshToken, env.tenantID, ownerID)
+	if err != nil {
+		t.Fatalf("RevokeRefreshTokenForTenant: %v", err)
+	}
+	if !revoked {
+		t.Error("a pre-00087 refresh token with no application_id could not be revoked")
+	}
+}

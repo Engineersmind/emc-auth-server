@@ -488,6 +488,18 @@ type sessionContext struct {
 	// refresh token while naming API B and walk from one grant to another
 	// without ever presenting a credential for B.
 	pinnedAudience string
+
+	// filterPermsForClient asks for the internal `permissions` array to be
+	// withheld from a non-first-party client (CLAUDE.md deferred #23).
+	//
+	// Opt-in per caller rather than applied unconditionally, and false is the
+	// correct zero value. Only the OAuth authorization-code path — the one that
+	// can ever mint for a client the tenant does not own — sets it; a Login or a
+	// magic link against a non-first-party application must keep emitting the
+	// full array, because there the token is the user's own session on that
+	// application and `permissions` is what every first-party consumer reads.
+	// Filtering everywhere would strip those claims from live flows.
+	filterPermsForClient bool
 }
 
 // issueTokenPair signs a JWT access token and persists a matching refresh token.
@@ -563,6 +575,14 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// Deferred #23, applied here because aud already carries first_party — see
+	// MintAudience.FirstParty. issueScopedTokenPair used to resolve the flag
+	// itself with a second read of the same oauth_clients row (PR #134 review);
+	// it now just asks for the filter and the resolution supplies the fact.
+	if sess.filterPermsForClient {
+		claims.Permissions = FilterPermissionsForClient(claims.Permissions, aud.FirstParty)
 	}
 
 	// Grant-level scope narrowing. A grant may permit fewer scopes than the
@@ -2433,6 +2453,18 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 //	                              named: two clients in one tenant could
 //	                              previously revoke each other's tokens.
 //
+// NULLIF($3, 0) rather than a bare $3 (PR #134 review). With "$3 = 0 OR
+// application_id = $3" a zero appRowID satisfied the predicate for EVERY row,
+// including tokens owned by a real client — so a caller with no application
+// identity could revoke any client's token in the tenant. Not reachable today:
+// the sole caller is OAuthTokenHandler.Revoke, which authenticates the client
+// before it even reads the token parameter and passes client.RowID, and an
+// IDENTITY column never yields 0. Written this way so it stays true for the
+// next caller. NULLIF yields NULL when appRowID is 0, and "application_id =
+// NULL" is never true, so the zero case is served entirely by the
+// application_id IS NULL branch above — which is exactly the set a caller
+// without an application identity should be able to revoke, and no more.
+//
 // The response is STILL 200 whatever happens here — RFC 7009 §2.2 forbids the
 // oracle, and "you may not revoke that" is as much of an oracle as "that token
 // does not exist". The boolean is for the audit row only.
@@ -2442,7 +2474,7 @@ func (s *AuthService) RevokeRefreshTokenForTenant(ctx context.Context, rawRefres
 		UPDATE refresh_tokens
 		SET    revoked_at = NOW()
 		WHERE  token_hash = $1 AND tenant_id = $2 AND revoked_at IS NULL
-		  AND  (application_id IS NULL OR $3 = 0 OR application_id = $3)
+		  AND  (application_id IS NULL OR application_id = NULLIF($3, 0))
 	`, hash, tenantID, appRowID)
 	if err != nil {
 		return false, fmt.Errorf("revoke refresh token: %w", err)
@@ -2582,12 +2614,16 @@ func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID
 	// would be the wrong model.
 	//
 	// This changes nothing today: every client that can reach here is
-	// first_party = true, so IsFirstParty returns true and perms pass through
-	// untouched.
-	perms = FilterPermissionsForClient(perms, s.audienceSvc.IsFirstParty(ctx, parseAppIDValue(appID)))
-
+	// first_party = true, so the filter passes perms through untouched.
+	//
+	// The flag is set rather than the filter applied, because the first_party
+	// fact arrives with the resolved audience one layer down and reading it here
+	// meant a second SELECT on the same row (PR #134 review).
 	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms,
-		sessionContext{amr: []string{AMRPassword}, grant: GrantAuthorizationCode, audience: audience},
+		sessionContext{
+			amr: []string{AMRPassword}, grant: GrantAuthorizationCode, audience: audience,
+			filterPermsForClient: true,
+		},
 		appID, strings.Join(scopes, " "))
 }
 
