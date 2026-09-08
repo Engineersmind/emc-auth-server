@@ -670,9 +670,29 @@ func (s *JWTService) SignManagement(ctx context.Context, identity *APIKeyIdentit
 		AdminScope:  AdminScopeTenant,
 		Permissions: identity.Permissions,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ID:        uuid.New().String(),
-			Issuer:    issuer,
-			Audience:  jwt.ClaimStrings{AudienceManagement},
+			ID:     uuid.New().String(),
+			Issuer: issuer,
+			// AudienceSelf, not the legacy AudienceManagement — issue #132.
+			//
+			// This token is minted to be spent on THIS server's management
+			// surface (/tenants, /applications, /users and the rest of
+			// adminGroup), which #132 restricts to api://emc-auth. The legacy
+			// "emc-auth-management" string carries no scheme, so the route
+			// policy reads it as an un-migrated token and admits it only while
+			// enforcement is off; the moment REQUIRE_AUDIENCE goes on, every
+			// API-key integration would lose the whole admin API at once.
+			//
+			// Resolved here as a constant rather than through
+			// AudienceService.ResolveMintAudience because an API key belongs to
+			// the TENANT and not to any one application (see AdminScope above),
+			// so there is no oauth_clients row to read an audience from. The
+			// mint sites that do have a client go through the resolver.
+			//
+			// Safe to change because nothing verifies this value: the token
+			// carries Gty, and legacyAudienceGrants is consulted only when gty
+			// is absent. presentedAudience reads gty first too, so even the
+			// metric label is unaffected.
+			Audience:  jwt.ClaimStrings{AudienceSelf},
 			Subject:   "key:" + strconv.FormatInt(identity.KeyID, 10),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ManagementTokenTTL)),

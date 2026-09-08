@@ -346,6 +346,67 @@ func (s *AudienceService) ListAudiences(ctx context.Context, tenantID int64) ([]
 	return out, rows.Err()
 }
 
+// AudienceInTenant reports whether an audience identifier belongs to a live
+// application inside one tenant.
+//
+// This is the read behind the identity-route policy in #132: those endpoints
+// exist FOR app-scoped tokens, so they accept any audience the caller's own
+// tenant owns rather than demanding this server's. Scoped by tenant_id and not
+// by audience alone, because "some application somewhere owns this identifier"
+// is not the question — a token from Acme's tenant presenting Globex's audience
+// must be refused, and a global existence check would admit it.
+//
+// Served by idx_oauth_clients_tenant_audience (migration 00087), so this is an
+// index-only lookup on the hot path of every authenticated identity request.
+//
+// Soft-deleted applications are excluded. Their identifiers stay reserved
+// forever — the unique index guarantees no reuse — but a token naming a
+// deleted application's audience names something that can no longer be spent.
+func (s *AudienceService) AudienceInTenant(ctx context.Context, tenantID int64, audience string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM   oauth_clients
+			WHERE  tenant_id = $1
+			  AND  audience  = $2
+			  AND  deleted_at IS NULL
+		)
+	`, tenantID, audience).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("audience in tenant: %w", err)
+	}
+	return exists, nil
+}
+
+// ClientRequiresAudience reads one application's require_audience column.
+//
+// This is the PER-CLIENT half of #132's enforcement, and the reason the cutover
+// can be staged at all. The deployment-wide REQUIRE_AUDIENCE flag enforces
+// across every tenant on the server in one step; this column enforces for one
+// application, so an operator flips consumers over one at a time and a mistake
+// is contained to the one that was flipped. Rollback is a single UPDATE with no
+// deploy.
+//
+// A missing application row reports false rather than erroring. The token has
+// already been verified by the time this is consulted, so a row absent here
+// means the application was deleted between mint and use — and refusing on the
+// audience dimension would be a confusing way to report that. The route policy
+// still applies; only the per-client opt-in is treated as absent.
+func (s *AudienceService) ClientRequiresAudience(ctx context.Context, appRowID int64) (bool, error) {
+	var required bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT require_audience FROM oauth_clients WHERE id = $1
+	`, appRowID).Scan(&required)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("client requires audience: %w", err)
+	}
+	return required, nil
+}
+
 // ListGrants returns the audiences one client is permitted to request.
 func (s *AudienceService) ListGrants(ctx context.Context, tenantID, appRowID int64) ([]ClientGrant, error) {
 	rows, err := s.pool.Query(ctx, `
