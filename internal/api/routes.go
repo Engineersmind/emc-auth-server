@@ -343,9 +343,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	if issErr != nil {
 		deps.Logger.Fatal().Err(issErr).Msg("tenant issuer resolver init failed — check OIDC_ISSUER_BASE_URL / APP_BASE_URL")
 	}
-	jwtSvc.WithTenantIssuers(issuerResolver).WithLegacyIssuer(deps.Config.JWTAllowLegacyIssuer)
+	jwtSvc.WithTenantIssuers(issuerResolver).
+		WithLegacyIssuer(deps.Config.JWTAllowLegacyIssuer).
+		WithRequireAudience(deps.Config.RequireAudience)
 	if !deps.Config.JWTAllowLegacyIssuer {
 		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_ISSUER=false — tokens carrying the old global JWT_ISSUER are REJECTED (issue #7 cutover). Any token minted before per-tenant issuers went live will fail.")
+	}
+	if deps.Config.RequireAudience {
+		deps.Logger.Warn().Msg("REQUIRE_AUDIENCE=true — the audience is MANDATORY server-wide (issue #132 cutover). Tokens carrying no gty claim and tokens resolving to no audience are REJECTED across every tenant on this server. Rollback is REQUIRE_AUDIENCE=false, config only, no deploy.")
 	}
 	deps.Logger.Info().
 		Str("issuer_base_url", issuerResolver.BaseURL()).

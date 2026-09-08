@@ -354,6 +354,17 @@ type JWTService struct {
 	// Only meaningful when keys != nil; without signing keys, refusing HS256 would
 	// leave nothing able to verify anything.
 	allowLegacyHS256 bool
+	// requireAudience refuses the legacy token shape outright: the grant type
+	// must come from "gty", and a token minted before that claim existed no
+	// longer verifies anywhere (issue #132, from config.RequireAudience).
+	//
+	// The third flag of exactly the same kind as the two above, and it is turned
+	// off for exactly the same reason: switching mint behaviour must not
+	// invalidate tokens minted moments earlier. Setting it true is the cutover,
+	// and the evidence for doing so is
+	// emc_auth_legacy_audience_verifications_total sitting at zero for longer
+	// than a refresh token's lifetime — not elapsed time, and not a clean deploy.
+	requireAudience bool
 }
 
 // NewJWTService creates a JWTService backed by the given pool.
@@ -429,6 +440,25 @@ func (s *JWTService) WithTenantIssuers(issuers *TenantIssuerResolver) *JWTServic
 // is emc_auth_legacy_issuer_verifications_total sitting at zero, not elapsed time.
 func (s *JWTService) WithLegacyIssuer(allow bool) *JWTService {
 	s.allowLegacyIssuer = allow
+	return s
+}
+
+// WithRequireAudience controls whether the legacy token shape still verifies
+// (issue #132 cutover, from config.RequireAudience).
+//
+// True refuses any token carrying no "gty" claim, so the grant type comes from
+// "gty" alone and the dual-read in grantAllowed stops being reachable.
+//
+// The fallback code is GATED here rather than deleted, and that is the point:
+// REQUIRE_AUDIENCE=false has to remain a working rollback for the whole
+// migration. A cutover with no rollback is a gamble. Deleting the fallback is a
+// separate, later release, once this has stayed on without incident for longer
+// than RefreshTokenTTL.
+//
+// Do not flip it until no live token predates #130. The evidence is
+// emc_auth_legacy_audience_verifications_total sitting at zero, not elapsed time.
+func (s *JWTService) WithRequireAudience(require bool) *JWTService {
+	s.requireAudience = require
 	return s
 }
 
@@ -854,6 +884,21 @@ func (s *JWTService) VerifyForAudience(ctx context.Context, tokenString string, 
 func (s *JWTService) grantAllowed(claims *Claims, allowed []string) bool {
 	if claims.Gty != "" {
 		return containsGrant(allowed, claims.Gty)
+	}
+
+	// Issue #132: with the audience mandatory, the grant type comes from "gty"
+	// alone and a token minted before that claim existed no longer verifies
+	// anywhere. Refused here rather than in the route policy because this is the
+	// single choke point every verify path already funnels through, so no route
+	// can be added that forgets it.
+	//
+	// Returned as an ordinary refusal, so the caller reports the same generic
+	// token_invalid 401 as any other bad token and counts it on
+	// emc_auth_token_audience_rejections_total. Naming the legacy shape would
+	// tell a caller its token is validly signed but obsolete, which is the
+	// oracle issue #84 closed.
+	if s.requireAudience {
+		return false
 	}
 
 	// Legacy token. The single-value requirement lives here and only here: every
