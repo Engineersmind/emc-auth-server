@@ -101,6 +101,11 @@ func requireAudience(audSvc *auth.AudienceService, requireGlobal bool, policy au
 				return next(c)
 			}
 
+			// Parsed once, up front: both the per-client enforcement read and the
+			// tenant-audience lookup need it, and a verified token with an
+			// unparseable tenant claim can satisfy neither.
+			tenantID, tenantErr := strconv.ParseInt(claims.TenantID, 10, 64)
+
 			presented, hasReal := realAudience(claims)
 
 			if !hasReal {
@@ -108,18 +113,24 @@ func requireAudience(audSvc *auth.AudienceService, requireGlobal bool, policy au
 				// a legacy token-type string. Accepted unless something has opted
 				// this caller in — see the type comment for why this is the only
 				// flag-gated branch.
+				//
+				// NOT counted on LegacyAudienceVerifications here. That counter is
+				// issue #130's migration gauge for tokens missing "gty", and
+				// JWTService.grantAllowed already increments it — with the
+				// clientIDLabel sentinel — on the path that actually uses the
+				// fallback. Incrementing it again would double-count every legacy
+				// token, and would widen the metric to "no audience" when it means
+				// "no gty". The #132 cutover gate is that counter reading zero, so
+				// inflating it here would keep the gate from ever clearing
+				// (PR #137 review).
 				enforcing := requireGlobal
-				if !enforcing {
+				if !enforcing && tenantErr == nil && tenantID > 0 {
 					if appRowID, err := strconv.ParseInt(claims.AppID, 10, 64); err == nil && appRowID > 0 {
-						required, err := audSvc.ClientRequiresAudience(c.Request().Context(), appRowID)
+						required, err := audSvc.ClientRequiresAudience(c.Request().Context(), tenantID, appRowID)
 						if err != nil {
-							// Fail CLOSED on a database error here, unlike the
-							// metrics label in audience.go which fails open. That
-							// one only mislabels a rejection that has already
-							// happened; this one decides whether an audience-less
-							// token reaches a route, and answering "not enforcing"
-							// on a blip would silently disable the switch an
-							// operator has deliberately turned on.
+							// Fail CLOSED on a database error. Answering "not
+							// enforcing" on a blip would silently disable a switch
+							// an operator deliberately turned on.
 							return unauthorized(c, "token_invalid", "invalid token",
 								`Bearer realm="`+bearerRealm+`", error="invalid_token"`)
 						}
@@ -127,27 +138,20 @@ func requireAudience(audSvc *auth.AudienceService, requireGlobal bool, policy au
 					}
 				}
 				if enforcing {
-					metrics.TokenAudienceRejections.WithLabelValues("none", c.Path()).Inc()
+					metrics.TokenAudienceRejections.WithLabelValues(refusalNoAudience, c.Path()).Inc()
 					return unauthorized(c, "token_invalid", "invalid token",
 						`Bearer realm="`+bearerRealm+`", error="invalid_token"`)
 				}
-				// Counted so the operator can watch this reach zero before the
-				// fallback is deleted in a later release. Keyed by application so
-				// a straggler is identifiable rather than merely visible.
-				metrics.LegacyAudienceVerifications.WithLabelValues(claims.AppID).Inc()
 				return next(c)
 			}
 
-			allowed, err := policyAllows(c, audSvc, policy, claims, presented)
+			allowed, err := policyAllows(c, audSvc, policy, claims, tenantID, tenantErr, presented)
 			if err != nil {
 				return unauthorized(c, "token_invalid", "invalid token",
 					`Bearer realm="`+bearerRealm+`", error="invalid_token"`)
 			}
 			if !allowed {
-				// Bounded label: presented came from a signature-verified token
-				// this server minted, so its cardinality is the number of
-				// applications, not attacker-controlled.
-				metrics.TokenAudienceRejections.WithLabelValues(presented, c.Path()).Inc()
+				metrics.TokenAudienceRejections.WithLabelValues(refusalLabel(policy), c.Path()).Inc()
 				// The same generic challenge as every other token failure. Naming
 				// the audience dimension would tell a caller it holds a validly
 				// signed token of the wrong scope, which is the oracle issue #84
@@ -160,9 +164,53 @@ func requireAudience(audSvc *auth.AudienceService, requireGlobal bool, policy au
 	}
 }
 
+// Refusal labels for emc_auth_token_audience_rejections_total.
+//
+// A BOUNDED, NORMALISED SET — not the presented audience itself (PR #137 review).
+//
+// JWTRequired already writes to this metric through presentedAudience, whose
+// label is one of the known grant names, one of the four legacy token-type
+// strings, or "other". Writing a full RFC identifier like
+// api://<tenant>/<app> alongside those would mix two formats in one label and
+// grow the series with every application registered, breaking dashboards that
+// assume the normalised set.
+//
+// These three say what an operator running the rollout actually needs — which
+// KIND of refusal happened — and the route label already carries where. Which
+// application was refused is answerable from the 401s on that route, and from
+// emc_auth_audience_grant_denials_total, which is keyed by client_id for
+// exactly that purpose.
+const (
+	// refusalNoAudience: the token carries no real audience and enforcement is
+	// on, per-client or deployment-wide.
+	refusalNoAudience = "none"
+	// refusalNotSelf: a tenant-scoped audience presented to the admin surface.
+	// The isolation #132 exists to enforce, and the label to watch during the
+	// cutover.
+	refusalNotSelf = "not_self"
+	// refusalForeignTenant: a well-formed audience no live application in the
+	// caller's own tenant owns.
+	refusalForeignTenant = "foreign_tenant"
+)
+
+// refusalLabel maps a policy to the reason its refusal happened. Total by
+// construction: policySelf can only refuse a non-self audience, and policyTenant
+// only reaches a refusal once self has been ruled out, which leaves the tenant
+// catalogue as the thing that said no.
+func refusalLabel(policy audiencePolicy) string {
+	if policy == policySelf {
+		return refusalNotSelf
+	}
+	return refusalForeignTenant
+}
+
 // policyAllows applies one route policy to a presented audience.
+//
+// tenantID and tenantErr come from the caller, which has already parsed the
+// claim for the per-client enforcement read — parsing it twice per request to
+// save one parameter would be the wrong trade on this path.
 func policyAllows(c echo.Context, audSvc *auth.AudienceService, policy audiencePolicy,
-	claims *auth.Claims, presented string) (bool, error) {
+	claims *auth.Claims, tenantID int64, tenantErr error, presented string) (bool, error) {
 
 	if presented == auth.AudienceSelf {
 		// Accepted by both surfaces. On the identity side because first-party
@@ -176,8 +224,7 @@ func policyAllows(c echo.Context, audSvc *auth.AudienceService, policy audienceP
 		return false, nil
 	}
 
-	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
-	if err != nil || tenantID <= 0 {
+	if tenantErr != nil || tenantID <= 0 {
 		// A verified token with an unparseable tenant claim cannot be scoped to
 		// a tenant's audience catalogue, so there is nothing to compare against.
 		return false, nil

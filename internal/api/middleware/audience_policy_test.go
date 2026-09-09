@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -154,6 +155,90 @@ func TestRouteAudiencePolicy_BoundaryHoldsBothWays(t *testing.T) {
 				t.Errorf("GET %s = %d, want %d\n  %s", tc.path, got, tc.want, tc.why)
 			}
 		})
+	}
+}
+
+// TestClientRequiresAudience_SoftDeletedClientEnforces pins the one place
+// #132's per-client read inverts what "no rows" normally means.
+//
+// From the PR #137 review: the query gained `deleted_at IS NULL` to match the
+// convention every other oauth_clients read in that file follows. That predicate
+// changes what absence means — a soft-deleted application used to return its
+// stored flag and now matches nothing — so reading absence as "this client did
+// not opt in" would ACCEPT an audience-less token minted by an application that
+// has since been deleted. A predicate added for tidiness would have opened a
+// fail-open.
+//
+// The asymmetry with AudienceInTenant is the thing worth a test rather than only
+// a comment: there, "not found" already means refuse, so the same filter fails
+// closed on its own. Identical SQL, opposite safety outcomes, and nothing in the
+// type system says so.
+func TestClientRequiresAudience_SoftDeletedClientEnforces(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := t.Context()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	t.Cleanup(func() { testhelper.CleanupTables(t, pool) })
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant: %v", err)
+	}
+
+	audSvc := auth.NewAudienceService(pool, logger)
+	appSvc := auth.NewApplicationService(pool, logger).WithAudiences(audSvc)
+
+	app, err := appSvc.CreateApplication(ctx,
+		tenantID, fmt.Sprintf("aud132-softdel-%d", time.Now().UnixNano()), "m2m", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	appRowID, err := strconv.ParseInt(app.ID, 10, 64)
+	if err != nil {
+		t.Fatalf("parse app id %q: %v", app.ID, err)
+	}
+
+	// Live and not opted in — the ordinary case, and the one that must stay false
+	// or every consumer would be enforcing before an operator flipped anything.
+	required, err := audSvc.ClientRequiresAudience(ctx, tenantID, appRowID)
+	if err != nil {
+		t.Fatalf("ClientRequiresAudience(live): %v", err)
+	}
+	if required {
+		t.Error("a live client with require_audience=false reports enforcing; " +
+			"the per-client rollout would be on for everyone before it was flipped")
+	}
+
+	// Soft-delete it. The row still exists and still carries require_audience =
+	// false, so a query without the deleted_at predicate would keep saying "not
+	// enforcing".
+	if _, err := pool.Exec(ctx,
+		`UPDATE oauth_clients SET deleted_at = NOW() WHERE id = $1`, appRowID); err != nil {
+		t.Fatalf("soft-delete client: %v", err)
+	}
+
+	required, err = audSvc.ClientRequiresAudience(ctx, tenantID, appRowID)
+	if err != nil {
+		t.Fatalf("ClientRequiresAudience(soft-deleted): %v", err)
+	}
+	if !required {
+		t.Error("a soft-deleted client reports NOT enforcing — an audience-less token " +
+			"minted by a deleted application would be accepted. Absence must enforce.")
+	}
+
+	// A different tenant asking about the same row gets the same fail-closed
+	// answer, which is what the tenant_id predicate is for.
+	required, err = audSvc.ClientRequiresAudience(ctx, tenantID+99999, appRowID)
+	if err != nil {
+		t.Fatalf("ClientRequiresAudience(wrong tenant): %v", err)
+	}
+	if !required {
+		t.Error("a row read under the wrong tenant_id reports NOT enforcing; " +
+			"the app-scoping predicate must fail closed like every other absence")
 	}
 }
 

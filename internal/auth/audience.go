@@ -362,6 +362,23 @@ func (s *AudienceService) ListAudiences(ctx context.Context, tenantID int64) ([]
 // Soft-deleted applications are excluded. Their identifiers stay reserved
 // forever — the unique index guarantees no reuse — but a token naming a
 // deleted application's audience names something that can no longer be spent.
+//
+// ON CACHING, because the next reader will want to (PR #137 review).
+//
+// This is one round-trip per authenticated identity request — every /auth/me,
+// /auth/refresh and /oauth/userinfo call once #132 is deployed. The index makes
+// it cheap, and at current scale it does not register in query volume.
+//
+// If it ever does, the shape to reach for is a bounded LRU keyed on
+// (tenantID, audience) with a TTL no longer than AccessTokenTTL: long enough to
+// collapse repeated calls from one client, short enough that a soft-deleted
+// application stops being admitted within a single token lifetime. What makes
+// that more expensive than it looks is invalidation — the entry has to be
+// dropped whenever oauth_clients.audience or deleted_at changes, and those
+// writes happen in the admin API, a different package with no reference to this
+// cache. A cache added without that wiring would keep admitting a revoked
+// application's tokens for its whole TTL, which is the opposite of the property
+// this function exists to provide. Measure first.
 func (s *AudienceService) AudienceInTenant(ctx context.Context, tenantID int64, audience string) (bool, error) {
 	var exists bool
 	err := s.pool.QueryRow(ctx, `
@@ -388,19 +405,42 @@ func (s *AudienceService) AudienceInTenant(ctx context.Context, tenantID int64, 
 // is contained to the one that was flipped. Rollback is a single UPDATE with no
 // deploy.
 //
-// A missing application row reports false rather than erroring. The token has
-// already been verified by the time this is consulted, so a row absent here
-// means the application was deleted between mint and use — and refusing on the
-// audience dimension would be a confusing way to report that. The route policy
-// still applies; only the per-client opt-in is treated as absent.
-func (s *AudienceService) ClientRequiresAudience(ctx context.Context, appRowID int64) (bool, error) {
+// Scoped by tenant_id as well as id, and filtered on deleted_at, so it holds the
+// same app-scoping invariant as every other oauth_clients read in this file
+// (PR #137 review). id is a global primary key, so tenant_id adds no isolation
+// in practice — it is there so a future reader does not have to work out why
+// this one query was the exception.
+//
+// NO ROWS MEANS ENFORCE, and this is the one place that answer is inverted from
+// what "reports the column" would suggest.
+//
+// Adding deleted_at IS NULL changes what absence means: before, a soft-deleted
+// application still returned its stored flag; now it matches nothing. Returning
+// false there — "this client did not opt in" — would ACCEPT an audience-less
+// token minted by an application that has since been deleted, which is a
+// fail-open introduced by a predicate added for tidiness. So absence enforces
+// instead.
+//
+// The asymmetry with AudienceInTenant is deliberate and worth naming, because
+// the two look like they should agree and their return values mean opposite
+// things: there, "not found" already means refuse, so filtering deleted_at fails
+// closed on its own. Here the same filter would fail open unless absence is read
+// as enforcement. Identical SQL, opposite safety outcomes.
+//
+// A token bearing a real audience from a deleted application is refused by
+// AudienceInTenant regardless, so this branch only decides audience-LESS tokens.
+func (s *AudienceService) ClientRequiresAudience(ctx context.Context, tenantID, appRowID int64) (bool, error) {
 	var required bool
 	err := s.pool.QueryRow(ctx, `
-		SELECT require_audience FROM oauth_clients WHERE id = $1
-	`, appRowID).Scan(&required)
+		SELECT require_audience
+		FROM   oauth_clients
+		WHERE  id         = $1
+		  AND  tenant_id  = $2
+		  AND  deleted_at IS NULL
+	`, appRowID, tenantID).Scan(&required)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
+			return true, nil
 		}
 		return false, fmt.Errorf("client requires audience: %w", err)
 	}
