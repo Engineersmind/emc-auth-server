@@ -258,6 +258,20 @@ type Config struct {
 	// Set via AUDIT_SIEM_WEBHOOK_URL.
 	AuditSIEMWebhookURL string
 
+	// AudienceScheme prefixes every per-application audience identifier
+	// (issue #131), as <scheme><tenant-slug>/<app-slug>. Default "api://".
+	//
+	// It exists so the scheme is not hardcoded in five places, NOT because a
+	// deployment should change it. Changing it after any application has been
+	// created splits the namespace in two: existing identifiers keep the old
+	// scheme (audiences are immutable by design, and every resource server
+	// validating one would break if they were not), while new applications get
+	// the new one. Treat it as set-once, before the first application exists.
+	//
+	// A malformed value is ignored with a warning rather than applied — see
+	// AudienceService.WithScheme. Must be a lowercase scheme followed by "://".
+	AudienceScheme string
+
 	// AuditSIEMWebhookSecret, when set, signs every outbound SIEM payload with
 	// HMAC-SHA256 in the X-EMC-Audit-Signature header so the receiver can
 	// authenticate the stream. Empty leaves payloads unsigned. Set via
@@ -318,6 +332,7 @@ func Load() *Config {
 		PasswordHashMaxConcurrent:       mustAtoi(getEnv("PASSWORD_HASH_MAX_CONCURRENT", "0")),
 		AuditSIEMWebhookURL:             getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
 		AuditSIEMWebhookSecret:          getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		AudienceScheme:                  getEnv("AUDIENCE_SCHEME", "api://"),
 	}
 }
 

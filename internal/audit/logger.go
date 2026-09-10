@@ -88,6 +88,17 @@ const (
 	ActionAdminApplicationDeleted       = "admin.application_deleted"
 	ActionAdminApplicationSecretRotated = "admin.application_secret_rotated"
 
+	// Admin — per-application audience grants (issue #131, migration 00087).
+	//
+	// Worth auditing at the same tier as application management, because a
+	// grant is what decides which API a client's tokens are good for. Creating
+	// one widens a client's reach across an application boundary; deleting one
+	// breaks an integration at its next token mint. Neither is visible in any
+	// other record.
+	ActionAdminAudienceGrantCreated = "admin.audience_grant_created"
+	ActionAdminAudienceGrantUpdated = "admin.audience_grant_updated"
+	ActionAdminAudienceGrantDeleted = "admin.audience_grant_deleted"
+
 	// Admin — multi-tenant administrative grants (migration 00078).
 	//
 	// Granting cross-tenant administrative access is among the most

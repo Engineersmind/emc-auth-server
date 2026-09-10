@@ -347,6 +347,7 @@ func main() {
 			AuditCaptureResponseBody:               cfg.AuditCaptureResponseBody,
 			BreachDetectionEnabled:                 cfg.BreachDetectionEnabled,
 			UntrustedIPCIDRs:                       cfg.UntrustedIPCIDRs,
+			AudienceScheme:                         cfg.AudienceScheme,
 		},
 	})
 

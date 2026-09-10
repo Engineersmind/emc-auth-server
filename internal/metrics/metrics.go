@@ -361,6 +361,50 @@ var (
 		[]string{"client_id"},
 	)
 
+	// AudienceGrantDenials counts token requests refused because the client
+	// holds no grant for the audience it asked for (issue #131).
+	//
+	// This is an ALERT, not a burn-down. A denial means a client asked for an
+	// API it was never granted: either an integrator has the wrong audience in
+	// their config (common, and this is how you find out before they open a
+	// ticket) or something is probing which APIs it can reach. The client is
+	// told invalid_target either way, with a body byte-identical to the one for
+	// an audience that does not exist, so without this counter a denial is
+	// invisible.
+	//
+	// Every denial path in AudienceService.resolveTargetGrant and
+	// ResolveMintAudience increments it through one helper (countDenial), so a
+	// new refusal branch cannot be added without the counter following. The
+	// increment is asserted in the test suite: CLAUDE.md deferred #12 is the
+	// same metric shape WITHOUT that assertion, and it has been dead since it
+	// was written.
+	//
+	// Labels: client_id (the public client_id, or "none" when the request
+	// carried no client identity), audience — the value REQUESTED, but only when
+	// that value names an application this deployment actually has. Otherwise one
+	// of four buckets: "none", "malformed", "reserved", "unknown".
+	//
+	// The buckets exist because the requested value is caller-controlled and a
+	// client can post a fresh one per request (PR #134 review, B1). Writing it
+	// straight into a label grows this series set without limit for the life of
+	// the process, and a format check does not help — api-aaaa/x, api-aaab/x and
+	// so on all pass it. Bounding the label by "is this one of ours" caps the
+	// series at the number of applications while keeping the answer to the
+	// question the counter exists for: which of OUR audiences is refused to whom.
+	//
+	// A rising "unknown" is the probe signal. The raw value it stood in for is
+	// logged at warn by AudienceService.denialLabel, so the "integrator pasted
+	// the wrong audience" case is still one grep away — bounded by log retention
+	// rather than by cardinality.
+	AudienceGrantDenials = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "audience_grant_denials_total",
+			Help:      "Token requests refused because the client has no grant for the requested audience.",
+		},
+		[]string{"client_id", "audience"},
+	)
+
 	// APIKeyAuth counts API-key → management-token exchanges by outcome.
 	APIKeyAuth = promauto.NewCounterVec(
 		prometheus.CounterOpts{
