@@ -85,10 +85,10 @@ func TestMeSessions_OverHTTP(t *testing.T) {
 	// Registration auto-signs-in, so clear those sessions: every assertion below
 	// counts sessions, and an unexplained extra one reads as a bug in the code under
 	// test rather than a fixture artefact.
-	if _, err := authSvc.RevokeOtherSessions(ctx, userID, tenantID, ""); err != nil {
+	if _, err := authSvc.RevokeOtherSessions(ctx, userID, ""); err != nil {
 		t.Fatalf("clear subject registration session: %v", err)
 	}
-	if _, err := authSvc.RevokeOtherSessions(ctx, otherUserID, tenantID, ""); err != nil {
+	if _, err := authSvc.RevokeOtherSessions(ctx, otherUserID, ""); err != nil {
 		t.Fatalf("clear bystander registration session: %v", err)
 	}
 

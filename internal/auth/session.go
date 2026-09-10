@@ -244,7 +244,19 @@ func (s *AuthService) RevokeSession(ctx context.Context, userID, tenantID, sessi
 // written inline so a copy-paste carries the reasoning with it.
 const keepNoSession = int64(-1)
 
-func (s *AuthService) RevokeOtherSessions(ctx context.Context, userID, tenantID int64, keepFamilyID string) (int64, error) {
+// Scoped to the USER, across every tenant, with no tenant parameter.
+//
+// This backs "sign out everywhere else", and the promise in those words is the
+// whole point: a session the caller asked to end must actually end. Filtering by
+// the current token's tenant left any session minted before a tenant switch
+// alive — the caller was told they had been signed out everywhere while a live
+// session remained on another device, which is the one outcome this endpoint must
+// never produce. A session belongs to the person, not to a tenant.
+//
+// The only caller is the self-service handler, where userID comes from verified
+// claims; there is no admin path here to widen. Account-wide revocation for
+// operators is RevokeAllUserSessions.
+func (s *AuthService) RevokeOtherSessions(ctx context.Context, userID int64, keepFamilyID string) (int64, error) {
 	keep := keepNoSession
 	if keepFamilyID != "" {
 		if parsed, err := strconv.ParseInt(keepFamilyID, 10, 64); err == nil {
@@ -263,10 +275,10 @@ func (s *AuthService) RevokeOtherSessions(ctx context.Context, userID, tenantID 
 	// revoking in between.
 	rows, err := tx.Query(ctx, `
 		UPDATE user_sessions
-		SET revoked_at = NOW(), revoked_reason = $4, updated_at = NOW()
-		WHERE user_id = $1 AND tenant_id = $2 AND id <> $3 AND revoked_at IS NULL
+		SET revoked_at = NOW(), revoked_reason = $3, updated_at = NOW()
+		WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL
 		RETURNING id
-	`, userID, tenantID, keep, RevokeReasonUserRevoked)
+	`, userID, keep, RevokeReasonUserRevoked)
 	if err != nil {
 		return 0, fmt.Errorf("revoke other sessions: %w", err)
 	}
