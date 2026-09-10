@@ -348,6 +348,7 @@ func main() {
 			BreachDetectionEnabled:                 cfg.BreachDetectionEnabled,
 			UntrustedIPCIDRs:                       cfg.UntrustedIPCIDRs,
 			AudienceScheme:                         cfg.AudienceScheme,
+			RequireAudience:                        cfg.RequireAudience,
 		},
 	})
 

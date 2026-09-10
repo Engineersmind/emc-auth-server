@@ -272,6 +272,28 @@ type Config struct {
 	// AudienceService.WithScheme. Must be a lowercase scheme followed by "://".
 	AudienceScheme string
 
+	// RequireAudience makes the audience mandatory server-wide (issue #132): a
+	// token that resolves to no audience is refused, and the legacy
+	// aud-as-token-type shape is no longer accepted on any verify path.
+	//
+	// This is the deployment-wide BACKSTOP, not the rollout mechanism. The
+	// per-client oauth_clients.require_audience column is what an operator
+	// flips during the cutover — one application at a time, so a mistake is
+	// contained to one consumer and reverts with a single UPDATE and no deploy.
+	// This flag enforces across every tenant on the server at once, including
+	// any whose behaviour nobody has audited, so it is turned on LAST: after
+	// every client that matters is already enforcing on its own flag and has
+	// been observed doing so.
+	//
+	// Leaving it false must remain a working rollback for the whole feature.
+	// That is why #132 GATES the legacy path rather than deleting it — a
+	// cutover with no rollback is a gamble, not a cutover. Removing the
+	// fallback code is a separate, later release, once this flag has stayed on
+	// without incident for longer than a refresh token's lifetime.
+	//
+	// Set via REQUIRE_AUDIENCE. Defaults to false.
+	RequireAudience bool
+
 	// AuditSIEMWebhookSecret, when set, signs every outbound SIEM payload with
 	// HMAC-SHA256 in the X-EMC-Audit-Signature header so the receiver can
 	// authenticate the stream. Empty leaves payloads unsigned. Set via
@@ -313,6 +335,13 @@ func Load() *Config {
 		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
 		// Same fail-towards-compatibility rule as JWT_ALLOW_LEGACY_HS256 above.
 		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "true") != "false",
+		// The same fail-towards-COMPATIBILITY rule as the two legacy flags
+		// above, with the polarity mirrored: those default true and only the
+		// exact string "false" tightens them, whereas this defaults false and
+		// only the exact string "true" tightens it. Either way a typo leaves
+		// every live token working rather than refusing all of them, which is
+		// the only direction a misread env var may fail in.
+		RequireAudience: getEnv("REQUIRE_AUDIENCE", "false") == "true",
 		// Defaults to APP_BASE_URL: in the single-binary deployment the auth server
 		// and the origin used for email links are the same host, so requiring both
 		// to be set would be a config trap with one obviously correct answer.
