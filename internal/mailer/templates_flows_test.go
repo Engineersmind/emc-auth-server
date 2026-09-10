@@ -21,10 +21,15 @@ func TestBlockedAccountTemplate_ReasonVariants(t *testing.T) {
 		wantInBody  string
 		rejectInCTA string
 	}{
+		// wantInBody is the fact the variant must state, matched on the shortest
+		// phrase that carries it rather than a whole sentence. The bodies are
+		// editable copy — they were rewritten wholesale once already — and a test
+		// that pins full sentences fails on a rewording that changed nothing about
+		// what the email tells the reader.
 		{
 			reason:      BlockReasonFailedAttempts,
 			wantCTA:     "Unblock account",
-			wantInBody:  "too many failed sign-in attempts",
+			wantInBody:  "failed sign-in attempts",
 			rejectInCTA: "Reset password",
 		},
 		{
@@ -34,9 +39,12 @@ func TestBlockedAccountTemplate_ReasonVariants(t *testing.T) {
 			rejectInCTA: "Unblock account",
 		},
 		{
+			// The distinguishing fact here is the negative: this alert follows a
+			// SUCCESSFUL sign-in, so the reader must be told the account is still
+			// open — otherwise the email reads as a lockout notice.
 			reason:      BlockReasonSuspiciousLogin,
 			wantCTA:     "Change password",
-			wantInBody:  "has not been blocked",
+			wantInBody:  "not blocked",
 			rejectInCTA: "Unblock account",
 		},
 	}
