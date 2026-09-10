@@ -118,7 +118,7 @@ func TestMeSessions_OverHTTP(t *testing.T) {
 	t.Cleanup(func() { mw.SetSessionRevocationChecker(nil) })
 
 	e := echo.New()
-	g := e.Group("/api/v1/auth/me/sessions", mw.JWTRequired(jwtSvc, auth.AudienceAPI))
+	g := e.Group("/api/v1/auth/me/sessions", mw.JWTRequired(jwtSvc, auth.HumanGrants...))
 	g.GET("", authHandler.ListMySessions)
 	g.DELETE("", authHandler.RevokeMyOtherSessions)
 	g.DELETE("/:familyID", authHandler.RevokeMySession)

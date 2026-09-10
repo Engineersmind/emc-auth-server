@@ -192,7 +192,7 @@ func TestTenantIssuerResolver_UnknownTenant(t *testing.T) {
 func TestJWTService_SignsPerTenantIssuer(t *testing.T) {
 	env := issuerFixture(t)
 
-	signed, err := env.svc.Sign(env.ctx, env.tenantID, auth.AudienceAPI, userClaims(env.userIDStr, env.tenantID))
+	signed, err := env.svc.Sign(env.ctx, env.tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(env.userIDStr, env.tenantID))
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestJWTService_NoResolverKeepsGlobalIssuer(t *testing.T) {
 	env := issuerFixture(t)
 	plain := newTestJWTService(t, env.pool, testIssuer) // no WithTenantIssuers
 
-	signed, err := plain.Sign(env.ctx, env.tenantID, auth.AudienceAPI, userClaims(env.userIDStr, env.tenantID))
+	signed, err := plain.Sign(env.ctx, env.tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(env.userIDStr, env.tenantID))
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}

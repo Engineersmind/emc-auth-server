@@ -189,7 +189,7 @@ func (e *discoveryEnv) fetchDocument(slug string) (OIDCDiscoveryDocument, httpRe
 func (e *discoveryEnv) signAccessToken() string {
 	e.t.Helper()
 
-	token, err := e.jwtSvc.Sign(e.ctx, e.tenantID, auth.AudienceAPI, &auth.Claims{
+	token, err := e.jwtSvc.Sign(e.ctx, e.tenantID, auth.AudienceAPI, auth.GrantPassword, &auth.Claims{
 		UserID:   e.userID,
 		TenantID: strconv.FormatInt(e.tenantID, 10),
 		Email:    "admin@emc.local",

@@ -420,6 +420,20 @@ type sessionContext struct {
 	// a fresh login. Rotation leaves it alone: it is already on the session row, so
 	// there is nothing to carry forward and nothing to get wrong.
 	authTime time.Time
+	// grant is the OAuth grant type that minted this token — one of the Grant*
+	// constants — and becomes the "gty" claim (issue #130).
+	//
+	// The one field here with NO usable zero value. Every other field has a
+	// documented default; an empty grant would mint a token that verification
+	// cannot place, so issueTokenPairWithScope refuses it rather than guessing.
+	// A new login method therefore cannot reach production without naming
+	// itself: the compiler will not catch the omitted field, so the mint does.
+	//
+	// It is close kin to amr but answers a different question, and both are
+	// needed: amr lists the factors presented (pwd, otp, mfa), while grant names
+	// the protocol flow that exchanged them for a token. A password login and an
+	// authorization-code flow can present identical amr.
+	grant string
 }
 
 // issueTokenPair signs a JWT access token and persists a matching refresh token.
@@ -446,6 +460,13 @@ func (s *AuthService) issueTokenPair(ctx context.Context, userID, tenantID int64
 // downstream as "granted nothing" and would strip the claims those callers
 // depend on (see Claims.Scope and /oauth/userinfo).
 func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenantID int64, email, role string, perms []string, sess sessionContext, appID, scope string) (*AuthResult, error) {
+	// Refused before any work is done, and before the transaction opens: a
+	// nameless grant is a bug in a caller, not a runtime condition, and the
+	// cheapest place to find it is the first line of the function every caller
+	// funnels through.
+	if sess.grant == "" {
+		return nil, ErrMissingGrantType
+	}
 	claims := &Claims{
 		UserID:      strconv.FormatInt(userID, 10),
 		TenantID:    strconv.FormatInt(tenantID, 10),
@@ -596,7 +617,7 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	// token carries no session identity and there is no way to invalidate one.
 	claims.SessionID = strconv.FormatInt(sessionID, 10)
 
-	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, claims)
+	accessToken, err := s.jwtSvc.Sign(ctx, tenantID, AudienceAPI, sess.grant, claims)
 	if err != nil {
 		return nil, fmt.Errorf("sign access token: %w", err)
 	}
@@ -1293,7 +1314,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	}
 
 	tokens, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms,
-		sessionContext{persistent: in.Persistent, amr: []string{AMRPassword}}, appID)
+		sessionContext{persistent: in.Persistent, amr: []string{AMRPassword}, grant: GrantPassword}, appID)
 	if err != nil {
 		return nil, err
 	}
@@ -1458,6 +1479,10 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 		sessionContext{
 			persistent: session.Persistent,
 			amr:        []string{AMRPassword, AMROTP, AMRMFA},
+			// The grant is the one that began the flow. MFA is a second factor
+			// on a password login, not a grant of its own — amr already records
+			// that the OTP step happened.
+			grant: GrantPassword,
 		}, session.AppID)
 }
 
@@ -1587,6 +1612,7 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 		sessionContext{
 			persistent: session.Persistent,
 			amr:        []string{AMRPassword, AMROTP, AMRMFA},
+			grant:      GrantPassword,
 		}, session.AppID)
 	if err != nil {
 		return nil, session, err
@@ -1888,6 +1914,12 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		perms = []string{}
 	}
 
+	// The rotation, not the login that started the session, is what minted this
+	// token. The grant that began the session is not stored on the refresh-token
+	// row and #130 adds no schema, so it cannot be carried forward — which is why
+	// GrantRefreshToken is a member of HumanGrants rather than a passthrough.
+	carried.grant = GrantRefreshToken
+
 	return s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, carried, appIDClaim(applicationID))
 }
 
@@ -2159,6 +2191,8 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		perms = []string{}
 	}
 
+	carried.grant = GrantRefreshToken
+
 	result, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms, carried, appIDClaim(applicationID))
 	return result, nil, err
 }
@@ -2195,7 +2229,7 @@ func (s *AuthService) IssueServiceToken(ctx context.Context, tenantID, appID int
 		Role:        "service",
 		Permissions: scopes,
 	}
-	token, err := s.jwtSvc.Sign(ctx, tenantID, AudienceM2M, claims)
+	token, err := s.jwtSvc.Sign(ctx, tenantID, AudienceM2M, GrantClientCredentials, claims)
 	if err != nil {
 		return "", 0, fmt.Errorf("sign service token: %w", err)
 	}
@@ -2362,7 +2396,7 @@ func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID
 	// perms by grant, or drop them for non-first-party clients, as part of that
 	// work. Read #19 before enabling third-party clients.
 	return s.issueTokenPairWithScope(ctx, userID, tenantID, email, role, perms,
-		sessionContext{amr: []string{AMRPassword}}, appID,
+		sessionContext{amr: []string{AMRPassword}, grant: GrantAuthorizationCode}, appID,
 		strings.Join(scopes, " "))
 }
 

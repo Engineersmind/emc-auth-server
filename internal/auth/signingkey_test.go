@@ -78,7 +78,7 @@ func TestSigningKeyService_RequiresSecretBox(t *testing.T) {
 func TestJWTService_SignsRS256WithThumbprintKID(t *testing.T) {
 	ctx, jwtSvc, keys, tenantID, userIDStr := signingFixture(t)
 
-	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
@@ -115,7 +115,7 @@ func TestJWTService_Verify_AcceptsLegacyHS256(t *testing.T) {
 	// Mint through a service with no key wiring: that is exactly the pre-#95 path.
 	pool := testhelper.NewTestDB(t)
 	legacySvc := newTestJWTService(t, pool, testIssuer)
-	legacyToken, err := legacySvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	legacyToken, err := legacySvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("legacy Sign() error = %v", err)
 	}
@@ -156,7 +156,7 @@ func TestJWTService_Verify_RejectsCrossTenantKID(t *testing.T) {
 
 	// Claims say tenant B; signature and kid are tenant A's.
 	claims := userClaims(userIDStr, tenantB)
-	tokenA, err := jwtSvc.Sign(ctx, tenantA, auth.AudienceAPI, userClaims(userIDStr, tenantA))
+	tokenA, err := jwtSvc.Sign(ctx, tenantA, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantA))
 	if err != nil {
 		t.Fatalf("Sign(A): %v", err)
 	}
@@ -230,7 +230,7 @@ func TestSigningKeyService_RotationDrill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureTenantKey: %v", err)
 	}
-	tokenBefore, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	tokenBefore, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign(before): %v", err)
 	}
@@ -281,7 +281,7 @@ func TestSigningKeyService_RotationDrill(t *testing.T) {
 		if _, err := jwtSvc.Verify(ctx, tokenBefore); err != nil {
 			t.Errorf("Verify(token signed before rotation) error = %v — rotation invalidated a live token", err)
 		}
-		tokenAfter, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+		tokenAfter, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 		if err != nil {
 			t.Fatalf("Sign(after): %v", err)
 		}
@@ -339,7 +339,7 @@ func TestJWTService_AllSignersEmitActiveKID(t *testing.T) {
 		t.Fatalf("EnsureTenantKey: %v", err)
 	}
 
-	accessToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	accessToken, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign() error = %v", err)
 	}
@@ -383,7 +383,7 @@ func TestJWTService_AllSignersEmitActiveKID(t *testing.T) {
 	}
 
 	t.Run("kid is stable across signings", func(t *testing.T) {
-		second, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+		second, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 		if err != nil {
 			t.Fatalf("Sign() error = %v", err)
 		}
@@ -430,7 +430,7 @@ func TestJWTService_Phase4Cutover(t *testing.T) {
 		t.Fatalf("SignedString: %v", err)
 	}
 
-	rs256Token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+	rs256Token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -461,7 +461,7 @@ func TestJWTService_Phase4Cutover(t *testing.T) {
 
 	// Signing must be unaffected: the cutover narrows verification only.
 	t.Run("signing still works after cutover", func(t *testing.T) {
-		fresh, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, userClaims(userIDStr, tenantID))
+		fresh, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, userClaims(userIDStr, tenantID))
 		if err != nil {
 			t.Fatalf("Sign after cutover: %v", err)
 		}

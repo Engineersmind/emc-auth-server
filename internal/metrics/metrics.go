@@ -335,6 +335,32 @@ var (
 		[]string{"audience", "route"},
 	)
 
+	// LegacyAudienceVerifications counts tokens verified through the legacy
+	// token-type "aud" fallback because they carry no "gty" claim (issue #130).
+	//
+	// This is a migration burn-down, not an alert. Every token minted from #130
+	// onward carries "gty", so this counter drains as the last pre-#130 tokens
+	// expire and should reach a sustained zero within one refresh-token lifetime
+	// (30 days). That sustained zero is the gate for issue #132, which removes
+	// the fallback: while it is non-zero, dropping the fallback would refuse live
+	// tokens.
+	//
+	// It reads zero for two very different reasons — no legacy tokens left, or
+	// nothing ever incrementing it — so the increment is asserted in the test
+	// suite. CLAUDE.md deferred #12 is the same metric shape without that
+	// assertion, dead since it was written.
+	//
+	// Labels: client_id (the app_id claim, or "none" for first-party tokens,
+	// which carry no application).
+	LegacyAudienceVerifications = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "legacy_audience_verifications_total",
+			Help:      "Tokens verified via the legacy aud token-type fallback because they carry no gty claim.",
+		},
+		[]string{"client_id"},
+	)
+
 	// APIKeyAuth counts API-key → management-token exchanges by outcome.
 	APIKeyAuth = promauto.NewCounterVec(
 		prometheus.CounterOpts{
