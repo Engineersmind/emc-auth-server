@@ -2068,6 +2068,21 @@ func (s *Service) UnlockUser(ctx context.Context, tenantID int64, applicationID 
 // Set above the default concurrent-session cap (20) so a user at the cap still
 // sees every session they have, and truncation only happens where the cap itself
 // has been raised.
+//
+// That headroom is PER TENANT, and ListOwnSessions now spans every tenant, so
+// the two no longer line up: max_concurrent_sessions is enforced per (user,
+// tenant), so an administrator at the default cap in six tenants can hold 120
+// live sessions and this page would show 100 of them. Bounded and not silent in
+// practice — ORDER BY last_seen_at DESC means the truncation falls on the least
+// recently active, so what an operator is looking for when they open this page
+// is what survives the cut — but the count would be wrong, and "sign out
+// everywhere else" is unaffected either way because RevokeOtherSessions does not
+// read this list.
+//
+// Left as-is rather than raised to 20 × tenants: the number of tenants an
+// administrator can reach is not known at query time, and a limit that large
+// gives up the bound this constant exists to provide. If the sessions page ever
+// needs to be exact across tenants, the fix is pagination, not a bigger LIMIT.
 const MaxSessionsListed = 100
 
 // ListUserSessions returns the user's live sessions, one row per session family,
@@ -2107,6 +2122,14 @@ func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicat
 // user id comes from verified claims rather than a path parameter, so there is no
 // user-supplied identifier left to validate, and user_id alone is the correct and
 // complete scope for "the sessions that are mine".
+//
+// MaxSessionsListed applies ACROSS tenants here, which is a weaker guarantee than
+// it is on the admin path: the concurrent-session cap is enforced per (user,
+// tenant), so an administrator reaching several tenants can hold more live
+// sessions than this returns. The truncation falls on the least recently active
+// (ORDER BY last_seen_at DESC), so the sessions an operator opened this page to
+// find are the ones that survive it — but a total count taken from this list
+// would be short. See MaxSessionsListed.
 func (s *Service) ListOwnSessions(ctx context.Context, userID int64, currentFamilyID string) ([]UserSession, error) {
 	return s.listSessionRows(ctx, nil, userID, currentFamilyID)
 }
