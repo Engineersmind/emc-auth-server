@@ -353,7 +353,7 @@ func TestRevokeOtherSessions_KeepsCallersOwnSession(t *testing.T) {
 	}
 
 	keepSID := sidOf(t, keep.AccessToken)
-	revoked, err := e.svc.RevokeOtherSessions(e.ctx, e.userID, e.tenantID, keepSID)
+	revoked, err := e.svc.RevokeOtherSessions(e.ctx, e.userID, keepSID)
 	if err != nil {
 		t.Fatalf("RevokeOtherSessions: %v", err)
 	}

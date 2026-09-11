@@ -325,9 +325,13 @@ func TestEmit_DoesNotTellTheSubjectAboutTheirOwnChange(t *testing.T) {
 	}
 }
 
-// A refusal is the only trace a probe leaves — the handler never runs. It is
-// therefore the one action reported on FAILURE rather than success.
-func TestEmit_ReportsDeniedPrivilegedRequests(t *testing.T) {
+// Failures are not mailed at all, refusals included.
+//
+// A refused privileged request is still audited — it is a probe's only trace —
+// but the notice is withdrawn from email because failure volume is chosen by
+// whoever is probing, not by how much work an operator did. See the note above
+// notableActions.
+func TestEmit_DoesNotMailDeniedPrivilegedRequests(t *testing.T) {
 	f := newNotifyFixture(t)
 	m := &captureMailer{}
 	s := f.liveSink(t, m)
@@ -338,15 +342,26 @@ func TestEmit_ReportsDeniedPrivilegedRequests(t *testing.T) {
 	s.Emit([]audit.Event{denied})
 	s.Close()
 
-	msgs := m.messages()
-	if len(msgs) != 1 {
-		t.Fatalf("sent %d messages, want 1 — a refusal must be reported", len(msgs))
+	if msgs := m.messages(); len(msgs) != 0 {
+		t.Errorf("sent %d messages for a refusal, want 0 — failures are audited, not mailed: %+v", len(msgs), msgs)
 	}
-	if msgs[0].To != f.owner {
-		t.Errorf("refusal reported to %s, want the owner", msgs[0].To)
-	}
-	if msgs[0].ActionLabel != "was refused access to a privileged route" {
-		t.Errorf("ActionLabel = %q", msgs[0].ActionLabel)
+}
+
+// A failed attempt at an action that IS notable on success stays unmailed too,
+// which is the rule the refusal case is now simply an instance of.
+func TestEmit_DoesNotMailFailedNotableActions(t *testing.T) {
+	f := newNotifyFixture(t)
+	m := &captureMailer{}
+	s := f.liveSink(t, m)
+
+	failed := event(f.tenantID, f.coOwner, audit.ActionAdminApplicationSecretRotated, "application", "9")
+	failed.Status = audit.StatusFailure
+
+	s.Emit([]audit.Event{failed})
+	s.Close()
+
+	if msgs := m.messages(); len(msgs) != 0 {
+		t.Errorf("sent %d messages for a failed rotation, want 0: %+v", len(msgs), msgs)
 	}
 }
 
