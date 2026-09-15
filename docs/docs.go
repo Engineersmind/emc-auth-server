@@ -4805,7 +4805,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/token": {
             "post": {
-                "description": "Issues a service-level access token. Credentials via Authorization: Basic base64(client_id:client_secret) header only. No user involved, no refresh token issued.",
+                "description": "DEPRECATED - use POST /oauth/token instead. Issues a service-level access token. Credentials via Authorization: Basic base64(client_id:client_secret) header only. No user involved, no refresh token issued. Responses carry Deprecation, Sunset and Link headers; see docs/AUTH_TOKEN_MIGRATION.md.",
                 "consumes": [
                     "application/json"
                 ],
@@ -4815,7 +4815,8 @@ const docTemplate = `{
                 "tags": [
                     "AUTH"
                 ],
-                "summary": "Client credentials token",
+                "summary": "Client credentials token (deprecated)",
+                "deprecated": true,
                 "parameters": [
                     {
                         "type": "string",
