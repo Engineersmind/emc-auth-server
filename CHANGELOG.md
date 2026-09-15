@@ -9,6 +9,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Deprecated
+- **`POST /api/v1/auth/token` is deprecated in favour of `POST /oauth/token`** (#132,
+  CLAUDE.md deferred #21). **Nothing changes for any caller**: the endpoint serves the same
+  requests, returns the same bodies and the same status codes, and is not scheduled for
+  removal in this release. Responses now additionally carry `Deprecation` (RFC 9745),
+  `Sunset` (RFC 8594) and `Link` (RFC 8288, `rel="successor-version"` → `/oauth/token`)
+  headers, so an integrator discovers the move from the response rather than a release note.
+  - The two endpoints mint **identical** tokens — both call `IssueServiceToken` with the
+    same audience resolution — so migrating changes the request encoding and nothing about
+    the credential a client holds. JSON body → form-encoded, and the `/api/v1` prefix is
+    dropped; the `Authorization: Basic` header is unchanged.
+  - **One prerequisite, and it is easy to miss:** `/oauth/token` enforces the per-client
+    grant allowlist (`auth.AllowsGrant`) that `/api/v1/auth/token` does not, and
+    `oauth_clients.grant_types` defaults to `'{authorization_code,refresh_token}'`
+    (migration `00032`) — which does **not** include `client_credentials`. A client that
+    works today can be refused there until an operator adds the grant.
+  - Migration guide, including the query to check a client's readiness:
+    `docs/AUTH_TOKEN_MIGRATION.md`. The `Sunset` date is a proposal under review.
+
 ### Fixed
 - **`POST /api/v1/auth/refresh` returned no tokens to application-scoped clients** (#108)
   — the rotated pair was delivered only through `setAuthCookies`, which deliberately
