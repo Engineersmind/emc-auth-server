@@ -33,6 +33,14 @@ func createTestUser(t *testing.T, f adminFixture, email string) int64 {
 // liveness is judged on; a negative value seeds an already-expired session.
 func seedRefreshToken(t *testing.T, f adminFixture, userID int64, ua string, expires time.Duration) int64 {
 	t.Helper()
+	return seedRefreshTokenInTenant(t, f, userID, f.tenantID, ua, expires)
+}
+
+// seedRefreshTokenInTenant is seedRefreshToken with the tenant named explicitly,
+// for the cross-tenant cases: a session minted under one tenant while the caller
+// is looking at another is the shape a tenant switch leaves behind.
+func seedRefreshTokenInTenant(t *testing.T, f adminFixture, userID, tenantID int64, ua string, expires time.Duration) int64 {
+	t.Helper()
 	ctx := context.Background()
 	window := fmt.Sprintf("%f seconds", expires.Seconds())
 
@@ -42,7 +50,7 @@ func seedRefreshToken(t *testing.T, f adminFixture, userID int64, ua string, exp
 		    (user_id, tenant_id, user_agent, device_hint, idle_expires_at, absolute_expires_at)
 		VALUES ($1, $2, $3, $3, NOW() + $4::interval, NOW() + $4::interval)
 		RETURNING id
-	`, userID, f.tenantID, ua, window).Scan(&sessionID); err != nil {
+	`, userID, tenantID, ua, window).Scan(&sessionID); err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
 
@@ -50,12 +58,28 @@ func seedRefreshToken(t *testing.T, f adminFixture, userID int64, ua string, exp
 		INSERT INTO refresh_tokens
 		    (user_id, tenant_id, token_hash, expires_at, session_id, session_family_id, user_agent)
 		VALUES ($1, $2, $3, NOW() + $4::interval, $5, $5, $6)
-	`, userID, f.tenantID,
+	`, userID, tenantID,
 		fmt.Sprintf("hash-%d-%s-%d", userID, ua, time.Now().UnixNano()),
 		window, sessionID, ua); err != nil {
 		t.Fatalf("seed refresh token: %v", err)
 	}
 	return sessionID
+}
+
+// seedTenant creates a bare live tenant. Only its id matters to these tests —
+// no roles or grants, since what is under test is session scoping rather than
+// whether a switch into it would be authorized.
+func seedTenant(t *testing.T, f adminFixture, slug string) int64 {
+	t.Helper()
+	unique := fmt.Sprintf("%s-%d", slug, time.Now().UnixNano())
+	var id int64
+	if err := f.pool.QueryRow(context.Background(), `
+		INSERT INTO tenants (name, slug, jwt_secret, is_active)
+		VALUES ($1, $1, 'x', true) RETURNING id
+	`, unique).Scan(&id); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	return id
 }
 
 func TestGetUserDetail_Enrichment(t *testing.T) {
@@ -193,6 +217,81 @@ func TestListUserSessions_ActiveOnly(t *testing.T) {
 	}
 	if sessions[0].UserAgent != "Firefox" {
 		t.Errorf("remaining session UA = %q, want Firefox", sessions[0].UserAgent)
+	}
+}
+
+
+// "My sessions" is a question about the USER, not about a tenant.
+//
+// This is the case that broke the account page. Signing in authenticates a
+// person once; the tenant in their token is context, and switching it is not a
+// second sign-in (auth.SwitchTenantContext reuses the session row). Scoping the
+// self-service list per tenant produced two wrong answers: an administrator who
+// switched saw an EMPTY list, because their session row still carries the tenant
+// they logged into, and the existence check ahead of it failed outright, because
+// an admin has no users row in a tenant they merely administer.
+//
+// ListOwnSessions must therefore return every live session the user has, in
+// whichever tenant it was minted for, while the admin path keeps validating.
+func TestListOwnSessions_SpansEveryTenant(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+	userID := createTestUser(t, f, "switcher@example.com")
+
+	// One session in the home tenant, and one carrying a different tenant — the
+	// shape left behind by signing in and then switching.
+	seedRefreshToken(t, f, userID, "Chrome", time.Hour)
+	otherTenant := seedTenant(t, f, "other")
+	seedRefreshTokenInTenant(t, f, userID, otherTenant, "Firefox", time.Hour)
+
+	sessions, err := f.svc.ListOwnSessions(ctx, userID, "")
+	if err != nil {
+		t.Fatalf("ListOwnSessions() error = %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2 — the list must span tenants, not just the token's", len(sessions))
+	}
+
+	// The admin path is unchanged: there the user id came from a URL, so a user
+	// who does not exist in the tenant asked about is still ErrNotFound.
+	if _, err := f.svc.ListUserSessions(ctx, otherTenant, nil, userID, ""); !errors.Is(err, admin.ErrNotFound) {
+		t.Fatalf("ListUserSessions(tenant without this user) error = %v, want ErrNotFound", err)
+	}
+
+	// And it stays scoped to the tenant it was asked about.
+	homeOnly, err := f.svc.ListUserSessions(ctx, f.tenantID, nil, userID, "")
+	if err != nil {
+		t.Fatalf("ListUserSessions(home tenant) error = %v", err)
+	}
+	if len(homeOnly) != 1 {
+		t.Errorf("admin-path sessions = %d, want 1 — that path must remain tenant-scoped", len(homeOnly))
+	}
+}
+
+// The revoke half. It resolves the session's own tenant, so a session listed
+// from another tenant can actually be ended — otherwise the button reports
+// "not found" for a row plainly on screen. Ownership is still enforced.
+func TestRevokeOwnSession_ReachesAnyTenantButOnlyOwnSessions(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+	userID := createTestUser(t, f, "revoker@example.com")
+	other := createTestUser(t, f, "someone-else@example.com")
+
+	otherTenant := seedTenant(t, f, "revoke-other")
+	elsewhere := seedRefreshTokenInTenant(t, f, userID, otherTenant, "Firefox", time.Hour)
+	theirs := seedRefreshToken(t, f, other, "Chrome", time.Hour)
+
+	// Another user's session is unreachable, even with no tenant to scope by.
+	if err := f.svc.RevokeOwnSession(ctx, userID, theirs, auth.RevokeReasonUserRevoked); !errors.Is(err, admin.ErrNotFound) {
+		t.Fatalf("RevokeOwnSession(another user's session) error = %v, want ErrNotFound", err)
+	}
+	// A session in a different tenant IS reachable — that is the fix.
+	if err := f.svc.RevokeOwnSession(ctx, userID, elsewhere, auth.RevokeReasonUserRevoked); err != nil {
+		t.Fatalf("RevokeOwnSession(own session in another tenant) error = %v", err)
+	}
+	// Revoking it again is a miss, so the first call really ended it.
+	if err := f.svc.RevokeOwnSession(ctx, userID, elsewhere, auth.RevokeReasonUserRevoked); !errors.Is(err, admin.ErrNotFound) {
+		t.Fatalf("second RevokeOwnSession error = %v, want ErrNotFound", err)
 	}
 }
 

@@ -8,3 +8,11 @@ docker-compose.yml text eol=lf
 *.sh   text eol=lf
 *.yaml text eol=lf
 *.yml  text eol=lf
+
+# Email templates are embedded with go:embed, so their bytes ship in the binary.
+# Without this, a Windows checkout (core.autocrlf=true) rewrites them to CRLF and
+# the compiled-in markup differs from what CI builds — including the generator
+# parts and build.sh that regenerate them.
+*.html text eol=lf
+*.part text eol=lf
+*.md   text eol=lf

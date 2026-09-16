@@ -2068,6 +2068,21 @@ func (s *Service) UnlockUser(ctx context.Context, tenantID int64, applicationID 
 // Set above the default concurrent-session cap (20) so a user at the cap still
 // sees every session they have, and truncation only happens where the cap itself
 // has been raised.
+//
+// That headroom is PER TENANT, and ListOwnSessions now spans every tenant, so
+// the two no longer line up: max_concurrent_sessions is enforced per (user,
+// tenant), so an administrator at the default cap in six tenants can hold 120
+// live sessions and this page would show 100 of them. Bounded and not silent in
+// practice — ORDER BY last_seen_at DESC means the truncation falls on the least
+// recently active, so what an operator is looking for when they open this page
+// is what survives the cut — but the count would be wrong, and "sign out
+// everywhere else" is unaffected either way because RevokeOtherSessions does not
+// read this list.
+//
+// Left as-is rather than raised to 20 × tenants: the number of tenants an
+// administrator can reach is not known at query time, and a limit that large
+// gives up the bound this constant exists to provide. If the sessions page ever
+// needs to be exact across tenants, the fix is pagination, not a bigger LIMIT.
 const MaxSessionsListed = 100
 
 // ListUserSessions returns the user's live sessions, one row per session family,
@@ -2075,10 +2090,56 @@ const MaxSessionsListed = 100
 //
 // currentFamilyID marks the caller's own session in the result; pass "" from the
 // admin path, where the caller is by definition somebody else.
+//
+// The user is resolved first so that an admin asking about a user who does not
+// exist in this tenant gets ErrNotFound rather than an empty list: those mean
+// different things when the id arrived in a URL. A caller reading their OWN
+// sessions must use ListOwnSessions instead — see the note there.
 func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64, currentFamilyID string) ([]UserSession, error) {
 	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
 		return nil, err
 	}
+	return s.listSessionRows(ctx, &tenantID, userID, currentFamilyID)
+}
+
+// ListOwnSessions returns every live session belonging to the caller, across all
+// tenants, without the existence check ListUserSessions performs.
+//
+// A session belongs to the PERSON, not to a tenant. Signing in authenticates a
+// human once; the tenant in their token is context the claims carry — which
+// tenant the console is currently showing — and switching it is not a second
+// sign-in. auth.SwitchTenantContext says as much ("Sessions are NOT rotated") and
+// reuses the session row. So "my active sessions" is a question about the user,
+// and answering it per tenant produced two wrong answers at once:
+//
+//   - Scoped to the token's tenant, an administrator who switched saw an EMPTY
+//     list, because their session row still carries the tenant they logged into.
+//   - The existence check ahead of it failed outright, since a platform admin or
+//     owner administering another tenant has no users row there, so the page
+//     reported "failed to load" rather than merely showing the wrong rows.
+//
+// Dropping both is safe here in a way it would not be on the admin path: the
+// user id comes from verified claims rather than a path parameter, so there is no
+// user-supplied identifier left to validate, and user_id alone is the correct and
+// complete scope for "the sessions that are mine".
+//
+// MaxSessionsListed applies ACROSS tenants here, which is a weaker guarantee than
+// it is on the admin path: the concurrent-session cap is enforced per (user,
+// tenant), so an administrator reaching several tenants can hold more live
+// sessions than this returns. The truncation falls on the least recently active
+// (ORDER BY last_seen_at DESC), so the sessions an operator opened this page to
+// find are the ones that survive it — but a total count taken from this list
+// would be short. See MaxSessionsListed.
+func (s *Service) ListOwnSessions(ctx context.Context, userID int64, currentFamilyID string) ([]UserSession, error) {
+	return s.listSessionRows(ctx, nil, userID, currentFamilyID)
+}
+
+// listSessionRows is the query shared by both entry points above.
+//
+// tenantID is nil for the self-service path, which spans every tenant the caller
+// has a session in; the admin path always passes one, because there the question
+// is about a user inside a particular tenant.
+func (s *Service) listSessionRows(ctx context.Context, tenantID *int64, userID int64, currentFamilyID string) ([]UserSession, error) {
 
 	// One row per session, straight from user_sessions — no DISTINCT ON over a
 	// rotation log. Liveness comes from auth.LiveSessionWhere rather than a
@@ -2090,13 +2151,18 @@ func (s *Service) ListUserSessions(ctx context.Context, tenantID int64, applicat
 	// The previous version ordered by session id because DISTINCT ON required it,
 	// which meant the limit silently kept the OLDEST hundred and hid everything
 	// recent — the Go-side sort then reordered those, making the output look correct.
+	// The tenant predicate is skipped entirely when tenantID is nil rather than
+	// being passed as NULL and compared: `tenant_id = NULL` is never true, so a
+	// NULL parameter would silently return no rows — which is exactly the empty
+	// list this method exists to stop returning.
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, host(ip_address), user_agent, device_hint, created_at, last_seen_at,
 		       LEAST(idle_expires_at, absolute_expires_at),
 		       idle_expires_at, absolute_expires_at,
 		       is_persistent, auth_time, amr
 		FROM user_sessions
-		WHERE user_id = $1 AND tenant_id = $2
+		WHERE user_id = $1
+		  AND ($2::BIGINT IS NULL OR tenant_id = $2)
 		  AND `+auth.LiveSessionWhere("")+`
 		ORDER BY last_seen_at DESC
 		LIMIT $3
@@ -2162,6 +2228,42 @@ func (s *Service) RevokeUserSession(ctx context.Context, tenantID int64, applica
 	if _, err := s.getUserByID(ctx, tenantID, applicationID, userID); err != nil {
 		return err
 	}
+	return s.revokeSessionRow(ctx, tenantID, userID, familyID, reason)
+}
+
+// RevokeOwnSession ends one of the caller's own sessions, in whichever tenant
+// that session was minted for.
+//
+// The tenant is read from the session row rather than taken from the caller's
+// claims, and that is what makes the button work. ListOwnSessions spans every
+// tenant, so the list can legitimately offer a session created before a tenant
+// switch; revoking it with the CURRENT token's tenant would match no row and
+// report "session not found" for a session plainly on screen.
+//
+// Ownership is still enforced, in two independent places: the lookup below is
+// keyed on user_id, and auth.RevokeSession re-checks user_id AND tenant_id on
+// the UPDATE itself. A caller can therefore only ever revoke a row that is
+// already theirs — the tenant is resolved from that row, never asserted by the
+// caller. userID comes from verified claims, not a path parameter.
+func (s *Service) RevokeOwnSession(ctx context.Context, userID, familyID int64, reason string) error {
+	var sessionTenantID int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT tenant_id FROM user_sessions WHERE id = $1 AND user_id = $2
+	`, familyID, userID).Scan(&sessionTenantID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Either no such session or not this caller's. Deliberately one answer:
+			// distinguishing them tells a caller whether a session id they guessed
+			// belongs to somebody else.
+			return ErrNotFound
+		}
+		return fmt.Errorf("resolve own session tenant: %w", err)
+	}
+	return s.revokeSessionRow(ctx, sessionTenantID, userID, familyID, reason)
+}
+
+// revokeSessionRow is the revoke shared by both entry points above.
+func (s *Service) revokeSessionRow(ctx context.Context, tenantID int64, userID, familyID int64, reason string) error {
 	n, err := s.revokeSession(ctx, userID, tenantID, familyID, reason)
 	if err != nil {
 		return fmt.Errorf("revoke session: %w", err)

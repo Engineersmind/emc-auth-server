@@ -1,0 +1,19 @@
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <tr>
+            <td align="center" style="padding:22px 20px 0 20px;">
+              <p class="text-faint" style="margin:0 0 5px 0;font-family:'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;line-height:1.5;color:#8b8b95;">Automated message from {{.ProductName}}{{if .AppName}} on behalf of {{.AppName}}{{end}}. Please do not reply.</p>
+              <p class="text-faint" style="margin:0;font-family:'Space Grotesk','Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#8b8b95;">&copy; {{.ProductName}}</p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

@@ -33,18 +33,30 @@ var notableActions = map[string]string{
 	audit.ActionAdminTenantAdminRemoved:       "removed an administrator",
 	audit.ActionAdminMFAPolicyUpdated:         "changed an application's MFA policy",
 	audit.ActionAdminTenantDeactivated:        "deactivated the tenant",
-	audit.ActionAdminAccessDenied:             "was refused access to a privileged route",
 }
 
-// notifyOnFailure lists actions whose FAILURE is the thing worth reporting.
+// Notifications are sent only for actions that SUCCEEDED.
 //
-// Everything else is reported only on success: an attempt that did not change
-// anything is not news. A refusal is the exception — it is the only trace a
-// probe leaves, because the handler never ran. A co-owner walking the tenant's
-// applications looking for one they can reach shows up here and nowhere else.
-var notifyOnFailure = map[string]bool{
-	audit.ActionAdminAccessDenied: true,
-}
+// Failures were briefly reported too — a refused privileged request being the
+// one case, since the handler never runs and the refusal is a probe's only
+// trace. That is withdrawn deliberately.
+//
+// Success volume is bounded by how much an operator can actually do. Failure
+// volume is bounded by nothing: it is chosen by whoever is probing, and a
+// co-owner walking a tenant's applications produces a distinct resource id per
+// attempt, so collapsing folds none of it. The per-recipient hourly cap then
+// caps the DAMAGE at twenty near-identical emails, which is how a channel gets
+// filtered to junk — losing the successful-action notices that share it.
+//
+// It is also the wrong channel economically: email is metered per message, so
+// an unbounded attacker-controlled stream is a billing surface as well as a
+// noise one.
+//
+// Nothing is lost from the record. audit.ActionAdminAccessDenied is still
+// written on every refusal by internal/api/middleware/permission.go and
+// internal/api/handlers/admin.go, and is still queryable in Monitoring. Only
+// the email is withdrawn. When a non-metered channel exists (Teams is the
+// intended one), failure alerts belong there.
 
 // selfNotify lists the actions whose actor also receives a copy.
 //

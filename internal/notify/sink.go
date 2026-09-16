@@ -152,9 +152,10 @@ func (s *EmailSink) Emit(events []audit.Event) {
 		}
 		// Status is the raw value the caller set; the writer's "" → success
 		// normalisation happens on the copy bound for the database. An attempt
-		// that changed nothing is not news — except for the actions whose
-		// failure IS the news, such as a refused privileged request.
-		if e.Status != "" && e.Status != audit.StatusSuccess && !notifyOnFailure[e.Action] {
+		// that changed nothing is not news, and a failed one is not mailed at
+		// all — see the note above notableActions for why refusals were dropped
+		// from this channel.
+		if e.Status != "" && e.Status != audit.StatusSuccess {
 			continue
 		}
 		keep = append(keep, e)

@@ -17,9 +17,13 @@ import (
 // need. Declared as an interface at the point of use so the account handlers do
 // not depend on the whole admin surface — and so a test can supply a stub without
 // standing up admin.Service.
+// The *Own* variants are the self-service ones. They are keyed on the user
+// alone, with no tenant: a session belongs to the person who signed in, and the
+// tenant in a token is context rather than a property of the login. See
+// admin.ListOwnSessions for why scoping these per tenant was wrong.
 type SessionLister interface {
-	ListUserSessions(ctx context.Context, tenantID int64, applicationID *int64, userID int64, currentFamilyID string) ([]admin.UserSession, error)
-	RevokeUserSession(ctx context.Context, tenantID int64, applicationID *int64, userID, familyID int64, reason string) error
+	ListOwnSessions(ctx context.Context, userID int64, currentFamilyID string) ([]admin.UserSession, error)
+	RevokeOwnSession(ctx context.Context, userID, familyID int64, reason string) error
 }
 
 // WithSessionLister wires the session queries behind the /me/sessions routes.
@@ -61,8 +65,8 @@ func (h *AuthHandler) ListMySessions(c echo.Context) error {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "session listing unavailable"})
 	}
 
-	sessions, err := h.adminSvc.ListUserSessions(c.Request().Context(),
-		subject.tenantID, nil, subject.userID, subject.sessionID)
+	sessions, err := h.adminSvc.ListOwnSessions(c.Request().Context(),
+		subject.userID, subject.sessionID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("account: list own sessions failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list sessions"})
@@ -108,8 +112,8 @@ func (h *AuthHandler) RevokeMySession(c echo.Context) error {
 		})
 	}
 
-	err = h.adminSvc.RevokeUserSession(c.Request().Context(),
-		subject.tenantID, nil, subject.userID, familyID, auth.RevokeReasonUserRevoked)
+	err = h.adminSvc.RevokeOwnSession(c.Request().Context(),
+		subject.userID, familyID, auth.RevokeReasonUserRevoked)
 	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "session not found"})
@@ -155,7 +159,7 @@ func (h *AuthHandler) RevokeMyOtherSessions(c echo.Context) error {
 	}
 
 	revoked, err := h.svc.RevokeOtherSessions(c.Request().Context(),
-		subject.userID, subject.tenantID, subject.sessionID)
+		subject.userID, subject.sessionID)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("account: revoke other sessions failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to revoke sessions"})
