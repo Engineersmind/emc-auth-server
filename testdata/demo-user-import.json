@@ -1,0 +1,366 @@
+{
+  "users": [
+    {
+      "email": "jane.okafor@example.com",
+      "first_name": "Jane",
+      "last_name": "Okafor",
+      "email_verified": true,
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea",
+      "password_changed_at": "2023-04-11T09:00:00Z"
+    },
+
+    {
+      "email": "MARCUS.Webb@Example.COM",
+      "first_name": "Marcus",
+      "last_name": "Webb",
+      "email_verified": true,
+      "password_hash": "$2a$10$Jd16.OUcGa1bmURYcGuFYOvCW3otHqSQ/5h1PB1OfUk5HLSyekOl."
+    },
+
+    {
+      "email": "priya.raman@example.com",
+      "first_name": "Priya",
+      "last_name": "Raman",
+      "email_verified": true,
+      "is_active": false,
+      "password_hash": "$2a$10$CAmI2ApkBN3ZpygxKfK07eUTALrIva7NoPP2gnS16Phy9.mCBRUfu"
+    },
+
+    {
+      "email": "tom.lindqvist@example.com",
+      "first_name": "Tom",
+      "last_name": "Lindqvist",
+      "email_verified": true,
+      "password_hash": "$argon2id$v=19$m=47104,t=1,p=1$1LwTcbxlaN9Anl/Hfd+TIA$GSWCgW5Ov2uX53+enPZlUk+RBuyc6MZf+InxQRxiZ1s"
+    },
+
+    {
+      "email": "hanna.virtanen@example.com",
+      "first_name": "Hanna",
+      "last_name": "Virtanen",
+      "email_verified": true,
+      "password_hash": "$2b$12$VEOPOObByf9JNoduH0J.s.CzuTT02WMq6g2rMHnczzEdWkP3hGvMa"
+    },
+
+    {
+      "email": "diego.salazar@example.com",
+      "first_name": "Diego",
+      "last_name": "Salazar",
+      "email_verified": true,
+      "password_hash": "$2y$08$umq68Opikf6xsEUoUekPQ.C5i2F5yJhHslsT0o1B7jys6Yq1tfc8q"
+    },
+
+    {
+      "email": "yuki.tanaka@example.com",
+      "first_name": "Yuki",
+      "last_name": "Tanaka",
+      "email_verified": true,
+      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$hFDJvDU7ChsvXDOUjX8MXA$Lk3+J23ubL3Vct6V/grCk/lrjQBW1VUFtmJ6EtunlbA"
+    },
+
+    {
+      "email": "noor.alghamdi@example.com",
+      "first_name": "Noor",
+      "last_name": "Al-Ghamdi",
+      "email_verified": true,
+      "password_hash": "$2a$04$P2Cu0fJfLUs/Wy27NGZyYu6sdLps9gVQqsigd4hlCQMNCQ8dRCDqG",
+      "password_changed_at": "2019-08-02T14:30:00Z"
+    },
+
+    {
+      "email": "luca.rossi@example.com",
+      "first_name": "Luca",
+      "last_name": "Rossi",
+      "email_verified": true,
+      "password_hash": "$2b$11$Km6np.LveCLBuyIqyBcG9upC2lKBcxDCjugQvK1r75gUiiJ3Luf8a"
+    },
+
+    {
+      "email": "amara.okon@example.com",
+      "first_name": "Amara",
+      "last_name": "Okonkwo",
+      "email_verified": false,
+      "password_hash": "$2y$06$KW2ISB.ChTOMhiwuuh9PSe0IhbkcIPTnnns8kzyZpE5xDNJYpXAc."
+    },
+
+    {
+      "email": "kenji.sato@example.com",
+      "first_name": "Kenji",
+      "last_name": "Sato",
+      "email_verified": true,
+      "password_hash": "$2a$13$OO3CI7Sf/1aJw1ELMaBaRugJeugk3Y7k2X80j7lem//0DL6f/r9JW"
+    },
+
+    {
+      "email": "elena.popa@example.com",
+      "first_name": "Elena",
+      "last_name": "Popa",
+      "email_verified": true,
+      "is_active": false,
+      "password_hash": "$2b$05$5cjfO7zHpsUllu.4aDgIh.GykSDfQc6C7CIeT9NYmhE4geQgWnhV2"
+    },
+
+    {
+      "email": "ravi.sharma@example.com",
+      "first_name": "Ravi",
+      "last_name": "Sharma",
+      "email_verified": true,
+      "password_hash": "$argon2id$v=19$m=47104,t=1,p=1$VprkVhPp4dVZyBU8uwsmow$bUFmkTi69x+ZLWJ9qplbxuL3tUS9lSsWUNXLjomb92A"
+    },
+
+    {
+      "email": "ingrid.berg@example.com",
+      "first_name": "Ingrid",
+      "last_name": "Berg",
+      "email_verified": true,
+      "password_hash": "$argon2id$v=19$m=12288,t=3,p=1$ORzuswySSxGDM4WwR0zDiw$gaXHHer8PQfNx7Fjs3Bl4FmWX1/EpzSMPqxtcDIRPH8"
+    },
+
+    {
+      "email": "omar.haddad@example.com",
+      "first_name": "Omar",
+      "last_name": "Haddad",
+      "email_verified": true,
+      "password_hash": "$argon2id$v=19$m=65536,t=1,p=2$M4hlK2Jjro9W/Xk9DVDt6Q$Gde1xdB1I/O4CRcILjYX/4L8LLTT5Jn+t+yRH6zeZ+0"
+    },
+
+    {
+      "email": "rosa.mendes@example.com",
+      "first_name": "Rosa",
+      "last_name": "Mendes",
+      "email_verified": true,
+      "role": "EMC",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    },
+
+    {
+      "email": "viktor.novak@example.com",
+      "first_name": "Viktor",
+      "last_name": "Novak",
+      "email_verified": true,
+      "role": "EMC",
+      "password_hash": "$argon2id$v=19$m=47104,t=1,p=1$VprkVhPp4dVZyBU8uwsmow$bUFmkTi69x+ZLWJ9qplbxuL3tUS9lSsWUNXLjomb92A"
+    },
+
+    {
+      "email": "grace.mutua@example.com",
+      "first_name": "Grace",
+      "last_name": "Mutua",
+      "email_verified": true,
+      "role": "",
+      "password_hash": "$2b$11$Km6np.LveCLBuyIqyBcG9upC2lKBcxDCjugQvK1r75gUiiJ3Luf8a"
+    },
+
+    {
+      "email": "padded.role@example.com",
+      "first_name": "Padded",
+      "last_name": "Role",
+      "email_verified": true,
+      "role": "  EMC  ",
+      "password_hash": "$2y$06$KW2ISB.ChTOMhiwuuh9PSe0IhbkcIPTnnns8kzyZpE5xDNJYpXAc."
+    },
+
+    {
+      "email": "sofia.duarte@example.com",
+      "first_name": "Sofia",
+      "last_name": "Duarte",
+      "email_verified": true,
+      "identities": [
+        {
+          "provider": "google",
+          "provider_sub": "108127461982736451923",
+          "provider_email": "sofia.duarte@gmail.com"
+        }
+      ]
+    },
+
+    {
+      "email": "chen.wei@example.com",
+      "first_name": "Chen",
+      "last_name": "Wei",
+      "email_verified": true,
+      "identities": [
+        { "provider": "microsoft", "provider_sub": "9f3c1a77-2b64-4e8d-91a5-6c0d7e2f8b13" }
+      ]
+    },
+
+    {
+      "email": "fatima.zahra@example.com",
+      "first_name": "Fatima",
+      "last_name": "Zahra",
+      "email_verified": true,
+      "password_hash": "$2a$10$CAmI2ApkBN3ZpygxKfK07eUTALrIva7NoPP2gnS16Phy9.mCBRUfu",
+      "identities": [
+        { "provider": "google", "provider_sub": "104558392017463829105" },
+        { "provider": "github", "provider_sub": "28104773" }
+      ]
+    },
+
+    {
+      "email": "aaron.mbeki@example.com",
+      "first_name": "Aaron",
+      "last_name": "Mbeki",
+      "email_verified": false,
+      "password_hash": "$2a$10$dbfaR3FE9t8Q9eIkTvnkVeMVENVbuRhg5JE9E9AXF5Nia//vZ72/W",
+      "identities": [
+        {
+          "provider": "google",
+          "provider_sub": "117003948261047382910"
+        }
+      ]
+    },
+
+    {
+      "email": "nina.plaintext@example.com",
+      "first_name": "Nina",
+      "last_name": "Plaintext",
+      "email_verified": true,
+      "password": "Plaintext!Import1"
+    },
+
+    {
+      "email": "otto.plainrole@example.com",
+      "first_name": "Otto",
+      "last_name": "Plainrole",
+      "email_verified": true,
+      "role": "EMC",
+      "password": "Plaintext!WithRole2"
+    },
+
+    {
+      "email": "pia.plainfed@example.com",
+      "first_name": "Pia",
+      "last_name": "Plainfed",
+      "email_verified": true,
+      "password": "Plaintext!AndFed3",
+      "identities": [{ "provider": "github", "provider_sub": "55512345" }]
+    },
+
+    {
+      "email": "not-an-email-address",
+      "first_name": "Malformed",
+      "last_name": "Address",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    },
+
+    {
+      "email": "",
+      "first_name": "Empty",
+      "last_name": "Email",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    },
+
+    {
+      "email": "no.credentials@example.com",
+      "first_name": "No",
+      "last_name": "Credentials"
+    },
+
+    {
+      "email": "plaintext.password@example.com",
+      "first_name": "Plaintext",
+      "last_name": "Password",
+      "password_hash": "hunter2"
+    },
+
+    {
+      "email": "md5.legacy@example.com",
+      "first_name": "MD5",
+      "last_name": "Legacy",
+      "password_hash": "5f4dcc3b5aa765d61d8327deb882cf99"
+    },
+
+    {
+      "email": "sha1.legacy@example.com",
+      "first_name": "SHA1",
+      "last_name": "Legacy",
+      "password_hash": "{SHA}5en6G6MezRroT3XKqkdPOmY/BfQ="
+    },
+
+    {
+      "email": "broken.argon@example.com",
+      "first_name": "Broken",
+      "last_name": "Argon",
+      "password_hash": "$argon2id$v=19$m=notanumber,t=1,p=1$c2FsdA$aGFzaA"
+    },
+
+    {
+      "email": "ghost.role@example.com",
+      "first_name": "Ghost",
+      "last_name": "Role",
+      "role": "role-that-does-not-exist",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    },
+
+    {
+      "email": "escalation.attempt@example.com",
+      "first_name": "Escalation",
+      "last_name": "Attempt",
+      "role": "owner",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    },
+
+    {
+      "email": "superadmin.attempt@example.com",
+      "first_name": "SuperAdmin",
+      "last_name": "Attempt",
+      "role": "super_admin",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    },
+
+    {
+      "email": "wrong.case.role@example.com",
+      "first_name": "Wrong",
+      "last_name": "Case",
+      "role": "emc",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    },
+
+
+    {
+      "email": "double.google@example.com",
+      "first_name": "Double",
+      "last_name": "Google",
+      "identities": [
+        { "provider": "google", "provider_sub": "111111111111111111111" },
+        { "provider": "google", "provider_sub": "222222222222222222222" }
+      ]
+    },
+
+    {
+      "email": "headless.identity@example.com",
+      "first_name": "Headless",
+      "last_name": "Identity",
+      "identities": [{ "provider": "google", "provider_email": "headless@gmail.com" }]
+    },
+
+    {
+      "email": "jane.okafor@example.com",
+      "first_name": "Jane",
+      "last_name": "Duplicate",
+      "password_hash": "$2a$10$Jd16.OUcGa1bmURYcGuFYOvCW3otHqSQ/5h1PB1OfUk5HLSyekOl."
+    },
+
+    {
+      "email": "both.credentials@example.com",
+      "first_name": "Both",
+      "last_name": "Credentials",
+      "password_hash": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea",
+      "password": "Plaintext!Conflict1"
+    },
+
+    {
+      "email": "short.plaintext@example.com",
+      "first_name": "Short",
+      "last_name": "Plaintext",
+      "password": "abc"
+    },
+
+    {
+      "email": "hash.in.password.field@example.com",
+      "first_name": "Hash",
+      "last_name": "WrongField",
+      "password": "$2a$10$mBpocixREAuSWfgUbmgWJO5bKSWNXZunMIDwD3t88o3UvrWIe5Jea"
+    }
+  ]
+}
