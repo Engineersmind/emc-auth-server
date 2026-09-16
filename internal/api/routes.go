@@ -126,6 +126,11 @@ type RoutesConfig struct {
 	// AudienceScheme prefixes every per-application audience identifier
 	// (issue #131). Empty falls back to auth.AudienceSchemeDefault.
 	AudienceScheme string
+	// RequireAudience is the deployment-wide audience backstop (issue #132).
+	// It decides only what happens to a token carrying NO audience; a token
+	// that carries a real one is always held to its route's policy. See
+	// config.Config.RequireAudience and middleware/audience.go.
+	RequireAudience bool
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -338,9 +343,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	if issErr != nil {
 		deps.Logger.Fatal().Err(issErr).Msg("tenant issuer resolver init failed — check OIDC_ISSUER_BASE_URL / APP_BASE_URL")
 	}
-	jwtSvc.WithTenantIssuers(issuerResolver).WithLegacyIssuer(deps.Config.JWTAllowLegacyIssuer)
+	jwtSvc.WithTenantIssuers(issuerResolver).
+		WithLegacyIssuer(deps.Config.JWTAllowLegacyIssuer).
+		WithRequireAudience(deps.Config.RequireAudience)
 	if !deps.Config.JWTAllowLegacyIssuer {
 		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_ISSUER=false — tokens carrying the old global JWT_ISSUER are REJECTED (issue #7 cutover). Any token minted before per-tenant issuers went live will fail.")
+	}
+	if deps.Config.RequireAudience {
+		deps.Logger.Warn().Msg("REQUIRE_AUDIENCE=true — the audience is MANDATORY server-wide (issue #132 cutover). Tokens carrying no gty claim and tokens resolving to no audience are REJECTED across every tenant on this server. Rollback is REQUIRE_AUDIENCE=false, config only, no deploy.")
 	}
 	deps.Logger.Info().
 		Str("issuer_base_url", issuerResolver.BaseURL()).
@@ -370,6 +380,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// they would come to disagree about what a valid audience looks like.
 	audienceSvc := auth.NewAudienceService(deps.Pool, deps.Logger).
 		WithScheme(deps.Config.AudienceScheme)
+
+	// Route audience policy — issue #132. Two policies over one boundary:
+	// identity endpoints accept any audience the caller's own tenant owns (plus
+	// this server's), admin endpoints accept only this server's.
+	//
+	// Declared here, beside the service they read, because they are referenced
+	// from route registrations both above and below the jwtRenew declaration.
+	//
+	// See middleware/audience.go for why the boundary has to hold in both
+	// directions: the identity endpoints exist FOR app-scoped tokens, and
+	// demanding api://emc-auth on GET /auth/me would return 401 on every
+	// request emc-insurance-platform makes.
+	identityAudience := mw.RequireTenantAudience(audienceSvc, deps.Config.RequireAudience)
+	adminAudience := mw.RequireSelfAudience(audienceSvc, deps.Config.RequireAudience)
 
 	authSvc := auth.NewAuthService(deps.Pool, jwtSvc, deps.Logger).
 		WithHasher(passwordHasher).
@@ -730,6 +754,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// the limiter keys on once claims are present.
 	authGroup.POST("/tenant-context", authHandler.TenantContext,
 		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
+		identityAudience,
 		mw.TokenRateLimiter(rlCfg))
 
 	// Which tenants may I administer? (plan step 5)
@@ -744,7 +769,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// reachable by an administrator whose current token names a tenant they are
 	// about to leave.
 	authGroup.GET("/my-tenants", authHandler.MyTenants,
-		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...))
+		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
+		identityAudience)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/reset-password", authHandler.ResetPassword)
 
@@ -808,7 +834,27 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// It validates the access token and, when expired, transparently rotates
 	// the refresh token (distributed lock + fresh user DB load) and writes new
 	// cookies onto the response before the handler body is flushed.
-	jwtRenew := mw.JWTRenew(jwtSvc, authSvc, deps.Redis, cookieCfg, auditLog, deps.Logger)
+	baseJWTRenew := mw.JWTRenew(jwtSvc, authSvc, deps.Redis, cookieCfg, auditLog, deps.Logger)
+
+	// The identity audience policy is composed INTO jwtRenew rather than added
+	// at each call site, and that is a fail-closed choice, not a brevity one.
+	//
+	// authGroup carries 36 routes of which only 7 are authenticated — login,
+	// register, forgot-password, apps/login and the rest are public and hold no
+	// token at all — so the policy cannot be mounted on the group. Listing the
+	// authenticated ones individually would work today and rot tomorrow: the
+	// next protected route added to authGroup would silently miss the policy,
+	// and missing it fails OPEN. Composing it here means every route that takes
+	// a JWT guard is covered by construction, which is the same reasoning
+	// jwt.go:210 gives for expressing route policy over named grant SETS rather
+	// than over individual grants.
+	//
+	// Order matters: baseJWTRenew runs first and publishes *auth.Claims on the
+	// context, then identityAudience judges them. Reversing it would hand the
+	// policy an empty context and refuse every request.
+	var jwtRenew echo.MiddlewareFunc = func(next echo.HandlerFunc) echo.HandlerFunc {
+		return baseJWTRenew(identityAudience(next))
+	}
 
 	// Auth routes — protected with transparent renewal (AUTH-09)
 	authGroup.GET("/me", authHandler.Me, jwtRenew, appRateLimit)
@@ -990,10 +1036,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// humans admits it. Spelling out grants here is how one route comes to be
 	// missed, and a missed route fails CLOSED — a working login method rejected on
 	// a subset of the API, which is the confusing kind of outage.
+	// adminAudience is the other half of the #132 boundary: a token minted for a
+	// tenant's own API must never reach this server's management surface, however
+	// wide its permissions. Mounted on the group, so every route registered
+	// through adminGroup or tenantMgmt inherits it — including ones added later.
 	adminGroup := apiV1.Group("", mw.JWTRequired(
 		jwtSvc,
 		mw.Grants(auth.HumanGrants, auth.AdminGrants, auth.MachineGrants)...,
-	), appRateLimit)
+	), adminAudience, appRateLimit)
 
 	// Ping (smoke test — requires admin:access)
 	adminGroup.GET("/ping", func(c echo.Context) error {
@@ -1529,9 +1579,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// return for them (issue #84). JWTRequired enforces it before the handler runs.
 	//
 	// GET and POST because OIDC Core §5.3 requires both.
+	//
+	// identityAudience, not adminAudience (issue #132): userinfo answers "who is
+	// this token's user", which is the same question GET /auth/me answers, and an
+	// app-scoped token is exactly the caller that asks it. An OIDC relying party
+	// holding a token for its own API must reach this or discovery-driven login
+	// breaks at the last step.
 	userInfoAuth := mw.JWTRequired(jwtSvc, auth.HumanGrants...)
-	e.GET(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
-	e.POST(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, mw.UserInfoRateLimiter())
+	e.GET(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, identityAudience, mw.UserInfoRateLimiter())
+	e.POST(handlers.PathOAuthUserInfo, oidcHandler.UserInfo, userInfoAuth, identityAudience, mw.UserInfoRateLimiter())
 
 	// SAML SP endpoints — public, no JWT required (04-01, 04-02)
 	e.GET("/saml/metadata", samlHandler.GetMetadata)
