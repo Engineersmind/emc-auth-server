@@ -2708,15 +2708,91 @@ func clientCredentialsFromHeader(c echo.Context, headerName string) (clientID, c
 	return id, secret, true, nil
 }
 
+// ---------------------------------------------------------------------------
+// Deprecation signalling for POST /api/v1/auth/token — CLAUDE.md deferred #21
+// ---------------------------------------------------------------------------
+
+var (
+	// authTokenDeprecatedAt is when this endpoint was announced deprecated, and
+	// is the RFC 9745 Deprecation value.
+	authTokenDeprecatedAt = time.Date(2026, time.September, 15, 0, 0, 0, 0, time.UTC)
+
+	// authTokenSunset is when POST /api/v1/auth/token is scheduled to stop
+	// being served — the RFC 8594 Sunset value.
+	//
+	// PROPOSED DATE, to be confirmed before this merges. It is deliberately far
+	// out: the endpoint has documented live consumers (CLIENT_CREDENTIALS_FLOW.md)
+	// and issue #132's instruction is to migrate them, not to strand them.
+	//
+	// Announcing a date is not enforcing one. Nothing in this package reads this
+	// value to decide whether to serve the request; the endpoint keeps behaving
+	// exactly as it does today until a separate, deliberate release removes it.
+	// Editing this constant changes only what integrators are told.
+	authTokenSunset = time.Date(2026, time.December, 31, 23, 59, 59, 0, time.UTC)
+)
+
+// authTokenMigrationGuide is the human-readable migration document named by the
+// rel="deprecation" link.
+const authTokenMigrationGuide = "https://github.com/Engineersmind/emc-auth-server/blob/master/docs/AUTH_TOKEN_MIGRATION.md"
+
+// setAuthTokenDeprecationHeaders marks a response from the deprecated
+// client-credentials alias.
+//
+// Written on EVERY response from the handler, success and failure alike, and
+// before any status is chosen. An integrator debugging a 401 is exactly the one
+// who needs to discover the endpoint is going away, and headers attached only to
+// 200s are invisible to an integration that is already broken.
+//
+// Three fields, all advisory and all additive. No status code, no response body,
+// no authentication behaviour changes, and a client that ignores all three is
+// entirely unaffected — which is the property that makes this safe to ship long
+// before the removal.
+//
+//   - Deprecation (RFC 9745) is a Date structured field: "@" followed by a Unix
+//     timestamp. Deliberately NOT the bare "true" of the pre-RFC drafts, which a
+//     conforming parser rejects because it is not a Date.
+//   - Sunset (RFC 8594) is an IMF-fixdate, the same shape as Expires.
+//   - Link (RFC 8288) carries the replacement. rel="successor-version" is the
+//     registered relation a machine client follows to find what to call instead;
+//     rel="deprecation" points a human at the migration guide.
+func setAuthTokenDeprecationHeaders(c echo.Context) {
+	h := c.Response().Header()
+	h.Set("Deprecation", "@"+strconv.FormatInt(authTokenDeprecatedAt.Unix(), 10))
+	h.Set("Sunset", authTokenSunset.Format(http.TimeFormat))
+	h.Set("Link", "<"+PathOAuthToken+`>; rel="successor-version", <`+
+		authTokenMigrationGuide+`>; rel="deprecation"`)
+}
+
 // Token handles POST /api/v1/auth/token.
+//
+// DEPRECATED (CLAUDE.md deferred #21) in favour of POST /oauth/token, which is
+// the RFC 6749 endpoint and the one the OIDC discovery document advertises as
+// token_endpoint. This handler still works, unchanged, and is still what
+// CLIENT_CREDENTIALS_FLOW.md documents to its live consumers.
+//
+// The two mint IDENTICAL tokens: both call AuthService.IssueServiceToken with
+// the same audience resolution, so migrating changes the request encoding and
+// nothing about the credential a client ends up holding. The differences an
+// integrator must care about are exactly two, and both are in the migration
+// guide: /oauth/token is form-encoded rather than JSON, and it enforces the
+// per-client grant allowlist (auth.AllowsGrant) that this endpoint does not.
+// The second is the trap — oauth_clients.grant_types defaults to
+// '{authorization_code,refresh_token}' (migration 00032), which does NOT
+// contain client_credentials, so a client that works here can be refused there
+// until an operator adds the grant.
+//
+// Nothing is removed here. The endpoint is only marked, so that consumers
+// discover the move from the response itself rather than from a release note;
+// removal is a separate deliberate release once they have.
 //
 // Client credentials are accepted ONLY via the Authorization header
 // (RFC 6749 §2.3.1): Basic base64(client_id:client_secret). The JSON body
 // carries grant_type alone; credentials in the body are rejected with
 // guidance so misconfigured integrations fail loudly, not silently.
 //
-// @Summary      Client credentials token
-// @Description  Issues a service-level access token. Credentials via Authorization: Basic base64(client_id:client_secret) header only. No user involved, no refresh token issued.
+// @Summary      Client credentials token (deprecated)
+// @Description  DEPRECATED - use POST /oauth/token instead. Issues a service-level access token. Credentials via Authorization: Basic base64(client_id:client_secret) header only. No user involved, no refresh token issued. Responses carry Deprecation, Sunset and Link headers; see docs/AUTH_TOKEN_MIGRATION.md.
+// @Deprecated
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
@@ -2727,6 +2803,9 @@ func clientCredentialsFromHeader(c echo.Context, headerName string) (clientID, c
 // @Failure      401   {object}  map[string]string
 // @Router       /api/v1/auth/token [post]
 func (h *AuthHandler) Token(c echo.Context) error {
+	// Set before anything can fail, so the markers reach error responses too.
+	setAuthTokenDeprecationHeaders(c)
+
 	var req TokenRequest
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
