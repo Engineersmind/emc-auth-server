@@ -40,11 +40,7 @@
 //     not "principal" but "account".
 package handlers
 
-import (
-	"net/http"
-
-	"github.com/labstack/echo/v4"
-)
+import "github.com/labstack/echo/v4"
 
 // APIError is the body of every failed response.
 type APIError struct {
@@ -52,9 +48,6 @@ type APIError struct {
 	Error string `json:"error"`
 	// Message is prose for the person who hit the failure. Never parse it.
 	Message string `json:"message,omitempty"`
-	// Details carries field-level validation results where a form needs to
-	// mark individual inputs. Omitted otherwise.
-	Details map[string]string `json:"details,omitempty"`
 }
 
 // fail writes a coded error with the human message registered for that code.
@@ -64,23 +57,6 @@ type APIError struct {
 // empty `message`.
 func fail(c echo.Context, status int, code string) error {
 	return c.JSON(status, APIError{Error: code, Message: userMessage(code)})
-}
-
-// failWith writes a coded error with a message this call site supplies, for the
-// cases where the useful sentence depends on runtime values — a lockout that
-// names its duration, an import row that names the role it could not find.
-func failWith(c echo.Context, status int, code, message string) error {
-	return c.JSON(status, APIError{Error: code, Message: message})
-}
-
-// failFields writes a validation failure with per-field messages, so a form can
-// mark the inputs that are wrong instead of showing one banner.
-func failFields(c echo.Context, code string, fields map[string]string) error {
-	return c.JSON(http.StatusBadRequest, APIError{
-		Error:   code,
-		Message: userMessage(code),
-		Details: fields,
-	})
 }
 
 // userMessage returns the sentence shown for a code, or "" when none is
