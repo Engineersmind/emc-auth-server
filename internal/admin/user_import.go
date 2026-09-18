@@ -38,6 +38,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -117,13 +118,40 @@ type ImportUser struct {
 // still honouring an explicit false. A plain struct decode cannot express that:
 // the zero value of bool is false, so an omitted is_active would import every
 // user deactivated.
+//
+// The unknown-field check is repeated here on purpose. DisallowUnknownFields on
+// the handler's decoder does not reach inside a type that implements
+// UnmarshalJSON — the decoder hands this method the raw bytes and whatever it
+// does with them is its own business — so a row with "passwordHash" instead of
+// "password_hash" was accepted by the outer decoder and dropped here. With
+// email_verified true that row still validates (a verified address is a route
+// in) and imports with no credential at all: an account the operator believes
+// carries a migrated password and which nobody can ever sign into. Rejecting
+// the upload is the only outcome that tells them.
+//
+// The export-only fields below are named explicitly so they keep being accepted
+// and ignored. ExportedUser emits application, created_at, last_login_at and
+// login_count — an export is also read by people reconciling licences and
+// dormancy — and the documented round trip is "export, add credentials,
+// re-import", so a strictness that refused the server's own export would break
+// the one thing the JSON format exists for. They are read into nothing on
+// purpose: an import does not get to choose a user's created_at or claim a
+// login history. Every OTHER unknown key is now a hard error, which is the
+// point — an operator who typed the wrong one hears about it.
 func (u *ImportUser) UnmarshalJSON(b []byte) error {
 	type raw ImportUser
 	var probe struct {
 		raw
 		IsActive *bool `json:"is_active"`
+
+		Application string     `json:"application"`
+		CreatedAt   *time.Time `json:"created_at"`
+		LastLoginAt *time.Time `json:"last_login_at"`
+		LoginCount  *int64     `json:"login_count"`
 	}
-	if err := json.Unmarshal(b, &probe); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&probe); err != nil {
 		return err
 	}
 	*u = ImportUser(probe.raw)
@@ -451,12 +479,19 @@ func (r *ImportResult) reject(row ImportRowResult, reason string) {
 // than an account that exists and can never be logged into — a failure mode
 // that is invisible until the user complains.
 func validateImportHash(h string) error {
+	// Identify alone is not enough, and that was the gap: it reads the prefix
+	// only — as its own doc says — so `$2a$10$abc` was accepted and stored, and
+	// the account it created could never authenticate. bcrypt.Cost refuses it at
+	// every login and nothing in the UI can explain why a password that imported
+	// successfully does not work.
+	//
+	// ValidateStoredHash runs each algorithm's real parser, and for Argon2id
+	// also bounds the cost parameters — so an uploaded hash cannot declare a
+	// gigabyte of memory and turn the first login into an OOM.
 	switch password.Identify(h) {
-	case password.AlgorithmBcrypt:
-		return nil
-	case password.AlgorithmArgon2id:
-		if _, _, _, err := password.DecodeArgon2id(h); err != nil {
-			return fmt.Errorf("malformed argon2id hash: %v", err)
+	case password.AlgorithmBcrypt, password.AlgorithmArgon2id:
+		if err := password.ValidateStoredHash(h); err != nil {
+			return fmt.Errorf("unusable password_hash: %v", err)
 		}
 		return nil
 	default:
