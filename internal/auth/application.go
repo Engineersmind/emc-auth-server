@@ -331,6 +331,43 @@ type AppDetail struct {
 	IsActive        bool      `json:"is_active"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
+	// TokenValidation is everything a resource server needs to verify a token
+	// minted for this application. Omitted when the issuer is not resolvable.
+	//
+	// Grouped rather than three loose fields because these values are only
+	// correct together: an integrator who configures the audience and skips the
+	// issuer is trusting a string that is unique per tenant, not globally.
+	TokenValidation *TokenValidationConfig `json:"token_validation,omitempty"`
+}
+
+// TokenValidationConfig is the integrator-facing verification contract for one
+// application: paste these into a JWT library and the application boundary is
+// enforced by that library rather than by hand-written middleware.
+//
+// Served by the server rather than assembled by each consumer on purpose. The
+// issuer format (`{base}/tenants/{slug}`) and the well-known paths belong to
+// this server, and a console or SDK that hardcodes them shows stale values the
+// moment the scheme changes — with no error, which is the worst way for an
+// identifier to be wrong. Issue #131 exists because duplicated assumptions
+// about identifiers cause exactly that class of incident.
+type TokenValidationConfig struct {
+	// Audience is this application's immutable identifier, repeated here so the
+	// three values can be copied as one block.
+	//
+	// Necessary but NOT sufficient on its own: it proves which application the
+	// token was minted for, and nothing about which tenant issued it.
+	Audience string `json:"audience"`
+	// Issuer pins the token to this tenant. Audiences are unique per tenant
+	// rather than globally, so validating the audience while ignoring the
+	// issuer means trusting a string another tenant could mint.
+	Issuer string `json:"issuer"`
+	// JWKSURI is the tenant's public key set. Per-tenant because the signing
+	// keys are: a single shared key set would defeat that isolation.
+	JWKSURI string `json:"jwks_uri"`
+	// DiscoveryURI lets a standards-aware library configure itself from one URL
+	// instead of three literals, which is the least error-prone option when the
+	// integrator's stack supports it.
+	DiscoveryURI string `json:"discovery_uri"`
 }
 
 // AppFilter holds optional filter and pagination params for ListApplicationsPaginated.

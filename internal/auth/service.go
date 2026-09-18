@@ -2317,16 +2317,79 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 
 	// Fresh user load from DB — catches suspensions, role changes, or email bans
 	// that occurred during the access token's lifetime (key security gate).
+	//
+	// The user is resolved by IDENTITY and the tenant is authorised SEPARATELY.
+	//
+	// This used to be one condition, `u.id = $1 AND u.tenant_id = $2`, which
+	// silently broke every administrator who had switched tenants. A switch mints
+	// a token stamped with the TARGET tenant (SwitchTenantContext →
+	// issueTokenPair(..., targetTenantID, ...)), while `users` holds exactly one
+	// row per person, carrying their HOME tenant. So the lookup asked for a row
+	// that cannot exist: id 5866 with tenant 4730 when the row says 4542. It
+	// returned ErrNoRows, the refresh answered 500 "user not found or inactive",
+	// and the console bounced to /login the moment the 15-minute access token
+	// expired — a logout that looked like an idle timeout and was not one.
+	//
+	// tenant_context.go:141 already documents this exact trap for permissions and
+	// solved it with loadAdminPermissionsForTenant. This path had the same flaw
+	// and never got the same treatment.
+	//
+	// The three-way authority test below is what keeps that split honest, and it
+	// mirrors SwitchTenantContext's own gate so the two cannot disagree about who
+	// may act where:
+	//
+	//   home tenant   an ordinary end user, whose token tenant always equals
+	//                 their home tenant. Unchanged behaviour — this is the arm
+	//                 every non-admin refresh takes.
+	//   admin grant   a co-owner or tenant administrator acting in a tenant that
+	//                 granted them. Re-checked on EVERY rotation, so revoking a
+	//                 grant now ends the session at the next refresh instead of
+	//                 letting it ride to the absolute cap.
+	//   tenant:manage a platform administrator, who reaches every tenant by
+	//                 permission rather than by membership and therefore has no
+	//                 grant row to find. Without this arm the fix would still
+	//                 lock out exactly the account that reported the bug.
+	//
+	// Kept as one round trip rather than a load-then-authorise pair: two queries
+	// would open a window in which a grant is revoked between them, and the
+	// rotation would mint against authority that no longer exists.
 	var email, roleName string
 	var roleID, applicationID *int64
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+		WHERE u.id = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND (
+		      u.tenant_id = $2
+		   OR EXISTS (
+		          SELECT 1 FROM admin_grants g
+		          WHERE g.user_id = u.id
+		            AND g.tenant_id = $2
+		            AND g.deleted_at IS NULL
+		            AND g.activated_at IS NOT NULL
+		      )
+		   OR EXISTS (
+		          SELECT 1
+		          FROM roles pr
+		          JOIN role_permissions prp ON prp.role_id = pr.id
+		          JOIN permissions pp       ON pp.id = prp.permission_id
+		          WHERE pr.id = u.role_id
+		            AND pr.tenant_id = u.tenant_id
+		            AND pr.deleted_at IS NULL
+		            AND pp.name = 'tenant:manage'
+		      )
+		  )
 	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Deliberately one message for all four ways to get here — inactive,
+			// deleted, no authority in this tenant, or no such user. A refresh
+			// client can do nothing differently with the distinction, and naming
+			// which condition failed would tell an attacker holding a stolen
+			// token whether the account exists.
 			return nil, nil, fmt.Errorf("user not found or inactive")
 		}
 		return nil, nil, fmt.Errorf("fetch user for refresh: %w", err)
