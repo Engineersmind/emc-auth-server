@@ -15,6 +15,7 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
+	"github.com/engineersmind/emc-auth-server/internal/api/paths"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
@@ -38,8 +39,12 @@ type AdminHandler struct {
 	// nil makes those routes answer 503 rather than panicking, matching the
 	// shape of the other optional services here.
 	audienceSvc *auth.AudienceService
-	audit       *audit.Logger
-	logger      zerolog.Logger
+	// issuers resolves a tenant's OIDC issuer, so an application detail can
+	// carry the token-validation block an integrator needs. nil simply omits
+	// that block — it is additive information, never a reason to fail a read.
+	issuers *auth.TenantIssuerResolver
+	audit   *audit.Logger
+	logger  zerolog.Logger
 }
 
 // NewAdminHandler creates an AdminHandler.
@@ -76,6 +81,51 @@ func (h *AdminHandler) WithTOTP(svc *auth.TOTPService) *AdminHandler {
 func (h *AdminHandler) WithAudiences(svc *auth.AudienceService) *AdminHandler {
 	h.audienceSvc = svc
 	return h
+}
+
+// WithIssuers attaches the tenant issuer resolver, which lets an application
+// detail carry the token-validation block (audience + issuer + JWKS URI).
+func (h *AdminHandler) WithIssuers(r *auth.TenantIssuerResolver) *AdminHandler {
+	h.issuers = r
+	return h
+}
+
+// attachTokenValidation fills app.TokenValidation with what a resource server
+// needs to verify this application's tokens.
+//
+// Assembled here rather than in the console or an SDK because the issuer format
+// and the well-known paths belong to this server. A consumer that builds them
+// itself keeps working right up until the scheme changes, then silently shows
+// stale values — an identifier that is wrong with no error attached.
+//
+// Every failure is non-fatal and leaves the block absent. This is additive
+// information on a read that must keep working: an application the operator
+// cannot load is strictly worse than one whose validation block is missing.
+func (h *AdminHandler) attachTokenValidation(c echo.Context, tenantID int64, app *auth.AppDetail) {
+	// No audience means a row created before per-application audiences existed.
+	// There is nothing for an integrator to validate against, so a block naming
+	// an issuer and an empty audience would be worse than none at all.
+	if h.issuers == nil || app == nil || app.Audience == "" {
+		return
+	}
+	issuer, err := h.issuers.Issuer(c.Request().Context(), tenantID)
+	if err != nil {
+		h.logger.Warn().Err(err).Int64("tenant_id", tenantID).
+			Msg("admin: issuer unresolved, omitting token_validation")
+		return
+	}
+	// Derived from the issuer rather than re-joined from the base URL and slug:
+	// the issuer IS the root of the tenant's well-known space, which is what
+	// lets a relying party be handed nothing but the issuer URL.
+	app.TokenValidation = &auth.TokenValidationConfig{
+		Audience: app.Audience,
+		Issuer:   issuer,
+		// paths.*Suffix rather than string literals: both are derived from the
+		// same templates the routes are registered with, so this block cannot
+		// advertise a URL the server does not actually serve.
+		JWKSURI:      issuer + paths.JWKSSuffix,
+		DiscoveryURI: issuer + paths.DiscoverySuffix,
+	}
 }
 
 func (h *AdminHandler) WithWebAuthn(svc *auth.WebAuthnService) *AdminHandler {
@@ -2866,7 +2916,7 @@ func (h *AdminHandler) ListApplications(c echo.Context) error {
 // GET /api/v1/tenants/:tid/applications/:id.
 //
 // @Summary      Get application
-// @Description  Returns one application (active or inactive) by ID. The secret is never included.
+// @Description  Returns one application (active or inactive) by ID. The secret is never included. Carries `token_validation` — the audience, issuer, JWKS and discovery URIs a resource server needs to verify this application's tokens — omitted when the application has no audience or the issuer cannot be resolved.
 // @Tags         admin-applications
 // @Produce      json
 // @Security     BearerAuth
@@ -2894,6 +2944,7 @@ func (h *AdminHandler) GetApplication(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: get application failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get application"})
 	}
+	h.attachTokenValidation(c, tenantID, app)
 	return c.JSON(http.StatusOK, app)
 }
 
@@ -2957,6 +3008,7 @@ func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 	}
 
 	h.auditAdminApp(c, claims, audit.ActionAdminApplicationUpdated, "application", app.ID, appIDFromClaim(app.ID))
+	h.attachTokenValidation(c, tenantID, app)
 	return c.JSON(http.StatusOK, app)
 }
 

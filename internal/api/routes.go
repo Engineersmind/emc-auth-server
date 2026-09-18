@@ -611,7 +611,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithMailer(m).
 		WithCORS(corsSvc).
 		WithWebAuthn(webauthnSvc).
-		WithAudiences(audienceSvc)
+		WithAudiences(audienceSvc).
+		WithIssuers(issuerResolver)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
 	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
