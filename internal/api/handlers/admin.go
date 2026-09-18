@@ -2142,14 +2142,29 @@ func (h *AdminHandler) auditAdminApp(c echo.Context, claims *auth.Claims, action
 // whole point is attribution (sending mail to an arbitrary address, say), an
 // event with empty actor fields is far better than no event at all.
 func (h *AdminHandler) auditAdminAppMeta(c echo.Context, claims *auth.Claims, action, resourceType, resourceID string, appID *int64, meta map[string]any) {
-	var (
-		tidPtr, uidPtr *int64
-		actorEmail     string
-	)
+	var tidPtr *int64
 	if claims != nil {
 		if tid, err := strconv.ParseInt(claims.TenantID, 10, 64); err == nil {
 			tidPtr = &tid
 		}
+	}
+	h.auditAdminTenantMeta(c, claims, tidPtr, action, resourceType, resourceID, appID, meta)
+}
+
+// auditAdminTenantMeta is auditAdminAppMeta for a handler whose target tenant is
+// not necessarily the caller's own.
+//
+// A cross-tenant /tenants/:tid/... route acts on the tenant named in the path,
+// so an event filed under the actor's JWT tenant lands in the wrong tenant's
+// log — and the operator reviewing the tenant that actually changed sees
+// nothing. tenantID is the tenant the handler resolved and acted upon; the
+// actor fields still come from the claims, which is where attribution belongs.
+func (h *AdminHandler) auditAdminTenantMeta(c echo.Context, claims *auth.Claims, tenantID *int64, action, resourceType, resourceID string, appID *int64, meta map[string]any) {
+	var (
+		uidPtr     *int64
+		actorEmail string
+	)
+	if claims != nil {
 		// Service tokens carry the public client_id in the UserID claim, which is
 		// not a users.id — record no user rather than a garbage zero.
 		if uid, err := strconv.ParseInt(claims.UserID, 10, 64); err == nil {
@@ -2158,7 +2173,7 @@ func (h *AdminHandler) auditAdminAppMeta(c echo.Context, claims *auth.Claims, ac
 		actorEmail = claims.Email
 	}
 	h.auditEvent(c, audit.Event{
-		TenantID:      tidPtr,
+		TenantID:      tenantID,
 		UserID:        uidPtr,
 		ApplicationID: appID,
 		ActorEmail:    actorEmail,
@@ -3873,13 +3888,14 @@ func wantsRecentEvents(c echo.Context) bool {
 // @Failure      401  {object}  map[string]string
 // @Router       /api/v1/admin/users/export [get]
 func (h *AdminHandler) ExportUsers(c echo.Context) error {
-	claims, ok := claimsFromCtx(c)
-	if !ok {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-	}
-	tenantID, err := tenantIDFromClaims(claims)
+	// tenantFromClaimsOrPath, not the claims alone: the canonical route carries
+	// :tid, and reading the tenant only from the JWT made the cross-tenant
+	// mirror export the caller's own directory instead of the one they asked
+	// for. RequireTenantSelfOrAny already bounds which :tid each caller may
+	// name, so this is about honouring the request, not about admitting one.
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -3890,7 +3906,11 @@ func (h *AdminHandler) ExportUsers(c echo.Context) error {
 	// committed and a failure mid-stream cannot be reported, so an event written
 	// afterwards would be missing exactly when the export went wrong. Recording
 	// the attempt is the property an incident review needs.
-	h.auditAdminApp(c, claims, audit.ActionAdminUsersExported, "user", "", appScope)
+	//
+	// Filed against the EXPORTED tenant, not the actor's: a cross-tenant export
+	// is a disclosure from the tenant in the path, and that is the log it has to
+	// appear in.
+	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersExported, "user", "", appScope, nil)
 
 	params := admin.UserExportParams{TenantID: tenantID, ApplicationID: appScope}
 
@@ -3944,6 +3964,16 @@ func bindImportDocument(c echo.Context) (admin.ImportDocument, error) {
 	if err := dec.Decode(&doc); err != nil {
 		return doc, err
 	}
+	// A JSON decoder stops at the end of the first value and leaves the rest of
+	// the stream alone, so `{"users":[...]}{"users":[...]}` — or a good document
+	// with a truncated second one glued on by a broken export script — decodes
+	// as the first half with the remainder silently discarded. An operator who
+	// uploaded two concatenated files would see half of their rows imported and
+	// nothing to explain the other half, which is the same failure mode
+	// DisallowUnknownFields exists to prevent.
+	if dec.More() {
+		return doc, errors.New("unexpected data after the JSON document")
+	}
 	return doc, nil
 }
 
@@ -3952,14 +3982,14 @@ func bindImportDocument(c echo.Context) (admin.ImportDocument, error) {
 // document. A file that could name its own tenant would be a cross-tenant
 // write primitive.
 func (h *AdminHandler) importScope(c echo.Context) (int64, *int64, *auth.Claims, bool) {
-	claims, ok := claimsFromCtx(c)
-	if !ok {
-		_ = c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return 0, nil, nil, false
-	}
-	tenantID, err := tenantIDFromClaims(claims)
+	// The tenant comes from the path when the route carries :tid, exactly as it
+	// does for every other cross-tenant admin handler. Reading it only from the
+	// JWT made /tenants/:tid/users/import import into the caller's own tenant
+	// and file the audit event there — the requested tenant was parsed by the
+	// router, guarded by RequireTenantSelfOrAny, and then ignored.
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		_ = c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant in token"})
+		_ = c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 		return 0, nil, nil, false
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
@@ -4005,7 +4035,7 @@ func (h *AdminHandler) ValidateUserImport(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "import validation failed"})
 	}
 
-	h.auditAdminAppMeta(c, claims, audit.ActionAdminUsersImportValidated, "user", "", appScope,
+	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersImportValidated, "user", "", appScope,
 		map[string]any{"total": res.Total, "rejected": res.Rejected, "skipped": res.Skipped})
 	return c.JSON(http.StatusOK, res)
 }
@@ -4063,7 +4093,7 @@ func (h *AdminHandler) CommitUserImport(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "import failed"})
 	}
 
-	h.auditAdminAppMeta(c, claims, audit.ActionAdminUsersImported, "import_job", job.ID, appScope,
+	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersImported, "import_job", job.ID, appScope,
 		map[string]any{"total": job.TotalRows, "rejected": job.Rejected, "update_existing": job.UpdateExisting})
 	return c.JSON(http.StatusAccepted, job)
 }
@@ -4185,7 +4215,7 @@ func (h *AdminHandler) CancelUserImportJob(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not cancel the import"})
 	}
 
-	h.auditAdminAppMeta(c, claims, audit.ActionAdminUsersImportCancelled, "import_job",
+	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersImportCancelled, "import_job",
 		c.Param("jobID"), appScope, nil)
 	return c.NoContent(http.StatusNoContent)
 }

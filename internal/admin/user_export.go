@@ -92,25 +92,55 @@ func csvSafe(s string) string {
 // queryExportRows is the one query both serialisers read.
 //
 // Shared rather than duplicated because the exclusions are the point: no
-// credential columns, no soft-deleted users, and the application scope applied
-// exactly once. A second copy is how one format comes to leak what the other
-// withholds.
+// credential columns, no soft-deleted users, no system-role holders, and the
+// application scope applied exactly once. A second copy is how one format comes
+// to leak what the other withholds.
+//
+// System-role holders are excluded because the export advertises itself as
+// re-importable and they are not. importRoleMap loads `is_system = false` roles
+// only — administrative tiers are granted by invitation, never by assignment —
+// so an owner or super_admin row fed back to the importer comes back as
+// `role "owner" is not available in this application`. The exclusion is spelled
+// the same way importRoleMap spells it, so the two cannot disagree about what a
+// system role is. It also means an export is a directory of end users rather
+// than a roster of who administers the tenant.
+//
+// last_login_at and login_count mirror userEnrichmentColumns in service.go
+// rather than approximating it. The action constant is `auth.login` (see
+// audit.ActionAuthLogin) — `login` matches nothing, so login_count read zero for
+// every user in every export. And a refresh token's created_at is when a token
+// was issued, not when the user was last seen, so the greatest of the session's
+// last use and the audited sign-in events is what the list endpoint shows for
+// the same field. An export and the console must not disagree about whether an
+// account is dormant; that judgement is most of what an export is used for.
 func (s *Service) queryExportRows(ctx context.Context, p UserExportParams) (pgx.Rows, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT u.email, u.first_name, u.last_name,
 		       COALESCE(r.name, ''), COALESCE(oc.name, ''),
 		       u.is_active, u.email_verified, u.created_at,
-		       (SELECT MAX(rt.created_at) FROM refresh_tokens rt
-		         WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id),
+		       GREATEST(
+		           (SELECT MAX(COALESCE(rt.last_used_at, rt.created_at))
+		            FROM refresh_tokens rt
+		            WHERE rt.user_id = u.id AND rt.tenant_id = u.tenant_id),
+		           (SELECT MAX(al.created_at) FROM audit_logs al
+		            WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
+		              AND al.action IN (
+		                  'auth.login', 'auth.google_login', 'auth.github_login',
+		                  'auth.magic_link_requested', 'auth.register'))
+		       ),
 		       (SELECT COUNT(*) FROM audit_logs al
 		         WHERE al.user_id = u.id AND al.tenant_id = u.tenant_id
-		           AND al.action = 'login' AND al.status = 'success')
+		           AND al.action = 'auth.login')
 		FROM users u
 		LEFT JOIN roles r          ON r.id = u.role_id
 		LEFT JOIN oauth_clients oc ON oc.id = u.application_id
 		WHERE u.tenant_id = $1
 		  AND u.deleted_at IS NULL
 		  AND ($2::BIGINT IS NULL OR u.application_id = $2)
+		  AND NOT EXISTS (
+		      SELECT 1 FROM roles sr
+		      WHERE sr.id = u.role_id AND sr.is_system = true
+		  )
 		ORDER BY u.created_at DESC
 		LIMIT $3
 	`, p.TenantID, p.ApplicationID, maxUserExportRows)
