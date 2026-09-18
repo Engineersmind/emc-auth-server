@@ -129,12 +129,31 @@ func (s *Service) EnqueueImport(
 			reason = v.Reason
 		}
 
-		// The plaintext password is split out of the payload so the two have
-		// different lifetimes: the column is erased the moment the row is
-		// processed, while the payload survives for the report.
+		// The credentials are split out of the payload so they have a different
+		// lifetime from the report. The plaintext goes to its own column, erased
+		// the moment the row is processed; the digest is not needed after the
+		// row is applied either, and a terminal row's payload keeps only what
+		// the report reads — email, status and reason.
 		plaintext := u.Password
 		stored := u
 		stored.Password = ""
+
+		// The normalised address, not the one the file spelled. The worker reads
+		// the payload and writes it straight into users.email, so a row uploaded
+		// as "MARCUS.Webb@Example.COM" would be stored in a form the normalising
+		// login lookup can never match — and a re-run, which normalises before
+		// checking for an existing user, would create a second account for the
+		// same person instead of skipping it.
+		if v, ok := verdict[i]; ok && v.Email != "" {
+			stored.Email = v.Email
+		}
+
+		// A rejected row never runs, so its digest has no consumer. Leaving it
+		// here would make the payload column a durable corpus of foreign hashes
+		// — exactly what the export path refuses to emit — for no benefit.
+		if status == ImportOutcomeReject {
+			redactImportCredentials(&stored)
+		}
 
 		blob, err := json.Marshal(stored)
 		if err != nil {
@@ -176,6 +195,31 @@ func (s *Service) EnqueueImport(
 
 // ImportRowPending marks a row the worker has yet to claim.
 const ImportRowPending = "pending"
+
+// redactImportCredentials strips every credential field from a row payload.
+//
+// Called wherever a row reaches a terminal state. The payload exists to answer
+// "what happened to row 41?" — ListImportJobRows reads email, status and reason
+// out of it and nothing else — but it was serialised from the whole uploaded
+// row, so a finished job left one password_hash per row at rest indefinitely.
+// That is a crackable corpus with no consumer, sitting in a table an operator
+// would never think to look in; the plaintext column beside it is already
+// erased on exactly this transition, and the digest deserves the same treatment.
+//
+// A new credential field on ImportUser must be added here too, which is why
+// this is one function rather than a line repeated at four call sites.
+func redactImportCredentials(u *ImportUser) {
+	u.Password = ""
+	u.PasswordHash = ""
+}
+
+// redactPayloadCredentialsSQL is redactImportCredentials as an UPDATE
+// expression, for the terminal transitions that never decode the row into Go.
+//
+// Deleting the keys rather than blanking them: an absent password_hash and an
+// empty one mean the same thing to every reader of this payload, and a key that
+// is gone cannot be mistaken for a value that was imported.
+const redactPayloadCredentialsSQL = `payload = (payload - 'password_hash' - 'password')`
 
 // GetImportJob reads one job, scoped to the caller's tenant and application.
 //
@@ -323,10 +367,13 @@ func (s *Service) CancelImportJob(ctx context.Context, tenantID int64, applicati
 	if ct.RowsAffected() == 0 {
 		return ErrJobNotFound
 	}
-	// The plaintext passwords of rows that will now never run have no reason to
-	// remain at rest.
+	// The credentials of rows that will now never run have no reason to remain
+	// at rest — the plaintext column and the digest carried in the payload
+	// alike. Cancellation is terminal for these rows, so this is the same
+	// erasure a processed row gets.
 	if _, err := s.pool.Exec(ctx, `
-		UPDATE user_import_job_rows SET plaintext_password = NULL
+		UPDATE user_import_job_rows
+		SET plaintext_password = NULL, `+redactPayloadCredentialsSQL+`
 		WHERE job_id = $1 AND status = 'pending'
 	`, jobID); err != nil {
 		return fmt.Errorf("cancel import job: clear credentials: %w", err)
