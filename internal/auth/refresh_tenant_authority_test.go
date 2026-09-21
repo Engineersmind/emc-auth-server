@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
 
@@ -42,6 +43,8 @@ const refreshAuthoritySQL = `
 	          WHERE pr.id = u.role_id
 	            AND pr.tenant_id = u.tenant_id
 	            AND pr.deleted_at IS NULL
+	            AND pr.application_id IS NULL
+	            AND pp.application_id IS NULL
 	            AND pp.name = 'tenant:manage'
 	      )
 	  )
@@ -49,11 +52,28 @@ const refreshAuthoritySQL = `
 
 func mayRefreshInto(t *testing.T, pool *pgxpool.Pool, userID, tenantID int64) bool {
 	t.Helper()
+
+	// The PRODUCTION rule. Previously this ran refreshAuthoritySQL, a verbatim
+	// copy — so a change to service.go alone left every test here green, and the
+	// mutation evidence only ever showed the copy was self-consistent (raised in
+	// review on #143).
+	allowed, err := auth.ExportedRefreshUserLoad(pool, testhelper.TestLogger(), context.Background(), userID, tenantID)
+	if err != nil {
+		t.Fatalf("refresh authority: %v", err)
+	}
+
+	// The copy is kept as a SECOND signal: it catches the two rules drifting
+	// apart semantically, which a behavioural check would not notice. A
+	// disagreement means service.go and this file no longer describe the same
+	// rule, and the test says which.
 	var n int
 	if err := pool.QueryRow(context.Background(), refreshAuthoritySQL, userID, tenantID).Scan(&n); err != nil {
 		t.Fatalf("authority query: %v", err)
 	}
-	return n > 0
+	if (n > 0) != allowed {
+		t.Errorf("the production rule and the copy in this file disagree (production=%v, copy=%v) — one of them changed without the other", allowed, n > 0)
+	}
+	return allowed
 }
 
 /*

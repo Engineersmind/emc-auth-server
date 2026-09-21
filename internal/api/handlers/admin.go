@@ -43,8 +43,13 @@ type AdminHandler struct {
 	// carry the token-validation block an integrator needs. nil simply omits
 	// that block — it is additive information, never a reason to fail a read.
 	issuers *auth.TenantIssuerResolver
-	audit   *audit.Logger
-	logger  zerolog.Logger
+	// servingBaseURL is APP_BASE_URL: the origin this server answers on, and
+	// therefore where the JWKS and discovery documents live. Distinct from the
+	// issuer's origin whenever the two are configured differently — see
+	// WithIssuers and attachTokenValidation.
+	servingBaseURL string
+	audit          *audit.Logger
+	logger         zerolog.Logger
 }
 
 // NewAdminHandler creates an AdminHandler.
@@ -85,8 +90,16 @@ func (h *AdminHandler) WithAudiences(svc *auth.AudienceService) *AdminHandler {
 
 // WithIssuers attaches the tenant issuer resolver, which lets an application
 // detail carry the token-validation block (audience + issuer + JWKS URI).
-func (h *AdminHandler) WithIssuers(r *auth.TenantIssuerResolver) *AdminHandler {
+//
+// servingBaseURL is APP_BASE_URL — the origin this server actually answers on.
+// It is passed separately because it is NOT always the issuer's origin: the
+// issuer comes from OIDC_ISSUER_BASE_URL, and a deployment may legitimately set
+// the two to different hosts. The JWKS and discovery documents are served from
+// this one, so they must be built from it. Empty falls back to the issuer
+// origin, which is correct for the common single-host deployment.
+func (h *AdminHandler) WithIssuers(r *auth.TenantIssuerResolver, servingBaseURL string) *AdminHandler {
 	h.issuers = r
+	h.servingBaseURL = strings.TrimRight(servingBaseURL, "/")
 	return h
 }
 
@@ -114,17 +127,35 @@ func (h *AdminHandler) attachTokenValidation(c echo.Context, tenantID int64, app
 			Msg("admin: issuer unresolved, omitting token_validation")
 		return
 	}
-	// Derived from the issuer rather than re-joined from the base URL and slug:
-	// the issuer IS the root of the tenant's well-known space, which is what
-	// lets a relying party be handed nothing but the issuer URL.
+	// The documents are built from the SERVING origin, not from the issuer.
+	//
+	// These are two different things whenever OIDC_ISSUER_BASE_URL and
+	// APP_BASE_URL differ, which is a supported configuration —
+	// warnIssuerHostMismatch (routes.go) logs it at startup and states plainly
+	// that "JWKS is served from APP_BASE_URL". Deriving the URLs from the issuer
+	// therefore published endpoints on a host this server does not answer on,
+	// and an integrator following them could not fetch the keys at all. Worse
+	// than omitting the block: the whole point of it is to save them guessing.
+	//
+	// The issuer keeps its own value, because it is an identifier rather than a
+	// location — a verifier compares the `iss` claim against it and must not see
+	// it rewritten to match wherever the documents happen to live.
+	docBase := issuer
+	if h.servingBaseURL != "" {
+		// Same tenant path the routes are registered with, rooted at the origin
+		// that serves them. Falls back to the issuer when APP_BASE_URL is unset,
+		// which is the single-host case where the two are identical anyway.
+		docBase = h.servingBaseURL + "/tenants/" + tenantSlugFromIssuer(issuer)
+	}
+
 	app.TokenValidation = &auth.TokenValidationConfig{
 		Audience: app.Audience,
 		Issuer:   issuer,
-		// paths.*Suffix rather than string literals: both are derived from the
-		// same templates the routes are registered with, so this block cannot
-		// advertise a URL the server does not actually serve.
-		JWKSURI:      issuer + paths.JWKSSuffix,
-		DiscoveryURI: issuer + paths.DiscoverySuffix,
+		// paths.*Suffix rather than string literals: both derive from the same
+		// templates the routes are registered with, so the PATH cannot drift
+		// from what is served even though the origin is chosen above.
+		JWKSURI:      docBase + paths.JWKSSuffix,
+		DiscoveryURI: docBase + paths.DiscoverySuffix,
 	}
 }
 
@@ -4026,4 +4057,21 @@ func renderErrorHint(err error) string {
 		return "{{." + field + "}} is not a variable this template provides — remove it or use one of the listed variables"
 	}
 	return msg
+}
+
+// tenantSlugFromIssuer extracts the tenant slug from an issuer URL.
+//
+// The issuer is "{base}/tenants/{slug}" by construction
+// (TenantIssuerResolver.IssuerForSlug), so the slug is the final segment. Taken
+// from the issuer rather than re-queried because the caller already holds it
+// and a second lookup could disagree with the value in the same response.
+//
+// Returns "" for an issuer that does not have that shape, which yields a
+// document base ending in "/tenants/" — visibly wrong rather than quietly
+// pointing somewhere plausible and incorrect.
+func tenantSlugFromIssuer(issuer string) string {
+	if i := strings.LastIndex(issuer, "/"); i >= 0 {
+		return issuer[i+1:]
+	}
+	return ""
 }

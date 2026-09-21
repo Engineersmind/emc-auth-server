@@ -612,7 +612,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		WithCORS(corsSvc).
 		WithWebAuthn(webauthnSvc).
 		WithAudiences(audienceSvc).
-		WithIssuers(issuerResolver)
+		// AppBaseURL, not the issuer base: the JWKS and discovery documents are
+		// served from this origin, and the two differ in a split-host deployment.
+		WithIssuers(issuerResolver, deps.Config.AppBaseURL)
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
 	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)

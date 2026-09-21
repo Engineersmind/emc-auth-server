@@ -3,9 +3,13 @@ package auth_test
 import (
 	"context"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
 
 // The authority rule loadPermissions applies when building a token's claims.
@@ -49,6 +53,8 @@ const loadPermissionsSQL = `
 		             WHERE pr.id = u.role_id
 		               AND pr.tenant_id = u.tenant_id
 		               AND pr.deleted_at IS NULL
+		               AND pr.application_id IS NULL
+		               AND pp.application_id IS NULL
 		               AND pp.name = 'tenant:manage'
 		         )
 		  )
@@ -68,6 +74,18 @@ const loadPermissionsSQL = `
 
 func permissionsFor(t *testing.T, pool *pgxpool.Pool, userID, tenantID int64) []string {
 	t.Helper()
+
+	// The PRODUCTION loader. This previously ran loadPermissionsSQL, a verbatim
+	// copy, so a change to service.go alone left these tests green (raised in
+	// review on #143).
+	prod, err := auth.ExportedLoadPermissions(pool, testhelper.TestLogger(), context.Background(), userID, tenantID)
+	if err != nil {
+		t.Fatalf("loadPermissions: %v", err)
+	}
+	sort.Strings(prod)
+
+	// The copy is kept as a second signal — it catches the two drifting apart,
+	// which a behavioural check alone would not.
 	rows, err := pool.Query(context.Background(), loadPermissionsSQL, userID, tenantID)
 	if err != nil {
 		t.Fatalf("permissions query: %v", err)
@@ -85,7 +103,13 @@ func permissionsFor(t *testing.T, pool *pgxpool.Pool, userID, tenantID int64) []
 		t.Fatalf("rows: %v", err)
 	}
 	sort.Strings(out)
-	return out
+	// Compared by content rather than with DeepEqual: the production loader
+	// normalises an empty result to []string{} while the scan loop below leaves
+	// it nil, and a nil-vs-empty difference is not a disagreement about the rule.
+	if strings.Join(out, ",") != strings.Join(prod, ",") {
+		t.Errorf("the production loader and the copy in this file disagree:\n  production = %v\n  copy       = %v\none of them changed without the other", prod, out)
+	}
+	return prod
 }
 
 func hasPerm(perms []string, want string) bool {
@@ -308,4 +332,70 @@ func refreshPermissionsFor(t *testing.T, pool *pgxpool.Pool, userID, tenantID in
 		return rolePermissionsInTenant(t, pool, tenantID, grantRole)
 	}
 	return permissionsFor(t, pool, userID, homeTenant)
+}
+
+// TestLoadPermissions_AppScopedTenantManageIsNotPlatformAuthority is the
+// escalation the review on #143 identified.
+//
+// CreatePermission accepts any name for an application-scoped permission, so an
+// application's own catalogue can contain a permission called 'tenant:manage'.
+// The platform arm originally matched on that NAME alone, so holding an
+// ordinary app role carrying it would have been read as unrestricted platform
+// authority — permissions in every tenant on the installation.
+//
+// resolveRegistrationTenant defines the platform tier as a TENANT-LEVEL role
+// (application_id IS NULL) holding a tenant-level permission, and both
+// authority queries now require the same. No such rows exist in production
+// data, which is why this fixture has to build them.
+func TestLoadPermissions_AppScopedTenantManageIsNotPlatformAuthority(t *testing.T) {
+	pool, f := setupAuthority(t)
+	ctx := context.Background()
+
+	// An application in the impostor's own tenant.
+	var appID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO oauth_clients (tenant_id, name, app_type, client_id, scopes)
+		VALUES ($1, 'Impostor App', 'web', 'impostor_client', '{}')
+		RETURNING id
+	`, f.otherTenant).Scan(&appID); err != nil {
+		t.Fatalf("insert application: %v", err)
+	}
+
+	// An APPLICATION-scoped role and permission, both named exactly like the
+	// platform pair. Nothing forbids this today.
+	var roleID, permID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO roles (tenant_id, application_id, name) VALUES ($1, $2, 'app-super') RETURNING id
+	`, f.otherTenant, appID).Scan(&roleID); err != nil {
+		t.Fatalf("insert app role: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO permissions (tenant_id, application_id, name, description)
+		VALUES ($1, $2, 'tenant:manage', 'impostor')
+		RETURNING id
+	`, f.otherTenant, appID).Scan(&permID); err != nil {
+		t.Fatalf("insert app permission: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO role_permissions (role_id, permission_id, tenant_id) VALUES ($1, $2, $3)
+	`, roleID, permID, f.otherTenant); err != nil {
+		t.Fatalf("grant app permission: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET role_id = $1 WHERE id = $2`, roleID, f.endUser); err != nil {
+		t.Fatalf("assign app role: %v", err)
+	}
+
+	// The impostor must reach NOTHING outside their own tenant.
+	if perms := permissionsFor(t, pool, f.endUser, f.platformTenant); len(perms) != 0 {
+		t.Errorf("an application-scoped 'tenant:manage' granted %v in a foreign tenant — this is platform escalation by permission name", perms)
+	}
+	if perms := permissionsFor(t, pool, f.endUser, f.grantedTenant); len(perms) != 0 {
+		t.Errorf("an application-scoped 'tenant:manage' granted %v in a tenant with no grant", perms)
+	}
+
+	// And the refresh rule must refuse them the same way, or they could rotate
+	// a token into any tenant even without carrying the permissions.
+	if mayRefreshInto(t, pool, f.endUser, f.platformTenant) {
+		t.Error("an application-scoped 'tenant:manage' allowed a refresh into a foreign tenant")
+	}
 }

@@ -2096,7 +2096,10 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+		WHERE u.id = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND (`+tenantAuthorityPredicate+`)
 	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2176,7 +2179,10 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, se
 		SELECT u.email, COALESCE(r.name, ''), u.role_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+		WHERE u.id = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND (`+tenantAuthorityPredicate+`)
 	`, userID, tenantID).Scan(&email, &roleName, &roleID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2420,36 +2426,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		WHERE u.id = $1
 		  AND u.is_active = true
 		  AND u.deleted_at IS NULL
-		  AND (
-		      u.tenant_id = $2
-		   OR EXISTS (
-		          SELECT 1 FROM admin_grants g
-		          WHERE g.user_id = u.id
-		            AND g.tenant_id = $2
-		            AND g.deleted_at IS NULL
-		            AND g.activated_at IS NOT NULL
-		      )
-		   OR EXISTS (
-		          SELECT 1
-		          FROM roles pr
-		          JOIN role_permissions prp ON prp.role_id = pr.id
-		          JOIN permissions pp       ON pp.id = prp.permission_id
-		          WHERE pr.id = u.role_id
-		            AND pr.tenant_id = u.tenant_id
-		            AND pr.deleted_at IS NULL
-		            -- Tenant-level on BOTH sides, matching the platform
-		            -- definition in resolveRegistrationTenant. The permission
-		            -- NAME alone does not identify the platform tier:
-		            -- CreatePermission accepts any name for an
-		            -- application-scoped permission, so an application's own
-		            -- catalogue may contain a 'tenant:manage'. Without these,
-		            -- an ordinary app role carrying that name would let its
-		            -- holder refresh into any tenant on the installation.
-		            AND pr.application_id IS NULL
-		            AND pp.application_id IS NULL
-		            AND pp.name = 'tenant:manage'
-		      )
-		  )
+		  AND (`+tenantAuthorityPredicate+`)
 	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
