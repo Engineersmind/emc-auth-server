@@ -1085,3 +1085,165 @@ func TestImport_AcceptsIdentityWithVerifiedEmail(t *testing.T) {
 		t.Errorf("outcome = %q (%s), want create", row.Outcome, row.Reason)
 	}
 }
+
+// --- update_existing: an absent role is not an instruction ----------------
+
+// A row that names no role must keep the role the user already has.
+//
+// The update wrote role_id unconditionally, so an omitted column silently
+// applied the application default — the tier meant for a user being CREATED.
+// A stale export listing only emails, fed back with update_existing, therefore
+// demoted the entire directory in one upload. The dry run disclosed it, but
+// "absent means reset" is not a reading of a migration file anyone expects.
+func TestImport_UpdateExisting_AbsentRoleKeepsCurrentRole(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	def, err := f.svc.CreateRole(ctx, f.tenantID, &f.appID, "DefaultMember", nil)
+	if err != nil {
+		t.Fatalf("CreateRole(default) error = %v", err)
+	}
+	if err := f.svc.SetDefaultRole(ctx, f.tenantID, f.appID, parseID(t, def.ID)); err != nil {
+		t.Fatalf("SetDefaultRole() error = %v", err)
+	}
+	elevated, err := f.svc.CreateRole(ctx, f.tenantID, &f.appID, "Manager", nil)
+	if err != nil {
+		t.Fatalf("CreateRole(Manager) error = %v", err)
+	}
+
+	u, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID,
+		"keeprole@example.com", "pw-keeprole-1234", "Keep", "Role", nil)
+	if err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID,
+		parseID(t, u.ID), parseID(t, elevated.ID)); err != nil {
+		t.Fatalf("AssignUserRole() error = %v", err)
+	}
+
+	// The row carries no Role — exactly the shape of an export trimmed to
+	// emails, or a file written by hand that only means to fix a name.
+	res, err := f.svc.CommitImport(ctx, f.tenantID, &f.appID, admin.ImportDocument{
+		UpdateExisting: true,
+		Users: []admin.ImportUser{{
+			Email:        "keeprole@example.com",
+			FirstName:    "Renamed",
+			PasswordHash: bcryptHash(t, "pw"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CommitImport() error = %v", err)
+	}
+
+	var role, first string
+	if err := f.pool.QueryRow(ctx, `
+		SELECT COALESCE(r.name, ''), u.first_name FROM users u
+		LEFT JOIN roles r ON r.id = u.role_id
+		WHERE u.email = 'keeprole@example.com'`).Scan(&role, &first); err != nil {
+		t.Fatalf("read role: %v", err)
+	}
+	if role != "Manager" {
+		t.Errorf("role = %q, want Manager kept — an absent role demoted the user", role)
+	}
+	// The rest of the update must still apply; "keep the role" is not "skip
+	// the row".
+	if first != "Renamed" {
+		t.Errorf("first_name = %q, want Renamed — the update did not apply", first)
+	}
+	if row := rowByEmail(t, res, "keeprole@example.com"); row.Reason != "profile updated; role unchanged" {
+		t.Errorf("reason = %q, want the unchanged-role wording", row.Reason)
+	}
+}
+
+// The same rule protects a system role, which matters more: the importer
+// refuses to GRANT one, so an unconditional write could strip a tier it has no
+// way to restore. An owner listed in a file that names no role stays an owner.
+func TestImport_UpdateExisting_AbsentRoleKeepsSystemRole(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	u, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID,
+		"keepsystem@example.com", "pw-keepsystem-12", "Keep", "System", nil)
+	if err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+	// Set directly: CreateUser and AssignUserRole both refuse a system role,
+	// which is the asymmetry under test — the row still exists in production.
+	sysRoleID := seedSystemRoleID(t, f)
+	if _, err := f.pool.Exec(ctx,
+		`UPDATE users SET role_id = $1 WHERE id = $2`, sysRoleID, parseID(t, u.ID)); err != nil {
+		t.Fatalf("set system role: %v", err)
+	}
+
+	if _, err := f.svc.CommitImport(ctx, f.tenantID, &f.appID, admin.ImportDocument{
+		UpdateExisting: true,
+		Users: []admin.ImportUser{{
+			Email:        "keepsystem@example.com",
+			PasswordHash: bcryptHash(t, "pw"),
+		}},
+	}); err != nil {
+		t.Fatalf("CommitImport() error = %v", err)
+	}
+
+	var gotID int64
+	if err := f.pool.QueryRow(ctx,
+		`SELECT COALESCE(role_id, 0) FROM users WHERE email = 'keepsystem@example.com'`).Scan(&gotID); err != nil {
+		t.Fatalf("read role id: %v", err)
+	}
+	if gotID != sysRoleID {
+		t.Errorf("role_id = %d, want the system role %d kept — "+
+			"an import stripped a tier it cannot grant back", gotID, sysRoleID)
+	}
+}
+
+// Naming a role must still change it. The fix is "absent means keep", not
+// "updates never touch the role" — without this the previous two tests would
+// pass against a version that simply ignored the column.
+func TestImport_UpdateExisting_NamedRoleStillChanges(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	from, err := f.svc.CreateRole(ctx, f.tenantID, &f.appID, "Before", nil)
+	if err != nil {
+		t.Fatalf("CreateRole(Before) error = %v", err)
+	}
+	if _, err := f.svc.CreateRole(ctx, f.tenantID, &f.appID, "After", nil); err != nil {
+		t.Fatalf("CreateRole(After) error = %v", err)
+	}
+
+	u, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID,
+		"changerole@example.com", "pw-changerole-12", "Change", "Role", nil)
+	if err != nil {
+		t.Fatalf("CreateUser() error = %v", err)
+	}
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID,
+		parseID(t, u.ID), parseID(t, from.ID)); err != nil {
+		t.Fatalf("AssignUserRole() error = %v", err)
+	}
+
+	res, err := f.svc.CommitImport(ctx, f.tenantID, &f.appID, admin.ImportDocument{
+		UpdateExisting: true,
+		Users: []admin.ImportUser{{
+			Email:        "changerole@example.com",
+			Role:         "After",
+			PasswordHash: bcryptHash(t, "pw"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("CommitImport() error = %v", err)
+	}
+
+	var role string
+	if err := f.pool.QueryRow(ctx, `
+		SELECT COALESCE(r.name, '') FROM users u
+		LEFT JOIN roles r ON r.id = u.role_id
+		WHERE u.email = 'changerole@example.com'`).Scan(&role); err != nil {
+		t.Fatalf("read role: %v", err)
+	}
+	if role != "After" {
+		t.Errorf("role = %q, want After — a named role no longer applies", role)
+	}
+	if row := rowByEmail(t, res, "changerole@example.com"); row.Reason != "role Before → After" {
+		t.Errorf("reason = %q, want the role change spelled out", row.Reason)
+	}
+}

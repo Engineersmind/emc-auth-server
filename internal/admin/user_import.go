@@ -404,7 +404,15 @@ func (s *Service) runImport(ctx context.Context, tenantID int64, applicationID *
 			// A demotion and a promotion are the same word otherwise, and the
 			// dry run is the only place an operator can catch the former before
 			// it happens.
-			newRoleName := roleNameFor(roles, roleID)
+			//
+			// A row naming no role keeps the role the user has, so the dry run
+			// reports "unchanged" for it rather than the default-role demotion
+			// the old unconditional write would have performed.
+			role := amendRole(u.Role, roleID)
+			newRoleName := existing.roleName
+			if role.set {
+				newRoleName = roleNameFor(roles, role.id)
+			}
 			row.Outcome = ImportOutcomeUpdate
 			if newRoleName != existing.roleName {
 				row.Reason = fmt.Sprintf("role %s → %s",
@@ -414,9 +422,12 @@ func (s *Service) runImport(ctx context.Context, tenantID int64, applicationID *
 			}
 
 			if !dryRun {
-				if err := s.updateImportedUser(ctx, tenantID, existing.id, u, roleID); err != nil {
-					res.reject(row, "update failed")
-					continue
+				if err := s.updateImportedUser(ctx, tenantID, existing.id, u, role); err != nil {
+					// The database failed, which says nothing about this row.
+					// Rejecting it would report a valid user as invalid and
+					// carry on writing off the rest of the file the same way,
+					// so the whole request fails instead — see the insert path.
+					return nil, fmt.Errorf("import: update user: %w", err)
 				}
 				// A role change does not reach an already-issued access token:
 				// permissions are baked in at login and the middleware reads
@@ -450,6 +461,16 @@ func (s *Service) runImport(ctx context.Context, tenantID int64, applicationID *
 				res.Rows = append(res.Rows, row)
 				res.Skipped++
 				continue
+			}
+			// A constraint or a value the database refused is the row's own
+			// fault and reproducible, so it is a verdict. Anything else is the
+			// database being unavailable, and that is not this row's verdict
+			// to carry: the synchronous path has no pending state to park it
+			// in and no retry, so the request fails and the operator re-uploads
+			// a file whose report they can trust. Rejecting instead marked
+			// every remaining row invalid because of one connection blip.
+			if !isRowDataErr(err) {
+				return nil, fmt.Errorf("import: create user: %w", err)
 			}
 			// The underlying error is deliberately not echoed: it can carry
 			// column values and constraint names, and this report is handed
@@ -751,19 +772,37 @@ func displayRole(name string) string {
 //
 // first_name and last_name are only written when the row carries them, so a
 // file listing nothing but emails and roles does not blank everybody's name.
-func (s *Service) updateImportedUser(ctx context.Context, tenantID, userID int64, u ImportUser, roleID *int64) error {
+//
+// role_id follows that same rule, via amendedRole: a row that names no role
+// keeps the role the user already has, rather than resetting them to the
+// application default. Writing it unconditionally made an omitted column
+// destructive — a file listing nothing but emails would demote the entire
+// directory to the default role, or to no role at all in an application that
+// has no default. Worse for a system role: the importer refuses to GRANT one
+// (importRoleMap loads is_system = false only), so an unconditional write could
+// strip an owner of a tier the import path could never put back.
+func (s *Service) updateImportedUser(ctx context.Context, tenantID, userID int64, u ImportUser, role amendedRole) error {
 	_, err := s.pool.Exec(ctx, `
 		UPDATE users SET
-		    role_id    = $1,
-		    first_name = CASE WHEN $2 = '' THEN first_name ELSE $2 END,
-		    last_name  = CASE WHEN $3 = '' THEN last_name  ELSE $3 END,
+		    role_id    = CASE WHEN $1 THEN $2 ELSE role_id END,
+		    first_name = CASE WHEN $3 = '' THEN first_name ELSE $3 END,
+		    last_name  = CASE WHEN $4 = '' THEN last_name  ELSE $4 END,
 		    updated_at = NOW()
-		WHERE id = $4 AND tenant_id = $5 AND deleted_at IS NULL
-	`, roleID, u.FirstName, u.LastName, userID, tenantID)
+		WHERE id = $5 AND tenant_id = $6 AND deleted_at IS NULL
+	`, role.set, role.id, u.FirstName, u.LastName, userID, tenantID)
 	if err != nil {
 		return fmt.Errorf("import: update user: %w", err)
 	}
 	return nil
+}
+
+// amendedRole is the role half of an update: whether to write role_id at all,
+// and what to write when so. The two have to travel together — a bare *int64
+// cannot distinguish "the row named no role" from "the row named one that
+// resolves to none", and on an existing user those mean opposite things.
+type amendedRole struct {
+	set bool
+	id  *int64
 }
 
 func nullIfEmpty(s string) *string {

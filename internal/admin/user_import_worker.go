@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
 )
 
@@ -51,6 +52,22 @@ const (
 
 	// How often a running worker renews its lease.
 	importLeaseRenew = 30 * time.Second
+
+	// How often finished jobs are swept, and how long they are kept.
+	//
+	// A finished job's rows are a report: which addresses were created, which
+	// were rejected and why. Nobody reads that a fortnight later, but until
+	// this existed nothing deleted it either, so every import a deployment had
+	// ever run stayed in the table permanently. The payloads no longer carry
+	// credentials — the row write erases both the plaintext and the digest —
+	// but they are still a list of every email address ever imported, kept
+	// forever for no one.
+	//
+	// Fourteen days is chosen to outlast the conversation an import starts: an
+	// operator reconciling "why is this person missing" is doing it the same
+	// week, not the next quarter.
+	importSweepInterval = 6 * time.Hour
+	importJobRetention  = 14 * 24 * time.Hour
 )
 
 // StartImportWorker launches the background drain and returns a stop function.
@@ -77,6 +94,8 @@ func (s *Service) StartImportWorker(logger zerolog.Logger) (stop func()) {
 		defer wg.Done()
 		ticker := time.NewTicker(importPollInterval)
 		defer ticker.Stop()
+		sweep := time.NewTicker(importSweepInterval)
+		defer sweep.Stop()
 		for {
 			select {
 			case <-done:
@@ -89,6 +108,12 @@ func (s *Service) StartImportWorker(logger zerolog.Logger) (stop func()) {
 					!errors.Is(err, context.Canceled) {
 					logger.Error().Err(err).Msg("import worker: job failed")
 				}
+			case <-sweep.C:
+				// Retention runs on the same goroutine as the drain, not its
+				// own: both touch the same pool and the shutdown contract above
+				// is already written for one. A sweep and a job never overlap,
+				// which also keeps the delete off the hasher's critical path.
+				s.sweepFinishedImportJobs(logger)
 			}
 		}
 	}()
@@ -348,7 +373,24 @@ func (s *Service) processImportRow(
 		return false
 	}
 
-	outcome, reason := s.applyImportRow(ctx, job, row, roles, defaultRoleID)
+	outcome, reason, infra := s.applyImportRow(ctx, job, row, roles, defaultRoleID)
+	if infra != nil {
+		// The row could not be judged, so it gets no verdict. It stays pending
+		// with its credential intact and is picked up again — by this worker on
+		// the next pass, or by whoever reclaims the job after the lease expires.
+		//
+		// Recording `reject` here, which is what this used to do, turned a
+		// transient database failure into a permanent one: rejected rows are
+		// never retried on resume, so a connection blip part-way through a
+		// 10,000-row job wrote off every remaining row as invalid and the
+		// operator's only recourse was to re-upload the whole file and hope.
+		//
+		// Returning false stops the job rather than grinding the rest of the
+		// file through the same broken connection.
+		log.Error().Err(infra).Int("row", row.index).
+			Msg("import worker: row left pending after an infrastructure failure")
+		return false
+	}
 
 	// The credentials are erased in the same statement that records the
 	// outcome, so neither a plaintext password nor an imported digest outlives
@@ -412,13 +454,17 @@ func (s *Service) claimImportRow(ctx context.Context, jobID, rowID int64, worker
 }
 
 // applyImportRow performs one row's database work and returns its verdict.
+//
+// A non-nil infra error means the row could not be judged — the database was
+// unreachable, not the row invalid. It is returned separately from the verdict
+// because the two must not share a fate: see processImportRow.
 func (s *Service) applyImportRow(
 	ctx context.Context,
 	job *claimedImportJob,
 	row *pendingImportRow,
 	roles map[string]int64,
 	defaultRoleID *int64,
-) (outcome, reason string) {
+) (outcome, reason string, infra error) {
 	u := row.user
 	email := u.Email // normalised at enqueue, when the row was validated
 
@@ -426,48 +472,128 @@ func (s *Service) applyImportRow(
 	if !ok {
 		return ImportOutcomeReject, fmt.Sprintf(
 			"role %q is not available in this application — create it first, or correct the name",
-			u.Role)
+			u.Role), nil
 	}
 
 	existing, err := s.importUserExists(ctx, job.tenantID, job.applicationID, email)
 	if err != nil {
-		return ImportOutcomeReject, "lookup failed"
+		// The row is fine; we could not ask about it. Rejecting here turned a
+		// connection blip into a permanent verdict on a valid row.
+		return "", "", fmt.Errorf("existence check: %w", err)
 	}
 
 	if existing != nil {
 		if !job.updateExisting {
-			return ImportOutcomeSkip, "user already exists"
+			return ImportOutcomeSkip, "user already exists", nil
 		}
-		newRole := roleNameFor(roles, roleID)
+		// An absent role keeps the one they have, so it is not a change to
+		// report and must not deny their sessions either.
+		role := amendRole(u.Role, roleID)
+		newRole := existing.roleName
+		if role.set {
+			newRole = roleNameFor(roles, role.id)
+		}
 		changed := newRole != existing.roleName
-		if err := s.updateImportedUser(ctx, job.tenantID, existing.id, u, roleID); err != nil {
-			return ImportOutcomeReject, "update failed"
+		if err := s.updateImportedUser(ctx, job.tenantID, existing.id, u, role); err != nil {
+			return "", "", fmt.Errorf("update user: %w", err)
 		}
 		if changed && s.authSvc != nil {
 			// A role change does not reach an already-issued access token:
 			// permissions are baked in at login. Without this the demotion is
 			// advisory until the token expires.
+			//
+			// Returns nothing by design and logs its own Redis failures
+			// (session denylist: account-wide write failed), with the same
+			// fail-open posture every other caller gets. Not fatal to the row:
+			// the role change is committed, and the denial has no retry to
+			// offer — the window it leaves is one access-token lifetime.
 			s.authSvc.DenyUserSessions(ctx, existing.id, job.tenantID)
 			return ImportOutcomeUpdate, fmt.Sprintf("role %s → %s",
-				displayRole(existing.roleName), displayRole(newRole))
+				displayRole(existing.roleName), displayRole(newRole)), nil
 		}
-		return ImportOutcomeUpdate, "profile updated; role unchanged"
+		return ImportOutcomeUpdate, "profile updated; role unchanged", nil
 	}
 
 	if err := s.insertImportedUser(ctx, job.tenantID, job.applicationID, email, u, roleID); err != nil {
 		if isDuplicateErr(err) {
 			// Lost a race with a concurrent create. The desired end state holds.
-			return ImportOutcomeSkip, "user already exists"
+			return ImportOutcomeSkip, "user already exists", nil
+		}
+		// A constraint violation is the row's own fault and is a verdict; any
+		// other write error is the database being unavailable and is not.
+		if !isRowDataErr(err) {
+			return "", "", fmt.Errorf("insert user: %w", err)
 		}
 		// The underlying error can carry column values and constraint names,
 		// and this reason is handed back over the API.
-		return ImportOutcomeReject, "write failed"
+		return ImportOutcomeReject, "write failed", nil
 	}
-	return ImportOutcomeCreate, ""
+	return ImportOutcomeCreate, "", nil
+}
+
+// sweepFinishedImportJobs deletes jobs that reached a terminal state longer
+// ago than importJobRetention.
+//
+// Only terminal jobs: `pending` and `running` are excluded by the status
+// predicate, so a long import is never swept out from under its own worker no
+// matter how long it has been going. finished_at, not created_at, for the same
+// reason — the clock starts when the job stopped.
+//
+// The rows go with it through ON DELETE CASCADE on user_import_job_rows.job_id,
+// which is why this deletes the parent rather than the rows: a sweep of rows
+// alone would leave a job reporting counts for a report that no longer exists.
+//
+// Failure is logged and retried on the next tick. Retention lag is not an
+// availability problem, and this must never be able to stop the drain.
+func (s *Service) sweepFinishedImportJobs(logger zerolog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	tag, err := s.pool.Exec(ctx, `
+		DELETE FROM user_import_jobs
+		WHERE status IN ('completed', 'failed', 'cancelled')
+		  AND finished_at IS NOT NULL
+		  AND finished_at < NOW() - $1::INTERVAL
+	`, importJobRetention.String())
+	if err != nil {
+		logger.Error().Err(err).Msg("import worker: retention sweep failed")
+		return
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		logger.Info().Int64("jobs", n).
+			Dur("retention", importJobRetention).
+			Msg("import worker: swept finished import jobs")
+	}
+}
+
+// isRowDataErr reports whether err is the row's own fault — a constraint or a
+// value the database refused — as opposed to the database being unreachable.
+//
+// The distinction decides whether a failed row gets a permanent verdict or is
+// left pending for the next attempt. Class 23 is integrity_constraint_violation
+// and class 22 is data_exception (a value too long for its column, a bad
+// encoding); both are reproducible properties of the row, so retrying it would
+// fail identically and `reject` is the honest answer. Everything else —
+// connection loss, admin shutdown, a full disk — says nothing about the row.
+//
+// A non-PgError (a dial failure, a context deadline) never reaches here as a
+// data error, which is the conservative direction: the row stays pending and
+// gets another attempt rather than being written off.
+func isRowDataErr(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return strings.HasPrefix(pgErr.Code, "23") || strings.HasPrefix(pgErr.Code, "22")
 }
 
 // resolveImportRole applies the three-tier rule: a named role, else the
 // application default, else none. ok is false when a named role is unavailable.
+//
+// The default-role tier is for a CREATE, where it stops a migrated user being
+// less privileged than the identical user who signs up through /register a
+// minute later. An update reads the same row through amendRole instead, because
+// on a user who already exists that tier would be a demotion.
 func resolveImportRole(name string, roles map[string]int64, defaultRoleID *int64) (*int64, bool) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
@@ -478,6 +604,20 @@ func resolveImportRole(name string, roles map[string]int64, defaultRoleID *int64
 		return nil, false
 	}
 	return &id, true
+}
+
+// amendRole decides what an update does to role_id, given the role the row
+// named and the id it resolved to.
+//
+// A row that names a role changes it. A row that names none leaves it alone —
+// the application default applies to a user being created, never to one who
+// already has a role, since "the column was absent from the file" is not an
+// instruction to demote anybody.
+func amendRole(name string, roleID *int64) amendedRole {
+	if strings.TrimSpace(name) == "" {
+		return amendedRole{}
+	}
+	return amendedRole{set: true, id: roleID}
 }
 
 // completeImportJob marks a finished job done, if it is still ours.
