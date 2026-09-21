@@ -1,0 +1,212 @@
+package auth_test
+
+import (
+	"context"
+	"sort"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// The authority rule loadPermissions applies when building a token's claims.
+//
+// Companion to refresh_tenant_authority_test.go. #142 fixed the rule in
+// RefreshWithLock's user load, which decides WHETHER a token may be minted.
+// This is the same rule in the function that decides WHAT IS IN IT, and it was
+// missed: a platform admin's refresh succeeded, and the token came back with
+// zero permissions.
+//
+// The visible failure was a 403 on every admin page while browsing another
+// tenant — "Failed to load application" for a super_admin looking at an
+// application they own. RequireAppScope's `tenant:manage` fast path cannot fire
+// on claims that carry no permissions, and the client cannot recover: a 403 is
+// an answer, so the refresh interceptor does not retry, and a refreshed token
+// would carry the same empty set anyway.
+//
+// Kept as SQL, copied verbatim from service.go, for the same reason the refresh
+// fixture is: the bug was a WHERE clause and the fix is a WHERE clause.
+//
+// Keep in sync with internal/auth/service.go — loadPermissions.
+const loadPermissionsSQL = `
+	WITH authority AS (
+		SELECT u.id, u.role_id, u.tenant_id
+		FROM users u
+		WHERE u.id = $1
+		  AND (
+		         u.tenant_id = $2
+		      OR EXISTS (
+		             SELECT 1 FROM admin_grants g
+		             WHERE g.user_id = u.id
+		               AND g.tenant_id = $2
+		               AND g.deleted_at IS NULL
+		               AND g.activated_at IS NOT NULL
+		         )
+		      OR EXISTS (
+		             SELECT 1
+		             FROM roles pr
+		             JOIN role_permissions prp ON prp.role_id = pr.id
+		             JOIN permissions pp       ON pp.id = prp.permission_id
+		             WHERE pr.id = u.role_id
+		               AND pr.tenant_id = u.tenant_id
+		               AND pr.deleted_at IS NULL
+		               AND pp.name = 'tenant:manage'
+		         )
+		  )
+	)
+	SELECT DISTINCT p.name
+	FROM permissions p
+	JOIN role_permissions rp ON rp.permission_id = p.id
+	JOIN authority a ON a.role_id = rp.role_id
+	UNION
+	SELECT DISTINCT p.name
+	FROM permissions p
+	JOIN user_permissions up ON up.permission_id = p.id
+	JOIN authority a ON a.id = up.user_id
+	WHERE up.tenant_id = $2
+	ORDER BY 1
+`
+
+func permissionsFor(t *testing.T, pool *pgxpool.Pool, userID, tenantID int64) []string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), loadPermissionsSQL, userID, tenantID)
+	if err != nil {
+		t.Fatalf("permissions query: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func hasPerm(perms []string, want string) bool {
+	for _, p := range perms {
+		if p == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestLoadPermissions_PlatformAdminKeepsPermissionsAcrossTenants is the
+// reported bug: a super_admin whose home tenant is A, browsing tenant B.
+//
+// Before the fix the role join required `u.tenant_id = $2`, which is false for
+// every tenant except their own, so this returned nothing at all.
+func TestLoadPermissions_PlatformAdminKeepsPermissionsAcrossTenants(t *testing.T) {
+	pool, f := setupAuthority(t)
+
+	perms := permissionsFor(t, pool, f.platformAdmin, f.otherTenant)
+	if len(perms) == 0 {
+		t.Fatal("a platform admin browsing another tenant received NO permissions — every admin route answers 403 and no refresh can fix it")
+	}
+	if !hasPerm(perms, "tenant:manage") {
+		t.Errorf("permissions = %v, want tenant:manage — RequireAppScope's fast path depends on it", perms)
+	}
+
+	// Their own tenant must be unchanged: this arm is the ordinary case and the
+	// fix must not have moved it.
+	home := permissionsFor(t, pool, f.platformAdmin, f.platformTenant)
+	if !hasPerm(home, "tenant:manage") {
+		t.Errorf("home-tenant permissions = %v, want tenant:manage", home)
+	}
+}
+
+// TestLoadPermissions_EndUserGainsNothingCrossTenant is the containment test,
+// and the one that matters most.
+//
+// Widening a permission lookup is exactly the change that quietly grants
+// everyone everything. An ordinary user must still receive nothing for a tenant
+// that is not theirs — the fix adds permissions ONLY for callers holding
+// platform authority or an activated grant.
+func TestLoadPermissions_EndUserGainsNothingCrossTenant(t *testing.T) {
+	pool, f := setupAuthority(t)
+
+	if perms := permissionsFor(t, pool, f.endUser, f.platformTenant); len(perms) != 0 {
+		t.Errorf("an ordinary user received %v for a foreign tenant, want none — this would be a cross-tenant permission leak", perms)
+	}
+	if perms := permissionsFor(t, pool, f.endUser, f.grantedTenant); len(perms) != 0 {
+		t.Errorf("an ordinary user received %v for a tenant they have no grant in, want none", perms)
+	}
+}
+
+// An activated grant is authority, so the grant holder's permissions resolve in
+// the granted tenant — the arm a "just look up the grant" fix would get right
+// and the tenant:manage arm would miss.
+func TestLoadPermissions_ActivatedGrantCarriesPermissions(t *testing.T) {
+	pool, f := setupAuthority(t)
+
+	// grantAdmin has no role, so the role arm yields nothing either way; what is
+	// asserted here is that the authority CTE admits them at all. A direct
+	// user_permission in the granted tenant proves the join reaches them.
+	var permID int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO permissions (tenant_id, name, description)
+		VALUES ($1, 'grant:probe', 'authority fixture')
+		RETURNING id
+	`, f.grantedTenant).Scan(&permID); err != nil {
+		t.Fatalf("insert probe permission: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO user_permissions (user_id, permission_id, tenant_id)
+		VALUES ($1, $2, $3)
+	`, f.grantAdmin, permID, f.grantedTenant); err != nil {
+		t.Fatalf("insert direct permission: %v", err)
+	}
+
+	perms := permissionsFor(t, pool, f.grantAdmin, f.grantedTenant)
+	if !hasPerm(perms, "grant:probe") {
+		t.Errorf("permissions = %v, want grant:probe — an activated grant must carry the user's permissions in that tenant", perms)
+	}
+}
+
+// A grant that was invited and never accepted is not authority, matching the
+// refresh rule. If this ever passes, an unaccepted invitation has become a
+// standing permission.
+func TestLoadPermissions_PendingGrantIsNotAuthority(t *testing.T) {
+	pool, f := setupAuthority(t)
+
+	if perms := permissionsFor(t, pool, f.pendingAdmin, f.grantedTenant); len(perms) != 0 {
+		t.Errorf("a pending (unaccepted) grant yielded %v, want none", perms)
+	}
+}
+
+// Direct user_permissions rows stay scoped to the tenant they were granted in,
+// even for a platform admin. Platform authority widens which ROLE permissions
+// apply; it does not relocate a per-tenant direct grant to another tenant.
+func TestLoadPermissions_DirectGrantsStayTenantScoped(t *testing.T) {
+	pool, f := setupAuthority(t)
+	ctx := context.Background()
+
+	var permID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO permissions (tenant_id, name, description)
+		VALUES ($1, 'scoped:probe', 'authority fixture')
+		RETURNING id
+	`, f.grantedTenant).Scan(&permID); err != nil {
+		t.Fatalf("insert probe permission: %v", err)
+	}
+	// Granted to the platform admin, but only inside grantedTenant.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_permissions (user_id, permission_id, tenant_id)
+		VALUES ($1, $2, $3)
+	`, f.platformAdmin, permID, f.grantedTenant); err != nil {
+		t.Fatalf("insert direct permission: %v", err)
+	}
+
+	if perms := permissionsFor(t, pool, f.platformAdmin, f.grantedTenant); !hasPerm(perms, "scoped:probe") {
+		t.Errorf("permissions in the granting tenant = %v, want scoped:probe", perms)
+	}
+	if perms := permissionsFor(t, pool, f.platformAdmin, f.otherTenant); hasPerm(perms, "scoped:probe") {
+		t.Errorf("a direct grant made in one tenant leaked into another: %v", perms)
+	}
+}

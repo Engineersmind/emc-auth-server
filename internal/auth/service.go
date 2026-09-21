@@ -397,18 +397,66 @@ func (s *AuthService) resolveRegistrationTenant(ctx context.Context) (int64, err
 }
 
 // loadPermissions returns the list of permission names for a given user.
+//
+// tenantID is the tenant the token is being minted FOR, which is not always the
+// user's home tenant: a platform admin browsing another tenant gets a token
+// scoped to that tenant. The role join therefore matches on the user's OWN
+// tenant rather than on the target, with authority over the target established
+// separately below.
+//
+// The previous form required `u.tenant_id = $2`, so every permission vanished
+// the moment a platform admin looked at a tenant other than their own. The
+// claims came back empty, RequireAppScope's `tenant:manage` fast path could not
+// fire, and the request was refused 403 — an error the client cannot recover
+// from, because refreshing the token reproduces the same empty set. Same defect
+// as the refresh-path fix in #142, in the function that builds the claims.
+//
+// Authority over the target tenant is one of:
+//   - it IS the user's own tenant (the ordinary case), or
+//   - an activated, undeleted admin_grants row for that tenant, or
+//   - a role carrying tenant:manage, which is platform-wide by definition.
+//
+// A user with none of these gets the empty set exactly as before, so this only
+// ever adds permissions for callers the middleware would have admitted anyway.
 func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int64) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
+		WITH authority AS (
+			SELECT u.id, u.role_id, u.tenant_id
+			FROM users u
+			WHERE u.id = $1
+			  AND (
+			         u.tenant_id = $2
+			      OR EXISTS (
+			             SELECT 1 FROM admin_grants g
+			             WHERE g.user_id = u.id
+			               AND g.tenant_id = $2
+			               AND g.deleted_at IS NULL
+			               AND g.activated_at IS NOT NULL
+			         )
+			      OR EXISTS (
+			             SELECT 1
+			             FROM roles pr
+			             JOIN role_permissions prp ON prp.role_id = pr.id
+			             JOIN permissions pp       ON pp.id = prp.permission_id
+			             WHERE pr.id = u.role_id
+			               AND pr.tenant_id = u.tenant_id
+			               AND pr.deleted_at IS NULL
+			               AND pp.name = 'tenant:manage'
+			         )
+			  )
+		)
 		SELECT DISTINCT p.name
 		FROM permissions p
 		JOIN role_permissions rp ON rp.permission_id = p.id
-		JOIN users u ON u.role_id = rp.role_id
-		WHERE u.id = $1 AND u.tenant_id = $2
+		JOIN authority a ON a.role_id = rp.role_id
 		UNION
 		SELECT DISTINCT p.name
 		FROM permissions p
 		JOIN user_permissions up ON up.permission_id = p.id
-		WHERE up.user_id = $1 AND up.tenant_id = $2
+		JOIN authority a ON a.id = up.user_id
+		-- Direct grants stay scoped to the tenant they were made in: they are
+		-- per-tenant by design, unlike a platform role.
+		WHERE up.tenant_id = $2
 		ORDER BY 1
 	`, userID, tenantID)
 	if err != nil {
