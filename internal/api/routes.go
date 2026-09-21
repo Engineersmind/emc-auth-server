@@ -1396,9 +1396,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.GET("/audit-logs/export", adminHandler.ExportAuditLogs, auditRead, auditMaintLimit)
 
 	// User directory export — same maintenance limit as the audit export, and for
-	// the same reason: it streams up to maxUserExportRows straight from the
-	// database. Registered here rather than beside the other user routes so both
-	// exports share one limiter and one rationale.
+	// the same reason: it streams the tenant's whole directory straight from the
+	// database. The export itself is uncapped, so this limiter is what bounds how
+	// often a large tenant can ask for it. Registered here rather than beside the
+	// other user routes so both exports share one limiter and one rationale.
 	//
 	// Guarded by the READ permission of whichever route family it belongs to —
 	// the export is ListUsers' data in another format, so anything narrower would

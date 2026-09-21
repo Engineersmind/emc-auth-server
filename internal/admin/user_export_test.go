@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -370,5 +372,68 @@ func TestExportUsersJSON_MatchesCSVScope(t *testing.T) {
 		if u.Email == "scope-tenant@example.com" {
 			t.Error("app-scoped JSON export leaked a tenant-level user")
 		}
+	}
+}
+
+// --- no row cap ----------------------------------------------------------
+
+// The export must return every user in the directory.
+//
+// It used to stop at 50000 rows, a cap copied from the audit export. Because
+// the query is ORDER BY created_at DESC, that cap dropped the OLDEST accounts —
+// the long-standing ones an operator reconciling licences is most likely to
+// care about — and wrote nothing to say it had. A file that looks complete and
+// is silently short is worse than a slow one.
+//
+// Seeding 50k users to prove the old boundary would cost minutes, so the guard
+// is on the query itself: it must carry no LIMIT at all. That is what makes the
+// property true for any directory size, not just the one a test can afford to
+// build.
+func TestExportUsers_QueryHasNoRowCap(t *testing.T) {
+	src, err := os.ReadFile("user_export.go")
+	if err != nil {
+		t.Fatalf("read user_export.go: %v", err)
+	}
+	// The single shared query both serialisers read. A LIMIT reintroduced here
+	// silently truncates every export in both formats.
+	if bytes.Contains(src, []byte("LIMIT")) {
+		t.Error("the user export query has a LIMIT again — a capped export " +
+			"drops the oldest users with no marker; bound it by the route's " +
+			"rate limiter instead")
+	}
+}
+
+// Every user is streamed out, with none dropped off either end. Sized well
+// under any plausible cap — the point is that the count is exact and the
+// oldest row (the one a DESC cap would drop first) is present.
+func TestExportUsers_ReturnsEveryUser(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	const want = 25
+	for i := 0; i < want; i++ {
+		email := fmt.Sprintf("bulk-%02d@example.com", i)
+		if _, err := f.svc.CreateUser(ctx, f.tenantID, &f.appID,
+			email, "pw-bulkexport-12", "Bulk", "User", nil); err != nil {
+			t.Fatalf("CreateUser(%s) error = %v", email, err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := f.svc.ExportUsersJSON(ctx,
+		admin.UserExportParams{TenantID: f.tenantID, ApplicationID: &f.appID}, &buf); err != nil {
+		t.Fatalf("ExportUsersJSON() error = %v", err)
+	}
+	var doc admin.ExportedDocument
+	if err := json.Unmarshal(buf.Bytes(), &doc); err != nil {
+		t.Fatalf("parse export: %v", err)
+	}
+	if len(doc.Users) != want {
+		t.Errorf("exported %d users, want all %d", len(doc.Users), want)
+	}
+	// The first user created is the oldest, so it sorts last under
+	// created_at DESC and is the first casualty of a cap.
+	if exportedUserByEmail(doc.Users, "bulk-00@example.com") == nil {
+		t.Error("the oldest user is missing — the export is truncating from the tail")
 	}
 }

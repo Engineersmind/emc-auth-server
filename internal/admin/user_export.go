@@ -1,10 +1,11 @@
 // user_export.go — streaming CSV export of a tenant's user directory.
 //
-// Modelled on internal/audit/export.go: one bounded query streamed straight
-// into the writer, so a large tenant never buffers its whole directory in
-// memory. The shapes are deliberately identical — same row cap, same
+// Modelled on internal/audit/export.go: one query streamed straight into the
+// writer, so a large tenant never buffers its whole directory in memory. Same
 // maintenance rate limiter on the route, same "headers are already sent"
-// failure posture in the handler.
+// failure posture in the handler. It does NOT share that file's row cap — see
+// the note on the export query for why a directory is bounded differently from
+// an audit trail.
 //
 // # What is deliberately absent
 //
@@ -38,10 +39,25 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// maxUserExportRows caps a single export so a broad request cannot stream
-// unbounded data or hold a database connection indefinitely. Matches the audit
-// export's cap for the same reason.
-const maxUserExportRows = 50000
+// There is deliberately no row cap here.
+//
+// This export previously stopped at 50000 rows, copied from the audit export
+// beside it. That was wrong for a directory: the query is ORDER BY created_at
+// DESC, so the cap dropped the OLDEST users — the long-standing accounts an
+// operator is most likely to be reconciling — and said nothing about it. The
+// result was a file that looks complete and is short by an unknown number of
+// rows, which is worse than either a refusal or a slow download.
+//
+// Nothing needs the cap to stay safe. Both serialisers stream row by row
+// straight into the response writer, so peak memory is one row regardless of
+// tenant size; pgx reads the result set in batches rather than materialising
+// it; and the route already carries the maintenance rate limiter, which is
+// what actually bounds how often a large tenant can ask for this.
+//
+// The audit export keeps its own cap, and that is not an inconsistency: its
+// rows are unbounded in TIME — a wide date filter can select tens of millions —
+// whereas a tenant's directory is bounded by how many users it has.
+
 
 // userExportHeader is the CSV column order.
 //
@@ -142,8 +158,7 @@ func (s *Service) queryExportRows(ctx context.Context, p UserExportParams) (pgx.
 		      WHERE sr.id = u.role_id AND sr.is_system = true
 		  )
 		ORDER BY u.created_at DESC
-		LIMIT $3
-	`, p.TenantID, p.ApplicationID, maxUserExportRows)
+	`, p.TenantID, p.ApplicationID)
 	if err != nil {
 		return nil, fmt.Errorf("user export query: %w", err)
 	}
@@ -166,7 +181,8 @@ func scanExportRow(rows pgx.Rows) (ExportedUser, error) {
 }
 
 // ExportUsersCSV writes the tenant's users as CSV to w, newest first, honoring
-// the optional application scope. Bounded by maxUserExportRows.
+// the optional application scope. Every matching user is written; the rows are
+// streamed, not accumulated.
 //
 // Soft-deleted users are excluded: an export describes the directory as it
 // stands, and a deleted account is not part of it.
@@ -242,9 +258,10 @@ type ExportedDocument struct {
 
 // ExportUsersJSON writes the tenant's users as a JSON document.
 //
-// Encoded row by row into the writer rather than marshalled from a slice: at
-// maxUserExportRows a buffered document is tens of megabytes held in memory for
-// the length of the request, and the CSV path beside it already streams.
+// Encoded row by row into the writer rather than marshalled from a slice: a
+// buffered document of a large directory is tens of megabytes held in memory
+// for the length of the request, and the CSV path beside it already streams.
+// With no row cap this is what keeps peak memory at one row.
 func (s *Service) ExportUsersJSON(ctx context.Context, p UserExportParams, w io.Writer) error {
 	rows, err := s.queryExportRows(ctx, p)
 	if err != nil {
