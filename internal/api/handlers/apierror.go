@@ -177,4 +177,6 @@ var errorMessages = map[string]string{
 	"import_too_large":   "That import is larger than this server accepts. Split it into smaller files.",
 	"import_invalid":     "That import file couldn't be read. Check it is valid JSON in the expected format.",
 	"import_job_missing": "We couldn't find that import. It may have finished and been cleared.",
+	"import_job_invalid": "That import reference isn't valid.",
+	"import_failed":      "We couldn't run that import. Try again — if it keeps happening, contact your administrator.",
 }

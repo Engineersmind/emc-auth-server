@@ -527,7 +527,7 @@ type CreatePermissionRequest struct {
 func (h *AdminHandler) CreatePermission(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -602,7 +602,7 @@ func (h *AdminHandler) optionalAppScope(c echo.Context, tenantID int64) (*int64,
 func (h *AdminHandler) ListPermissions(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -635,7 +635,7 @@ func (h *AdminHandler) ListPermissions(c echo.Context) error {
 func (h *AdminHandler) UpdatePermission(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -681,7 +681,7 @@ func (h *AdminHandler) UpdatePermission(c echo.Context) error {
 func (h *AdminHandler) DeletePermission(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -837,7 +837,7 @@ func (h *AdminHandler) applicationOwnedByTenant(c echo.Context, tenantID int64) 
 func (h *AdminHandler) CreateApplicationRole(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -886,7 +886,7 @@ func (h *AdminHandler) CreateApplicationRole(c echo.Context) error {
 func (h *AdminHandler) ListApplicationRoles(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -921,7 +921,7 @@ func (h *AdminHandler) ListApplicationRoles(c echo.Context) error {
 func (h *AdminHandler) UpdateApplicationRole(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -971,7 +971,7 @@ func (h *AdminHandler) UpdateApplicationRole(c echo.Context) error {
 func (h *AdminHandler) SetDefaultApplicationRole(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -1012,7 +1012,7 @@ func (h *AdminHandler) SetDefaultApplicationRole(c echo.Context) error {
 func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 
 	roleID, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -1058,7 +1058,7 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 func (h *AdminHandler) DeleteRole(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 
 	roleID, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -1121,7 +1121,7 @@ type AssignRoleRequest struct {
 func (h *AdminHandler) ListUsers(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1156,7 +1156,7 @@ func (h *AdminHandler) ListUsers(c echo.Context) error {
 func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1245,7 +1245,7 @@ func (h *AdminHandler) CreateAdminUser(c echo.Context) error {
 func (h *AdminHandler) ResendInvitation(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1305,7 +1305,7 @@ func actorName(claims *auth.Claims) string {
 func (h *AdminHandler) GetAdminUser(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1345,7 +1345,7 @@ func (h *AdminHandler) GetAdminUser(c echo.Context) error {
 func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1397,7 +1397,7 @@ func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1461,7 +1461,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 func (h *AdminHandler) DeleteAdminUser(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1498,7 +1498,7 @@ func (h *AdminHandler) DeleteAdminUser(c echo.Context) error {
 func (h *AdminHandler) ForcePasswordReset(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1544,7 +1544,7 @@ type SetUserStatusRequest struct {
 func (h *AdminHandler) GetAdminUserDetail(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1583,7 +1583,7 @@ func (h *AdminHandler) GetAdminUserDetail(c echo.Context) error {
 func (h *AdminHandler) SetUserStatus(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1636,7 +1636,7 @@ func (h *AdminHandler) SetUserStatus(c echo.Context) error {
 func (h *AdminHandler) UnlockUser(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1677,7 +1677,7 @@ func (h *AdminHandler) UnlockUser(c echo.Context) error {
 func (h *AdminHandler) ListUserSessions(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1716,7 +1716,7 @@ func (h *AdminHandler) ListUserSessions(c echo.Context) error {
 func (h *AdminHandler) RevokeUserSession(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1756,7 +1756,7 @@ func (h *AdminHandler) RevokeUserSession(c echo.Context) error {
 func (h *AdminHandler) RevokeAllUserSessions(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -1793,7 +1793,7 @@ func (h *AdminHandler) RevokeAllUserSessions(c echo.Context) error {
 func (h *AdminHandler) GetUserMFAStatus(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -2352,7 +2352,7 @@ type AppLimitRequest struct {
 func (h *AdminHandler) ListAppLimits(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 
 	limits, err := h.appLimitSvc.ListAppLimits(c.Request().Context(), tenantID)
@@ -2381,7 +2381,7 @@ func (h *AdminHandler) ListAppLimits(c echo.Context) error {
 func (h *AdminHandler) GetAppLimit(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -2429,7 +2429,7 @@ func (h *AdminHandler) GetAppLimit(c echo.Context) error {
 func (h *AdminHandler) SetAppLimit(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -2467,7 +2467,7 @@ func (h *AdminHandler) SetAppLimit(c echo.Context) error {
 func (h *AdminHandler) DeleteAppLimit(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -2783,7 +2783,7 @@ func appFilterFromQuery(c echo.Context) auth.AppFilter {
 func (h *AdminHandler) CreateApplication(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 
 	var req CreateApplicationRequest
@@ -2855,7 +2855,7 @@ func (h *AdminHandler) CreateApplication(c echo.Context) error {
 func (h *AdminHandler) ListApplications(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 
 	// RequireTenantSelfScoped lets an application-scoped administrator reach this
@@ -2896,7 +2896,7 @@ func (h *AdminHandler) ListApplications(c echo.Context) error {
 func (h *AdminHandler) GetApplication(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -2933,7 +2933,7 @@ func (h *AdminHandler) GetApplication(c echo.Context) error {
 func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -2994,7 +2994,7 @@ func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 func (h *AdminHandler) RotateApplicationSecret(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -3031,7 +3031,7 @@ func (h *AdminHandler) RotateApplicationSecret(c echo.Context) error {
 func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 
 	appID, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -3085,7 +3085,7 @@ type UpdateApplicationMFARequest struct {
 func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
 	tenantID, _, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -3119,7 +3119,7 @@ func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
 func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -3191,7 +3191,7 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 func (h *AdminHandler) ResetUserMFA(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appID, ok := h.applicationOwnedByTenant(c, tenantID)
 	if !ok {
@@ -3250,7 +3250,7 @@ type UpsertEmailSenderRequest struct {
 func (h *AdminHandler) emailSenderScope(c echo.Context) (tenantID int64, appRowID *int64, claims *auth.Claims, ok bool) {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		_ = c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		_ = c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 		return 0, nil, nil, false
 	}
 	if c.Param("appID") != "" {
@@ -3895,7 +3895,7 @@ func (h *AdminHandler) ExportUsers(c echo.Context) error {
 	// name, so this is about honouring the request, not about admitting one.
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
 	if !ok {
@@ -3989,7 +3989,7 @@ func (h *AdminHandler) importScope(c echo.Context) (int64, *int64, *auth.Claims,
 	// router, guarded by RequireTenantSelfOrAny, and then ignored.
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
 	if err != nil {
-		_ = c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		_ = c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
 		return 0, nil, nil, false
 	}
 	appScope, ok := h.optionalAppScope(c, tenantID)
@@ -4023,16 +4023,16 @@ func (h *AdminHandler) ValidateUserImport(c echo.Context) error {
 	}
 	doc, err := bindImportDocument(c)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid import document: " + err.Error()})
+		return c.JSON(http.StatusBadRequest, APIError{Error: "import_invalid", Message: "That import file couldn't be read: " + err.Error()})
 	}
 
 	res, err := h.svc.ValidateImport(c.Request().Context(), tenantID, appScope, doc)
 	if err != nil {
 		if errors.Is(err, admin.ErrImportTooLarge) {
-			return c.JSON(http.StatusRequestEntityTooLarge, map[string]string{"error": err.Error()})
+			return c.JSON(http.StatusRequestEntityTooLarge, APIError{Error: "import_too_large", Message: err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("admin: user import validation failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "import validation failed"})
+		return fail(c, http.StatusInternalServerError, "import_failed")
 	}
 
 	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersImportValidated, "user", "", appScope,
@@ -4072,7 +4072,7 @@ func (h *AdminHandler) CommitUserImport(c echo.Context) error {
 	}
 	doc, err := bindImportDocument(c)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid import document: " + err.Error()})
+		return c.JSON(http.StatusBadRequest, APIError{Error: "import_invalid", Message: "That import file couldn't be read: " + err.Error()})
 	}
 
 	var actorID *int64
@@ -4087,10 +4087,10 @@ func (h *AdminHandler) CommitUserImport(c echo.Context) error {
 	job, err := h.svc.EnqueueImport(c.Request().Context(), tenantID, appScope, doc, actorID, actorEmail)
 	if err != nil {
 		if errors.Is(err, admin.ErrImportTooLarge) {
-			return c.JSON(http.StatusRequestEntityTooLarge, map[string]string{"error": err.Error()})
+			return c.JSON(http.StatusRequestEntityTooLarge, APIError{Error: "import_too_large", Message: err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("admin: user import enqueue failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "import failed"})
+		return fail(c, http.StatusInternalServerError, "import_failed")
 	}
 
 	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersImported, "import_job", job.ID, appScope,
@@ -4115,16 +4115,16 @@ func (h *AdminHandler) GetUserImportJob(c echo.Context) error {
 	}
 	jobID, err := strconv.ParseInt(c.Param("jobID"), 10, 64)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid job id"})
+		return fail(c, http.StatusBadRequest, "import_job_invalid")
 	}
 
 	job, err := h.svc.GetImportJob(c.Request().Context(), tenantID, appScope, jobID)
 	if err != nil {
 		if errors.Is(err, admin.ErrJobNotFound) {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "import job not found"})
+			return fail(c, http.StatusNotFound, "import_job_missing")
 		}
 		h.logger.Error().Err(err).Msg("admin: get import job failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not read the import job"})
+		return fail(c, http.StatusInternalServerError, "internal_error")
 	}
 	return c.JSON(http.StatusOK, job)
 }
@@ -4146,17 +4146,17 @@ func (h *AdminHandler) GetUserImportJobRows(c echo.Context) error {
 	}
 	jobID, err := strconv.ParseInt(c.Param("jobID"), 10, 64)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid job id"})
+		return fail(c, http.StatusBadRequest, "import_job_invalid")
 	}
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 
 	rows, err := h.svc.ListImportJobRows(c.Request().Context(), tenantID, appScope, jobID, limit)
 	if err != nil {
 		if errors.Is(err, admin.ErrJobNotFound) {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "import job not found"})
+			return fail(c, http.StatusNotFound, "import_job_missing")
 		}
 		h.logger.Error().Err(err).Msg("admin: list import job rows failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not read the import report"})
+		return fail(c, http.StatusInternalServerError, "internal_error")
 	}
 	return c.JSON(http.StatusOK, rows)
 }
@@ -4179,7 +4179,7 @@ func (h *AdminHandler) ListUserImportJobs(c echo.Context) error {
 	jobs, err := h.svc.ListImportJobs(c.Request().Context(), tenantID, appScope, limit)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: list import jobs failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not list import jobs"})
+		return fail(c, http.StatusInternalServerError, "internal_error")
 	}
 	return c.JSON(http.StatusOK, jobs)
 }
@@ -4204,15 +4204,15 @@ func (h *AdminHandler) CancelUserImportJob(c echo.Context) error {
 	}
 	jobID, err := strconv.ParseInt(c.Param("jobID"), 10, 64)
 	if err != nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid job id"})
+		return fail(c, http.StatusBadRequest, "import_job_invalid")
 	}
 
 	if err := h.svc.CancelImportJob(c.Request().Context(), tenantID, appScope, jobID); err != nil {
 		if errors.Is(err, admin.ErrJobNotFound) {
-			return c.JSON(http.StatusNotFound, map[string]string{"error": "import job not found, or already finished"})
+			return fail(c, http.StatusNotFound, "import_job_missing")
 		}
 		h.logger.Error().Err(err).Msg("admin: cancel import job failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not cancel the import"})
+		return fail(c, http.StatusInternalServerError, "internal_error")
 	}
 
 	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersImportCancelled, "import_job",
