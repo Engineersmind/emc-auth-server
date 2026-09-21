@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
@@ -93,6 +94,7 @@ var errProviderRawDetail = errors.New(`smtp send: dial tcp smtp.internal.example
 
 type testSendEnv struct {
 	h        *AdminHandler
+	pool     *pgxpool.Pool
 	mail     *recordingMailer
 	tenantID int64
 	appRowID int64
@@ -156,6 +158,7 @@ func newTestSendEnv(t *testing.T) *testSendEnv {
 
 	return &testSendEnv{
 		h:        h,
+		pool:     pool,
 		mail:     rec,
 		tenantID: tenantID,
 		appRowID: appRowID,
@@ -333,19 +336,29 @@ func TestSendTestRejectsAnInvalidRecipient(t *testing.T) {
 
 // ─── The saved template is what gets sent, to anyone ────────────────────────
 
-// Replaces TestSendTestForcesTheDiagnosticTemplateForExternalRecipients, which
-// pinned the opposite: until this change an external recipient silently got the
-// provider diagnostic instead of the template the admin had just saved, with
-// nothing in the response saying so. That made the feature unable to do the one
-// thing it exists for (see SendTestEmail for the full reasoning).
-//
-// The phishing risk that restriction addressed is now carried by the test
-// marking in mailer.markAsTest — asserted directly in the mailer package, since
-// that is where the subject prefix and the body notice are applied.
-func TestSendTestSendsTheSavedTemplateToAnExternalRecipient(t *testing.T) {
-	e := newTestSendEnv(t)
+// addMember inserts an active user of the tenant, so a test send addressed to
+// them passes the recipient boundary.
+func (e *testSendEnv) addMember(t *testing.T, email string) {
+	t.Helper()
+	if _, err := e.pool.Exec(e.ctx, `
+		INSERT INTO users (email, tenant_id, is_active) VALUES ($1, $2, true)
+	`, email, e.tenantID); err != nil {
+		t.Fatalf("insert member %s: %v", email, err)
+	}
+}
 
-	rec, body := e.post(t, `{"to":"qa-alias@elsewhere.example","template_type":"welcome"}`, false)
+// A rendered custom template reaches a colleague — a user of this tenant — so
+// the real use case (prove deliverability to a QA alias) still works.
+//
+// Replaces TestSendTestForcesTheDiagnosticTemplateForExternalRecipients, which
+// pinned a blanket restriction: ANY recipient other than the caller silently
+// received the provider diagnostic instead of the template the admin had just
+// saved, with nothing in the response saying so.
+func TestSendTestSendsTheSavedTemplateToATenantMember(t *testing.T) {
+	e := newTestSendEnv(t)
+	e.addMember(t, "qa-alias@emc.local")
+
+	rec, body := e.post(t, `{"to":"qa-alias@emc.local","template_type":"welcome"}`, false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %v", rec.Code, body)
 	}
@@ -356,10 +369,55 @@ func TestSendTestSendsTheSavedTemplateToAnExternalRecipient(t *testing.T) {
 	if got, _ := body["template"].(string); got != string(mailer.TemplateWelcome) {
 		t.Errorf("response template = %q, want %q", got, mailer.TemplateWelcome)
 	}
-	// The response has to say the message was marked, or the admin cannot tell
-	// a marked send from an unmarked one and we are back to guessing.
 	if marked, _ := body["marked_as_test"].(bool); !marked {
 		t.Error("marked_as_test = false; the UI cannot explain the [Test] prefix without it")
+	}
+}
+
+/*
+ * The boundary that makes arbitrary recipients safe, and the reason the test
+ * marking cannot be the control on its own.
+ *
+ * [Test] in the subject survives anything a template can do. The in-body notice
+ * does not: the author owns the document, so a rule like
+ * `body>div:first-child{display:none!important}` hides it while the message
+ * still carries real branding and a verified sender identity — a working
+ * phishing relay for any apps:write holder.
+ *
+ * So a RENDERED CUSTOM TEMPLATE may go only to the caller or to a user of this
+ * tenant. A stranger's address is refused outright rather than silently
+ * downgraded: an unexplained substitution is what made the previous behaviour
+ * impossible to diagnose.
+ */
+func TestSendTestRefusesACustomTemplateToANonMember(t *testing.T) {
+	e := newTestSendEnv(t)
+
+	rec, body := e.post(t, `{"to":"victim@elsewhere.example","template_type":"welcome"}`, false)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 — attacker-authored content must not reach an arbitrary address", rec.Code)
+	}
+	if len(e.mail.calls) != 0 {
+		t.Errorf("a message was sent anyway: %+v", e.mail.calls[0])
+	}
+	// The refusal has to name the way forward, or an admin with a legitimate
+	// external address has no idea what to do next.
+	if msg, _ := body["error"].(string); !strings.Contains(msg, "template_type") {
+		t.Errorf("error = %q; it should point at the provider diagnostic as the way to test an arbitrary address", msg)
+	}
+}
+
+// The provider diagnostic is exempt: it is not customizable, carries no
+// attacker-authored content, and proving deliverability to an arbitrary address
+// is exactly what it is for.
+func TestSendTestAllowsTheDiagnosticToAnyAddress(t *testing.T) {
+	e := newTestSendEnv(t)
+
+	rec, body := e.post(t, `{"to":"anyone@elsewhere.example"}`, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %v — the diagnostic must stay sendable anywhere", rec.Code, body)
+	}
+	if got := e.mail.calls[0].Type; got != mailer.TemplateProviderTest {
+		t.Errorf("template = %q, want %q", got, mailer.TemplateProviderTest)
 	}
 }
 
@@ -446,20 +504,35 @@ func TestSendTestDoesNotEchoRawProviderErrors(t *testing.T) {
 	}
 }
 
-// A service token carries no email, so there is no "self" for it. It used to
-// be the strictest case — every recipient counted as external, so it could
-// never send a real template (PR #91 FLAG-1). With the recipient rule gone it
-// is no longer special, and this test records that deliberately rather than
-// leaving the old guarantee silently dropped: an email-less caller CAN now send
-// a real template outward, and the marking is what keeps that safe.
+// A service token carries no email, so there is no "self" for it: every
+// recipient is external, and the membership boundary is the only thing standing
+// between the least attributable caller on the system and arbitrary delivery of
+// attacker-authored content.
 //
-// The audit record still distinguishes it — `external` is retained in the event
-// precisely so the least attributable callers stay reviewable.
-func TestSendTestSendsARealTemplateForATokenWithNoEmail(t *testing.T) {
+// Documented explicitly (PR #91 FLAG-1) because the alternative reading — empty
+// ownEmail matching an empty-ish recipient, or a refactor treating "" as
+// "self" — would reopen that path for exactly the caller least worth trusting.
+func TestSendTestRefusesACustomTemplateForATokenWithNoEmail(t *testing.T) {
 	e := newTestSendEnv(t)
 	e.claims.Email = "" // service token: client_id in UserID, no email claim
 
 	rec, body := e.post(t, `{"to":"someone@elsewhere.example","template_type":"welcome"}`, false)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403, body = %v", rec.Code, body)
+	}
+	if len(e.mail.calls) != 0 {
+		t.Errorf("an email-less caller delivered a real template outward: %+v", e.mail.calls[0])
+	}
+}
+
+// The same token CAN still reach a member of the tenant. The boundary is
+// membership, not the presence of an email claim.
+func TestSendTestAllowsATokenWithNoEmailToReachAMember(t *testing.T) {
+	e := newTestSendEnv(t)
+	e.claims.Email = ""
+	e.addMember(t, "member@emc.local")
+
+	rec, body := e.post(t, `{"to":"member@emc.local","template_type":"welcome"}`, false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %v", rec.Code, body)
 	}
@@ -467,7 +540,7 @@ func TestSendTestSendsARealTemplateForATokenWithNoEmail(t *testing.T) {
 		t.Errorf("template = %q, want %q", got, mailer.TemplateWelcome)
 	}
 	if marked, _ := body["marked_as_test"].(bool); !marked {
-		t.Error("marked_as_test = false — the marking is the only control left here")
+		t.Error("marked_as_test = false")
 	}
 }
 

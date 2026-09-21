@@ -3605,8 +3605,8 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 	if strings.ContainsAny(to, "\r\n") {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "recipient is not a valid email address"})
 	}
-	// Whether this send leaves the caller's own mailbox. Drives both the audit
-	// flag and the content restriction below.
+	// Whether this send leaves the caller's own mailbox. Drives the audit flag
+	// and the recipient boundary below.
 	external := !strings.EqualFold(to, ownEmail)
 
 	// No template_type means "just check the provider", which sends the
@@ -3618,6 +3618,39 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		tt = mailer.TemplateProviderTest
 	} else if !mailer.ValidTemplateType(tt) {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown template type"})
+	}
+
+	// A rendered CUSTOM template may go to the caller, or to a user of this
+	// tenant. Any other address gets the fixed diagnostic or nothing.
+	//
+	// The [Test] prefix and the in-body notice are defence in depth, NOT an
+	// authorization boundary. The subject prefix survives anything a template
+	// can do; the body notice does not. The template author owns the document,
+	// so a rule such as `body>div:first-child{display:none!important}`
+	// suppresses the banner while the message still carries real branding and a
+	// verified sender identity. The recipient is what actually bounds this.
+	//
+	// Tenant membership rather than self-only: proving deliverability to a
+	// colleague or a QA alias is the real use case, and those are addresses the
+	// tenant already legitimately mails. It is also the rule that
+	// SendTestEmailRequest.To has always documented.
+	//
+	// The provider diagnostic is exempt — it is not customizable, so it carries
+	// no attacker-authored content and remains sendable anywhere.
+	if external && tt != mailer.TemplateProviderTest {
+		member, err := h.svc.RecipientBelongsToTenant(c.Request().Context(), tenantID, to)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("admin: check test recipient membership failed")
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to verify the recipient"})
+		}
+		if !member {
+			// Refused, not silently downgraded: an unexplained substitution is
+			// exactly what made the previous behaviour impossible to diagnose.
+			return c.JSON(http.StatusForbidden, map[string]string{
+				"error": "a template preview can only be sent to your own address or to a user of this tenant — " +
+					"omit template_type to send the provider diagnostic to any address",
+			})
+		}
 	}
 
 	// SECURITY: the saved template IS what goes out, to whatever recipient was

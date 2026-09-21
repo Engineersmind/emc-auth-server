@@ -441,6 +441,16 @@ func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int6
 			             WHERE pr.id = u.role_id
 			               AND pr.tenant_id = u.tenant_id
 			               AND pr.deleted_at IS NULL
+			               -- Tenant-level on BOTH sides, matching the platform
+			               -- definition in resolveRegistrationTenant. The name
+			               -- alone is not the platform tier: CreatePermission
+			               -- accepts any name for an application-scoped
+			               -- permission, so an app catalogue may define its own
+			               -- 'tenant:manage'. Without these predicates, holding
+			               -- an ordinary app role named that way would be read
+			               -- as unrestricted platform authority.
+			               AND pr.application_id IS NULL
+			               AND pp.application_id IS NULL
 			               AND pp.name = 'tenant:manage'
 			         )
 			  )
@@ -2427,6 +2437,16 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		          WHERE pr.id = u.role_id
 		            AND pr.tenant_id = u.tenant_id
 		            AND pr.deleted_at IS NULL
+		            -- Tenant-level on BOTH sides, matching the platform
+		            -- definition in resolveRegistrationTenant. The permission
+		            -- NAME alone does not identify the platform tier:
+		            -- CreatePermission accepts any name for an
+		            -- application-scoped permission, so an application's own
+		            -- catalogue may contain a 'tenant:manage'. Without these,
+		            -- an ordinary app role carrying that name would let its
+		            -- holder refresh into any tenant on the installation.
+		            AND pr.application_id IS NULL
+		            AND pp.application_id IS NULL
 		            AND pp.name = 'tenant:manage'
 		      )
 		  )
@@ -2443,7 +2463,21 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		return nil, nil, fmt.Errorf("fetch user for refresh: %w", err)
 	}
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	// Permissions must be resolved the same way SwitchTenantContext resolved
+	// them, or a rotation silently changes what the session can do.
+	//
+	// A tenant administrator acting under a grant draws their permissions from
+	// the TARGET tenant's seeded owner/co_owner role — their home role is
+	// usually irrelevant and often absent. loadPermissions answers from the home
+	// role, so refreshing such a session replaced a working set of admin
+	// permissions with an empty one: 403 on every route roughly fifteen minutes
+	// after switching, which reads as a random loss of access rather than a
+	// rotation bug.
+	//
+	// Platform administrators keep the home-role answer, which is where
+	// tenant:manage lives and is exactly what loadAdminPermissionsForTenant
+	// returns for them — so that arm is unchanged.
+	perms, err := s.permissionsForRefresh(ctx, userID, tenantID)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions")
 		perms = []string{}

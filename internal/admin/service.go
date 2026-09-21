@@ -2747,3 +2747,36 @@ func containsSubstr(s, sub string) bool {
 	}
 	return false
 }
+
+// RecipientBelongsToTenant reports whether an address belongs to an active user
+// of this tenant.
+//
+// Bounds who may receive a rendered CUSTOM email template from the admin test
+// send. Template bodies are editable at the same permission level as that
+// endpoint, so allowing both an arbitrary recipient and arbitrary content would
+// make it a phishing relay from a verified sender identity. The [Test] subject
+// prefix and in-body notice are defence in depth rather than the control: the
+// template author owns the document and can hide the banner with CSS, so the
+// recipient is what actually bounds it.
+//
+// Tenant membership rather than self-only because proving deliverability to a
+// colleague or QA alias is the real use case, and those are addresses the
+// tenant already legitimately mails.
+//
+// Matched case-insensitively: addresses are stored as supplied.
+func (s *Service) RecipientBelongsToTenant(ctx context.Context, tenantID int64, email string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM users
+			WHERE tenant_id = $1
+			  AND lower(email) = lower($2)
+			  AND is_active = true
+			  AND deleted_at IS NULL
+		)
+	`, tenantID, email).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check test recipient membership: %w", err)
+	}
+	return exists, nil
+}

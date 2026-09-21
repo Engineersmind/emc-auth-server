@@ -210,3 +210,102 @@ func TestLoadPermissions_DirectGrantsStayTenantScoped(t *testing.T) {
 		t.Errorf("a direct grant made in one tenant leaked into another: %v", perms)
 	}
 }
+
+// TestRefreshPermissionsMatchTheSwitch is the rotation-drift guard.
+//
+// SwitchTenantContext resolves a granted administrator's permissions from the
+// TARGET tenant's seeded role. Refresh used loadPermissions, which answers from
+// the HOME role — usually absent for such a user — so the rotated token carried
+// nothing and every route answered 403 roughly fifteen minutes after switching.
+// The session did not end; it quietly lost its authority.
+//
+// The property asserted is agreement between the two paths, not a particular
+// permission list: whatever the switch grants, the refresh must still grant.
+func TestRefreshPermissionsMatchTheSwitch(t *testing.T) {
+	pool, f := setupAuthority(t)
+	ctx := context.Background()
+
+	// The granted tenant seeds an 'owner' role, matching the grant fixture.
+	var roleID, permID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO roles (tenant_id, name) VALUES ($1, 'owner') RETURNING id`,
+		f.grantedTenant).Scan(&roleID); err != nil {
+		t.Fatalf("insert owner role: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO permissions (tenant_id, name, description) VALUES ($1, 'apps:write', 'authority fixture') RETURNING id`,
+		f.grantedTenant).Scan(&permID); err != nil {
+		t.Fatalf("insert permission: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO role_permissions (role_id, permission_id, tenant_id) VALUES ($1, $2, $3)`,
+		roleID, permID, f.grantedTenant); err != nil {
+		t.Fatalf("grant permission to role: %v", err)
+	}
+
+	// What the switch resolves: the target tenant's owner role.
+	switchPerms := rolePermissionsInTenant(t, pool, f.grantedTenant, "owner")
+	if !hasPerm(switchPerms, "apps:write") {
+		t.Fatalf("fixture is wrong: the switch path resolves %v, expected apps:write", switchPerms)
+	}
+
+	// What the refresh resolves for the same user in the same tenant.
+	refreshPerms := refreshPermissionsFor(t, pool, f.grantAdmin, f.grantedTenant)
+	if !hasPerm(refreshPerms, "apps:write") {
+		t.Errorf("refresh resolved %v, want apps:write — a granted administrator loses their permissions at the first rotation, 403ing on every route about fifteen minutes after switching", refreshPerms)
+	}
+}
+
+// rolePermissionsInTenant is what loadAdminPermissionsForTenant resolves for a
+// grant holder: the target tenant's tenant-level role of that name.
+func rolePermissionsInTenant(t *testing.T, pool *pgxpool.Pool, tenantID int64, role string) []string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT DISTINCT p.name
+		FROM permissions p
+		JOIN role_permissions rp ON rp.permission_id = p.id
+		JOIN roles r             ON r.id = rp.role_id
+		WHERE r.tenant_id = $1 AND r.name = $2
+		  AND r.application_id IS NULL AND r.deleted_at IS NULL
+		ORDER BY 1
+	`, tenantID, role)
+	if err != nil {
+		t.Fatalf("role permissions query: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+// refreshPermissionsFor mirrors permissionsForRefresh's branch structure.
+// Kept in sync with internal/auth/tenant_context.go.
+func refreshPermissionsFor(t *testing.T, pool *pgxpool.Pool, userID, tenantID int64) []string {
+	t.Helper()
+	ctx := context.Background()
+
+	var homeTenant int64
+	if err := pool.QueryRow(ctx, `SELECT tenant_id FROM users WHERE id = $1`, userID).Scan(&homeTenant); err != nil {
+		t.Fatalf("home tenant: %v", err)
+	}
+	if homeTenant == tenantID {
+		return permissionsFor(t, pool, userID, tenantID)
+	}
+	var grantRole string
+	err := pool.QueryRow(ctx, `
+		SELECT admin_role FROM admin_grants
+		WHERE user_id = $1 AND tenant_id = $2
+		  AND deleted_at IS NULL AND activated_at IS NOT NULL
+		LIMIT 1
+	`, userID, tenantID).Scan(&grantRole)
+	if err == nil {
+		return rolePermissionsInTenant(t, pool, tenantID, grantRole)
+	}
+	return permissionsFor(t, pool, userID, homeTenant)
+}
