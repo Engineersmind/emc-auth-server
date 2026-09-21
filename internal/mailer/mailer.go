@@ -308,11 +308,27 @@ type mailerImpl struct {
 }
 
 // dispatch renders one email and sends it via the resolved transport.
+// dispatch renders and sends. The 13 real send paths call this directly, so
+// nothing here may treat a message as a test — see dispatchTest.
 func (m *mailerImpl) dispatch(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string, data TemplateData) error {
+	return m.dispatchMarked(ctx, sender, tmpl, tt, to, data, false)
+}
+
+// dispatchTest is dispatch for an admin test send: identical, except the
+// rendered message is stamped by markAsTest. A separate entry point so a real
+// notification cannot acquire the marking by accident.
+func (m *mailerImpl) dispatchTest(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string, data TemplateData) error {
+	return m.dispatchMarked(ctx, sender, tmpl, tt, to, data, true)
+}
+
+func (m *mailerImpl) dispatchMarked(ctx context.Context, sender *SMTPConfig, tmpl *Template, tt TemplateType, to string, data TemplateData, markTest bool) error {
 	b := brandingFrom(sender)
 	data.ProductName = b.ProductName
 	data.LogoURL = b.LogoURL
 	data.Email = to
+	if data.Year == 0 {
+		data.Year = time.Now().Year()
+	}
 
 	// Resolve the template: custom override → built-in default. A custom
 	// template that fails to render falls back to the built-in default.
@@ -334,6 +350,13 @@ func (m *mailerImpl) dispatch(ctx context.Context, sender *SMTPConfig, tmpl *Tem
 		} else {
 			return fmt.Errorf("render %s: %w", tt, err)
 		}
+	}
+
+	// After every render path above (custom, built-in, and the built-in
+	// fallback for a custom template that failed), so no route to the transport
+	// bypasses the marking.
+	if markTest {
+		out = markAsTest(out)
 	}
 
 	from, fromName, replyTo := m.global.From, m.global.FromName, m.global.ReplyTo
@@ -544,7 +567,7 @@ func (m *mailerImpl) SendTest(ctx context.Context, sender *SMTPConfig, tmpl *Tem
 	if tt != TemplateProviderTest && !ValidTemplateType(tt) {
 		tt = TemplateProviderTest
 	}
-	err := m.dispatch(ctx, sender, tmpl, tt, to, sampleTestData())
+	err := m.dispatchTest(ctx, sender, tmpl, tt, to, sampleTestData())
 	if err == nil {
 		m.logger.Info().Str("to", to).Str("type", string(tt)).Msg("test email sent")
 	}
@@ -630,4 +653,18 @@ func NewMailer(cfg MailerConfig) Mailer {
 		m.globalTr = &devTransport{logger: cfg.Logger}
 	}
 	return m
+}
+
+// ResolvedBranding is the branding a send from this sender would actually use,
+// exposed so a UI can show what a recipient will see rather than inferring it.
+//
+// Inferring it client-side does not work: ProductName is stored per sender row,
+// and which row wins is decided by the application → tenant → global
+// fall-through in ResolveWithScope. A screen that reads the row for its own
+// scope will confidently display a product name that the send never uses — an
+// application configured with a product name but sending through the platform's
+// default sender is branded with the platform's name, not its own.
+func ResolvedBranding(sender *SMTPConfig) (productName, logoURL, subjectPrefix string) {
+	b := brandingFrom(sender)
+	return b.ProductName, b.LogoURL, b.SubjectPrefix
 }

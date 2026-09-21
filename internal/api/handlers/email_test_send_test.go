@@ -331,32 +331,39 @@ func TestSendTestRejectsAnInvalidRecipient(t *testing.T) {
 	}
 }
 
-// ─── External recipients get built-in content only ──────────────────────────
+// ─── The saved template is what gets sent, to anyone ────────────────────────
 
-// The security fix from the review: template bodies are editable at this same
-// permission level, so an arbitrary recipient plus an arbitrary template would
-// make this a phishing relay from a verified sender identity.
-func TestSendTestForcesTheDiagnosticTemplateForExternalRecipients(t *testing.T) {
+// Replaces TestSendTestForcesTheDiagnosticTemplateForExternalRecipients, which
+// pinned the opposite: until this change an external recipient silently got the
+// provider diagnostic instead of the template the admin had just saved, with
+// nothing in the response saying so. That made the feature unable to do the one
+// thing it exists for (see SendTestEmail for the full reasoning).
+//
+// The phishing risk that restriction addressed is now carried by the test
+// marking in mailer.markAsTest — asserted directly in the mailer package, since
+// that is where the subject prefix and the body notice are applied.
+func TestSendTestSendsTheSavedTemplateToAnExternalRecipient(t *testing.T) {
 	e := newTestSendEnv(t)
 
-	rec, body := e.post(t, `{"to":"victim@elsewhere.example","template_type":"welcome"}`, false)
+	rec, body := e.post(t, `{"to":"qa-alias@elsewhere.example","template_type":"welcome"}`, false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %v", rec.Code, body)
 	}
 	call := e.mail.calls[0]
-	if call.Type != mailer.TemplateProviderTest {
-		t.Errorf("template = %q for an external recipient, want %q — attacker-authored content must not reach third parties", call.Type, mailer.TemplateProviderTest)
+	if call.Type != mailer.TemplateWelcome {
+		t.Errorf("template = %q, want %q — an admin testing a template must receive that template", call.Type, mailer.TemplateWelcome)
 	}
-	if call.Tmpl != nil {
-		t.Error("a per-scope template override was resolved for an external recipient")
+	if got, _ := body["template"].(string); got != string(mailer.TemplateWelcome) {
+		t.Errorf("response template = %q, want %q", got, mailer.TemplateWelcome)
 	}
-	if got, _ := body["template"].(string); got != string(mailer.TemplateProviderTest) {
-		t.Errorf("response template = %q, want the diagnostic template", got)
+	// The response has to say the message was marked, or the admin cannot tell
+	// a marked send from an unmarked one and we are back to guessing.
+	if marked, _ := body["marked_as_test"].(bool); !marked {
+		t.Error("marked_as_test = false; the UI cannot explain the [Test] prefix without it")
 	}
 }
 
-// Sending a real template to yourself stays available — that is the preview use
-// case, and it reaches nobody else.
+// Sending a real template to yourself stays available — the preview use case.
 func TestSendTestKeepsRealTemplatesForSelfSends(t *testing.T) {
 	e := newTestSendEnv(t)
 
@@ -366,6 +373,25 @@ func TestSendTestKeepsRealTemplatesForSelfSends(t *testing.T) {
 	}
 	if got := e.mail.calls[0].Type; got != mailer.TemplateWelcome {
 		t.Errorf("template = %q for a self-send, want %q", got, mailer.TemplateWelcome)
+	}
+}
+
+// An empty template_type is still a bare provider check, not a real account
+// email. This is the part of the #91 hardening that stays: the diagnostic is
+// not customizable, so no override is resolved for it.
+func TestSendTestStillDefaultsToTheProviderDiagnostic(t *testing.T) {
+	e := newTestSendEnv(t)
+
+	rec, body := e.post(t, `{"to":"qa-alias@elsewhere.example"}`, false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %v", rec.Code, body)
+	}
+	call := e.mail.calls[0]
+	if call.Type != mailer.TemplateProviderTest {
+		t.Errorf("template = %q with no template_type, want %q", call.Type, mailer.TemplateProviderTest)
+	}
+	if call.Tmpl != nil {
+		t.Error("a per-scope override was resolved for the diagnostic template")
 	}
 }
 
@@ -420,12 +446,16 @@ func TestSendTestDoesNotEchoRawProviderErrors(t *testing.T) {
 	}
 }
 
-// A service token carries no email, so ownEmail is "" and ANY supplied
-// recipient must count as external. Documented explicitly (PR #91 FLAG-1)
-// because the alternative reading — empty ownEmail matching an empty-ish
-// recipient, or a refactor treating "" as "self" — would silently reopen the
-// arbitrary-content path for exactly the least attributable caller.
-func TestSendTestTreatsAnyRecipientAsExternalForATokenWithNoEmail(t *testing.T) {
+// A service token carries no email, so there is no "self" for it. It used to
+// be the strictest case — every recipient counted as external, so it could
+// never send a real template (PR #91 FLAG-1). With the recipient rule gone it
+// is no longer special, and this test records that deliberately rather than
+// leaving the old guarantee silently dropped: an email-less caller CAN now send
+// a real template outward, and the marking is what keeps that safe.
+//
+// The audit record still distinguishes it — `external` is retained in the event
+// precisely so the least attributable callers stay reviewable.
+func TestSendTestSendsARealTemplateForATokenWithNoEmail(t *testing.T) {
 	e := newTestSendEnv(t)
 	e.claims.Email = "" // service token: client_id in UserID, no email claim
 
@@ -433,12 +463,11 @@ func TestSendTestTreatsAnyRecipientAsExternalForATokenWithNoEmail(t *testing.T) 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %v", rec.Code, body)
 	}
-	call := e.mail.calls[0]
-	if call.Type != mailer.TemplateProviderTest {
-		t.Errorf("template = %q, want %q — an email-less caller must never be able to send a real template outward", call.Type, mailer.TemplateProviderTest)
+	if got := e.mail.calls[0].Type; got != mailer.TemplateWelcome {
+		t.Errorf("template = %q, want %q", got, mailer.TemplateWelcome)
 	}
-	if call.Tmpl != nil {
-		t.Error("a per-scope override was resolved for an email-less caller")
+	if marked, _ := body["marked_as_test"].(bool); !marked {
+		t.Error("marked_as_test = false — the marking is the only control left here")
 	}
 }
 

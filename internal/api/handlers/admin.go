@@ -3324,6 +3324,28 @@ func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 		return nil
 	}
 
+	// The branding a send would really use, resolved the same way the send
+	// resolves it. Attached to both branches below because the question "what
+	// brand will the recipient see?" has an answer whether or not this scope has
+	// a sender row of its own — and the answer is frequently NOT this row's
+	// product name. See auth.EffectiveBranding.
+	effectiveBranding := func() *auth.EffectiveBranding {
+		sender, senderScope, err := h.senderSvc.ResolveWithScope(c.Request().Context(), tenantID, appRowID)
+		if err != nil {
+			// Non-fatal: the sender settings are still worth returning. The UI
+			// falls back to a placeholder rather than showing a wrong brand.
+			h.logger.Warn().Err(err).Msg("admin: resolve effective branding failed")
+			return nil
+		}
+		productName, logoURL, prefix := mailer.ResolvedBranding(sender)
+		return &auth.EffectiveBranding{
+			ProductName:   productName,
+			LogoURL:       logoURL,
+			SubjectPrefix: prefix,
+			Scope:         senderScope,
+		}
+	}
+
 	settings, err := h.senderSvc.Get(c.Request().Context(), tenantID, appRowID)
 	if err != nil {
 		// Not an error condition: this scope simply has no sender of its own, so
@@ -3338,9 +3360,10 @@ func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 				source = "tenant"
 			}
 			return c.JSON(http.StatusOK, auth.EmailSenderResolution{
-				Configured: false,
-				Source:     source,
-				Settings:   nil,
+				Configured:        false,
+				Source:            source,
+				Settings:          nil,
+				EffectiveBranding: effectiveBranding(),
 			})
 		}
 		h.logger.Error().Err(err).Msg("admin: get email sender failed")
@@ -3351,9 +3374,10 @@ func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 		source = "application"
 	}
 	return c.JSON(http.StatusOK, auth.EmailSenderResolution{
-		Configured: true,
-		Source:     source,
-		Settings:   settings,
+		Configured:        true,
+		Source:            source,
+		Settings:          settings,
+		EffectiveBranding: effectiveBranding(),
 	})
 }
 
@@ -3449,21 +3473,25 @@ func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "email sender removed — sends fall back to the next level"})
 }
 
-// SendTestEmailRequest is the body for POST .../email-settings/test. The
-// recipient is NOT accepted from the client — a test email is always sent to the
-// authenticated admin's own address, so this endpoint can never be abused as an
-// open relay to arbitrary addresses.
+// SendTestEmailRequest is the body for POST .../email-settings/test.
+//
+// The recipient IS accepted from the client, and the saved template is what
+// gets sent. Neither is restricted: what bounds this endpoint is the test
+// marking applied in mailer.markAsTest, not a limit on who may receive it or
+// which content may render. See PR #91 for the threat model and SendTestEmail
+// for why the marking replaced the old recipient-based restriction.
 type SendTestEmailRequest struct {
-	// TemplateType selects which template to render (empty = email_verification).
+	// TemplateType selects which template to render. Empty means the built-in
+	// provider diagnostic (mailer.TemplateProviderTest) — a bare provider check,
+	// NOT email_verification, which was the default until #91 and delivered a
+	// real-looking verification mail containing a dead sample link.
 	TemplateType string `json:"template_type"`
 	// To is the recipient. Empty = the requesting admin's own address.
 	//
-	// INVARIANT: a recipient other than the caller's own address always gets the
-	// built-in diagnostic template, never a per-scope override — see the
-	// enforcement in SendTestEmail. Template bodies are editable at this same
-	// permission level, so allowing both an arbitrary recipient and arbitrary
-	// content would make this a phishing relay from a verified sender identity.
-	// See PR #91 for the full threat model.
+	// Any valid address is accepted. The message is always stamped as a test —
+	// [Test] subject prefix plus an in-body notice, applied after rendering so a
+	// custom template cannot suppress it — so it cannot pass as a genuine
+	// product email regardless of who receives it or what the body says.
 	To string `json:"to"`
 	// AllowInherited permits an application-addressed test to proceed when the
 	// application has no sender of its own and would fall through to the
@@ -3501,6 +3529,20 @@ type SendTestEmailResponse struct {
 	Scope    string `json:"scope"`    // application | tenant | global
 	Provider string `json:"provider"` // smtp | sendgrid | dev
 	Template string `json:"template"`
+	// MarkedAsTest reports that the message was stamped with a [Test] subject
+	// prefix and an in-body test notice. Always true for this endpoint; sent
+	// explicitly so the UI can say so, rather than leaving an admin to wonder
+	// why the mail they received does not match the template they saved.
+	MarkedAsTest bool `json:"marked_as_test"`
+	// UsedCustomTemplate distinguishes "your saved template was sent" from "the
+	// built-in default was sent instead".
+	//
+	// The second happens for a reason that is invisible from the send itself: a
+	// stored template with is_active = false is skipped by Resolve, so an admin
+	// who saved a customisation while its Status toggle was off receives the
+	// default and concludes the save failed. The template screen turns this into
+	// an explanation rather than a mystery.
+	UsedCustomTemplate bool `json:"used_custom_template"`
 }
 
 // SendTestEmail handles POST .../email-settings/test and flat aliases: it sends
@@ -3578,23 +3620,28 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown template type"})
 	}
 
-	// SECURITY: an external recipient always gets the built-in diagnostic
-	// template, never a per-scope override.
+	// SECURITY: the saved template IS what goes out, to whatever recipient was
+	// asked for — and every test send is stamped as a test by the mailer.
 	//
-	// Template bodies are editable at the SAME permission level as this endpoint
-	// (PUT /email-templates/:type is apps:write), so allowing both an arbitrary
-	// recipient and an arbitrary template would let one apps:write token deliver
-	// attacker-authored HTML, with product branding, from a verified sender
-	// identity — to any address on the internet. With an inherited global
-	// sender that is the operator's shared domain, so the blast radius crosses
-	// the tenant boundary.
+	// The risk this addresses is real: template bodies are editable at the SAME
+	// permission level as this endpoint (PUT /email-templates/:type is
+	// apps:write), so one token can author HTML and choose who receives it, from
+	// a verified sender identity with product branding and SPF/DKIM passing.
+	// With an inherited global sender that is the operator's shared domain, so
+	// the blast radius crosses the tenant boundary.
 	//
-	// Restricting content rather than recipients keeps the actual use case
-	// (proving deliverability to a QA alias or a customer domain) fully intact.
-	// Template previews still work — they just go to your own mailbox.
-	if external {
-		tt = mailer.TemplateProviderTest
-	}
+	// This used to be answered by forcing the diagnostic template whenever the
+	// recipient was not the caller's own address (26d6c80, from review on #91).
+	// That defeated the feature: an admin who saved a template and sent a test
+	// received the provider diagnostic instead, with nothing in the response or
+	// the UI saying why. Auth0's equivalent ("Try") sends the saved template.
+	//
+	// The marking in mailer.markAsTest replaces it and is strictly stronger: a
+	// [Test] subject prefix and an unremovable in-body notice mean the message
+	// cannot pass as a genuine product email. It is applied post-render, so a
+	// custom template cannot opt out, and it also covers the case the recipient
+	// rule permitted — an unmarked real template sent to your own address and
+	// forwarded onward.
 
 	// Sender AND the scope it came from, in one query — see ResolveWithScope for
 	// why these must not be two separate lookups.
@@ -3608,7 +3655,29 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 	// even if a row with this type were inserted into email_templates directly.
 	var tmpl *mailer.Template
 	if tt != mailer.TemplateProviderTest {
-		tmpl = h.tmplSvc.ResolveTemplate(c.Request().Context(), tenantID, appRowID, tt)
+		// ResolveTemplateForTest, not ResolveTemplate: Status (is_active) decides
+		// whether real users receive this email, not which content a test
+		// renders. Testing a template before enabling it is the normal order of
+		// work — and every new application starts with its templates disabled,
+		// so the active-only lookup made "Send test" return the built-in default
+		// for exactly the template the admin was looking at.
+		tmpl = h.tmplSvc.ResolveTemplateForTest(c.Request().Context(), tenantID, appRowID, tt)
+
+		// A custom template that fails to render is reported, not swallowed.
+		//
+		// The send path deliberately degrades to the built-in default on a render
+		// error, so a broken template can never block a password reset. For the
+		// editor that silence was the whole problem: a template referencing one
+		// unknown variable produced the built-in email, which is
+		// indistinguishable from never having saved a template at all. The
+		// operator is told which variable broke it instead of guessing.
+		if err := mailer.ValidateTemplate(tmpl, tt); err != nil {
+			h.logger.Warn().Err(err).Str("type", string(tt)).Msg("admin: custom template failed to render for test send")
+			return c.JSON(http.StatusUnprocessableEntity, map[string]string{
+				"error":  "this template could not be rendered, so the test was not sent: " + renderErrorHint(err),
+				"detail": err.Error(),
+			})
+		}
 	}
 
 	provider := h.mailer.GlobalProvider()
@@ -3667,11 +3736,15 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		"external": external,
 	})
 	return c.JSON(http.StatusOK, SendTestEmailResponse{
-		Message:  "test email sent to " + to,
-		To:       to,
-		Scope:    scope,
-		Provider: provider,
-		Template: string(tt),
+		Message:      "test email sent to " + to,
+		To:           to,
+		Scope:        scope,
+		Provider:     provider,
+		Template:     string(tt),
+		MarkedAsTest: true,
+		// nil here means Resolve found no ACTIVE override for this scope, so the
+		// built-in went out — see UsedCustomTemplate.
+		UsedCustomTemplate: tmpl != nil,
 	})
 }
 
@@ -3902,4 +3975,22 @@ func wantsRecentEvents(c echo.Context) bool {
 		}
 	}
 	return false
+}
+
+// renderErrorHint turns a Go template error into something an operator can act
+// on. The raw text ("executing \"html\" at <.Year>: can't evaluate field Year
+// in type mailer.TemplateData") names the offending variable but buries it in
+// internals; the unknown-field case is by far the most common, so it gets a
+// sentence that says what to do. Anything else is passed through, since a parse
+// error's position is genuinely the useful part.
+func renderErrorHint(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, "can't evaluate field "); i >= 0 {
+		field := strings.TrimSpace(strings.TrimPrefix(msg[i:], "can't evaluate field "))
+		if j := strings.Index(field, " "); j > 0 {
+			field = field[:j]
+		}
+		return "{{." + field + "}} is not a variable this template provides — remove it or use one of the listed variables"
+	}
+	return msg
 }

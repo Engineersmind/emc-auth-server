@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"strings"
 	tmpltext "text/template"
+	"time"
 )
 
 // TemplateType identifies one transactional email. Every type has a built-in
@@ -164,6 +165,20 @@ type TemplateData struct {
 	// the lock does not expire on its own, which is what keeps the "you can also
 	// simply wait" sentence out of a permanent lock's email.
 	RetryMinutes int
+
+	// Year is the current year, for a copyright line in a custom template.
+	//
+	// Supplied because custom templates reach for it and there is no other way
+	// to get it: templates must not do date arithmetic, and html/template fails
+	// the whole render on an unknown field rather than emitting a blank. A
+	// footer reading "© {{.Year}} Acme" therefore did not degrade to a missing
+	// year — it silently discarded the entire custom template and sent the
+	// built-in default, which is indistinguishable from the template never
+	// having been saved.
+	//
+	// Filled centrally in dispatch, so every send path and the built-ins get it
+	// without each caller remembering.
+	Year int
 }
 
 // EmailChangeApplied is the TemplateData.Reason value that turns the
@@ -606,4 +621,112 @@ this, contact whoever administers this tenant.
 func BuiltinTemplate(t TemplateType) (Template, bool) {
 	tmpl, ok := builtinTemplates[t]
 	return tmpl, ok
+}
+
+// ---------------------------------------------------------------------------
+// Test-send marking.
+// ---------------------------------------------------------------------------
+
+// TestSubjectPrefix and the banner text below are the two things that keep an
+// admin "send test" from being usable as a phishing relay.
+//
+// The template editor and the test-send endpoint share one permission
+// (apps:write), so a caller who can pick an arbitrary recipient can also author
+// the HTML that reaches them — from a verified sender identity, with real
+// branding, SPF and DKIM passing. PR #91 flagged that relaxation; the follow-up
+// (26d6c80) answered it by forcing the built-in diagnostic template whenever
+// the recipient was not the caller's own address, which made the feature unable
+// to do the one thing it exists for: show you the template you just saved.
+//
+// Marking the message replaces that restriction and is strictly stronger. It
+// also covers the case the recipient rule allowed — sending an unmarked,
+// genuine-looking template to your own address and forwarding it onward.
+const (
+	TestSubjectPrefix = "[Test]"
+
+	testNoticeText = "This is a test email sent from the email template configuration screen. " +
+		"It was triggered by an administrator to preview a template and contains sample data. " +
+		"No action is required, and nothing in your account has changed. " +
+		"This notice does not appear in real emails."
+
+	testNoticeHeading = "Test email — not a real notification"
+)
+
+// markAsTest stamps a rendered message as a configuration test.
+//
+// Applied AFTER rendering, on purpose. A flag threaded into TemplateData would
+// be defeatable: the operator controls the template body, so a template that
+// simply never referenced the flag would render unmarked. Operating on the
+// finished subject, HTML and text means custom and built-in templates are
+// marked identically and a template cannot opt out of it.
+//
+// Only reached from SendTest. The 13 real send paths call dispatch directly and
+// are unaffected — see TestRealFlowsAreNeverMarkedAsTest.
+func markAsTest(out rendered) rendered {
+	out.Subject = TestSubjectPrefix + " " + out.Subject
+
+	// Prepended to the body rather than appended: a long template would push a
+	// footer below the fold, and the notice is worthless if it is only visible
+	// to someone who scrolls. Inline styles because email clients strip <style>
+	// blocks, and no reliance on the template's own markup.
+	banner := `<div style="margin:0 0 16px;padding:12px 16px;border:2px solid #b45309;border-radius:6px;background:#fffbeb;color:#7c2d12;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5">` +
+		`<strong style="display:block;margin-bottom:4px;font-size:15px">` + testNoticeHeading + `</strong>` +
+		testNoticeText +
+		`</div>`
+
+	// Injected after <body> when there is one so the banner lands inside the
+	// rendered document; otherwise prefixed, which is correct for a fragment.
+	if i := bodyOpenIndex(out.HTML); i >= 0 {
+		out.HTML = out.HTML[:i] + banner + out.HTML[i:]
+	} else {
+		out.HTML = banner + out.HTML
+	}
+
+	if strings.TrimSpace(out.Text) != "" {
+		out.Text = testNoticeHeading + "\n\n" + testNoticeText + "\n\n---\n\n" + out.Text
+	} else {
+		out.Text = testNoticeHeading + "\n\n" + testNoticeText
+	}
+	return out
+}
+
+// bodyOpenIndex returns the offset just past the first <body ...> tag, or -1
+// when the HTML has no body element. Case-insensitive; tolerates attributes.
+func bodyOpenIndex(html string) int {
+	lower := strings.ToLower(html)
+	start := strings.Index(lower, "<body")
+	if start < 0 {
+		return -1
+	}
+	end := strings.Index(lower[start:], ">")
+	if end < 0 {
+		return -1
+	}
+	return start + end + 1
+}
+
+// ValidateTemplate reports whether a custom template renders, returning the
+// underlying error when it does not.
+//
+// Exists because the send path's fallback is deliberately silent: dispatch logs
+// a warning and uses the built-in default so a broken template can never block
+// a password reset. That is right for real mail and wrong for the editor, where
+// it meant a template with one bad variable — `{{.Year}}` before Year existed —
+// looked exactly like a template that had never been saved. The admin sees the
+// built-in arrive, concludes the save failed, and has no way to learn that a
+// render error is the reason.
+//
+// Rendered against sampleTestData so the check matches what a test send does.
+func ValidateTemplate(tmpl *Template, tt TemplateType) error {
+	if tmpl == nil {
+		return nil // no override: the built-in default always renders
+	}
+	data := sampleTestData()
+	data.ProductName = defaultProductName
+	data.Email = "preview@example.com"
+	data.Year = time.Now().Year()
+	if _, err := tmpl.render(data); err != nil {
+		return err
+	}
+	return nil
 }
