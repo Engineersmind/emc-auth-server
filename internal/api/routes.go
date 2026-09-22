@@ -126,6 +126,17 @@ type RoutesConfig struct {
 	// AudienceScheme prefixes every per-application audience identifier
 	// (issue #131). Empty falls back to auth.AudienceSchemeDefault.
 	AudienceScheme string
+	// CaptchaEnabled is the deployment-level switch for the self-hosted CAPTCHA
+	// (issue #145). False leaves the gate inert and the challenge route
+	// answering 404 captcha_disabled, which is byte-identical to the behaviour
+	// before this feature existed.
+	CaptchaEnabled bool
+	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
+	// Required when CaptchaEnabled is true.
+	CaptchaHMACKey string
+	// CaptchaTTLSeconds is the fallback challenge lifetime, used only when the
+	// policy table could not be read.
+	CaptchaTTLSeconds int
 	// RequireAudience is the deployment-wide audience backstop (issue #132).
 	// It decides only what happens to a token carrying NO audience; a token
 	// that carries a real one is always held to its route's policy. See
@@ -694,6 +705,35 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// authorization codes, as opposed to oauthSvc above which consumes
 	// Google's and GitHub's.
 	authzSvc := auth.NewAuthorizationServer(deps.Pool, deps.Logger)
+
+	// CAPTCHA (issue #145). Constructed unconditionally so the admin policy
+	// routes work whether or not the deployment has switched the feature on —
+	// an operator must be able to see and stage a policy before enabling it.
+	//
+	// NewCaptchaService returns an error only when CaptchaEnabled is true and
+	// the HMAC key is missing or too short. That is a boot-time misconfiguration
+	// and the server refuses to start on it, rather than silently storing
+	// recoverable answers.
+	captchaPolicySvc := auth.NewCaptchaPolicyService(deps.Pool, deps.Logger)
+	captchaSvc, capErr := auth.NewCaptchaService(
+		deps.Redis,
+		captchaPolicySvc,
+		deps.Config.CaptchaHMACKey,
+		time.Duration(deps.Config.CaptchaTTLSeconds)*time.Second,
+		deps.Config.CaptchaEnabled,
+		deps.Logger,
+	)
+	if capErr != nil {
+		deps.Logger.Fatal().Err(capErr).Msg("captcha init failed — check CAPTCHA_HMAC_KEY / REDIS_URL")
+	}
+	captchaHandler := handlers.NewCaptchaHandler(captchaSvc, authzSvc, deps.Logger)
+	// So an operator's policy change applies to the next request rather than
+	// after the resolver's cache expires — which matters most in the direction
+	// nobody plans for: turning the feature off because it is blocking people.
+	adminSvc.WithCaptchaPolicy(captchaPolicySvc)
+	// The gate itself. Must come after captchaSvc exists, which is why it is here
+	// rather than in the authHandler builder chain above.
+	authHandler.WithCaptcha(captchaSvc)
 	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
 	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
 		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure)
@@ -726,6 +766,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 
 	// Auth routes — public (no JWT required)
 	authGroup := apiV1.Group("/auth")
+
+	// CAPTCHA challenge issuance (issue #145). Unauthenticated by necessity —
+	// it is called before sign-in — and CPU-bound, since it renders a PNG, which
+	// together make it an amplification target. It carries the token limiter and
+	// the per-client limiter for that reason, not merely for symmetry with the
+	// routes around it.
+	apiV1.POST("/captcha/challenge", captchaHandler.IssueChallenge,
+		mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/register", authHandler.Register)
 	// Login is rate-limited at route level (not global) to avoid impacting other endpoints.
 	authGroup.POST("/login", authHandler.Login, mw.LoginRateLimiter(rlCfg))
@@ -1156,6 +1204,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.UpdateLockoutPolicy, appUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/lockout-policy", adminHandler.DeleteLockoutPolicy, appUsersWrite)
 
+	// Captcha policy (issue #145). Carries apps:* rather than users:* — a
+	// captcha is application configuration, like the passkey relying party,
+	// not a property of anybody's account.
+	adminGroup.GET("/tenants/:tid/captcha-policy", adminHandler.GetCaptchaPolicy, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/captcha-policy", adminHandler.UpdateCaptchaPolicy, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/captcha-policy", adminHandler.DeleteCaptchaPolicy, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/captcha-policy", adminHandler.GetCaptchaPolicy, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/captcha-policy", adminHandler.UpdateCaptchaPolicy, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/captcha-policy", adminHandler.DeleteCaptchaPolicy, appAppsWrite)
+
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
 	adminGroup.PUT("/tenants/:tid/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
@@ -1438,6 +1496,25 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications/:appID/passkey-policy", adminHandler.GetApplicationPasskeyPolicy, appsRead)
 	adminGroup.PUT("/applications/:appID/passkey-policy", adminHandler.UpdateApplicationPasskeyPolicy, appsWrite)
 	adminGroup.DELETE("/applications/:appID/passkey-policy", adminHandler.DeleteApplicationPasskeyPolicy, appsWrite)
+
+	// Slug-less captcha-policy variants — the caller's own tenant, resolved from
+	// their claims rather than from the path.
+	// Platform scope — the policy the tenant-LESS sign-in flows read
+	// (/auth/login, /auth/session, /auth/login/otp). tenant:manage, because it
+	// governs the shared sign-in surface: a tenant administrator must not be
+	// able to put a captcha in front of every other tenant's console login.
+	//
+	// No DELETE: the platform row terminates resolution for every scope, so it
+	// must always exist. Disable it with enabled=false.
+	adminGroup.GET("/platform/captcha-policy", adminHandler.GetPlatformCaptchaPolicy, platformOnly)
+	adminGroup.PUT("/platform/captcha-policy", adminHandler.UpdatePlatformCaptchaPolicy, platformOnly)
+
+	adminGroup.GET("/captcha-policy", adminHandler.GetCaptchaPolicy, appsRead)
+	adminGroup.PUT("/captcha-policy", adminHandler.UpdateCaptchaPolicy, appsWrite)
+	adminGroup.DELETE("/captcha-policy", adminHandler.DeleteCaptchaPolicy, appsWrite)
+	adminGroup.GET("/applications/:appID/captcha-policy", adminHandler.GetCaptchaPolicy, appsRead)
+	adminGroup.PUT("/applications/:appID/captcha-policy", adminHandler.UpdateCaptchaPolicy, appsWrite)
+	adminGroup.DELETE("/applications/:appID/captcha-policy", adminHandler.DeleteCaptchaPolicy, appsWrite)
 
 	adminGroup.GET("/users/:uid/passkeys", adminHandler.ListUserPasskeys, usersRead)
 	adminGroup.DELETE("/users/:uid/passkeys/:pid", adminHandler.RevokeUserPasskey, usersWrite)

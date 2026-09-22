@@ -83,6 +83,16 @@ services:
       # fail to decrypt (login returns 500).
       JWT_SIGNING_KEY_ENCRYPTION_KEY: "${JWT_SIGNING_KEY_ENCRYPTION_KEY:-}"
       JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS: "${JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS:-}"
+      # CAPTCHA (issue #145). On locally so the feature can actually be
+      # exercised; the PLATFORM DEFAULT policy row is still enabled=false, so
+      # nothing demands a captcha until a policy is switched on through the
+      # admin API. Both switches are required — that is the design.
+      #
+      # The key below is a throwaway for local development. In any real
+      # deployment it comes from the environment and is at least 32 characters:
+      #   openssl rand -hex 32
+      CAPTCHA_ENABLED: "true"
+      CAPTCHA_HMAC_KEY: "local-dev-only-captcha-hmac-key-0123456789abcdef"
       SEED_DEMO_DATA: "true"
       SEED_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:9090"
       # :8080 is the passkey demo app (demo-tenant-app/). Without it the demo's
