@@ -68,6 +68,17 @@ const (
 	// week, not the next quarter.
 	importSweepInterval = 6 * time.Hour
 	importJobRetention  = 14 * 24 * time.Hour
+
+	// How many infrastructure failures one row may cost before it is written
+	// off as a rejection and the job carries on without it.
+	//
+	// An infra failure leaves the row pending so a transient blip does not
+	// become a permanent verdict, but "pending forever" is its own outage: the
+	// job never completes, and the progress response cannot distinguish a slow
+	// import from one wedged on row N. Five attempts spread over five lease
+	// cycles is roughly ten minutes of a failure reproducing identically —
+	// past that it is a property of the row or its surroundings, not weather.
+	maxImportRowAttempts = 5
 )
 
 // StartImportWorker launches the background drain and returns a stop function.
@@ -287,6 +298,11 @@ type pendingImportRow struct {
 	index     int
 	user      ImportUser
 	plaintext string
+	// attempts already spent on this row before this one. Zero on the first
+	// pass; non-zero means a worker — this one on an earlier pass, or whoever
+	// held the lease before it turned over — hit an infrastructure failure
+	// here and left the row pending for a retry.
+	attempts int
 }
 
 // nextImportRow reads the job's next unprocessed row.
@@ -308,7 +324,7 @@ func (s *Service) nextImportRow(ctx context.Context, jobID int64, workerID strin
 	var blob []byte
 	var pw *string
 	err := s.pool.QueryRow(ctx, `
-		SELECT r.id, r.row_index, r.payload, r.plaintext_password
+		SELECT r.id, r.row_index, r.payload, r.plaintext_password, r.attempts
 		FROM user_import_job_rows r
 		JOIN user_import_jobs j ON j.id = r.job_id
 		WHERE r.job_id = $1
@@ -317,7 +333,7 @@ func (s *Service) nextImportRow(ctx context.Context, jobID int64, workerID strin
 		  AND j.locked_by = $2
 		ORDER BY r.row_index
 		LIMIT 1
-	`, jobID, workerID).Scan(&r.id, &r.index, &blob, &pw)
+	`, jobID, workerID).Scan(&r.id, &r.index, &blob, &pw, &r.attempts)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -385,11 +401,36 @@ func (s *Service) processImportRow(
 		// 10,000-row job wrote off every remaining row as invalid and the
 		// operator's only recourse was to re-upload the whole file and hope.
 		//
-		// Returning false stops the job rather than grinding the rest of the
-		// file through the same broken connection.
-		log.Error().Err(infra).Int("row", row.index).
-			Msg("import worker: row left pending after an infrastructure failure")
-		return false
+		// But an unbounded retry is the mirror-image failure. A row that fails
+		// the same way every time — an application deleted mid-import, a value
+		// the database will never accept — leaves the job in `running` forever,
+		// reclaimed every lease TTL, with nothing in the progress response
+		// separating "slow" from "stuck on row N since Tuesday". So the attempt
+		// is counted, and past the bound the row is written off as a rejection
+		// carrying the failure that caused it, and the job moves on.
+		//
+		// Retrying stays free for the transient case, which is the common one:
+		// maxImportRowAttempts blips in a row on the same row is already not a
+		// blip.
+		attempt := row.attempts + 1
+		if attempt < maxImportRowAttempts {
+			if err := s.recordImportRowFailure(ctx, row.id, infra); err != nil {
+				log.Error().Err(err).Int("row", row.index).
+					Msg("import worker: row attempt write failed")
+				return false
+			}
+			log.Warn().Err(infra).Int("row", row.index).Int("attempt", attempt).
+				Msg("import worker: row left pending after an infrastructure failure")
+			// Returning false stops the job rather than grinding the rest of
+			// the file through the same broken connection.
+			return false
+		}
+
+		log.Error().Err(infra).Int("row", row.index).Int("attempt", attempt).
+			Msg("import worker: row rejected after repeated infrastructure failures")
+		outcome, reason = ImportOutcomeReject, fmt.Sprintf(
+			"could not be applied after %d attempts — the row was not imported; retry it once the cause is resolved",
+			attempt)
 	}
 
 	// The credentials are erased in the same statement that records the
@@ -453,6 +494,28 @@ func (s *Service) claimImportRow(ctx context.Context, jobID, rowID int64, worker
 	return ok, nil
 }
 
+// recordImportRowFailure counts one infrastructure failure against a row and
+// stores its cause, leaving the row pending for a retry.
+//
+// The count is what bounds the retry; the cause is what makes a stuck row
+// diagnosable. They are written together because a count with no cause tells an
+// operator that something failed four times and nothing about what.
+//
+// last_error is deliberately not the row's `reason`: `reason` is the verdict an
+// operator reads in the report, and a driver error string carries connection
+// details and constraint names that have no place there. This column is only
+// read by an administrator looking into a job that has stopped making progress.
+func (s *Service) recordImportRowFailure(ctx context.Context, rowID int64, cause error) error {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE user_import_job_rows
+		SET attempts = attempts + 1, last_error = $2
+		WHERE id = $1
+	`, rowID, cause.Error()); err != nil {
+		return fmt.Errorf("record import row failure: %w", err)
+	}
+	return nil
+}
+
 // applyImportRow performs one row's database work and returns its verdict.
 //
 // A non-nil infra error means the row could not be judged — the database was
@@ -497,21 +560,44 @@ func (s *Service) applyImportRow(
 		if err := s.updateImportedUser(ctx, job.tenantID, existing.id, u, role); err != nil {
 			return "", "", fmt.Errorf("update user: %w", err)
 		}
-		if changed && s.authSvc != nil {
-			// A role change does not reach an already-issued access token:
-			// permissions are baked in at login. Without this the demotion is
-			// advisory until the token expires.
-			//
-			// Returns nothing by design and logs its own Redis failures
-			// (session denylist: account-wide write failed), with the same
-			// fail-open posture every other caller gets. Not fatal to the row:
-			// the role change is committed, and the denial has no retry to
-			// offer — the window it leaves is one access-token lifetime.
-			s.authSvc.DenyUserSessions(ctx, existing.id, job.tenantID)
-			return ImportOutcomeUpdate, fmt.Sprintf("role %s → %s",
-				displayRole(existing.roleName), displayRole(newRole)), nil
+		if !changed {
+			return ImportOutcomeUpdate, "profile updated; role unchanged", nil
 		}
-		return ImportOutcomeUpdate, "profile updated; role unchanged", nil
+
+		// The reason is computed from the role diff alone, exactly as the dry
+		// run computes it (see runImport). It was previously written inside the
+		// authSvc branch, which meant a deployment that had not wired the auth
+		// service reported a real demotion back to the operator as "role
+		// unchanged" — the preview and the commit disagreeing about what the
+		// same file did, in the direction that hides it. What the report says
+		// happened must not depend on whether a collaborator is present.
+		reason := fmt.Sprintf("role %s → %s",
+			displayRole(existing.roleName), displayRole(newRole))
+
+		if s.authSvc == nil {
+			// Not fatal — the role change is committed and correct — but the
+			// user keeps an access token carrying the old permissions until it
+			// expires, so this is a real gap and is logged as one rather than
+			// skipped in silence. routes.go wires the auth service; reaching
+			// here in production means that wiring was lost.
+			s.logger.Error().
+				Int64("user_id", existing.id).Int64("tenant_id", job.tenantID).
+				Str("from", existing.roleName).Str("to", newRole).
+				Msg("import worker: role changed without session revocation — auth service not wired")
+			return ImportOutcomeUpdate, reason, nil
+		}
+
+		// A role change does not reach an already-issued access token:
+		// permissions are baked in at login. Without this the demotion is
+		// advisory until the token expires.
+		//
+		// Returns nothing by design and logs its own Redis failures
+		// (session denylist: account-wide write failed), with the same
+		// fail-open posture every other caller gets. Not fatal to the row:
+		// the role change is committed, and the denial has no retry to
+		// offer — the window it leaves is one access-token lifetime.
+		s.authSvc.DenyUserSessions(ctx, existing.id, job.tenantID)
+		return ImportOutcomeUpdate, reason, nil
 	}
 
 	if err := s.insertImportedUser(ctx, job.tenantID, job.applicationID, email, u, roleID); err != nil {
