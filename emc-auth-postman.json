@@ -950,7 +950,7 @@
           }
         },
         {
-          "name": "Login - wrong answer (expect 401 captcha_invalid)",
+          "name": "Login - wrong answer (expect 428 captcha_invalid)",
           "event": [
             {
               "listen": "test",
@@ -958,7 +958,7 @@
                 "exec": [
                   "// The gate runs BEFORE the credential check, so this is",
                   "// captcha_invalid rather than invalid credentials - and no bcrypt ran.",
-                  "pm.test('401', () => pm.response.to.have.status(401));",
+                  "pm.test('428', () => pm.response.to.have.status(428));",
                   "pm.test('captcha_invalid', () =>",
                   "  pm.expect(pm.response.json().error).to.eql('captcha_invalid'));"
                 ],

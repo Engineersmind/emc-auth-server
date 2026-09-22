@@ -125,7 +125,31 @@ func (s *Service) GetCaptchaPolicy(ctx context.Context, tenantID int64, applicat
 	default:
 		view.Scope = "platform"
 	}
-	view.Inherited = (applicationID != nil && rowApp == nil) || rowTenant == nil
+	// Inherited means "no row exists at the scope that was ASKED FOR", which is
+	// what tells the console whether editing creates a row and whether a
+	// "reset to inherited" DELETE has anything to remove.
+	//
+	// The old one-liner — (applicationID != nil && rowApp == nil) || rowTenant == nil
+	// — got the platform scope wrong. A platform request has rowTenant nil by
+	// definition (the row's tenant_id IS NULL), so the second clause always fired
+	// and GET /platform/captcha-policy reported inherited: true for a row that
+	// plainly exists and has no DELETE endpoint at all. The console renders
+	// "Reset to inherited" off this field, so it would have offered to remove
+	// something unremovable. Reported by Copilot on PR #147; the symptom was
+	// visible in a manual run before anyone read the formula.
+	switch {
+	case applicationID != nil:
+		// Application scope: inherited unless an application row answered.
+		view.Inherited = rowApp == nil
+	case tenantID != 0:
+		// Tenant scope: inherited unless a tenant row answered.
+		view.Inherited = rowTenant == nil
+	default:
+		// Platform scope. Reaching here at all means a row answered — the
+		// no-rows case returned platformFallbackCaptchaView above — and that row
+		// IS the requested scope, so nothing was inherited.
+		view.Inherited = false
+	}
 	return &view, nil
 }
 

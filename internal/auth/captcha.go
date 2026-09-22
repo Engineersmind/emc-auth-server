@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -133,6 +134,14 @@ type CaptchaService struct {
 	// defaultTTL applies when a resolved policy carries none, which happens only
 	// on the degraded path where the policy table could not be read.
 	defaultTTL time.Duration
+
+	// redisUp caches the last Redis reachability probe, and lastProbe is when it
+	// was taken (UnixNano). Only 'always' mode reads them — see gateArmed.
+	//
+	// Cached rather than probed per request because this sits on the login path:
+	// at most one PING per captchaRedisProbeInterval, whatever the request rate.
+	redisUp   atomic.Bool
+	lastProbe atomic.Int64
 }
 
 // NewCaptchaService wires a captcha service.
@@ -161,14 +170,18 @@ func NewCaptchaService(
 	if defaultTTL <= 0 {
 		defaultTTL = DefaultCaptchaPolicy.TTL
 	}
-	return &CaptchaService{
+	svc := &CaptchaService{
 		redis:      redisCli,
 		policy:     policy,
 		logger:     logger,
 		hmacKey:    []byte(hmacKey),
 		enabled:    enabled,
 		defaultTTL: defaultTTL,
-	}, nil
+	}
+	// Optimistic start: a healthy deployment must behave exactly as before, and
+	// the first probe corrects this within captchaRedisProbeInterval if not.
+	svc.redisUp.Store(true)
+	return svc, nil
 }
 
 // Enabled reports whether the deployment-level switch is on. Handlers use it to
@@ -324,7 +337,15 @@ func (s *CaptchaService) Check(ctx context.Context, req CaptchaRequest) error {
 // limiters are the tiers that must fail closed, and they do.
 func (s *CaptchaService) gateArmed(ctx context.Context, policy CaptchaPolicy, req CaptchaRequest) bool {
 	if policy.Mode == CaptchaModeAlways {
-		return true
+		// NOT an unconditional true. In 'always' mode nothing else on this path
+		// touches Redis, so with Redis down the gate armed, Issue could not
+		// store a challenge, verify could not consume one, and every protected
+		// request answered 428 with no way for any caller to satisfy it — a
+		// total login outage for the scope, which is the exact outcome the
+		// fail-open design elsewhere in this file exists to prevent. Adaptive
+		// mode never had the bug because its Redis GET already failed open.
+		// Reported by Copilot on PR #147.
+		return s.redisReachable(ctx)
 	}
 	if req.IP == "" {
 		// No usable origin means the adaptive counter has nothing to key on.
@@ -341,6 +362,34 @@ func (s *CaptchaService) gateArmed(ctx context.Context, policy CaptchaPolicy, re
 		return false
 	}
 	return n >= policy.TriggerAfterFailures
+}
+
+// captchaRedisProbeInterval is how long one Redis reachability result is reused.
+//
+// One second: long enough that a burst of sign-ins costs a single PING, short
+// enough that recovery is visible almost immediately. The window is the maximum
+// time 'always' mode can keep demanding challenges after Redis has gone away.
+const captchaRedisProbeInterval = time.Second
+
+// redisReachable reports whether Redis answered recently, probing at most once
+// per captchaRedisProbeInterval.
+//
+// Two goroutines can probe concurrently on expiry. That is harmless — they write
+// the same answer — and cheaper than holding a lock across a network call on the
+// authentication path.
+func (s *CaptchaService) redisReachable(ctx context.Context) bool {
+	now := time.Now().UnixNano()
+	if now-s.lastProbe.Load() < int64(captchaRedisProbeInterval) {
+		return s.redisUp.Load()
+	}
+	err := s.redis.Ping(ctx).Err()
+	s.redisUp.Store(err == nil)
+	s.lastProbe.Store(now)
+	if err != nil {
+		s.logger.Warn().Err(err).
+			Msg("captcha: redis unreachable, always-mode gate opens rather than blocking sign-in")
+	}
+	return err == nil
 }
 
 // verify checks a submitted answer and burns the challenge.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -189,6 +190,14 @@ type CaptchaPolicyService struct {
 	cache map[captchaPolicyKey]cachedCaptchaPolicy
 	ttl   time.Duration
 
+	// gen is bumped by InvalidateCache. A load that started before an
+	// invalidation must not publish its now-stale result afterwards — see
+	// Resolve. Without it, an operator disabling a policy during an incident
+	// could have the old one re-cached a moment later by a request already in
+	// flight, and stay live for up to captchaPolicyCacheTTL. Reported by
+	// Copilot on PR #147.
+	gen atomic.Uint64
+
 	// reload collapses concurrent misses on the same scope into one query.
 	//
 	// Without it, InvalidateCache — which replaces the WHOLE cross-tenant map on
@@ -268,13 +277,22 @@ func (s *CaptchaPolicyService) Resolve(ctx context.Context, tenantID int64, appl
 	// each re-take the write lock to store the same value.
 	cacheKey := fmt.Sprintf("%d:%d", key.tenantID, key.applicationID)
 	res, err, _ := s.reload.Do(cacheKey, func() (any, error) {
+		// Read the generation BEFORE the query, so any invalidation that lands
+		// while it runs is detectable afterwards.
+		startGen := s.gen.Load()
 		policy, lErr := s.load(ctx, tenantID, applicationID)
 		if lErr != nil {
 			return nil, lErr
 		}
 		s.mu.Lock()
-		s.cache[key] = cachedCaptchaPolicy{policy: policy, cachedAt: time.Now()}
+		if s.gen.Load() == startGen {
+			s.cache[key] = cachedCaptchaPolicy{policy: policy, cachedAt: time.Now()}
+		}
 		s.mu.Unlock()
+		// Returned to THIS caller either way. The value was correct when it was
+		// read, and refusing to answer would fail a live request to avoid
+		// reusing a value that is at most one query old; only the caching of it
+		// is suppressed, so the next request re-reads.
 		return policy, nil
 	})
 	if err != nil {
@@ -374,6 +392,9 @@ func (s *CaptchaPolicyService) InvalidateCache() {
 	if s == nil {
 		return
 	}
+	// Bump before clearing, so a load already in flight sees the new generation
+	// when it goes to publish and drops its result instead of repopulating.
+	s.gen.Add(1)
 	s.mu.Lock()
 	s.cache = make(map[captchaPolicyKey]cachedCaptchaPolicy)
 	s.mu.Unlock()

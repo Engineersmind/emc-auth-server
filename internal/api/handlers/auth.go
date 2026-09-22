@@ -1557,7 +1557,7 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 	// Client authentication has already run, so this is the one protected flow
 	// where the real tenant and application scope are known at gate time.
 	//
-	// A refused captcha returns 401, NOT the generic 200. That is deliberate and
+	// A refused captcha returns 428, NOT the generic 200. That is deliberate and
 	// it leaks nothing: the refusal depends only on this origin's recent failure
 	// count and on whether an answer was supplied — never on whether the address
 	// is registered. Answering 200 here would be worse than useless, since the
