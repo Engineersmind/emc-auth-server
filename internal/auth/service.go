@@ -2108,7 +2108,17 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("fetch user for refresh: %w", err)
 	}
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	// permissionsForRefresh, not loadPermissions: the identity check above
+	// admits a grant-holder or platform administrator acting OUTSIDE their home
+	// tenant, and loadPermissions answers from the home role regardless of the
+	// tenant asked about. Pairing a widened identity check with the narrow
+	// permission load is what produced #142 on the locking path — a granted
+	// administrator whose rotated token carried either nothing (403 on every
+	// route a quarter-hour after switching) or, for a user with a broader home
+	// role, that role's permissions inside a tenant they were granted less in.
+	// This path is POST /oauth/token with grant_type=refresh_token, so it is the
+	// common rotation, not an edge case.
+	perms, err := s.permissionsForRefresh(ctx, userID, tenantID)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions, continuing with empty set")
 		perms = []string{}
@@ -2191,7 +2201,13 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, se
 		return nil, fmt.Errorf("fetch user for grace window: %w", err)
 	}
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	// permissionsForRefresh for the same reason as the refresh path above, and
+	// with less margin for error: GraceResult.Permissions is applied to the
+	// in-flight request directly through graceToAuthClaims, with no token
+	// minting or signature step in between. A losing side of a concurrent
+	// rotation would otherwise have the wrong permission set applied to the
+	// request it is serving right now.
+	perms, err := s.permissionsForRefresh(ctx, userID, tenantID)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("grace window: failed to load permissions")
 		perms = []string{}

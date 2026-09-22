@@ -33,6 +33,25 @@ func ExportedPermissionsForRefresh(pool *pgxpool.Pool, logger zerolog.Logger, ct
 	return NewAuthService(pool, nil, logger).permissionsForRefresh(ctx, userID, tenantID)
 }
 
+// ExportedCheckGraceWindow calls the production checkGraceWindow.
+//
+// Exported so a test can assert what the CALL SITE resolves rather than what
+// permissionsForRefresh resolves in isolation. That distinction is the whole
+// point: permissionsForRefresh was already correct and already covered, while
+// this path and Refresh still called loadPermissions, so every existing test
+// passed with the bug in place (raised in review on #143).
+//
+// This one matters most of the three — GraceResult.Permissions is applied to
+// the in-flight request directly through graceToAuthClaims, with no token
+// minting or signature verification in between.
+func ExportedCheckGraceWindow(pool *pgxpool.Pool, logger zerolog.Logger, ctx context.Context, userID, tenantID, sessionID int64) ([]string, error) {
+	res, err := NewAuthService(pool, nil, logger).checkGraceWindow(ctx, userID, tenantID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return res.Permissions, nil
+}
+
 // ExportedRefreshUserLoad runs the refresh path's user load — the WHERE clause
 // that decides whether a rotation may proceed at all — and reports whether the
 // user was found for this tenant.
