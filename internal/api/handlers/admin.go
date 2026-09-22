@@ -1045,7 +1045,7 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 // DeleteRole handles DELETE /api/v1/admin/roles/:id.
 //
 // @Summary      Delete role
-// @Description  Deletes a non-system role from the tenant. Users assigned this role will have their role cleared. Requires admin:access.
+// @Description  Soft-deletes a non-system role. The role stops being listed, assignable, and grantable at registration, and its permissions are revoked: every user holding it has their role cleared and their active sessions signed out, so the loss of permissions takes effect immediately. The response reports how many users were detached, and the audit record names them. Requires admin:access.
 // @Tags         admin-rbac
 // @Produce      json
 // @Security     BearerAuth
@@ -1064,15 +1064,52 @@ func (h *AdminHandler) DeleteRole(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
 
-	if err := h.svc.DeleteRole(c.Request().Context(), tenantID, roleID); err != nil {
+	holders, err := h.svc.DeleteRole(c.Request().Context(), tenantID, roleID)
+	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found or is a system role"})
 		}
 		h.logger.Error().Err(err).Msg("admin: delete role failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", strconv.FormatInt(roleID, 10))
-	return c.JSON(http.StatusOK, map[string]string{"message": "role deleted"})
+	h.auditRoleDeleted(c, claims, roleID, holders)
+	return c.JSON(http.StatusOK, map[string]string{
+		"message":        "role deleted",
+		"users_detached": strconv.Itoa(len(holders)),
+	})
+}
+
+// auditRoleDeleted records a role deletion together with the accounts it
+// stripped.
+//
+// The holder list is the point. Deleting a role takes permissions away from
+// everyone holding it, and without recording who that was at the moment of
+// deletion the question "what did this account lose, and when" has no answer
+// afterwards — users.role_id has already been detached and the role_permissions
+// rows are gone. The event itself already existed; what it lacked was the blast
+// radius.
+//
+// Truncated at 100 ids. A role held by thousands would otherwise write an audit
+// row large enough to matter, and the count carries the magnitude for anything
+// past that; the individual accounts are recoverable from the deny entries and
+// the session log.
+func (h *AdminHandler) auditRoleDeleted(c echo.Context, claims *auth.Claims, roleID int64, holders []int64) {
+	const maxLogged = 100
+	meta := map[string]any{"users_detached": len(holders)}
+	if len(holders) > 0 {
+		logged := holders
+		if len(logged) > maxLogged {
+			logged = logged[:maxLogged]
+			meta["user_ids_truncated"] = true
+		}
+		ids := make([]string, 0, len(logged))
+		for _, id := range logged {
+			ids = append(ids, strconv.FormatInt(id, 10))
+		}
+		meta["user_ids"] = ids
+	}
+	h.auditAdminAppMeta(c, claims, audit.ActionAdminRoleDeleted, "role",
+		strconv.FormatInt(roleID, 10), nil, meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -1380,8 +1417,17 @@ func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 
 // AssignUserRole handles PUT /api/v1/admin/users/:id/role.
 //
-// @Summary      Assign role to user
-// @Description  Sets the user's role within the tenant. Requires admin:access.
+// REPLACES the user's role; it does not add one. The name reads additive and the
+// four routes that reach it are all PUT on a singular noun, which is the honest
+// signal — but a caller who sends two roles expecting both keeps only the second,
+// with no error. There is no additive form today; the schema holds one role.
+//
+// Every live session for the user is denied once the change commits, so the new
+// permissions take effect on the next request rather than whenever the old access
+// token happens to expire. See admin.AssignUserRole.
+//
+// @Summary      Replace a user's role
+// @Description  Replaces the user's role within the tenant. This is a replacement, not an addition: the user ends up holding exactly the role given, and any role they held before is discarded. Sending two roles in sequence leaves only the second. Every active session for the user is signed out so the change takes effect immediately; clients holding a refresh token can obtain a correctly-scoped token without the user re-authenticating. Requires admin:access.
 // @Tags         admin-users
 // @Accept       json
 // @Produce      json
@@ -2602,7 +2648,7 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 // TenantDeleteRole handles DELETE /api/v1/admin/tenants/:tid/roles/:rid.
 //
 // @Summary      Delete a role from a target tenant
-// @Description  Permanently deletes a role from the target tenant. Requires tenant:manage.
+// @Description  Soft-deletes a role from the target tenant. The role stops being listed, assignable, and grantable at registration, and its permissions are revoked: every user holding it has their role cleared and their active sessions signed out. The response reports how many users were detached, and the audit record names them. Requires tenant:manage.
 // @Tags         admin-cross-tenant
 // @Produce      json
 // @Security     BearerAuth
@@ -2620,7 +2666,8 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
-	if err := h.svc.DeleteRole(c.Request().Context(), tid, rid); err != nil {
+	holders, err := h.svc.DeleteRole(c.Request().Context(), tid, rid)
+	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found or is a system role"})
 		}
@@ -2628,8 +2675,11 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", strconv.FormatInt(rid, 10))
-	return c.JSON(http.StatusOK, map[string]string{"message": "role deleted"})
+	h.auditRoleDeleted(c, claims, rid, holders)
+	return c.JSON(http.StatusOK, map[string]string{
+		"message":        "role deleted",
+		"users_detached": strconv.Itoa(len(holders)),
+	})
 }
 
 // --- Users under a tenant ---

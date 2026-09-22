@@ -1373,7 +1373,7 @@ func (s *WebAuthnService) resolveByCredential(ctx context.Context, rawID, userHa
 		FROM webauthn_credentials wc
 		JOIN users u  ON u.id = wc.user_id
 		JOIN webauthn_user_handles wh ON wh.user_id = wc.user_id
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		JOIN tenants t ON t.id = u.tenant_id
 		WHERE wc.credential_id = $1
 		  AND wc.rp_id = $2

@@ -1265,6 +1265,7 @@ func (s *Service) ListRoles(ctx context.Context, tenantID int64, applicationID *
 		FROM roles
 		WHERE tenant_id = $1
 		  AND ($2::BIGINT IS NULL OR application_id = $2)
+		  AND deleted_at IS NULL
 		ORDER BY name
 	`, tenantID, applicationID)
 	if err != nil {
@@ -1320,7 +1321,10 @@ func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID in
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var roleAppID *int64
-	err = tx.QueryRow(ctx, `SELECT application_id FROM roles WHERE id = $1 AND tenant_id = $2`, roleID, tenantID).Scan(&roleAppID)
+	err = tx.QueryRow(ctx,
+		`SELECT application_id FROM roles
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		roleID, tenantID).Scan(&roleAppID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -1358,6 +1362,7 @@ func (s *Service) UpdateRoleName(ctx context.Context, tenantID, applicationID, r
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE roles SET name = $1, updated_at = NOW()
 		WHERE id = $2 AND tenant_id = $3 AND application_id = $4 AND is_system = false
+		  AND deleted_at IS NULL
 	`, name, roleID, tenantID, applicationID)
 	if err != nil {
 		if isDuplicateErr(err) {
@@ -1371,18 +1376,118 @@ func (s *Service) UpdateRoleName(ctx context.Context, tenantID, applicationID, r
 	return s.getRoleByID(ctx, tenantID, roleID)
 }
 
-// DeleteRole removes a role from the tenant.
-func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) error {
-	ct, err := s.pool.Exec(ctx, `
-		DELETE FROM roles WHERE id = $1 AND tenant_id = $2 AND is_system = false
+// DeleteRole soft-deletes a role and detaches everything that pointed at it,
+// returning the ids of the users who held it.
+//
+// Soft, not hard, for the reason roles.deleted_at was added in 00020 and the
+// reason resolveRegistrationTenant already filters on it: a real DELETE leaves no
+// record of what the holders held. Dropping 500 users to zero permissions in one
+// statement, with no way to answer "what did this role grant, and to whom" a day
+// later, is not an operation an identity provider should offer. The returned ids
+// are what lets the caller audit the blast radius.
+//
+// The cost of going soft is that every FK cascade stops firing, so this does
+// their work explicitly, in one transaction:
+//
+//   - role_permissions was ON DELETE CASCADE (00006). Without the explicit
+//     DELETE the grants survive, and because loadPermissions resolves
+//     users.role_id -> role_permissions the role would go on granting its full
+//     permission set to every holder — deleting a role would GRANT permissions
+//     rather than revoke them. This is the single most dangerous consequence of
+//     the change and the reason the DELETE is not optional.
+//   - users.role_id was ON DELETE SET NULL (00008). Without the explicit UPDATE
+//     holders keep pointing at the tombstone, and the twelve
+//     `LEFT JOIN roles r ON r.id = u.role_id` sites emit a deleted role's name
+//     into the `role` JWT claim.
+//   - tenant_admins.previous_role_id was ON DELETE SET NULL (00063). Without the
+//     explicit UPDATE, RemoveTenantAdmin restores a deleted role onto a
+//     de-administered user, defeating the escalation fix 00063 exists to provide.
+//
+// is_default is cleared in the same UPDATE so the tombstone stops occupying the
+// one-default-per-application slot; 00088 also narrows that index, and both are
+// deliberate — see the migration.
+//
+// Sessions are denied for every holder after the commit, on the same reasoning
+// as AssignUserRole: their tokens carry permissions this role no longer grants.
+func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) ([]int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin delete role tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Soft-delete first: its RowsAffected is what distinguishes "no such role",
+	// "already deleted", and "system role" from a live one, and doing it before
+	// the detaching writes means an ineligible role costs nothing.
+	ct, err := tx.Exec(ctx, `
+		UPDATE roles SET deleted_at = NOW(), is_default = false, updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND is_system = false AND deleted_at IS NULL
 	`, roleID, tenantID)
 	if err != nil {
-		return fmt.Errorf("delete role: %w", err)
+		return nil, fmt.Errorf("delete role: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	return nil
+
+	// Collected before the detach, for the same reason RevokeAllUserSessions
+	// counts before revoking: afterwards there is nobody left to collect.
+	// Soft-deleted users are excluded — they hold no sessions to deny and do not
+	// belong in an audit record of who was affected.
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM users
+		WHERE role_id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		ORDER BY id
+	`, roleID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("delete role: collect holders: %w", err)
+	}
+	holders := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("delete role: scan holder: %w", err)
+		}
+		holders = append(holders, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("delete role: iterate holders: %w", err)
+	}
+
+	// Standing in for FK2, ON DELETE CASCADE.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM role_permissions WHERE role_id = $1`, roleID); err != nil {
+		return nil, fmt.Errorf("delete role: strip permissions: %w", err)
+	}
+
+	// Standing in for FK1, ON DELETE SET NULL. Not scoped to the holders read
+	// above: that read excludes soft-deleted users, and leaving their role_id
+	// dangling would resurrect the deleted role's name on their next admin-API
+	// appearance.
+	if _, err := tx.Exec(ctx,
+		`UPDATE users SET role_id = NULL, updated_at = NOW()
+		 WHERE role_id = $1 AND tenant_id = $2`, roleID, tenantID); err != nil {
+		return nil, fmt.Errorf("delete role: detach holders: %w", err)
+	}
+
+	// Standing in for FK3, ON DELETE SET NULL. NULL is 00063's documented
+	// fail-closed restore value.
+	if _, err := tx.Exec(ctx,
+		`UPDATE tenant_admins SET previous_role_id = NULL
+		 WHERE previous_role_id = $1 AND tenant_id = $2`, roleID, tenantID); err != nil {
+		return nil, fmt.Errorf("delete role: clear previous-role references: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit delete role: %w", err)
+	}
+
+	for _, uid := range holders {
+		s.denyUserSessions(ctx, uid, tenantID, "role deleted")
+	}
+	return holders, nil
 }
 
 // SetDefaultRole marks roleID as the default role for applicationID, clearing
@@ -1398,8 +1503,11 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 
 	var isSystem bool
 	var appID *int64
+	// deleted_at IS NULL: a soft-deleted role must not become an application's
+	// default, which would hand it to every user who registers afterwards.
 	err = tx.QueryRow(ctx, `
-		SELECT is_system, application_id FROM roles WHERE id = $1 AND tenant_id = $2
+		SELECT is_system, application_id FROM roles
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, roleID, tenantID).Scan(&isSystem, &appID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1411,6 +1519,13 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 		return ErrSystemRole
 	}
 
+	// Deliberately NOT filtered on deleted_at, unlike every other statement in
+	// this function. This is what frees the one-default-per-application slot, and
+	// a soft-deleted row that still carried is_default = true would hold that slot
+	// against the UPDATE below. DeleteRole clears the flag and 00088 narrows the
+	// index, so such a row should not exist — but this statement is the only thing
+	// that can unstick one written before either landed, and filtering it here
+	// would turn that stale row into a permanent 23505 on this application.
 	_, err = tx.Exec(ctx, `
 		UPDATE roles SET is_default = false
 		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
@@ -1421,7 +1536,7 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 
 	_, err = tx.Exec(ctx, `
 		UPDATE roles SET is_default = true
-		WHERE id = $1 AND tenant_id = $2 AND application_id = $3
+		WHERE id = $1 AND tenant_id = $2 AND application_id = $3 AND deleted_at IS NULL
 	`, roleID, tenantID, applicationID)
 	if err != nil {
 		return fmt.Errorf("set default role: %w", err)
@@ -1475,7 +1590,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at,
 		       `+userEnrichmentColumns+`
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.tenant_id = $1
 		  AND u.deleted_at IS NULL
 		  AND ($2::BIGINT IS NULL OR u.application_id = $2)
@@ -1546,8 +1661,11 @@ func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID 
 	if roleID != nil {
 		var roleAppID *int64
 		var roleIsSystem bool
+		// deleted_at IS NULL for the same reason as AssignUserRole: creating a user
+		// straight onto a soft-deleted role is the same defect by another door.
 		err := s.pool.QueryRow(ctx,
-			`SELECT application_id, is_system FROM roles WHERE id = $1 AND tenant_id = $2`,
+			`SELECT application_id, is_system FROM roles
+			 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 			*roleID, tenantID,
 		).Scan(&roleAppID, &roleIsSystem)
 		if err != nil {
@@ -1716,11 +1834,29 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID int64, applicationID 
 // is "super_admin", so the same call would confer tenant:manage — authority over
 // every tenant.
 // applicationID optionally pins the user lookup to one application.
+//
+// REPLACEMENT, NOT ADDITION. The user ends up holding exactly roleID; whatever
+// they held before is discarded. The route is a PUT on a singular noun, which
+// says so, but the name reads like "add a role" and the schema permits only one
+// — so calling this twice with two different roles leaves the user holding the
+// second alone, with no error and no warning. There is no additive form. When
+// one arrives it will be a POST to a plural collection, not this.
+//
+// Every live session is denied once the new role is committed. Permissions are
+// baked into the JWT at login by loadPermissions and read from claims.Permissions
+// by the middleware; nothing re-reads the database per request. Without the deny,
+// a demotion is invisible to enforcement until the access token expires, so a
+// user demoted from admin to viewer goes on exercising admin permissions for the
+// remainder of its TTL (#146).
 func (s *Service) AssignUserRole(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64) error {
 	var roleAppID *int64
 	var roleIsSystem bool
+	// deleted_at IS NULL, so a soft-deleted role is ErrNotFound rather than
+	// assignable. DeleteRole is a soft delete as of #146; without this predicate
+	// its tombstones stay fully grantable through this path.
 	err := s.pool.QueryRow(ctx,
-		`SELECT application_id, is_system FROM roles WHERE id = $1 AND tenant_id = $2`,
+		`SELECT application_id, is_system FROM roles
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		roleID, tenantID,
 	).Scan(&roleAppID, &roleIsSystem)
 	if err != nil {
@@ -1760,7 +1896,43 @@ func (s *Service) AssignUserRole(ctx context.Context, tenantID int64, applicatio
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
 	}
+
+	// After the write lands, never before: the denylist entry cannot be rolled
+	// back, so denying sessions for a role change that then failed would sign a
+	// user out on the strength of a write that never happened. Same ordering and
+	// same reasoning as RevokeAllUserSessions.
+	//
+	// Deliberately NOT a users.token_version bump. That counter reads like the
+	// account-wide kill switch and is written by nine paths, but nothing in this
+	// codebase verifies it — it has never affected token validity. The denylist
+	// is the only mechanism that invalidates an issued access token.
+	//
+	// The entry is account-wide, so this signs the user out of every device, not
+	// just the one whose permissions changed. That is the correct blast radius:
+	// the stale permissions are in every token the account holds. It is not a
+	// forced re-login — the entry stores the revocation instant, so tokens minted
+	// afterwards pass, and the refresh path re-reads permissions from the database
+	// and mints a correctly-scoped token without the user re-authenticating.
+	s.denyUserSessions(ctx, userID, tenantID, "role assignment")
 	return nil
+}
+
+// denyUserSessions ends every live session for an account after a change to what
+// that account may do.
+//
+// Wrapped rather than called directly because authSvc is optional — a Service
+// built without WithAuthService (as several tests are) would otherwise skip
+// revocation silently, which is the exact failure this package keeps re-learning.
+// The warning names the deployment mistake rather than leaving a security control
+// quietly disabled.
+func (s *Service) denyUserSessions(ctx context.Context, userID, tenantID int64, reason string) {
+	if s.authSvc == nil {
+		s.logger.Warn().
+			Int64("user_id", userID).Int64("tenant_id", tenantID).Str("reason", reason).
+			Msg("admin: auth service not wired; sessions stay valid until the access token expires")
+		return
+	}
+	s.authSvc.DenyUserSessions(ctx, userID, tenantID)
 }
 
 // DeleteUser soft-deletes a user (sets deleted_at, is_active = false), with
@@ -2454,13 +2626,13 @@ func (s *Service) ListOwnedTenants(ctx context.Context, email string) ([]OwnedTe
 			-- switcher and this table never report different numbers for one
 			-- tenant.
 			--
-			-- role_count takes no deleted_at filter, and matches ListRoles, which
-			-- takes none either: roles are hard-DELETEd (see DeleteRole), so the
-			-- deleted_at column migration 00020 added to the table is never
-			-- written. Filtering on it would only imply a soft-delete path that
-			-- does not exist.
+			-- role_count filters deleted_at and matches ListRoles, which filters it
+			-- too. Both took no filter until #146: DeleteRole hard-DELETEd, so the
+			-- column 00020 added was never written and filtering on it would only
+			-- have implied a soft-delete path that did not exist. It exists now, and
+			-- an unfiltered count here would report tombstones as live roles.
 			(SELECT COUNT(*) FROM users        WHERE tenant_id = t.id AND deleted_at IS NULL) AS user_count,
-			(SELECT COUNT(*) FROM roles        WHERE tenant_id = t.id)                        AS role_count,
+			(SELECT COUNT(*) FROM roles        WHERE tenant_id = t.id AND deleted_at IS NULL) AS role_count,
 			(SELECT COUNT(*) FROM oauth_clients WHERE tenant_id = t.id AND deleted_at IS NULL) AS app_count
 		FROM admin_grants g
 		JOIN users u   ON u.id = g.user_id
@@ -2613,7 +2785,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at,
 		       `+userEnrichmentColumns+`
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
 		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
 	`, userID, tenantID, applicationID).Scan(
@@ -2648,7 +2820,7 @@ func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID int64) (*Rol
 	var appID *int64
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id, application_id, name, is_system, is_default, created_at
-		FROM roles WHERE id = $1 AND tenant_id = $2
+		FROM roles WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, roleID, tenantID).Scan(&id, &tid, &appID, &r.Name, &r.IsSystem, &r.IsDefault, &r.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

@@ -312,12 +312,21 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		if previousRoleID != nil {
 			var name string
 			var isSystem bool
+			// deleted_at IS NULL, so a role deleted between promotion and removal
+			// is not recorded as restorable. ErrNoRows then leaves isSystem false
+			// and the nil-out below is driven by the explicit not-found branch
+			// rather than by a zero value that happens to read the same way.
+			found := true
 			if err = tx.QueryRow(ctx,
-				`SELECT name, is_system FROM roles WHERE id = $1`, *previousRoleID,
-			).Scan(&name, &isSystem); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-				return nil, fmt.Errorf("inspect previous role: %w", err)
+				`SELECT name, is_system FROM roles WHERE id = $1 AND deleted_at IS NULL`,
+				*previousRoleID,
+			).Scan(&name, &isSystem); err != nil {
+				if !errors.Is(err, pgx.ErrNoRows) {
+					return nil, fmt.Errorf("inspect previous role: %w", err)
+				}
+				found = false
 			}
-			if isSystem && (name == auth.AdminRoleOwner || name == auth.AdminRoleCoOwner) {
+			if !found || (isSystem && (name == auth.AdminRoleOwner || name == auth.AdminRoleCoOwner)) {
 				previousRoleID = nil
 			}
 		}

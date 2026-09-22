@@ -570,7 +570,8 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 	var tempRoleID int64
 	err = s.pool.QueryRow(ctx, `
 		SELECT id FROM roles
-		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true AND is_system = false
+		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
+		  AND is_system = false AND deleted_at IS NULL
 	`, st.TenantID, st.AppRowID).Scan(&tempRoleID)
 	if err == nil {
 		roleID = &tempRoleID
@@ -711,7 +712,7 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 		SELECT u.email, COALESCE(r.name, ''), oc.id
 		FROM   users u
 		JOIN   oauth_clients oc ON oc.client_id = $3 AND oc.tenant_id = $2 AND oc.deleted_at IS NULL
-		LEFT   JOIN roles r ON r.id = u.role_id
+		LEFT   JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE  u.id = $1 AND u.tenant_id = $2
 		  AND  u.is_active = true AND u.deleted_at IS NULL
 	`, userID, tenantID, clientID).Scan(&email, &roleName, &appRowID)

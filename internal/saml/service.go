@@ -221,7 +221,7 @@ func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) 
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.id, COALESCE(r.name, '')
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.tenant_id = $1 AND u.email = $2 AND u.is_active = true AND u.deleted_at IS NULL
 	`, tenantIDInt, email).Scan(&userID, &roleName)
 	if err == nil {

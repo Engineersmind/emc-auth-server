@@ -198,7 +198,7 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, '')
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		JOIN tenants t ON t.id = u.tenant_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.application_id = $3
 		  AND u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true

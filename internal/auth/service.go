@@ -397,13 +397,37 @@ func (s *AuthService) resolveRegistrationTenant(ctx context.Context) (int64, err
 }
 
 // loadPermissions returns the list of permission names for a given user.
+//
+// Two independent sources, UNIONed and deduplicated: permissions the user holds
+// through their role, and permissions granted to the account directly. The role
+// half currently carries all of them — nothing in this codebase writes
+// user_permissions — so a filter that empties it empties the token.
+//
+// The roles join exists only for r.deleted_at. Resolution runs
+// users.role_id -> role_permissions and never needed the roles row itself, which
+// is why the filter was missing: there was no alias to hang it on. That was
+// harmless while DeleteRole hard-deleted, because ON DELETE CASCADE removed the
+// role_permissions rows and the join found nothing. #146 made the delete soft, so
+// the cascade no longer fires and the grants survive their role. Without this
+// predicate a deleted role would go on granting its full permission set to every
+// holder, making deletion a no-op against enforcement. DeleteRole also strips the
+// grants explicitly; this is the backstop for any row written before it did.
+//
+// is_active/deleted_at on the user match what every caller already checks in the
+// query immediately preceding this one (login's candidate query, all three
+// refresh reloads, magic link, both code exchanges, the passkey assertion). They
+// are defence in depth against a future caller that forgets, not a new gate — and
+// they are on the role half only, since the direct half attaches to the account
+// rather than to any role and must survive independently.
 func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int64) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT p.name
 		FROM permissions p
 		JOIN role_permissions rp ON rp.permission_id = p.id
+		JOIN roles r ON r.id = rp.role_id AND r.deleted_at IS NULL
 		JOIN users u ON u.role_id = rp.role_id
 		WHERE u.id = $1 AND u.tenant_id = $2
+		  AND u.is_active = true AND u.deleted_at IS NULL
 		UNION
 		SELECT DISTINCT p.name
 		FROM permissions p
@@ -424,10 +448,27 @@ func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int6
 		}
 		perms = append(perms, name)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate permissions: %w", err)
+	}
 	if perms == nil {
 		perms = []string{}
 	}
-	return perms, rows.Err()
+
+	// An empty set is a legitimate result — a user whose application defines no
+	// default role has held one since before this change — so this warns rather
+	// than refusing. But it is also the shape of every regression in this query,
+	// and the symptom is a login that SUCCEEDS into a session where every
+	// permission-gated route 403s. No caller checks len(perms), so without a line
+	// here that failure is invisible in the logs: the login emits success and the
+	// 403s name a permission rather than its absence. This repo has already hit it
+	// once, when a grant activated while role_id stayed NULL (tenant_admin.go:103).
+	if len(perms) == 0 {
+		s.logger.Warn().
+			Int64("user_id", userID).Int64("tenant_id", tenantID).
+			Msg("permission load returned an empty set; token will be refused by every permission-gated route")
+	}
+	return perms, nil
 }
 
 // sessionContext describes the session a token pair is being minted into.
@@ -858,27 +899,39 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
 	// Only application-credentialed registration can pick up a default role —
 	// end-user default roles are defined per application, and tenant-management
 	// roles (owner/super_admin) must never be auto-assigned by self-registration.
+	//
+	// Read inside the transaction, with the INSERT that consumes it. Outside, a
+	// SetDefaultRole committing between the two left the new user holding the
+	// superseded default — a narrow race, but one that costs nothing to close and
+	// whose damage (a user on the wrong role, silently, forever) outlives the
+	// request that caused it.
+	//
+	// deleted_at IS NULL so a soft-deleted role is not handed to everyone who
+	// registers afterwards. DeleteRole clears is_default, so this should find
+	// nothing; the predicate is what makes that a guarantee rather than an
+	// ordering assumption.
 	var roleID *int64
 	var roleName string
 	if appRowID != nil {
-		err = s.pool.QueryRow(ctx,
+		err = tx.QueryRow(ctx,
 			`SELECT id, name FROM roles
-			 WHERE tenant_id = $1 AND application_id = $2 AND is_default = true AND is_system = false`,
+			 WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
+			   AND is_system = false AND deleted_at IS NULL`,
 			tenantID, *appRowID,
 		).Scan(&roleID, &roleName)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("fetch default role: %w", err)
 		}
 	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var userID int64
 	err = tx.QueryRow(ctx, `
@@ -1242,7 +1295,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		FROM users u
 		JOIN user_credentials uc ON uc.user_id = u.id
 		JOIN tenants t ON t.id = u.tenant_id
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.email = $1 AND u.deleted_at IS NULL AND t.is_active = true
 		  AND (
 		        u.is_active = true
@@ -2037,7 +2090,7 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
 	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
@@ -2117,7 +2170,7 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, se
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, ''), u.role_id
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
 	`, userID, tenantID).Scan(&email, &roleName, &roleID)
 	if err != nil {
@@ -2322,7 +2375,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
 	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
@@ -2546,7 +2599,7 @@ func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenan
 		       COALESCE(r.name, '')
 		FROM   users u
 		JOIN   tenants t ON t.id = u.tenant_id
-		LEFT   JOIN roles r ON r.id = u.role_id
+		LEFT   JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE  u.id = $1 AND u.tenant_id = $2 AND u.application_id = $3
 		  AND  u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
 	`, userID, tenantID, appRowID).Scan(&email, &firstName, &lastName, &emailVerified, &updatedAt, &roleName)

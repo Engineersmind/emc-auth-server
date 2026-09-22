@@ -157,7 +157,8 @@ func (s *AuthService) SwitchTenantContext(ctx context.Context, userID, currentTe
 	if platformAdmin {
 		if err = s.pool.QueryRow(ctx, `
 			SELECT COALESCE(r.name, '') FROM users u
-			LEFT JOIN roles r ON r.id = u.role_id WHERE u.id = $1
+			LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
+			WHERE u.id = $1
 		`, userID).Scan(&claimRole); err != nil {
 			return nil, fmt.Errorf("load platform admin role: %w", err)
 		}
