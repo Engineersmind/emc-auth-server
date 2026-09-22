@@ -824,6 +824,21 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	authGroup.POST("/apps/register", authHandler.AppRegister, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/apps/login", authHandler.AppLogin, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
+	// Attach roles to one of the application's own users after registration
+	// (#146). Sits beside /apps/register and /apps/login because it shares their
+	// credential channel — Authorization: Basic, never a bearer token — and their
+	// blast radius: authority over this application's users and nothing else.
+	//
+	// Not on adminGroup, whose guards expect a bearer token carrying an
+	// admin_scope claim. Admitting a caller that has neither would have meant
+	// loosening those guards, which is how a privilege boundary erodes.
+	//
+	// Rate-limited like the other credential endpoints: it presents a secret on
+	// every call AND changes what a user may do, so it is both a brute-force
+	// surface and a privilege-churn surface.
+	authGroup.POST("/apps/users/roles", authHandler.AssignAppUserRoles,
+		mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+
 	// Passwordless magic-link sign-in (issue #63 follow-on) — per-application
 	// opt-in. The link replaces only the password step: verification runs the
 	// same MFA gate as /apps/login, so a 'required' app still challenges.
@@ -1169,6 +1184,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/tenants/:tid/users/:uid", adminHandler.GetAdminUser, tidUsersRead)
 	adminGroup.PUT("/tenants/:tid/users/:uid", adminHandler.UpdateAdminUser, tidUsersWrite)
 	adminGroup.PUT("/tenants/:tid/users/:uid/role", adminHandler.AssignUserRole, tidUsersWrite)
+	// Additive role collection (#146 phase 2). POST composes, DELETE revokes one;
+	// the PUT above still replaces, for the callers that depend on it.
+	adminGroup.GET("/tenants/:tid/users/:uid/roles", adminHandler.ListUserRoles, tidUsersRead)
+	adminGroup.POST("/tenants/:tid/users/:uid/roles", adminHandler.AddUserRole, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/users/:uid/roles/:rid", adminHandler.RemoveUserRole, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, tidUsersWrite)
 	adminGroup.POST("/tenants/:tid/users/:uid/invite", adminHandler.ResendInvitation, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/users/:uid", adminHandler.DeleteAdminUser, tidUsersWrite)
@@ -1293,6 +1313,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid", adminHandler.GetAdminUser, appUsersRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, appUsersWrite)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/roles", adminHandler.ListUserRoles, appUsersRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/roles", adminHandler.AddUserRole, appUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/roles/:rid", adminHandler.RemoveUserRole, appUsersWrite)
 	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, appUsersWrite)
 	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/invite", adminHandler.ResendInvitation, appUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, appUsersWrite)
@@ -1358,6 +1381,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/users/:id", adminHandler.GetAdminUser, usersRead)
 	adminGroup.PUT("/users/:id", adminHandler.UpdateAdminUser, usersWrite)
 	adminGroup.PUT("/users/:id/role", adminHandler.AssignUserRole, usersWrite)
+	adminGroup.GET("/users/:id/roles", adminHandler.ListUserRoles, usersRead)
+	adminGroup.POST("/users/:id/roles", adminHandler.AddUserRole, usersWrite)
+	adminGroup.DELETE("/users/:id/roles/:rid", adminHandler.RemoveUserRole, usersWrite)
 	adminGroup.DELETE("/users/:id", adminHandler.DeleteAdminUser, usersWrite)
 	adminGroup.POST("/users/:id/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
 	adminGroup.GET("/users/:id/detail", adminHandler.GetAdminUserDetail, usersRead)
@@ -1471,6 +1497,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminGroup.GET("/applications/:appID/users/:uid", adminHandler.GetAdminUser, usersRead)
 	adminGroup.PUT("/applications/:appID/users/:uid", adminHandler.UpdateAdminUser, usersWrite)
 	adminGroup.PUT("/applications/:appID/users/:uid/role", adminHandler.AssignUserRole, usersWrite)
+	adminGroup.GET("/applications/:appID/users/:uid/roles", adminHandler.ListUserRoles, usersRead)
+	adminGroup.POST("/applications/:appID/users/:uid/roles", adminHandler.AddUserRole, usersWrite)
+	adminGroup.DELETE("/applications/:appID/users/:uid/roles/:rid", adminHandler.RemoveUserRole, usersWrite)
 	adminGroup.POST("/applications/:appID/users/:uid/force-password-reset", adminHandler.ForcePasswordReset, usersWrite)
 	adminGroup.DELETE("/applications/:appID/users/:uid", adminHandler.DeleteAdminUser, usersWrite)
 	adminGroup.GET("/applications/:appID/users/:uid/detail", adminHandler.GetAdminUserDetail, usersRead)

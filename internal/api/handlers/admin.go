@@ -1462,7 +1462,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
 	}
 
-	if err := h.svc.AssignUserRole(c.Request().Context(), tenantID, appScope, userID, roleID); err != nil {
+	if err := h.svc.AssignUserRole(c.Request().Context(), tenantID, appScope, userID, roleID, actorUserID(claims)); err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "user or role not found"})
 		}
@@ -1489,6 +1489,168 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 	}
 	h.auditAdmin(c, claims, audit.ActionAdminUserRoleAssigned, "user", strconv.FormatInt(userID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "role assigned"})
+}
+
+// roleGrantTarget resolves the tenant, application scope, user and role that a
+// role-collection request names, answering the request itself on any failure.
+//
+// Shared by the add and remove handlers because both take the same four path
+// pieces under four route shapes each, and duplicating the parsing is how one of
+// them ends up missing the application-scope resolution the other has.
+func (h *AdminHandler) roleGrantTarget(c echo.Context, roleParam string) (tenantID int64, appScope *int64, userID, roleID int64, claims *auth.Claims, ok bool) {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		_ = c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return 0, nil, 0, 0, nil, false
+	}
+	appScope, scopeOK := h.optionalAppScope(c, tenantID)
+	if !scopeOK {
+		return 0, nil, 0, 0, nil, false
+	}
+	userID, err = userIDFromPath(c)
+	if err != nil {
+		_ = c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+		return 0, nil, 0, 0, nil, false
+	}
+	roleID, err = strconv.ParseInt(c.Param(roleParam), 10, 64)
+	if err != nil {
+		_ = c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
+		return 0, nil, 0, 0, nil, false
+	}
+	return tenantID, appScope, userID, roleID, claims, true
+}
+
+// roleGrantError maps the service's refusals onto responses, shared by the add
+// and remove handlers so the two cannot disagree about what a 403 means.
+func (h *AdminHandler) roleGrantError(c echo.Context, claims *auth.Claims, userID, roleID int64, err error, what string) error {
+	switch {
+	case errors.Is(err, admin.ErrNotFound):
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "user or role not found"})
+	case errors.Is(err, admin.ErrRoleScope):
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, admin.ErrSystemRole):
+		// 403, not 400: the request is well-formed and the role exists. What is
+		// refused is the privilege transfer. Recorded as access_denied so it
+		// reaches the notifier, exactly as the replacement path does.
+		h.auditPrivilegeRefused(c, claims, "user", strconv.FormatInt(userID, 10),
+			"grant of system role "+strconv.FormatInt(roleID, 10))
+		return c.JSON(http.StatusForbidden, map[string]string{
+			"error": "administrative roles are granted by invitation, not by assignment",
+		})
+	default:
+		h.logger.Error().Err(err).Msg("admin: " + what + " failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to " + what})
+	}
+}
+
+// AddUserRole handles POST /api/v1/admin/users/:id/roles.
+//
+// ADDITIVE, and a POST to a plural collection rather than a PUT on a singular
+// noun, so the verb and the path say what the operation does. The replacing form
+// remains at PUT .../role for the callers that depend on it.
+//
+// Idempotent: granting a role the user already holds returns 200, not a conflict.
+// A client retrying a timed-out request must not have to distinguish "it worked"
+// from "it already worked".
+//
+// @Summary      Grant a role to a user
+// @Description  Grants a role to the user in addition to the roles they already hold. Unlike PUT /users/{id}/role this does not replace anything. Idempotent — granting a role the user already holds succeeds without changing it. Administrative (system) roles are refused; those are granted by invitation. Every active session is signed out so the new permissions take effect immediately. Requires users:write.
+// @Tags         admin-users
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      string            true  "User ID"
+// @Param        body  body      AssignRoleRequest true  "Role ID to grant"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string
+// @Failure      404   {object}  map[string]string
+// @Router       /api/v1/users/{id}/roles [post]
+func (h *AdminHandler) AddUserRole(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	var req AssignRoleRequest
+	if err := c.Bind(&req); err != nil || req.RoleID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "role_id is required"})
+	}
+	roleID, err := strconv.ParseInt(req.RoleID, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
+	}
+
+	if err := h.svc.AddUserRole(c.Request().Context(), tenantID, appScope, userID, roleID, actorUserID(claims)); err != nil {
+		return h.roleGrantError(c, claims, userID, roleID, err, "grant role")
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserRoleAssigned, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "role granted"})
+}
+
+// RemoveUserRole handles DELETE /api/v1/admin/users/:id/roles/:rid.
+//
+// @Summary      Revoke a role from a user
+// @Description  Revokes one role from the user, leaving every other role they hold. Returns 404 if the user did not hold the role. If the revoked role was their primary, the earliest surviving grant is promoted in its place. Every active session is signed out so the loss of permissions takes effect immediately. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Param        rid  path      string  true  "Role ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/roles/{rid} [delete]
+func (h *AdminHandler) RemoveUserRole(c echo.Context) error {
+	tenantID, appScope, userID, roleID, claims, ok := h.roleGrantTarget(c, "rid")
+	if !ok {
+		return nil
+	}
+	if err := h.svc.RemoveUserRole(c.Request().Context(), tenantID, appScope, userID, roleID); err != nil {
+		return h.roleGrantError(c, claims, userID, roleID, err, "revoke role")
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserRoleRevoked, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "role revoked"})
+}
+
+// ListUserRoles handles GET /api/v1/admin/users/:id/roles.
+//
+// @Summary      List a user's roles
+// @Description  Returns every role the user holds, in grant order, each with who granted it and when. The role matching users.role_id is flagged is_primary — that is the one the deprecated `role` JWT claim carries. Requires users:read.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {array}   admin.UserRoleResult
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/roles [get]
+func (h *AdminHandler) ListUserRoles(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	roles, err := h.svc.ListUserRoles(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: list user roles failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list user roles"})
+	}
+	return c.JSON(http.StatusOK, roles)
 }
 
 // DeleteAdminUser handles DELETE /api/v1/admin/users/:id.
