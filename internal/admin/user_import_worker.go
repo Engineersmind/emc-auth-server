@@ -75,9 +75,12 @@ const (
 	// An infra failure leaves the row pending so a transient blip does not
 	// become a permanent verdict, but "pending forever" is its own outage: the
 	// job never completes, and the progress response cannot distinguish a slow
-	// import from one wedged on row N. Five attempts spread over five lease
-	// cycles is roughly ten minutes of a failure reproducing identically —
-	// past that it is a property of the row or its surroundings, not weather.
+	// import from one wedged on row N.
+	//
+	// Five attempts, one per poll interval, is around twenty-five seconds of a
+	// failure reproducing identically. That is comfortably longer than a
+	// connection blip or a failover and far short of the ten minutes a
+	// lease-cycle retry would have cost, while still bounding the job.
 	maxImportRowAttempts = 5
 )
 
@@ -402,16 +405,16 @@ func (s *Service) processImportRow(
 		// operator's only recourse was to re-upload the whole file and hope.
 		//
 		// But an unbounded retry is the mirror-image failure. A row that fails
-		// the same way every time — an application deleted mid-import, a value
-		// the database will never accept — leaves the job in `running` forever,
-		// reclaimed every lease TTL, with nothing in the progress response
+		// the same way every time — a trigger the row can never satisfy, a
+		// dependency that has gone away — leaves the job never completing and
+		// endlessly re-attempted, with nothing in the progress response
 		// separating "slow" from "stuck on row N since Tuesday". So the attempt
 		// is counted, and past the bound the row is written off as a rejection
 		// carrying the failure that caused it, and the job moves on.
 		//
 		// Retrying stays free for the transient case, which is the common one:
-		// maxImportRowAttempts blips in a row on the same row is already not a
-		// blip.
+		// maxImportRowAttempts failures in a row on the same row is already not
+		// a blip.
 		attempt := row.attempts + 1
 		if attempt < maxImportRowAttempts {
 			if err := s.recordImportRowFailure(ctx, row.id, infra); err != nil {
@@ -421,8 +424,17 @@ func (s *Service) processImportRow(
 			}
 			log.Warn().Err(infra).Int("row", row.index).Int("attempt", attempt).
 				Msg("import worker: row left pending after an infrastructure failure")
-			// Returning false stops the job rather than grinding the rest of
-			// the file through the same broken connection.
+			// Stop working the job rather than grinding the rest of the file
+			// through the same broken connection — but HAND IT BACK rather
+			// than walking away holding the lease. Simply returning left the
+			// job `running` under a live lease, so the next attempt could not
+			// start until the lease expired: at one lease TTL per attempt, the
+			// retry bound would take the better part of ten minutes to reach a
+			// verdict. Released, the row is retried on the next poll, and the
+			// bound is reached in seconds rather than lease cycles.
+			if err := s.releaseImportJob(ctx, job.id, workerID); err != nil {
+				log.Error().Err(err).Msg("import worker: release after row failure")
+			}
 			return false
 		}
 

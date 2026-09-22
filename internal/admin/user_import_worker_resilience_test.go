@@ -110,10 +110,16 @@ func TestImportWorker_ReportsRoleChangeWithoutAuthService(t *testing.T) {
 // and GetImportJob cannot tell an operator the difference between a slow import
 // and one wedged on row N since Tuesday.
 //
-// The failure is made reproducible rather than simulated: the row's application
-// is deleted out from under the job, so every attempt hits the same foreign-key
-// failure on insert. Past maxImportRowAttempts the row becomes a rejection
-// carrying the reason, and the job finishes.
+// The failure is made reproducible rather than simulated: a trigger on `users`
+// raises the same error on every insert for this address, so each attempt fails
+// identically. Past maxImportRowAttempts the row becomes a rejection carrying
+// the reason, and the job finishes.
+//
+// The trigger raises SQLSTATE 58000 deliberately. isRowDataErr treats classes
+// 22 and 23 as the row's own fault — a verdict, not a retry — so a constraint
+// violation would exercise the wrong path entirely. 58000 is an external
+// failure, which is what "the database could not answer" looks like to the
+// worker and what the retry bound exists to bound.
 func TestImportWorker_StopsRetryingAPermanentlyFailingRow(t *testing.T) {
 	f := newAdminFixture(t)
 	ctx := context.Background()
@@ -128,13 +134,33 @@ func TestImportWorker_StopsRetryingAPermanentlyFailingRow(t *testing.T) {
 	}
 	id := jobIDOf(t, queued)
 
-	// Force every insert for this job to fail the same way, permanently: the
-	// job's application row is gone, so the user insert's FK can never be
-	// satisfied no matter how many times the row is retried.
-	if _, err := f.pool.Exec(ctx,
-		`UPDATE user_import_jobs SET application_id = 2147483647 WHERE id = $1`, id); err != nil {
-		t.Fatalf("point the job at a missing application: %v", err)
+	// Scoped to this one address so the fixture's other rows are unaffected,
+	// and dropped on cleanup so it cannot outlive the test.
+	if _, err := f.pool.Exec(ctx, `
+		CREATE OR REPLACE FUNCTION emc_test_block_stuck_import() RETURNS trigger AS $$
+		BEGIN
+			IF NEW.email = 'stuck@example.com' THEN
+				RAISE EXCEPTION 'simulated permanent infrastructure failure'
+					USING ERRCODE = '58000';
+			END IF;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+
+		CREATE TRIGGER emc_test_block_stuck_import
+			BEFORE INSERT ON users
+			FOR EACH ROW EXECUTE FUNCTION emc_test_block_stuck_import();
+	`); err != nil {
+		t.Fatalf("install the failing trigger: %v", err)
 	}
+	t.Cleanup(func() {
+		if _, err := f.pool.Exec(context.Background(), `
+			DROP TRIGGER IF EXISTS emc_test_block_stuck_import ON users;
+			DROP FUNCTION IF EXISTS emc_test_block_stuck_import();
+		`); err != nil {
+			t.Errorf("drop the failing trigger: %v", err)
+		}
+	})
 
 	job := drainJob(t, f, id, &f.appID)
 
