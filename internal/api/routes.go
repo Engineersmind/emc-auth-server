@@ -733,6 +733,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	adminSvc.WithCaptchaPolicy(captchaPolicySvc)
 	// The gate itself. Must come after captchaSvc exists, which is why it is here
 	// rather than in the authHandler builder chain above.
+	authHandler.WithAuthorization(authzSvc)
 	authHandler.WithCaptcha(captchaSvc)
 	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
 	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
@@ -772,8 +773,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// together make it an amplification target. It carries the token limiter and
 	// the per-client limiter for that reason, not merely for symmetry with the
 	// routes around it.
+	//
+	// AppClientBodyRateLimiter, not appClientRateLimit: this route takes
+	// client_id from the JSON body, and the header-keyed limiter read an empty
+	// client_id here and passed every request straight through. See PR #147
+	// review — the per-application bucket this comment claimed was mounted did
+	// not exist until the body-aware variant replaced it.
 	apiV1.POST("/captcha/challenge", captchaHandler.IssueChallenge,
-		mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+		mw.TokenRateLimiter(rlCfg),
+		mw.AppClientBodyRateLimiter(appLimitSvc, deps.Redis, deps.Logger))
 	authGroup.POST("/register", authHandler.Register)
 	// Login is rate-limited at route level (not global) to avoid impacting other endpoints.
 	authGroup.POST("/login", authHandler.Login, mw.LoginRateLimiter(rlCfg))

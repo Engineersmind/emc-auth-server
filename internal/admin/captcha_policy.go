@@ -99,17 +99,9 @@ func (s *Service) GetCaptchaPolicy(ctx context.Context, tenantID int64, applicat
 	var view CaptchaPolicyView
 	var rowTenant, rowApp *int64
 
-	err := s.pool.QueryRow(ctx, `
-		SELECT tenant_id, application_id, enabled, provider, mode, protected_flows,
-		       trigger_after_failures, failure_window_seconds, code_length,
-		       case_sensitive, ttl_seconds, max_attempts_per_challenge, noise_level
-		FROM captcha_policies
-		WHERE (application_id = $2 AND tenant_id = $1)
-		   OR (application_id IS NULL AND tenant_id = $1)
-		   OR (application_id IS NULL AND tenant_id IS NULL)
-		ORDER BY application_id NULLS LAST, tenant_id NULLS LAST
-		LIMIT 1
-	`, tenantID, applicationID).Scan(&rowTenant, &rowApp,
+	// Shared with the runtime resolver — see auth.CaptchaPolicyResolveSQL for
+	// why this precedence rule lives in exactly one place.
+	err := s.pool.QueryRow(ctx, auth.CaptchaPolicyResolveSQL, tenantID, applicationID).Scan(&rowTenant, &rowApp,
 		&view.Enabled, &view.Provider, &view.Mode, &view.ProtectedFlows,
 		&view.TriggerAfterFailures, &view.FailureWindowSeconds, &view.CodeLength,
 		&view.CaseSensitive, &view.TTLSeconds, &view.MaxAttemptsPerChallenge,
@@ -346,7 +338,22 @@ func (s *Service) SetPlatformCaptchaPolicy(ctx context.Context, in CaptchaPolicy
 		return nil, err
 	}
 
-	ct, err := s.pool.Exec(ctx, `
+	// UPDATE-then-INSERT inside one transaction, matching SetCaptchaPolicy.
+	//
+	// The unique index on the platform row (migration 00090,
+	// captcha_policies_platform_default) already means a lost race surfaces as a
+	// clean 23505 rather than a duplicate row, and with no platform DELETE the
+	// RowsAffected == 0 branch is unreachable today. The transaction is here so
+	// the two near-identical writers do not rely on different guarantees — if a
+	// platform delete is ever added, this becomes a live race, and the cheap
+	// moment to close it is now rather than under time pressure. Raised on PR #147.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin platform captcha policy update: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	ct, err := tx.Exec(ctx, `
 		UPDATE captcha_policies
 		SET enabled = $1, mode = $2, protected_flows = $3,
 		    trigger_after_failures = $4, failure_window_seconds = $5,
@@ -363,7 +370,7 @@ func (s *Service) SetPlatformCaptchaPolicy(ctx context.Context, in CaptchaPolicy
 		// The seeded row is gone. Re-create it rather than failing: resolution
 		// for every scope ends here, so its absence is worse than any value it
 		// could hold.
-		if _, err := s.pool.Exec(ctx, `
+		if _, err := tx.Exec(ctx, `
 			INSERT INTO captcha_policies
 			    (tenant_id, application_id, enabled, provider, mode, protected_flows,
 			     trigger_after_failures, failure_window_seconds, code_length,
@@ -375,6 +382,9 @@ func (s *Service) SetPlatformCaptchaPolicy(ctx context.Context, in CaptchaPolicy
 			next.NoiseLevel); err != nil {
 			return nil, fmt.Errorf("recreate platform captcha policy: %w", err)
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit platform captcha policy update: %w", err)
 	}
 
 	s.invalidateCaptchaCache()

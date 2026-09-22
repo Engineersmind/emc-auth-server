@@ -177,14 +177,6 @@ func (s *CaptchaService) Enabled() bool {
 	return s != nil && s.enabled && s.redis != nil
 }
 
-// Policy exposes the resolver so the admin write path can invalidate its cache.
-func (s *CaptchaService) Policy() *CaptchaPolicyService {
-	if s == nil {
-		return nil
-	}
-	return s.policy
-}
-
 // ---------------------------------------------------------------------------
 // Issue
 // ---------------------------------------------------------------------------

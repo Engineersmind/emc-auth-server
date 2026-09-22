@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 )
 
 // ---------------------------------------------------------------------------
@@ -187,6 +188,16 @@ type CaptchaPolicyService struct {
 	mu    sync.RWMutex
 	cache map[captchaPolicyKey]cachedCaptchaPolicy
 	ttl   time.Duration
+
+	// reload collapses concurrent misses on the same scope into one query.
+	//
+	// Without it, InvalidateCache — which replaces the WHOLE cross-tenant map on
+	// any single admin write, at any scope — left every scope cold at once, and
+	// the next burst of login/register/otp/forgot-password traffic across all
+	// tenants each issued its own SELECT. That is a stampede against the policy
+	// table on the authentication hot path, triggered by one operator toggling
+	// one unrelated tenant's setting. Reported on PR #147.
+	reload singleflight.Group
 }
 
 type captchaPolicyKey struct {
@@ -248,19 +259,58 @@ func (s *CaptchaPolicyService) Resolve(ctx context.Context, tenantID int64, appl
 		return DefaultCaptchaPolicy
 	}
 
-	policy, err := s.load(ctx, tenantID, applicationID)
+	// One query per scope per miss, however many callers arrive at once. The
+	// followers block on the leader's result rather than each opening their own
+	// — which is the whole point, because the callers here are concurrent login
+	// attempts and the miss is usually cache-wide (see the reload field).
+	//
+	// The cache is written inside the shared function, so the followers do not
+	// each re-take the write lock to store the same value.
+	cacheKey := fmt.Sprintf("%d:%d", key.tenantID, key.applicationID)
+	res, err, _ := s.reload.Do(cacheKey, func() (any, error) {
+		policy, lErr := s.load(ctx, tenantID, applicationID)
+		if lErr != nil {
+			return nil, lErr
+		}
+		s.mu.Lock()
+		s.cache[key] = cachedCaptchaPolicy{policy: policy, cachedAt: time.Now()}
+		s.mu.Unlock()
+		return policy, nil
+	})
 	if err != nil {
 		s.logger.Warn().Err(err).
 			Int64("tenant_id", tenantID).
 			Msg("captcha policy: resolve failed, using platform defaults")
 		return DefaultCaptchaPolicy
 	}
-
-	s.mu.Lock()
-	s.cache[key] = cachedCaptchaPolicy{policy: policy, cachedAt: time.Now()}
-	s.mu.Unlock()
-	return policy
+	return res.(CaptchaPolicy)
 }
+
+// CaptchaPolicyResolveSQL is the "most-specific-wins" precedence query —
+// application row, else tenant row, else the platform default — shared by the
+// runtime resolver here and by the admin read path in internal/admin.
+//
+// Shared rather than written twice, because the two copies had already started
+// to drift: this side derives Source from the returned ids while the admin side
+// derives Scope and Inherited from the same shape, independently. A precedence
+// change applied to one and missed in the other would let the console's
+// "effective policy" disagree with what the gate actually enforces — a
+// disagreement that shows up as a captcha appearing where the UI says it should
+// not, with nothing in either file to explain it. Reported on PR #147.
+//
+// Parameters are $1 = tenant_id, $2 = application_id (nullable), in that order.
+// Column order is part of the contract: both call sites Scan positionally.
+const CaptchaPolicyResolveSQL = `
+		SELECT tenant_id, application_id, enabled, provider, mode, protected_flows,
+		       trigger_after_failures, failure_window_seconds, code_length,
+		       case_sensitive, ttl_seconds, max_attempts_per_challenge, noise_level
+		FROM captcha_policies
+		WHERE (application_id = $2 AND tenant_id = $1)
+		   OR (application_id IS NULL AND tenant_id = $1)
+		   OR (application_id IS NULL AND tenant_id IS NULL)
+		ORDER BY application_id NULLS LAST, tenant_id NULLS LAST
+		LIMIT 1
+	`
 
 // load reads the most specific matching policy row.
 //
@@ -272,17 +322,7 @@ func (s *CaptchaPolicyService) load(ctx context.Context, tenantID int64, applica
 	var rowTenant, rowApp *int64
 	var windowSecs, ttlSecs int
 
-	err := s.pool.QueryRow(ctx, `
-		SELECT tenant_id, application_id, enabled, provider, mode, protected_flows,
-		       trigger_after_failures, failure_window_seconds, code_length,
-		       case_sensitive, ttl_seconds, max_attempts_per_challenge, noise_level
-		FROM captcha_policies
-		WHERE (application_id = $2 AND tenant_id = $1)
-		   OR (application_id IS NULL AND tenant_id = $1)
-		   OR (application_id IS NULL AND tenant_id IS NULL)
-		ORDER BY application_id NULLS LAST, tenant_id NULLS LAST
-		LIMIT 1
-	`, tenantID, applicationID).Scan(
+	err := s.pool.QueryRow(ctx, CaptchaPolicyResolveSQL, tenantID, applicationID).Scan(
 		&rowTenant, &rowApp, &p.Enabled, &p.Provider, &p.Mode, &p.ProtectedFlows,
 		&p.TriggerAfterFailures, &windowSecs, &p.CodeLength,
 		&p.CaseSensitive, &ttlSecs, &p.MaxAttemptsPerChallenge, &p.NoiseLevel)

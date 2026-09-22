@@ -226,14 +226,42 @@ func firstPartyCaptchaScope() captchaScope {
 // still in place. That is deliberate — refusing differently would tell an
 // unauthenticated caller whether a client_id exists, the same oracle the
 // challenge endpoint avoids by answering 404 captcha_disabled for both cases.
+// ON WHICH LOOKUP, AND WHY IT MUST BE THIS ONE
+//
+// AuthorizationServer.LookupClient, not ApplicationService.ResolveClient. The
+// two disagree: ResolveClient omits `AND is_active` (deliberately — it exists to
+// attribute audit events for suspended applications too), while LookupClient
+// includes it and is what POST /captcha/challenge uses.
+//
+// Using ResolveClient here made a suspended application with an enabled captcha
+// policy unsatisfiable: the gate resolved its policy and answered 428
+// captcha_required, while the challenge endpoint answered 404 captcha_disabled
+// for the same client_id, so no request sequence could get through. Reported on
+// PR #147. Both sides of the gate now run the same query, which is the property
+// that has to hold — whatever that query filters on.
+//
+// A suspended client now resolves to the platform scope, so it is gated only if
+// the platform policy says so, and Login rejects it a few lines later for being
+// inactive. That is the correct order: the captcha is a speed bump, not the
+// thing that enforces suspension.
 func (h *AuthHandler) appCaptchaScopeFor(c echo.Context, clientID string) captchaScope {
 	scope := captchaScope{ClientID: clientID}
-	if h.captchaSvc == nil || !h.captchaSvc.Enabled() || h.appSvc == nil || clientID == "" {
+	if h.captchaSvc == nil || !h.captchaSvc.Enabled() || h.authz == nil || clientID == "" {
 		return scope
 	}
-	if tenantID, appID, ok := h.appSvc.ResolveClient(c.Request().Context(), clientID); ok {
-		scope.TenantID = tenantID
-		scope.ApplicationID = &appID
+	client, err := h.authz.LookupClient(c.Request().Context(), clientID)
+	if err != nil {
+		// Unknown, deleted or suspended. Fall back to the platform scope rather
+		// than refusing differently — answering differently here would tell an
+		// unauthenticated caller whether a client_id exists, the same oracle the
+		// challenge endpoint avoids by returning 404 captcha_disabled for both.
+		if !errors.Is(err, auth.ErrClientNotFound) {
+			h.logger.Warn().Err(err).Msg("captcha: client lookup failed, using platform scope")
+		}
+		return scope
 	}
+	rowID := client.RowID
+	scope.TenantID = client.TenantID
+	scope.ApplicationID = &rowID
 	return scope
 }

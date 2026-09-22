@@ -31,11 +31,15 @@ type AuthHandler struct {
 	totpSvc   *auth.TOTPService         // nil when TOTP not configured
 	emailSvc  *auth.EmailMFAService     // nil when email MFA not configured
 	apiKeySvc *auth.APIKeyService
-	appSvc    *auth.ApplicationService  // nil until WithApplications is called
-	invSvc    *auth.InvitationService   // nil when invitations are not configured
-	chgSvc    *auth.EmailChangeService  // nil when email change is not configured
-	blockSvc  *auth.AccountBlockService // nil when account lockout is not configured
-	jwtSvc    *auth.JWTService
+	appSvc    *auth.ApplicationService // nil until WithApplications is called
+	// authz resolves a client_id to its application, using the SAME query the
+	// captcha challenge endpoint uses. Shared deliberately — see
+	// appCaptchaScopeFor. nil until WithAuthorization is called.
+	authz    *auth.AuthorizationServer
+	invSvc   *auth.InvitationService   // nil when invitations are not configured
+	chgSvc   *auth.EmailChangeService  // nil when email change is not configured
+	blockSvc *auth.AccountBlockService // nil when account lockout is not configured
+	jwtSvc   *auth.JWTService
 	// captchaSvc gates the unauthenticated flows (issue #145). nil, or a service
 	// whose deployment switch is off, makes every gate call a no-op — which is
 	// what keeps this feature invisible until somebody turns it on.
@@ -181,6 +185,17 @@ func (h *AuthHandler) WithJWT(jwtSvc *auth.JWTService) *AuthHandler {
 // nil, refresh still detects replay but cannot serialize concurrent rotations.
 // WithCaptcha wires the captcha gate. Optional: without it the protected
 // handlers behave exactly as they did before issue #145.
+// WithAuthorization attaches the AuthorizationServer so the captcha gate can
+// resolve a client_id through the same lookup the challenge endpoint uses.
+//
+// Optional: without it the gate falls back to the platform scope, which is the
+// pre-#147 behaviour and is safe — it under-applies policy rather than
+// demanding a captcha nobody can obtain.
+func (h *AuthHandler) WithAuthorization(authz *auth.AuthorizationServer) *AuthHandler {
+	h.authz = authz
+	return h
+}
+
 func (h *AuthHandler) WithCaptcha(svc *auth.CaptchaService) *AuthHandler {
 	h.captchaSvc = svc
 	return h
@@ -677,6 +692,15 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
 	}
 
+	// The password was correct, so release the origin's counter — the same rule
+	// Login and SessionLogin already applied, and missing here it meant a shared
+	// address stayed gated for the whole failure window even after a legitimate
+	// sign-in through this very endpoint. Worse, RecordFailure slides the TTL on
+	// every new failure, so one bad request per window kept an office NAT gated
+	// indefinitely. Cleared before the MFA branches because reaching them proves
+	// the password step passed, whatever happens at the second factor.
+	h.captchaClearFailures(c, appLoginScope)
+
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
 	}
@@ -914,6 +938,16 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	}
 
 	metrics.MFAChallenges.WithLabelValues("mfa", "success").Inc()
+
+	// Release the origin's counter. This one matters more than it looks:
+	// otpScope is the PLATFORM first-party scope, shared with /auth/login,
+	// /auth/session and tenant-level /auth/register. Without this, somebody who
+	// mistyped a TOTP code twice and then succeeded left the shared counter
+	// armed, and every other user behind that address — campus Wi-Fi, corporate
+	// NAT — kept being captcha-gated on all four flows for the rest of the
+	// window.
+	h.captchaClearFailures(c, otpScope)
+
 	tid, uid, appID := claimsFromToken(result.AccessToken)
 	h.auditEvent(c, audit.Event{
 		TenantID:      tid,
@@ -1497,6 +1531,21 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 		if !errors.Is(err, auth.ErrInvalidClient) {
 			h.logger.Error().Err(err).Msg("forgot-password: client authentication failed")
 		}
+		// Count it. Without this, ForgotPassword was the one protected flow that
+		// recorded nothing at all, so under the default adaptive mode its gate
+		// could never arm however low trigger_after_failures was set — the
+		// captcha was decorative here. The generic 200 that hides whether the
+		// client_id or the secret was wrong also hid the attempt from the
+		// counter, which is exactly the traffic the counter exists to notice.
+		//
+		// Resolved from the unverified client_id, exactly as AppLogin does. It
+		// has to be: RecordFailure re-resolves policy from the tenant and
+		// application ids, so recording against a bare client_id would land on
+		// the PLATFORM policy while the gate above checks the APPLICATION one —
+		// an application running adaptive mode over a disabled platform row
+		// would count nothing and still never arm. The two must agree on scope
+		// or the counter and the gate are reading different policies.
+		h.captchaRecordFailure(c, h.appCaptchaScopeFor(c, id))
 		return c.JSON(http.StatusOK, genericOK)
 	}
 
