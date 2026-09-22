@@ -58,6 +58,28 @@ import (
 // rows are unbounded in TIME — a wide date filter can select tens of millions —
 // whereas a tenant's directory is bounded by how many users it has.
 
+// userExportTimeout bounds what ONE export request can cost.
+//
+// Removing the row cap made the query unbounded in size, and the maintenance
+// rate limiter on the route bounds how OFTEN an export can be asked for, not
+// how expensive one of them is. Those are different guarantees: a tenant with
+// millions of users could hold a pooled connection and the per-user login
+// aggregates for as long as the query took, with nothing to stop it.
+//
+// A deadline is the proportionate bound. It is not a row cap in disguise — a
+// cap silently returns a short file, whereas an expired deadline fails the
+// request with an error the operator can see and act on. Ten minutes is far
+// past any healthy export (the manual 2,000-user run drained in seconds) and
+// well inside the point where a connection held open becomes a problem for
+// everyone else.
+//
+// This bounds the request; it does not make the query cheaper. Each row still
+// carries its correlated login aggregates, and a directory large enough to
+// approach this deadline wants the background-job treatment the import side
+// already has — a streaming cursor or a queued export — rather than a longer
+// deadline. That is the follow-up; this is the guard rail until then.
+const userExportTimeout = 10 * time.Minute
+
 
 // userExportHeader is the CSV column order.
 //
@@ -187,6 +209,12 @@ func scanExportRow(rows pgx.Rows) (ExportedUser, error) {
 // Soft-deleted users are excluded: an export describes the directory as it
 // stands, and a deleted account is not part of it.
 func (s *Service) ExportUsersCSV(ctx context.Context, p UserExportParams, w io.Writer) error {
+	// Covers the whole stream, not just the query: the cost of an export is
+	// the scan plus the serialisation of every row it yields, and a deadline
+	// that expired at the first Next() would bound neither.
+	ctx, cancel := context.WithTimeout(ctx, userExportTimeout)
+	defer cancel()
+
 	rows, err := s.queryExportRows(ctx, p)
 	if err != nil {
 		return err
@@ -263,6 +291,10 @@ type ExportedDocument struct {
 // for the length of the request, and the CSV path beside it already streams.
 // With no row cap this is what keeps peak memory at one row.
 func (s *Service) ExportUsersJSON(ctx context.Context, p UserExportParams, w io.Writer) error {
+	// Same bound as the CSV path, for the same reason — see userExportTimeout.
+	ctx, cancel := context.WithTimeout(ctx, userExportTimeout)
+	defer cancel()
+
 	rows, err := s.queryExportRows(ctx, p)
 	if err != nil {
 		return err
