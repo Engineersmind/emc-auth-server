@@ -219,7 +219,7 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 	appID := strconv.FormatInt(appRowID, 10)
 	// Never persistent — see the issueTokenPair call below for why a magic link
 	// does not grant a remembered device.
-	if gate, err := s.mfaGate(ctx, sess.UserID, tenantID, appRowID, appID, email, roleName, perms, false); err != nil {
+	if gate, err := s.mfaGate(ctx, sess.UserID, tenantID, appRowID, appID, email, roleName, perms, false, nil); err != nil {
 		return nil, err
 	} else if gate != nil {
 		return gate, nil
