@@ -81,7 +81,7 @@ func (h *AuthHandler) PreviewInvitation(c echo.Context) error {
 	preview, err := h.invSvc.Preview(c.Request().Context(), token)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidInvitation) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired invitation link"})
+			return fail(c, http.StatusBadRequest, "invitation_invalid")
 		}
 		h.logger.Error().Err(err).Msg("auth: preview invitation failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "could not read that invitation"})
@@ -131,7 +131,7 @@ func (h *AuthHandler) AcceptInvitation(c echo.Context) error {
 	})
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidInvitation) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired invitation link"})
+			return fail(c, http.StatusBadRequest, "invitation_invalid")
 		}
 		if errors.Is(err, auth.ErrInvitationBlocked) {
 			// The link is valid; the account state is what forbids acceptance.
@@ -250,7 +250,7 @@ func (h *AuthHandler) ConfirmEmailChange(c echo.Context) error {
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrInvalidEmailChange):
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired confirmation link"})
+			return fail(c, http.StatusBadRequest, "verification_link_invalid")
 		case errors.Is(err, auth.ErrEmailTaken):
 			return c.JSON(http.StatusConflict, map[string]string{"error": "that email address has since been taken"})
 		}

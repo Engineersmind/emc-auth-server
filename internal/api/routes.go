@@ -273,7 +273,10 @@ func warnIssuerHostMismatch(issuer, appBaseURL, env string, logger zerolog.Logge
 }
 
 // RegisterRoutes configures all route groups and middleware on the Echo instance.
-func RegisterRoutes(e *echo.Echo, deps Deps) {
+// RegisterRoutes wires the HTTP surface and returns a cleanup function that
+// stops the background work it started. Callers must invoke it during graceful
+// shutdown, before the database pool is closed.
+func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// Middleware stack — order matters:
 	// 1. RequestID  — generates unique ID for each request (used by logger)
 	// 2. SecurityHeaders — HSTS + X-Content-Type-Options etc. on every response
@@ -561,6 +564,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 		// denylist, without which an admin revoke would report success while the
 		// session's access token kept working for up to another 15 minutes.
 		WithAuthService(authSvc)
+
+	// Background drain for queued bulk user imports.
+	//
+	// Started here rather than in main because adminSvc is built here, and
+	// stopped through the returned cleanup so an in-flight row finishes and the
+	// job is handed back to the queue rather than left to its lease expiring.
+	stopImportWorker := adminSvc.StartImportWorker(deps.Logger)
 
 	// The end-user session routes (/me/sessions) reuse the admin service's session
 	// queries with the caller's own ids. Wired here rather than in the builder chain
@@ -1387,6 +1397,59 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	// export streams up to maxExportRows and verify recomputes the whole chain.
 	auditMaintLimit := mw.AuditMaintenanceRateLimiter(0)
 	adminGroup.GET("/audit-logs/export", adminHandler.ExportAuditLogs, auditRead, auditMaintLimit)
+
+	// User directory export — same maintenance limit as the audit export, and for
+	// the same reason: it streams the tenant's whole directory straight from the
+	// database. The export itself is uncapped, so this limiter is what bounds how
+	// often a large tenant can ask for it. Registered here rather than beside the
+	// other user routes so both exports share one limiter and one rationale.
+	//
+	// Guarded by the READ permission of whichever route family it belongs to —
+	// the export is ListUsers' data in another format, so anything narrower would
+	// leave a CSV download as the way around that endpoint's scoping.
+	adminGroup.GET("/users/export", adminHandler.ExportUsers, usersRead, auditMaintLimit)
+	adminGroup.GET("/tenants/:tid/users/export", adminHandler.ExportUsers, tidUsersRead, auditMaintLimit)
+	adminGroup.GET("/applications/:appID/users/export", adminHandler.ExportUsers, usersRead, auditMaintLimit)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/export", adminHandler.ExportUsers, appUsersRead, auditMaintLimit)
+
+	// Bulk user import — migration off another identity provider.
+	//
+	// Both stages carry the WRITE permission, the dry run included: its report
+	// names which of the uploaded addresses already exist in the tenant, which
+	// is a directory disclosure rather than a validation detail.
+	//
+	// Same maintenance limiter as the exports: an import walks up to
+	// maxImportRows with a transaction each.
+	adminGroup.POST("/users/import/validate", adminHandler.ValidateUserImport, usersWrite, auditMaintLimit)
+	adminGroup.POST("/users/import", adminHandler.CommitUserImport, usersWrite, auditMaintLimit)
+	adminGroup.POST("/tenants/:tid/users/import/validate", adminHandler.ValidateUserImport, tidUsersWrite, auditMaintLimit)
+	adminGroup.POST("/tenants/:tid/users/import", adminHandler.CommitUserImport, tidUsersWrite, auditMaintLimit)
+	adminGroup.POST("/applications/:appID/users/import/validate", adminHandler.ValidateUserImport, usersWrite, auditMaintLimit)
+	adminGroup.POST("/applications/:appID/users/import", adminHandler.CommitUserImport, usersWrite, auditMaintLimit)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/import/validate", adminHandler.ValidateUserImport, appUsersWrite, auditMaintLimit)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/import", adminHandler.CommitUserImport, appUsersWrite, auditMaintLimit)
+
+	// Job progress and the per-row report.
+	//
+	// Reads are on the READ permission and carry no maintenance limit: a client
+	// polls these while an import runs, and rate-limiting progress would make
+	// the UI appear to stall. Cancel is a write.
+	adminGroup.GET("/users/import", adminHandler.ListUserImportJobs, usersRead)
+	adminGroup.GET("/users/import/:jobID", adminHandler.GetUserImportJob, usersRead)
+	adminGroup.GET("/users/import/:jobID/rows", adminHandler.GetUserImportJobRows, usersRead)
+	adminGroup.DELETE("/users/import/:jobID", adminHandler.CancelUserImportJob, usersWrite)
+	adminGroup.GET("/tenants/:tid/users/import", adminHandler.ListUserImportJobs, tidUsersRead)
+	adminGroup.GET("/tenants/:tid/users/import/:jobID", adminHandler.GetUserImportJob, tidUsersRead)
+	adminGroup.GET("/tenants/:tid/users/import/:jobID/rows", adminHandler.GetUserImportJobRows, tidUsersRead)
+	adminGroup.DELETE("/tenants/:tid/users/import/:jobID", adminHandler.CancelUserImportJob, tidUsersWrite)
+	adminGroup.GET("/applications/:appID/users/import", adminHandler.ListUserImportJobs, usersRead)
+	adminGroup.GET("/applications/:appID/users/import/:jobID", adminHandler.GetUserImportJob, usersRead)
+	adminGroup.GET("/applications/:appID/users/import/:jobID/rows", adminHandler.GetUserImportJobRows, usersRead)
+	adminGroup.DELETE("/applications/:appID/users/import/:jobID", adminHandler.CancelUserImportJob, usersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/import", adminHandler.ListUserImportJobs, appUsersRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/import/:jobID", adminHandler.GetUserImportJob, appUsersRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/import/:jobID/rows", adminHandler.GetUserImportJobRows, appUsersRead)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/import/:jobID", adminHandler.CancelUserImportJob, appUsersWrite)
 	adminGroup.GET("/audit-logs/:id", adminHandler.GetTenantAuditLogByID, auditRead)
 	tenantMgmt.GET("/audit-logs/system", adminHandler.GetSystemAuditLogs)
 	tenantMgmt.GET("/audit-logs/system/:id", adminHandler.GetSystemAuditLogByID)
@@ -1679,4 +1742,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) {
 	e.GET("/api/*", func(c echo.Context) error {
 		return echo.ErrNotFound
 	})
+
+	return func() {
+		stopImportWorker()
+	}
 }

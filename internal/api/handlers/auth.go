@@ -272,7 +272,7 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
 	}
 	if len(req.Password) < 8 {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		return fail(c, http.StatusBadRequest, "password_too_short")
 	}
 
 	result, err := h.svc.Register(c.Request().Context(), auth.RegisterInput{
@@ -288,7 +288,7 @@ func (h *AuthHandler) Register(c echo.Context) error {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
 		}
 		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "email already registered"})
+			return fail(c, http.StatusConflict, "email_already_registered")
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
@@ -329,7 +329,13 @@ func invalidCredentials(c echo.Context, err error) error {
 	if errors.As(err, &soft) {
 		c.Response().Header().Set("Retry-After", strconv.Itoa(soft.RetryAfterSeconds()))
 	}
-	return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+	// One code and one sentence whatever went wrong — no such account, wrong
+	// password, or correct password against a soft-locked account. Distinguishing
+	// them here is what turns a login form into an account-enumeration oracle,
+	// and the soft-lock case additionally tells an attacker their guess was
+	// right. Retry-After carries the only hint, and only to a client that
+	// already got this far.
+	return fail(c, http.StatusUnauthorized, "invalid_credentials")
 }
 
 // softLockMeta tags a login-failure audit event that was refused by a soft lock,
@@ -390,7 +396,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
 
 	if result.OTPChallenge != nil {
@@ -482,7 +488,7 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
 	}
 	if len(req.Password) < 8 {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		return fail(c, http.StatusBadRequest, "password_too_short")
 	}
 
 	clientID, clientSecret, errResp := appCredentialsFromRequest(c)
@@ -504,7 +510,7 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 		}
 		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "email already registered in this application"})
+			return fail(c, http.StatusConflict, "email_already_registered")
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
@@ -581,7 +587,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
 
 	if result.OTPChallenge != nil {
@@ -719,7 +725,7 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 		if errors.Is(err, auth.ErrInvalidMagicLink) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "sign-in failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
 
 	if result.OTPChallenge != nil {
@@ -797,7 +803,7 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		}
 		if containsMsg(err, "invalid TOTP") || containsMsg(err, "invalid or expired") || containsMsg(err, "invalid backup") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired OTP code"})
+			return fail(c, http.StatusUnauthorized, "mfa_code_invalid")
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "OTP login failed"})
 	}
@@ -1227,10 +1233,10 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+			return fail(c, http.StatusUnauthorized, "session_terminated")
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
+			return fail(c, http.StatusUnauthorized, "refresh_token_invalid")
 		}
 		if errors.Is(err, auth.ErrServiceUnavailable) {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})
@@ -1438,10 +1444,10 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	})
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidResetToken) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired reset token"})
+			return fail(c, http.StatusBadRequest, "reset_link_invalid")
 		}
 		if containsMsg(err, "at least 8 characters") {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+			return fail(c, http.StatusBadRequest, "password_too_short")
 		}
 		h.logger.Error().Err(err).Msg("reset-password failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "password reset failed"})
@@ -1560,7 +1566,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
 		if containsMsg(err, "invalid TOTP") {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid TOTP code — check your authenticator app"})
+			return fail(c, http.StatusBadRequest, "mfa_code_invalid")
 		}
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
@@ -1910,7 +1916,7 @@ func (h *AuthHandler) LoginOTPResend(c echo.Context) error {
 			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
 		}
 		if containsMsg(err, "invalid or expired") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired OTP session"})
+			return fail(c, http.StatusUnauthorized, "mfa_session_expired")
 		}
 		if containsMsg(err, "not an available method") {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -2462,7 +2468,7 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
 
 	if result.OTPChallenge != nil {
@@ -2544,10 +2550,10 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+			return fail(c, http.StatusUnauthorized, "session_terminated")
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
+			return fail(c, http.StatusUnauthorized, "refresh_token_invalid")
 		}
 		if errors.Is(err, auth.ErrServiceUnavailable) {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})
