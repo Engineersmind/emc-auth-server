@@ -597,6 +597,19 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 		return 0, "", fmt.Errorf("insert JIT user: %w", err)
 	}
 
+	// Mirror into user_roles, as application Register does: the join table is what
+	// resolution reads since #146 phase 2, and a JIT user with only role_id set
+	// would sign in carrying none of that role's permissions.
+	if roleID != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+			VALUES ($1, $2, $3, NULL)
+			ON CONFLICT (user_id, role_id) DO NOTHING
+		`, userID, *roleID, st.TenantID); err != nil {
+			return 0, "", fmt.Errorf("record JIT default role grant: %w", err)
+		}
+	}
+
 	_, err = tx.Exec(ctx, `
 		INSERT INTO user_identities
 		    (user_id, tenant_id, application_id, provider, provider_sub, provider_email)

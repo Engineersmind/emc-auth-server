@@ -249,6 +249,21 @@ type LoginInput struct {
 	// accidentally opt its users into month-long sessions on shared machines.
 	Persistent bool
 
+	// Roles narrows the session to a subset of the roles the user holds (#146
+	// phase 4). Empty — the normal case — means the session carries the full union
+	// and nothing about resolution changes.
+	//
+	// NARROWING ONLY. Every name is checked against the roles the account actually
+	// holds, and a role it does not hold refuses the login with the same generic
+	// error a wrong password produces. Without that check this field would be a
+	// privilege escalation with a friendly name: a caller could simply ask for
+	// "owner". See resolveActiveRoles.
+	//
+	// Useful for a console that wants an explicitly low-privilege session for
+	// routine work, so a mistake cannot reach the permissions the account holds
+	// but the operator did not intend to use.
+	Roles []string
+
 	// VerifiedApp carries an application context that the CALLER has already
 	// established from the database, bypassing the client_secret check below.
 	//
@@ -420,21 +435,44 @@ func (s *AuthService) resolveRegistrationTenant(ctx context.Context) (int64, err
 // they are on the role half only, since the direct half attaches to the account
 // rather than to any role and must survive independently.
 func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int64) ([]string, error) {
+	return s.loadPermissionsScoped(ctx, userID, tenantID, nil)
+}
+
+// loadPermissionsScoped is loadPermissions narrowed to a subset of the roles the
+// user holds. A nil activeRoles means the full union — today's behaviour, and
+// what every caller but a scoped login passes.
+//
+// The role half reads user_roles, not users.role_id: a user may hold several
+// roles since #146 phase 2, and resolving through the scalar column would return
+// only the primary one. users.role_id is still written and still carries the
+// primary role, so the UNION below is a widening — every permission the old query
+// returned is still returned, because the backfill copied role_id into user_roles
+// and AssignUserRole keeps the two in step.
+//
+// activeRoles filters the ROLE half only. Direct user_permissions grants attach
+// to the person rather than to any role, so a session scoped to one role keeps
+// them; scoping them away would silently strip permissions an operator granted
+// the account itself. The filter is by role NAME rather than id because that is
+// what a client asks for at login and what the `roles` claim carries — ids are an
+// implementation detail no caller should need.
+func (s *AuthService) loadPermissionsScoped(ctx context.Context, userID, tenantID int64, activeRoles []string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT DISTINCT p.name
 		FROM permissions p
 		JOIN role_permissions rp ON rp.permission_id = p.id
-		JOIN roles r ON r.id = rp.role_id AND r.deleted_at IS NULL
-		JOIN users u ON u.role_id = rp.role_id
-		WHERE u.id = $1 AND u.tenant_id = $2
+		JOIN roles r  ON r.id = rp.role_id AND r.deleted_at IS NULL
+		JOIN user_roles ur ON ur.role_id = rp.role_id
+		JOIN users u  ON u.id = ur.user_id
+		WHERE ur.user_id = $1 AND ur.tenant_id = $2
 		  AND u.is_active = true AND u.deleted_at IS NULL
+		  AND ($3::TEXT[] IS NULL OR r.name = ANY($3::TEXT[]))
 		UNION
 		SELECT DISTINCT p.name
 		FROM permissions p
 		JOIN user_permissions up ON up.permission_id = p.id
 		WHERE up.user_id = $1 AND up.tenant_id = $2
 		ORDER BY 1
-	`, userID, tenantID)
+	`, userID, tenantID, activeRoles)
 	if err != nil {
 		return nil, fmt.Errorf("load permissions: %w", err)
 	}
@@ -469,6 +507,86 @@ func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int6
 			Msg("permission load returned an empty set; token will be refused by every permission-gated route")
 	}
 	return perms, nil
+}
+
+// loadRoles returns the names of every live role the user holds, ordered by the
+// instant each was granted.
+//
+// Grant order, not alphabetical: it makes the primary role — the one registration
+// assigned, or the earliest surviving grant — first in the list, so a consumer
+// that reads roles[0] gets a stable answer rather than one that reshuffles when an
+// unrelated role is added. The `role` claim carries the same value for exactly
+// this reason.
+func (s *AuthService) loadRoles(ctx context.Context, userID, tenantID int64) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT r.name
+		FROM user_roles ur
+		JOIN roles r ON r.id = ur.role_id AND r.deleted_at IS NULL
+		WHERE ur.user_id = $1 AND ur.tenant_id = $2
+		ORDER BY ur.granted_at, r.id
+	`, userID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("load roles: %w", err)
+	}
+	defer rows.Close()
+
+	roles := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan role: %w", err)
+		}
+		roles = append(roles, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate roles: %w", err)
+	}
+	return roles, nil
+}
+
+// resolveActiveRoles validates the roles a client asked its session to be scoped
+// to, against the roles the user actually holds.
+//
+// NARROWING ONLY, NEVER WIDENING. This one check carries the entire security
+// property of session scoping: without it any caller could request "owner" at
+// login and be handed it. A requested role the user does not hold is refused
+// outright rather than silently dropped, because silently dropping it produces a
+// token narrower than the client believes it holds, and the resulting 403s are
+// indistinguishable from a permission bug.
+//
+// The refusal is deliberately generic — ErrInvalidCredentials, the same error a
+// wrong password produces. A specific "you do not hold that role" would turn the
+// login endpoint into an oracle for which roles exist in a tenant and who holds
+// them, which is exactly the enumeration this service refuses everywhere else.
+//
+// nil (no roles requested) means the full union, so an ordinary login is
+// unaffected by every line of this.
+func resolveActiveRoles(requested, held []string) ([]string, error) {
+	if len(requested) == 0 {
+		return nil, nil
+	}
+	heldSet := make(map[string]struct{}, len(held))
+	for _, r := range held {
+		heldSet[r] = struct{}{}
+	}
+	// Byte-identical to what a wrong password returns, deliberately: see the
+	// doc comment. Built with fmt.Errorf rather than a sentinel to match the
+	// login path's existing refusals, which callers compare by message.
+	// Deduplicated, and kept in the caller's order so the claim reads back the way
+	// it was asked for.
+	seen := make(map[string]struct{}, len(requested))
+	active := make([]string, 0, len(requested))
+	for _, r := range requested {
+		if _, ok := heldSet[r]; !ok {
+			return nil, fmt.Errorf("invalid credentials")
+		}
+		if _, dup := seen[r]; dup {
+			continue
+		}
+		seen[r] = struct{}{}
+		active = append(active, r)
+	}
+	return active, nil
 }
 
 // sessionContext describes the session a token pair is being minted into.
@@ -509,6 +627,18 @@ type sessionContext struct {
 	// the protocol flow that exchanged them for a token. A password login and an
 	// authorization-code flow can present identical amr.
 	grant string
+
+	// activeRoles narrows the session to a subset of the roles the user holds
+	// (#146 phase 4). Nil — the normal case — means the session carries the full
+	// union and nothing about resolution changes.
+	//
+	// Carried on the session rather than passed per mint because it has to survive
+	// refresh rotation. A refresh that silently restored the full set would defeat
+	// the entire feature: a client could scope down, rotate once, and come back
+	// holding everything. The refresh path reloads it from the refresh_tokens row
+	// and passes it here, so a narrowed session stays narrowed for its whole life
+	// and widening requires a fresh login.
+	activeRoles []string
 
 	// audience is an EXPLICITLY requested audience — the `audience` or RFC 8707
 	// `resource` parameter (issue #131). Empty is the normal case and is not an
@@ -598,6 +728,28 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 		return nil, err
 	}
 	claims.AdminScope, claims.AdminApps = adminScope, adminApps
+
+	// Roles is resolved here for the same reason adminScope is: every path that
+	// mints a user token funnels through this function, so a role granted or
+	// revoked between login and a refresh rotation cannot survive by riding a
+	// caller that forgot to reload it.
+	//
+	// A failure degrades to the primary role rather than failing the mint, matching
+	// the stance every caller already takes on loadPermissions: a user who
+	// authenticated correctly should not be unable to sign in because a
+	// supplementary claim could not be built. Permissions — the claim enforcement
+	// actually reads — were resolved by the caller and are unaffected.
+	roles, err := s.loadRoles(ctx, userID, tenantID)
+	if err != nil {
+		s.logger.Warn().Err(err).Int64("user_id", userID).
+			Msg("mint: failed to load roles; falling back to the primary role alone")
+		roles = nil
+	}
+	if len(roles) == 0 && role != "" {
+		roles = []string{role}
+	}
+	claims.Roles = roles
+	claims.ActiveRoles = sess.activeRoles
 
 	// The audience — issue #131. Resolved BEFORE the transaction opens, because
 	// a denial is the caller's error and must not leave a half-written session
@@ -770,10 +922,10 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO refresh_tokens
 		    (user_id, tenant_id, token_hash, expires_at, session_id, session_family_id,
-		     application_id, audience, last_used_at)
-		VALUES ($1, $2, $3, $4, $5, $5, $6, NULLIF($7, ''), NOW())
+		     application_id, audience, active_roles, last_used_at)
+		VALUES ($1, $2, $3, $4, $5, $5, $6, NULLIF($7, ''), $8, NOW())
 	`, userID, tenantID, refreshHash, tokenExpiresAt, sessionID,
-		parseAppID(appID), aud.Value); err != nil {
+		parseAppID(appID), aud.Value, sess.activeRoles); err != nil {
 		return nil, fmt.Errorf("persist refresh token: %w", err)
 	}
 
@@ -941,6 +1093,21 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 	`, tenantID, in.Email, in.FirstName, in.LastName, roleID, appRowID).Scan(&userID)
 	if err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
+	}
+
+	// The default role goes into user_roles too, in this same transaction. Since
+	// #146 phase 2 the join table is what loadPermissions reads, so a registration
+	// that wrote only role_id would produce a user who displays a role and resolves
+	// no permissions from it. granted_by is NULL because nobody granted it — the
+	// application's default-role configuration did.
+	if roleID != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+			VALUES ($1, $2, $3, NULL)
+			ON CONFLICT (user_id, role_id) DO NOTHING
+		`, userID, *roleID, tenantID); err != nil {
+			return nil, fmt.Errorf("record default role grant: %w", err)
+		}
 	}
 
 	_, err = tx.Exec(ctx, `
@@ -1477,7 +1644,27 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// Advisory breached-password check (detached; never delays or blocks login).
 	s.brchSvc.Notify(ctx, tenantID, appRowIDFromClaim(appID), userID, email, in.Password)
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	// Validated BEFORE any token is minted and before the MFA gate: a request for
+	// a role the account does not hold is refused outright, with the same generic
+	// error a wrong password gives. Anything less makes in.Roles a way to ask for
+	// privileges rather than a way to give them up.
+	var activeRoles []string
+	if len(in.Roles) > 0 {
+		held, err := s.loadRoles(ctx, userID, tenantID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve session roles: %w", err)
+		}
+		activeRoles, err = resolveActiveRoles(in.Roles, held)
+		if err != nil {
+			// Logged at the server, generic to the caller: the operator needs to
+			// see which role was refused, the client must not learn it exists.
+			s.logger.Warn().Int64("user_id", userID).Strs("requested", in.Roles).
+				Msg("login: refused a session scoped to roles the account does not hold")
+			return nil, err
+		}
+	}
+
+	perms, err := s.loadPermissionsScoped(ctx, userID, tenantID, activeRoles)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("login: failed to load permissions, continuing with empty set")
 		perms = []string{}
@@ -1500,7 +1687,12 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	}
 
 	tokens, err := s.issueTokenPair(ctx, userID, tenantID, email, roleName, perms,
-		sessionContext{persistent: in.Persistent, amr: []string{AMRPassword}, grant: GrantPassword}, appID)
+		sessionContext{
+			persistent:  in.Persistent,
+			amr:         []string{AMRPassword},
+			grant:       GrantPassword,
+			activeRoles: activeRoles,
+		}, appID)
 	if err != nil {
 		return nil, err
 	}
@@ -2060,14 +2252,15 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	var pinnedAudience *string
 	err := s.pool.QueryRow(ctx, `
 		SELECT rt.id, s.user_id, s.tenant_id, s.id,
-		       s.is_persistent, s.auth_time, s.amr, rt.audience
+		       s.is_persistent, s.auth_time, s.amr, rt.audience, rt.active_roles
 		FROM refresh_tokens rt
 		JOIN user_sessions s ON s.id = rt.session_id
 		WHERE rt.token_hash = $1
 		  AND `+LiveTokenWhere("rt.")+`
 		  AND `+LiveSessionWhere("s."),
 		hash).Scan(&tokenID, &userID, &tenantID, &sessionID,
-		&carried.persistent, &carried.authTime, &carried.amr, &pinnedAudience)
+		&carried.persistent, &carried.authTime, &carried.amr, &pinnedAudience,
+		&carried.activeRoles)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken
@@ -2100,7 +2293,7 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("fetch user for refresh: %w", err)
 	}
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	perms, err := s.loadPermissionsScoped(ctx, userID, tenantID, carried.activeRoles)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions, continuing with empty set")
 		perms = []string{}
@@ -2146,7 +2339,12 @@ const gracePeriod = 10 // seconds
 // The session must still be live, not merely have a recent token: a session revoked
 // during the grace window must not be waved through by a token minted a moment
 // before the revoke.
-func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, sessionID int64) (*GraceResult, error) {
+// activeRoles is the session's role scope, read by the caller from the presented
+// token's row. Passed rather than re-derived so the grace token is narrowed
+// exactly as the rotation it stands in for would have been — a grace window that
+// returned the full permission set would be a way to widen a scoped session by
+// replaying its own previous token.
+func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, sessionID int64, activeRoles []string) (*GraceResult, error) {
 	err := s.pool.QueryRow(ctx, `
 		SELECT 1
 		FROM refresh_tokens rt
@@ -2180,7 +2378,7 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, se
 		return nil, fmt.Errorf("fetch user for grace window: %w", err)
 	}
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	perms, err := s.loadPermissionsScoped(ctx, userID, tenantID, activeRoles)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("grace window: failed to load permissions")
 		perms = []string{}
@@ -2277,13 +2475,14 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		       COALESCE(s.auth_time, rt.created_at),
 		       COALESCE(s.amr, '{}'),
 		       s.revoked_at, s.idle_expires_at, s.absolute_expires_at,
-		       rt.audience
+		       rt.audience, rt.active_roles
 		FROM refresh_tokens rt
 		LEFT JOIN user_sessions s ON s.id = rt.session_id
 		WHERE rt.token_hash = $1
 	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionID, &revokedAt, &expiresAt,
 		&carried.persistent, &carried.authTime, &carried.amr,
-		&sessionRevokedAt, &sessionIdleExpires, &sessionAbsoluteExpires, &pinnedAudience)
+		&sessionRevokedAt, &sessionIdleExpires, &sessionAbsoluteExpires, &pinnedAudience,
+		&carried.activeRoles)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, ErrInvalidRefreshToken
@@ -2312,7 +2511,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		// Another request is currently rotating this session. Wait briefly then
 		// check whether a fresh token was issued within the grace window.
 		time.Sleep(300 * time.Millisecond)
-		grace, err := s.checkGraceWindow(ctx, userID, tenantID, sessionID)
+		grace, err := s.checkGraceWindow(ctx, userID, tenantID, sessionID, carried.activeRoles)
 		return nil, grace, err
 	}
 
@@ -2385,7 +2584,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		return nil, nil, fmt.Errorf("fetch user for refresh: %w", err)
 	}
 
-	perms, err := s.loadPermissions(ctx, userID, tenantID)
+	perms, err := s.loadPermissionsScoped(ctx, userID, tenantID, carried.activeRoles)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions")
 		perms = []string{}
