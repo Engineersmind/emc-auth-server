@@ -17,6 +17,7 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
 	mw "github.com/engineersmind/emc-auth-server/internal/api/middleware"
+	"github.com/engineersmind/emc-auth-server/internal/api/paths"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
@@ -40,8 +41,17 @@ type AdminHandler struct {
 	// nil makes those routes answer 503 rather than panicking, matching the
 	// shape of the other optional services here.
 	audienceSvc *auth.AudienceService
-	audit       *audit.Logger
-	logger      zerolog.Logger
+	// issuers resolves a tenant's OIDC issuer, so an application detail can
+	// carry the token-validation block an integrator needs. nil simply omits
+	// that block — it is additive information, never a reason to fail a read.
+	issuers *auth.TenantIssuerResolver
+	// servingBaseURL is APP_BASE_URL: the origin this server answers on, and
+	// therefore where the JWKS and discovery documents live. Distinct from the
+	// issuer's origin whenever the two are configured differently — see
+	// WithIssuers and attachTokenValidation.
+	servingBaseURL string
+	audit          *audit.Logger
+	logger         zerolog.Logger
 }
 
 // NewAdminHandler creates an AdminHandler.
@@ -78,6 +88,77 @@ func (h *AdminHandler) WithTOTP(svc *auth.TOTPService) *AdminHandler {
 func (h *AdminHandler) WithAudiences(svc *auth.AudienceService) *AdminHandler {
 	h.audienceSvc = svc
 	return h
+}
+
+// WithIssuers attaches the tenant issuer resolver, which lets an application
+// detail carry the token-validation block (audience + issuer + JWKS URI).
+//
+// servingBaseURL is APP_BASE_URL — the origin this server actually answers on.
+// It is passed separately because it is NOT always the issuer's origin: the
+// issuer comes from OIDC_ISSUER_BASE_URL, and a deployment may legitimately set
+// the two to different hosts. The JWKS and discovery documents are served from
+// this one, so they must be built from it. Empty falls back to the issuer
+// origin, which is correct for the common single-host deployment.
+func (h *AdminHandler) WithIssuers(r *auth.TenantIssuerResolver, servingBaseURL string) *AdminHandler {
+	h.issuers = r
+	h.servingBaseURL = strings.TrimRight(servingBaseURL, "/")
+	return h
+}
+
+// attachTokenValidation fills app.TokenValidation with what a resource server
+// needs to verify this application's tokens.
+//
+// Assembled here rather than in the console or an SDK because the issuer format
+// and the well-known paths belong to this server. A consumer that builds them
+// itself keeps working right up until the scheme changes, then silently shows
+// stale values — an identifier that is wrong with no error attached.
+//
+// Every failure is non-fatal and leaves the block absent. This is additive
+// information on a read that must keep working: an application the operator
+// cannot load is strictly worse than one whose validation block is missing.
+func (h *AdminHandler) attachTokenValidation(c echo.Context, tenantID int64, app *auth.AppDetail) {
+	// No audience means a row created before per-application audiences existed.
+	// There is nothing for an integrator to validate against, so a block naming
+	// an issuer and an empty audience would be worse than none at all.
+	if h.issuers == nil || app == nil || app.Audience == "" {
+		return
+	}
+	issuer, err := h.issuers.Issuer(c.Request().Context(), tenantID)
+	if err != nil {
+		h.logger.Warn().Err(err).Int64("tenant_id", tenantID).
+			Msg("admin: issuer unresolved, omitting token_validation")
+		return
+	}
+	// The documents are built from the SERVING origin, not from the issuer.
+	//
+	// These are two different things whenever OIDC_ISSUER_BASE_URL and
+	// APP_BASE_URL differ, which is a supported configuration —
+	// warnIssuerHostMismatch (routes.go) logs it at startup and states plainly
+	// that "JWKS is served from APP_BASE_URL". Deriving the URLs from the issuer
+	// therefore published endpoints on a host this server does not answer on,
+	// and an integrator following them could not fetch the keys at all. Worse
+	// than omitting the block: the whole point of it is to save them guessing.
+	//
+	// The issuer keeps its own value, because it is an identifier rather than a
+	// location — a verifier compares the `iss` claim against it and must not see
+	// it rewritten to match wherever the documents happen to live.
+	docBase := issuer
+	if h.servingBaseURL != "" {
+		// Same tenant path the routes are registered with, rooted at the origin
+		// that serves them. Falls back to the issuer when APP_BASE_URL is unset,
+		// which is the single-host case where the two are identical anyway.
+		docBase = h.servingBaseURL + "/tenants/" + tenantSlugFromIssuer(issuer)
+	}
+
+	app.TokenValidation = &auth.TokenValidationConfig{
+		Audience: app.Audience,
+		Issuer:   issuer,
+		// paths.*Suffix rather than string literals: both derive from the same
+		// templates the routes are registered with, so the PATH cannot drift
+		// from what is served even though the origin is chosen above.
+		JWKSURI:      docBase + paths.JWKSSuffix,
+		DiscoveryURI: docBase + paths.DiscoverySuffix,
+	}
 }
 
 func (h *AdminHandler) WithWebAuthn(svc *auth.WebAuthnService) *AdminHandler {
@@ -2883,7 +2964,7 @@ func (h *AdminHandler) ListApplications(c echo.Context) error {
 // GET /api/v1/tenants/:tid/applications/:id.
 //
 // @Summary      Get application
-// @Description  Returns one application (active or inactive) by ID. The secret is never included.
+// @Description  Returns one application (active or inactive) by ID. The secret is never included. Carries `token_validation` — the audience, issuer, JWKS and discovery URIs a resource server needs to verify this application's tokens — omitted when the application has no audience or the issuer cannot be resolved.
 // @Tags         admin-applications
 // @Produce      json
 // @Security     BearerAuth
@@ -2911,6 +2992,7 @@ func (h *AdminHandler) GetApplication(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: get application failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get application"})
 	}
+	h.attachTokenValidation(c, tenantID, app)
 	return c.JSON(http.StatusOK, app)
 }
 
@@ -2974,6 +3056,7 @@ func (h *AdminHandler) UpdateApplication(c echo.Context) error {
 	}
 
 	h.auditAdminApp(c, claims, audit.ActionAdminApplicationUpdated, "application", app.ID, appIDFromClaim(app.ID))
+	h.attachTokenValidation(c, tenantID, app)
 	return c.JSON(http.StatusOK, app)
 }
 
@@ -3289,6 +3372,28 @@ func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 		return nil
 	}
 
+	// The branding a send would really use, resolved the same way the send
+	// resolves it. Attached to both branches below because the question "what
+	// brand will the recipient see?" has an answer whether or not this scope has
+	// a sender row of its own — and the answer is frequently NOT this row's
+	// product name. See auth.EffectiveBranding.
+	effectiveBranding := func() *auth.EffectiveBranding {
+		sender, senderScope, err := h.senderSvc.ResolveWithScope(c.Request().Context(), tenantID, appRowID)
+		if err != nil {
+			// Non-fatal: the sender settings are still worth returning. The UI
+			// falls back to a placeholder rather than showing a wrong brand.
+			h.logger.Warn().Err(err).Msg("admin: resolve effective branding failed")
+			return nil
+		}
+		productName, logoURL, prefix := mailer.ResolvedBranding(sender)
+		return &auth.EffectiveBranding{
+			ProductName:   productName,
+			LogoURL:       logoURL,
+			SubjectPrefix: prefix,
+			Scope:         senderScope,
+		}
+	}
+
 	settings, err := h.senderSvc.Get(c.Request().Context(), tenantID, appRowID)
 	if err != nil {
 		// Not an error condition: this scope simply has no sender of its own, so
@@ -3303,9 +3408,10 @@ func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 				source = "tenant"
 			}
 			return c.JSON(http.StatusOK, auth.EmailSenderResolution{
-				Configured: false,
-				Source:     source,
-				Settings:   nil,
+				Configured:        false,
+				Source:            source,
+				Settings:          nil,
+				EffectiveBranding: effectiveBranding(),
 			})
 		}
 		h.logger.Error().Err(err).Msg("admin: get email sender failed")
@@ -3316,9 +3422,10 @@ func (h *AdminHandler) GetEmailSender(c echo.Context) error {
 		source = "application"
 	}
 	return c.JSON(http.StatusOK, auth.EmailSenderResolution{
-		Configured: true,
-		Source:     source,
-		Settings:   settings,
+		Configured:        true,
+		Source:            source,
+		Settings:          settings,
+		EffectiveBranding: effectiveBranding(),
 	})
 }
 
@@ -3414,21 +3521,25 @@ func (h *AdminHandler) DeleteEmailSender(c echo.Context) error {
 	return c.JSON(http.StatusOK, map[string]string{"message": "email sender removed — sends fall back to the next level"})
 }
 
-// SendTestEmailRequest is the body for POST .../email-settings/test. The
-// recipient is NOT accepted from the client — a test email is always sent to the
-// authenticated admin's own address, so this endpoint can never be abused as an
-// open relay to arbitrary addresses.
+// SendTestEmailRequest is the body for POST .../email-settings/test.
+//
+// The recipient IS accepted from the client, and the saved template is what
+// gets sent. Neither is restricted: what bounds this endpoint is the test
+// marking applied in mailer.markAsTest, not a limit on who may receive it or
+// which content may render. See PR #91 for the threat model and SendTestEmail
+// for why the marking replaced the old recipient-based restriction.
 type SendTestEmailRequest struct {
-	// TemplateType selects which template to render (empty = email_verification).
+	// TemplateType selects which template to render. Empty means the built-in
+	// provider diagnostic (mailer.TemplateProviderTest) — a bare provider check,
+	// NOT email_verification, which was the default until #91 and delivered a
+	// real-looking verification mail containing a dead sample link.
 	TemplateType string `json:"template_type"`
 	// To is the recipient. Empty = the requesting admin's own address.
 	//
-	// INVARIANT: a recipient other than the caller's own address always gets the
-	// built-in diagnostic template, never a per-scope override — see the
-	// enforcement in SendTestEmail. Template bodies are editable at this same
-	// permission level, so allowing both an arbitrary recipient and arbitrary
-	// content would make this a phishing relay from a verified sender identity.
-	// See PR #91 for the full threat model.
+	// Any valid address is accepted. The message is always stamped as a test —
+	// [Test] subject prefix plus an in-body notice, applied after rendering so a
+	// custom template cannot suppress it — so it cannot pass as a genuine
+	// product email regardless of who receives it or what the body says.
 	To string `json:"to"`
 	// AllowInherited permits an application-addressed test to proceed when the
 	// application has no sender of its own and would fall through to the
@@ -3466,6 +3577,20 @@ type SendTestEmailResponse struct {
 	Scope    string `json:"scope"`    // application | tenant | global
 	Provider string `json:"provider"` // smtp | sendgrid | dev
 	Template string `json:"template"`
+	// MarkedAsTest reports that the message was stamped with a [Test] subject
+	// prefix and an in-body test notice. Always true for this endpoint; sent
+	// explicitly so the UI can say so, rather than leaving an admin to wonder
+	// why the mail they received does not match the template they saved.
+	MarkedAsTest bool `json:"marked_as_test"`
+	// UsedCustomTemplate distinguishes "your saved template was sent" from "the
+	// built-in default was sent instead".
+	//
+	// The second happens for a reason that is invisible from the send itself: a
+	// stored template with is_active = false is skipped by Resolve, so an admin
+	// who saved a customisation while its Status toggle was off receives the
+	// default and concludes the save failed. The template screen turns this into
+	// an explanation rather than a mystery.
+	UsedCustomTemplate bool `json:"used_custom_template"`
 }
 
 // SendTestEmail handles POST .../email-settings/test and flat aliases: it sends
@@ -3528,8 +3653,8 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 	if strings.ContainsAny(to, "\r\n") {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "recipient is not a valid email address"})
 	}
-	// Whether this send leaves the caller's own mailbox. Drives both the audit
-	// flag and the content restriction below.
+	// Whether this send leaves the caller's own mailbox. Drives the audit flag
+	// and the recipient boundary below.
 	external := !strings.EqualFold(to, ownEmail)
 
 	// No template_type means "just check the provider", which sends the
@@ -3543,23 +3668,61 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "unknown template type"})
 	}
 
-	// SECURITY: an external recipient always gets the built-in diagnostic
-	// template, never a per-scope override.
+	// A rendered CUSTOM template may go to the caller, or to a user of this
+	// tenant. Any other address gets the fixed diagnostic or nothing.
 	//
-	// Template bodies are editable at the SAME permission level as this endpoint
-	// (PUT /email-templates/:type is apps:write), so allowing both an arbitrary
-	// recipient and an arbitrary template would let one apps:write token deliver
-	// attacker-authored HTML, with product branding, from a verified sender
-	// identity — to any address on the internet. With an inherited global
-	// sender that is the operator's shared domain, so the blast radius crosses
-	// the tenant boundary.
+	// The [Test] prefix and the in-body notice are defence in depth, NOT an
+	// authorization boundary. The subject prefix survives anything a template
+	// can do; the body notice does not. The template author owns the document,
+	// so a rule such as `body>div:first-child{display:none!important}`
+	// suppresses the banner while the message still carries real branding and a
+	// verified sender identity. The recipient is what actually bounds this.
 	//
-	// Restricting content rather than recipients keeps the actual use case
-	// (proving deliverability to a QA alias or a customer domain) fully intact.
-	// Template previews still work — they just go to your own mailbox.
-	if external {
-		tt = mailer.TemplateProviderTest
+	// Tenant membership rather than self-only: proving deliverability to a
+	// colleague or a QA alias is the real use case, and those are addresses the
+	// tenant already legitimately mails. It is also the rule that
+	// SendTestEmailRequest.To has always documented.
+	//
+	// The provider diagnostic is exempt — it is not customizable, so it carries
+	// no attacker-authored content and remains sendable anywhere.
+	if external && tt != mailer.TemplateProviderTest {
+		member, err := h.svc.RecipientBelongsToTenant(c.Request().Context(), tenantID, to)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("admin: check test recipient membership failed")
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to verify the recipient"})
+		}
+		if !member {
+			// Refused, not silently downgraded: an unexplained substitution is
+			// exactly what made the previous behaviour impossible to diagnose.
+			return c.JSON(http.StatusForbidden, map[string]string{
+				"error": "a template preview can only be sent to your own address or to a user of this tenant — " +
+					"omit template_type to send the provider diagnostic to any address",
+			})
+		}
 	}
+
+	// SECURITY: the saved template IS what goes out, to whatever recipient was
+	// asked for — and every test send is stamped as a test by the mailer.
+	//
+	// The risk this addresses is real: template bodies are editable at the SAME
+	// permission level as this endpoint (PUT /email-templates/:type is
+	// apps:write), so one token can author HTML and choose who receives it, from
+	// a verified sender identity with product branding and SPF/DKIM passing.
+	// With an inherited global sender that is the operator's shared domain, so
+	// the blast radius crosses the tenant boundary.
+	//
+	// This used to be answered by forcing the diagnostic template whenever the
+	// recipient was not the caller's own address (26d6c80, from review on #91).
+	// That defeated the feature: an admin who saved a template and sent a test
+	// received the provider diagnostic instead, with nothing in the response or
+	// the UI saying why. Auth0's equivalent ("Try") sends the saved template.
+	//
+	// The marking in mailer.markAsTest replaces it and is strictly stronger: a
+	// [Test] subject prefix and an unremovable in-body notice mean the message
+	// cannot pass as a genuine product email. It is applied post-render, so a
+	// custom template cannot opt out, and it also covers the case the recipient
+	// rule permitted — an unmarked real template sent to your own address and
+	// forwarded onward.
 
 	// Sender AND the scope it came from, in one query — see ResolveWithScope for
 	// why these must not be two separate lookups.
@@ -3573,7 +3736,29 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 	// even if a row with this type were inserted into email_templates directly.
 	var tmpl *mailer.Template
 	if tt != mailer.TemplateProviderTest {
-		tmpl = h.tmplSvc.ResolveTemplate(c.Request().Context(), tenantID, appRowID, tt)
+		// ResolveTemplateForTest, not ResolveTemplate: Status (is_active) decides
+		// whether real users receive this email, not which content a test
+		// renders. Testing a template before enabling it is the normal order of
+		// work — and every new application starts with its templates disabled,
+		// so the active-only lookup made "Send test" return the built-in default
+		// for exactly the template the admin was looking at.
+		tmpl = h.tmplSvc.ResolveTemplateForTest(c.Request().Context(), tenantID, appRowID, tt)
+
+		// A custom template that fails to render is reported, not swallowed.
+		//
+		// The send path deliberately degrades to the built-in default on a render
+		// error, so a broken template can never block a password reset. For the
+		// editor that silence was the whole problem: a template referencing one
+		// unknown variable produced the built-in email, which is
+		// indistinguishable from never having saved a template at all. The
+		// operator is told which variable broke it instead of guessing.
+		if err := mailer.ValidateTemplate(tmpl, tt); err != nil {
+			h.logger.Warn().Err(err).Str("type", string(tt)).Msg("admin: custom template failed to render for test send")
+			return c.JSON(http.StatusUnprocessableEntity, map[string]string{
+				"error":  "this template could not be rendered, so the test was not sent: " + renderErrorHint(err),
+				"detail": err.Error(),
+			})
+		}
 	}
 
 	provider := h.mailer.GlobalProvider()
@@ -3632,11 +3817,15 @@ func (h *AdminHandler) SendTestEmail(c echo.Context) error {
 		"external": external,
 	})
 	return c.JSON(http.StatusOK, SendTestEmailResponse{
-		Message:  "test email sent to " + to,
-		To:       to,
-		Scope:    scope,
-		Provider: provider,
-		Template: string(tt),
+		Message:      "test email sent to " + to,
+		To:           to,
+		Scope:        scope,
+		Provider:     provider,
+		Template:     string(tt),
+		MarkedAsTest: true,
+		// nil here means Resolve found no ACTIVE override for this scope, so the
+		// built-in went out — see UsedCustomTemplate.
+		UsedCustomTemplate: tmpl != nil,
 	})
 }
 
@@ -3867,6 +4056,41 @@ func wantsRecentEvents(c echo.Context) bool {
 		}
 	}
 	return false
+}
+
+// renderErrorHint turns a Go template error into something an operator can act
+// on. The raw text ("executing \"html\" at <.Year>: can't evaluate field Year
+// in type mailer.TemplateData") names the offending variable but buries it in
+// internals; the unknown-field case is by far the most common, so it gets a
+// sentence that says what to do. Anything else is passed through, since a parse
+// error's position is genuinely the useful part.
+func renderErrorHint(err error) string {
+	msg := err.Error()
+	if i := strings.Index(msg, "can't evaluate field "); i >= 0 {
+		field := strings.TrimSpace(strings.TrimPrefix(msg[i:], "can't evaluate field "))
+		if j := strings.Index(field, " "); j > 0 {
+			field = field[:j]
+		}
+		return "{{." + field + "}} is not a variable this template provides — remove it or use one of the listed variables"
+	}
+	return msg
+}
+
+// tenantSlugFromIssuer extracts the tenant slug from an issuer URL.
+//
+// The issuer is "{base}/tenants/{slug}" by construction
+// (TenantIssuerResolver.IssuerForSlug), so the slug is the final segment. Taken
+// from the issuer rather than re-queried because the caller already holds it
+// and a second lookup could disagree with the value in the same response.
+//
+// Returns "" for an issuer that does not have that shape, which yields a
+// document base ending in "/tenants/" — visibly wrong rather than quietly
+// pointing somewhere plausible and incorrect.
+func tenantSlugFromIssuer(issuer string) string {
+	if i := strings.LastIndex(issuer, "/"); i >= 0 {
+		return issuer[i+1:]
+	}
+	return ""
 }
 
 // ExportUsers handles GET /api/v1/admin/users/export and its tenant- and

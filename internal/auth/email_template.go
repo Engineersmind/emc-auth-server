@@ -78,17 +78,30 @@ func (in *UpsertTemplateInput) validate() error {
 // Resolve returns the effective template for a send, or nil when no active
 // override exists (caller uses the built-in default). App row wins over tenant.
 func (s *EmailTemplateService) Resolve(ctx context.Context, tenantID int64, appRowID *int64, tt mailer.TemplateType) (*mailer.Template, error) {
+	return s.resolve(ctx, tenantID, appRowID, tt, true)
+}
+
+// resolve is the shared lookup. `activeOnly` is the only difference between a
+// real send and an admin test send, and it is a parameter rather than a second
+// query so the application → tenant precedence cannot drift between them.
+func (s *EmailTemplateService) resolve(ctx context.Context, tenantID int64, appRowID *int64, tt mailer.TemplateType, activeOnly bool) (*mailer.Template, error) {
 	var subject, html, text string
 	err := s.pool.QueryRow(ctx, `
 		SELECT subject, html_body, text_body
 		FROM email_templates
 		WHERE tenant_id = $1
 		  AND template_type = $3
-		  AND is_active = true
+		  AND ($4 = false OR is_active = true)
 		  AND (application_id IS NULL OR application_id = $2)
+		  -- An empty body is a placeholder row, not a template: new applications
+		  -- are seeded one per type (mail is opt-in) with is_active = false and
+		  -- EMPTY bodies. A test send ignores is_active, so without this it would
+		  -- resolve that placeholder and mail a blank message instead of falling
+		  -- through to the built-in default.
+		  AND COALESCE(NULLIF(TRIM(html_body), ''), NULLIF(TRIM(text_body), '')) IS NOT NULL
 		ORDER BY application_id ASC NULLS LAST
 		LIMIT 1
-	`, tenantID, appRowID, string(tt)).Scan(&subject, &html, &text)
+	`, tenantID, appRowID, string(tt), activeOnly).Scan(&subject, &html, &text)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil // built-in default
@@ -239,6 +252,31 @@ func (s *EmailTemplateService) ResolveTemplate(ctx context.Context, tenantID int
 	tmpl, err := s.Resolve(ctx, tenantID, appRowID, tt)
 	if err != nil {
 		s.logger.Warn().Err(err).Str("type", string(tt)).Int64("tenant_id", tenantID).Msg("template resolution failed — using built-in default")
+		return nil
+	}
+	return tmpl
+}
+
+// ResolveTemplateForTest resolves the saved template IGNORING is_active, for the
+// admin "send test" action.
+//
+// Status (is_active) governs whether real users receive an email, not which
+// content a test renders. Applying it to both meant an admin who saved a
+// template while it was still disabled — the state every new application starts
+// in, since mail is opt-in — received the built-in default from "Send test" and
+// had no way to check their own content before enabling it. Testing before
+// turning an email on is the normal order of work, so the test path must see
+// the template the editor is showing.
+//
+// IsTypeEnabled is unchanged and still suppresses real sends, so a disabled
+// template remains disabled for users.
+func (s *EmailTemplateService) ResolveTemplateForTest(ctx context.Context, tenantID int64, appRowID *int64, tt mailer.TemplateType) *mailer.Template {
+	if s == nil {
+		return nil
+	}
+	tmpl, err := s.resolve(ctx, tenantID, appRowID, tt, false)
+	if err != nil {
+		s.logger.Warn().Err(err).Str("type", string(tt)).Int64("tenant_id", tenantID).Msg("test template resolution failed — using built-in default")
 		return nil
 	}
 	return tmpl

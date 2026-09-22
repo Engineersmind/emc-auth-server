@@ -887,6 +887,16 @@ definitions:
         items:
           type: string
         type: array
+      token_validation:
+        allOf:
+        - $ref: '#/definitions/auth.TokenValidationConfig'
+        description: |-
+          TokenValidation is everything a resource server needs to verify a token
+          minted for this application. Omitted when the issuer is not resolvable.
+
+          Grouped rather than three loose fields because these values are only
+          correct together: an integrator who configures the audience and skips the
+          issuer is trusting a string that is unique per tenant, not globally.
       updated_at:
         type: string
     type: object
@@ -1030,11 +1040,30 @@ definitions:
       updated_at:
         type: string
     type: object
+  auth.EffectiveBranding:
+    properties:
+      logo_url:
+        type: string
+      product_name:
+        type: string
+      scope:
+        description: Scope names the sender the branding came from ("application",
+          "tenant" or "global").
+        type: string
+      subject_prefix:
+        type: string
+    type: object
   auth.EmailSenderResolution:
     properties:
       configured:
         description: Configured reports whether THIS scope has its own sender row.
         type: boolean
+      effective_branding:
+        allOf:
+        - $ref: '#/definitions/auth.EffectiveBranding'
+        description: EffectiveBranding is the branding a send from here would actually
+          use, after the application -> tenant -> global fall-through. NOT the same
+          as settings.product_name.
       settings:
         allOf:
         - $ref: '#/definitions/auth.EmailSenderSettings'
@@ -1408,6 +1437,34 @@ definitions:
         type: boolean
       enrolled:
         type: boolean
+    type: object
+  auth.TokenValidationConfig:
+    properties:
+      audience:
+        description: |-
+          Audience is this application's immutable identifier, repeated here so the
+          three values can be copied as one block.
+
+          Necessary but NOT sufficient on its own: it proves which application the
+          token was minted for, and nothing about which tenant issued it.
+        type: string
+      discovery_uri:
+        description: |-
+          DiscoveryURI lets a standards-aware library configure itself from one URL
+          instead of three literals, which is the least error-prone option when the
+          integrator's stack supports it.
+        type: string
+      issuer:
+        description: |-
+          Issuer pins the token to this tenant. Audiences are unique per tenant
+          rather than globally, so validating the audience while ignoring the
+          issuer means trusting a string another tenant could mint.
+        type: string
+      jwks_uri:
+        description: |-
+          JWKSURI is the tenant's public key set. Per-tenant because the signing
+          keys are: a single shared key set would defeat that isolation.
+        type: string
     type: object
   auth.UserIdentityDetail:
     properties:
@@ -1920,6 +1977,14 @@ definitions:
     properties:
       message:
         type: string
+      marked_as_test:
+        description: true when the message was stamped with a [Test] subject prefix
+          and an in-body test notice
+        type: boolean
+      used_custom_template:
+        description: false when the built-in default was sent instead of the saved
+          override (most often a disabled template)
+        type: boolean
       provider:
         description: smtp | sendgrid | dev
         type: string
@@ -3552,7 +3617,9 @@ paths:
       - admin-applications
     get:
       description: Returns one application (active or inactive) by ID. The secret
-        is never included.
+        is never included. Carries `token_validation` — the audience, issuer, JWKS
+        and discovery URIs a resource server needs to verify this application's tokens
+        — omitted when the application has no audience or the issuer cannot be resolved.
       parameters:
       - description: Application ID
         in: path

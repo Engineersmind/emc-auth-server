@@ -466,3 +466,113 @@ func (s *AuthService) SwitchTenantContextForClaims(
 	}
 	return s.SwitchTenantContext(ctx, userID, currentTenantID, targetTenantID, platformAdmin, sess)
 }
+
+// permissionsForRefresh resolves a rotating session's permissions the same way
+// SwitchTenantContext resolved them when the session entered this tenant.
+//
+// A refresh must not change what a session can do. Calling loadPermissions
+// directly did exactly that for a tenant administrator acting under a grant:
+// their permissions come from the TARGET tenant's seeded owner/co_owner role,
+// while loadPermissions answers from their home role — usually absent, so the
+// rotated token carried nothing and every route answered 403 about fifteen
+// minutes after switching. That reads as a random loss of access rather than a
+// rotation bug, which is what made it worth a named helper rather than an
+// inline branch.
+//
+// Three cases, matching the authority arms the refresh lookup already applies:
+//
+//   - home tenant: an ordinary user, or an administrator in their own tenant.
+//     loadPermissions is correct and unchanged — this is the common path.
+//   - active grant: permissions come from the target tenant's role for that
+//     grant, identical to the switch.
+//   - platform admin: home-tenant permissions, where tenant:manage lives. This
+//     is also what loadAdminPermissionsForTenant returns for them, so the two
+//     paths agree by construction.
+//
+// Degrading rather than failing on a grant lookup error is deliberate: the
+// caller already treats a permission error as "empty set and carry on", and a
+// refresh that 500s is worse than one that returns a reduced token the next
+// request will re-authorise.
+func (s *AuthService) permissionsForRefresh(ctx context.Context, userID, tenantID int64) ([]string, error) {
+	var homeTenant int64
+	if err := s.pool.QueryRow(ctx,
+		`SELECT tenant_id FROM users WHERE id = $1`, userID,
+	).Scan(&homeTenant); err != nil {
+		return nil, fmt.Errorf("load home tenant for refresh: %w", err)
+	}
+
+	// Acting in their own tenant: nothing tenant-crossing is involved.
+	if homeTenant == tenantID {
+		return s.loadPermissions(ctx, userID, tenantID)
+	}
+
+	// Outside the home tenant, a grant is what decides the answer. A platform
+	// administrator has none, and falls through to their own permissions.
+	ok, grantRole, err := HasAdminGrant(ctx, s.pool, userID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("check grant for refresh: %w", err)
+	}
+	if ok {
+		return s.loadAdminPermissionsForTenant(ctx, userID, tenantID, grantRole, false)
+	}
+
+	// No grant: a platform administrator reaching another tenant by permission.
+	// Their authority lives on their home role, which is where tenant:manage is.
+	return s.loadPermissions(ctx, userID, homeTenant)
+}
+
+// tenantAuthorityPredicate is the SQL condition that decides whether a user may
+// act in a tenant: their own tenant, an activated grant, or a platform role.
+//
+// Defined once and interpolated into the queries that need it, so the refresh
+// user load and any authority check cannot drift apart. $1 is the user id and
+// $2 the tenant being acted in; the caller supplies the surrounding SELECT.
+//
+// The platform arm requires a TENANT-LEVEL role and permission
+// (application_id IS NULL on both), matching resolveRegistrationTenant.
+// CreatePermission accepts any name for an application-scoped permission, so an
+// application catalogue may define its own 'tenant:manage' — without those
+// predicates, holding an ordinary app role of that name would read as
+// unrestricted platform authority (raised in review on #143).
+const tenantAuthorityPredicate = `
+	    u.tenant_id = $2
+	 OR EXISTS (
+	        SELECT 1 FROM admin_grants g
+	        WHERE g.user_id = u.id
+	          AND g.tenant_id = $2
+	          AND g.deleted_at IS NULL
+	          AND g.activated_at IS NOT NULL
+	    )
+	 OR EXISTS (
+	        SELECT 1
+	        FROM roles pr
+	        JOIN role_permissions prp ON prp.role_id = pr.id
+	        JOIN permissions pp       ON pp.id = prp.permission_id
+	        WHERE pr.id = u.role_id
+	          AND pr.tenant_id = u.tenant_id
+	          AND pr.deleted_at IS NULL
+	          AND pr.application_id IS NULL
+	          AND pp.application_id IS NULL
+	          AND pp.name = 'tenant:manage'
+	    )
+`
+
+// refreshUserHasAuthority reports whether an active user may act in a tenant,
+// applying tenantAuthorityPredicate — the same condition the refresh user load
+// applies. Exists so that rule can be exercised directly rather than through a
+// copied SQL string; see export_authority_test.go.
+func (s *AuthService) refreshUserHasAuthority(ctx context.Context, userID, tenantID int64) (bool, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM users u
+		WHERE u.id = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND (`+tenantAuthorityPredicate+`)
+	`, userID, tenantID).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("check refresh authority: %w", err)
+	}
+	return n > 0, nil
+}

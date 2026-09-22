@@ -83,6 +83,30 @@ type EmailSenderResolution struct {
 	Source string `json:"source"`
 	// Settings is the sender row at this scope, or null when inheriting.
 	Settings *EmailSenderSettings `json:"settings"`
+	// EffectiveBranding is the branding a send from here would actually use,
+	// after the application → tenant → global fall-through and the platform
+	// default.
+	//
+	// It is NOT the same as Settings.ProductName, and the difference is the
+	// point. ProductName is stored per sender row, so a screen that reads its
+	// own scope's row shows a product name the send may never use: an
+	// application that has a row of its own but delivers through the platform's
+	// default sender is branded with the platform's name. A template preview
+	// built from Settings therefore shows the wrong brand with full confidence,
+	// which is worse than showing a placeholder.
+	EffectiveBranding *EffectiveBranding `json:"effective_branding,omitempty"`
+}
+
+// EffectiveBranding is what a recipient will actually see, resolved server-side
+// because only the server knows which sender row wins.
+type EffectiveBranding struct {
+	ProductName   string `json:"product_name"`
+	LogoURL       string `json:"logo_url"`
+	SubjectPrefix string `json:"subject_prefix"`
+	// Scope names the sender the branding came from ("application", "tenant" or
+	// "global"), so the UI can say WHY the brand is what it is instead of just
+	// asserting it.
+	Scope string `json:"scope"`
 }
 
 // UpsertSenderInput is the write payload for sender settings.

@@ -209,8 +209,12 @@ func sendTestVia(t *testing.T, tt TemplateType) outMessage {
 func TestProviderTestTemplateAnnouncesItselfAsATest(t *testing.T) {
 	msg := sendTestVia(t, TemplateProviderTest)
 
-	if msg.Subject != "Test email" {
-		t.Errorf("subject = %q, want %q", msg.Subject, "Test email")
+	// Every test send is now prefixed by markAsTest, so the diagnostic reads
+	// "[Test] Test email". Asserted as prefix + content rather than equality:
+	// the guarantee is that it announces itself as a test, which the prefix
+	// strengthens rather than breaks.
+	if !strings.HasPrefix(msg.Subject, TestSubjectPrefix) || !strings.Contains(msg.Subject, "Test email") {
+		t.Errorf("subject = %q, want %q plus \"Test email\"", msg.Subject, TestSubjectPrefix)
 	}
 	// The failure this guards: a recipient being asked to verify an address.
 	for _, banned := range []string{"Verify", "verify", "Confirm your email"} {
@@ -237,8 +241,8 @@ func TestProviderTestTemplateAnnouncesItselfAsATest(t *testing.T) {
 func TestSendTestFallsBackToTheDiagnosticTemplate(t *testing.T) {
 	msg := sendTestVia(t, TemplateType("no-such-template"))
 
-	if msg.Subject != "Test email" {
-		t.Errorf("subject = %q for an unknown type, want the diagnostic %q", msg.Subject, "Test email")
+	if !strings.Contains(msg.Subject, "Test email") {
+		t.Errorf("subject = %q for an unknown type, want the diagnostic \"Test email\" (with the %s prefix)", msg.Subject, TestSubjectPrefix)
 	}
 }
 

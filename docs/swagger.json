@@ -1805,7 +1805,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns one application (active or inactive) by ID. The secret is never included.",
+                "description": "Returns one application (active or inactive) by ID. The secret is never included. Carries `token_validation` — the audience, issuer, JWKS and discovery URIs a resource server needs to verify this application's tokens — omitted when the application has no audience or the issuer cannot be resolved.",
                 "produces": [
                     "application/json"
                 ],
@@ -10766,6 +10766,14 @@
                         "type": "string"
                     }
                 },
+                "token_validation": {
+                    "description": "TokenValidation is everything a resource server needs to verify a token\nminted for this application. Omitted when the issuer is not resolvable.\n\nGrouped rather than three loose fields because these values are only\ncorrect together: an integrator who configures the audience and skips the\nissuer is trusting a string that is unique per tenant, not globally.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/auth.TokenValidationConfig"
+                        }
+                    ]
+                },
                 "updated_at": {
                     "type": "string"
                 }
@@ -10957,12 +10965,38 @@
                 }
             }
         },
+        "auth.EffectiveBranding": {
+            "type": "object",
+            "properties": {
+                "logo_url": {
+                    "type": "string"
+                },
+                "product_name": {
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "Scope names the sender the branding came from (\"application\", \"tenant\" or \"global\").",
+                    "type": "string"
+                },
+                "subject_prefix": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.EmailSenderResolution": {
             "type": "object",
             "properties": {
                 "configured": {
                     "description": "Configured reports whether THIS scope has its own sender row.",
                     "type": "boolean"
+                },
+                "effective_branding": {
+                    "description": "EffectiveBranding is the branding a send from here would actually use, after the application -> tenant -> global fall-through. NOT the same as settings.product_name.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/auth.EffectiveBranding"
+                        }
+                    ]
                 },
                 "settings": {
                     "description": "Settings is the sender row at this scope, or null when inheriting.",
@@ -11428,6 +11462,27 @@
                 },
                 "enrolled": {
                     "type": "boolean"
+                }
+            }
+        },
+        "auth.TokenValidationConfig": {
+            "type": "object",
+            "properties": {
+                "audience": {
+                    "description": "Audience is this application's immutable identifier, repeated here so the\nthree values can be copied as one block.\n\nNecessary but NOT sufficient on its own: it proves which application the\ntoken was minted for, and nothing about which tenant issued it.",
+                    "type": "string"
+                },
+                "discovery_uri": {
+                    "description": "DiscoveryURI lets a standards-aware library configure itself from one URL\ninstead of three literals, which is the least error-prone option when the\nintegrator's stack supports it.",
+                    "type": "string"
+                },
+                "issuer": {
+                    "description": "Issuer pins the token to this tenant. Audiences are unique per tenant\nrather than globally, so validating the audience while ignoring the\nissuer means trusting a string another tenant could mint.",
+                    "type": "string"
+                },
+                "jwks_uri": {
+                    "description": "JWKSURI is the tenant's public key set. Per-tenant because the signing\nkeys are: a single shared key set would defeat that isolation.",
+                    "type": "string"
                 }
             }
         },
@@ -12100,6 +12155,14 @@
                 "message": {
                     "type": "string"
                 },
+                "marked_as_test": {
+                    "description": "true when the message was stamped with a [Test] subject prefix and an in-body test notice",
+                    "type": "boolean"
+                },
+                    "used_custom_template": {
+                        "description": "false when the built-in default was sent instead of the saved override (most often a disabled template)",
+                        "type": "boolean"
+                    },
                 "provider": {
                     "description": "smtp | sendgrid | dev",
                     "type": "string"
