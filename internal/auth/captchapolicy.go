@@ -283,7 +283,18 @@ func (s *CaptchaPolicyService) Resolve(ctx context.Context, tenantID int64, appl
 			Msg("captcha policy: resolve failed, using platform defaults")
 		return DefaultCaptchaPolicy
 	}
-	return res.(CaptchaPolicy)
+	// Comma-ok, not a bare assertion. errcheck is right to insist: singleflight
+	// returns any, and a bare assertion here would panic on the authentication
+	// path if this function ever returned something else. Falling back to the
+	// disabled default keeps the same failure mode as an unreadable policy table.
+	policy, ok := res.(CaptchaPolicy)
+	if !ok {
+		s.logger.Error().
+			Int64("tenant_id", tenantID).
+			Msg("captcha policy: reload returned an unexpected type, using platform defaults")
+		return DefaultCaptchaPolicy
+	}
+	return policy
 }
 
 // CaptchaPolicyResolveSQL is the "most-specific-wins" precedence query —
