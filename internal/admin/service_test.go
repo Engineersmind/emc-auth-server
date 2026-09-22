@@ -356,7 +356,7 @@ func TestUsers_ApplicationScoped(t *testing.T) {
 		t.Fatalf("CreateRole(app) error = %v", err)
 	}
 	appUserID := parseID(t, appUser.ID)
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, appUserID, parseID(t, appRole.ID)); err != nil {
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, appUserID, parseID(t, appRole.ID), nil); err != nil {
 		t.Fatalf("AssignUserRole(app user, app role) error = %v", err)
 	}
 	// A tenant-level role on an app user must be rejected. Uses a NON-system
@@ -367,11 +367,11 @@ func TestUsers_ApplicationScoped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateRole(tenant-level) error = %v", err)
 	}
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, appUserID, parseID(t, tenantRole.ID)); !errors.Is(err, admin.ErrRoleScope) {
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, appUserID, parseID(t, tenantRole.ID), nil); !errors.Is(err, admin.ErrRoleScope) {
 		t.Errorf("AssignUserRole(app user, tenant-level role) error = %v, want ErrRoleScope", err)
 	}
 	// App role on a tenant-level user must be rejected too.
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, tenantUserID, parseID(t, appRole.ID)); !errors.Is(err, admin.ErrRoleScope) {
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, tenantUserID, parseID(t, appRole.ID), nil); !errors.Is(err, admin.ErrRoleScope) {
 		t.Errorf("AssignUserRole(tenant user, app role) error = %v, want ErrRoleScope", err)
 	}
 
@@ -409,7 +409,7 @@ func TestSystemRolesAreNotAssignable(t *testing.T) {
 	}
 
 	// Re-roling an existing tenant-level user.
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, parseID(t, victim.ID), systemRoleID); !errors.Is(err, admin.ErrSystemRole) {
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, nil, parseID(t, victim.ID), systemRoleID, nil); !errors.Is(err, admin.ErrSystemRole) {
 		t.Errorf("AssignUserRole(tenant user, system role) error = %v, want ErrSystemRole", err)
 	}
 

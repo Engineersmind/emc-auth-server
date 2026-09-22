@@ -253,7 +253,7 @@ func TestAssignUserRole_RefusesDeletedRole(t *testing.T) {
 	// Latent before #146, because a hard-deleted row could not be looked up at
 	// all. The moment the row survives, the missing deleted_at predicate makes it
 	// fully assignable again.
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, userID, goneID); !errors.Is(err, admin.ErrNotFound) {
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, userID, goneID, nil); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("AssignUserRole(deleted role) error = %v, want ErrNotFound", err)
 	}
 }
