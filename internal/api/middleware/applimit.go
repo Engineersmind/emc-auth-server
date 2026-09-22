@@ -1,6 +1,9 @@
 package middleware
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -143,4 +146,82 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 	}
 
 	return next(c)
+}
+
+// captchaBodyLimit caps how much of a request body the body-aware limiter will
+// read looking for a client_id. The only route using it takes three short
+// string fields; anything larger is not a challenge request and does not get to
+// make the limiter allocate for it.
+const captchaBodyLimit = 8 << 10 // 8 KiB
+
+// AppClientBodyRateLimiter is AppClientRateLimiter for routes that carry
+// client_id in the JSON BODY rather than in an Authorization: Basic header.
+//
+// It exists because mounting AppClientRateLimiter on POST /captcha/challenge was
+// silently inert. That limiter keys on tokenClientID(c), which reads only the
+// Authorization and X-Client-Authorization headers — and the challenge endpoint
+// is called before sign-in, so it carries neither. The key was always "", the
+// clientID == "" early return fired on every request, and the per-application
+// bucket the route was documented as carrying never existed. Only the per-IP
+// TokenRateLimiter was actually bounding the PNG render, so a known client_id
+// flooded from many addresses got no per-application throttle at all.
+//
+// Reading the body in middleware is normally worth avoiding, which is why this
+// is a separate constructor rather than a change to tokenClientID: it applies to
+// exactly the routes that need it, and the handler still binds the body itself.
+// The body is restored before next(c) so binding is unaffected.
+//
+// Same bucket namespace ("appauth:") as AppClientRateLimiter, deliberately —
+// both identify a caller by an unverified, public client_id before any secret is
+// checked, so they belong in the same pre-auth bucket and must stay out of the
+// JWT-authenticated "app:" one.
+//
+// Fails OPEN on an unreadable or unparseable body: the handler is the component
+// that owns rejecting a malformed request, and a limiter that 400s first would
+// change the response an integrator sees for a bad payload.
+func AppClientBodyRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
+	limiter := redis_rate.NewLimiter(redisCli)
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			clientID := clientIDFromBody(c)
+			if clientID == "" {
+				return next(c)
+			}
+			tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
+			if !ok {
+				return next(c)
+			}
+			return enforceAppLimit(c, next, limiter, logger, "appauth:", tenantID, appID, rpm, burst)
+		}
+	}
+}
+
+// clientIDFromBody peeks at the JSON body for a client_id and puts the body
+// back, so the handler's own Bind still sees a complete request.
+//
+// Returns "" for anything it cannot read — no body, oversized body, malformed
+// JSON, or no client_id field. Every one of those means "no per-client bucket
+// applies", never "reject".
+func clientIDFromBody(c echo.Context) string {
+	req := c.Request()
+	if req.Body == nil {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(req.Body, captchaBodyLimit))
+	// Restore unconditionally, including on a read error: the handler must get
+	// whatever was readable rather than an already-consumed body.
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(raw))
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+
+	var probe struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return ""
+	}
+	return probe.ClientID
 }

@@ -352,6 +352,9 @@ func main() {
 			UntrustedIPCIDRs:                       cfg.UntrustedIPCIDRs,
 			AudienceScheme:                         cfg.AudienceScheme,
 			RequireAudience:                        cfg.RequireAudience,
+			CaptchaEnabled:                         cfg.CaptchaEnabled,
+			CaptchaHMACKey:                         cfg.CaptchaHMACKey,
+			CaptchaTTLSeconds:                      cfg.CaptchaTTLSeconds,
 		},
 	})
 

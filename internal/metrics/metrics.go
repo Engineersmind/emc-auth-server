@@ -133,6 +133,63 @@ var (
 		[]string{"limiter"},
 	)
 
+	// ---------------------------------------------------------------------
+	// CAPTCHA (issue #145)
+	//
+	// Three counters, and every one is incremented at its call site — see
+	// internal/auth/captcha.go. That is worth stating because RateLimitHits
+	// above spent months declared and never incremented, which made rate-limit
+	// rejections invisible in Prometheus: the metric existed, the dashboards
+	// existed, and the number was always zero. A declared-but-unwired counter is
+	// worse than no counter, because it reads as evidence.
+	//
+	// These also gate the planned default-on rollout: flipping the platform
+	// default depends on CaptchaVerifications showing a near-zero rate of
+	// `invalid` against `ok` in production.
+	// ---------------------------------------------------------------------
+
+	// CaptchaChallengesIssued counts challenges minted, by the flow they were
+	// minted for. A rate far above CaptchaVerifications means clients are
+	// fetching challenges they never submit — usually a broken retry loop.
+	CaptchaChallengesIssued = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "captcha_challenges_issued_total",
+			Help:      "Total CAPTCHA challenges issued, by flow.",
+		},
+		[]string{"purpose"},
+	)
+
+	// CaptchaVerifications counts answers submitted and how they resolved.
+	//
+	// Labels: purpose, result (ok, invalid, expired, reused).
+	//
+	// `invalid` is the number to watch. A sustained high ratio against `ok`
+	// means real people cannot read the images — lower noise_level before
+	// assuming it is an attack, because an attack does not usually bother
+	// answering at all.
+	CaptchaVerifications = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "captcha_verifications_total",
+			Help:      "Total CAPTCHA answers submitted, by flow and outcome.",
+		},
+		[]string{"purpose", "result"},
+	)
+
+	// CaptchaRequired counts requests refused with captcha_required — the gate
+	// arming. In adaptive mode this is the closest thing to a live
+	// credential-stuffing signal the server has, because it only fires after
+	// repeated failures from one origin.
+	CaptchaRequired = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "captcha_required_total",
+			Help:      "Total requests refused pending a CAPTCHA, by flow.",
+		},
+		[]string{"purpose"},
+	)
+
 	// RateLimitFailOpen counts requests that bypassed a rate limiter because the
 	// limiter itself could not make a decision.
 	//

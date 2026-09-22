@@ -215,6 +215,13 @@ const (
 	ActionAdminLockoutPolicySet   = "admin.lockout_policy_set"
 	ActionAdminLockoutPolicyReset = "admin.lockout_policy_reset"
 
+	// Captcha policy (issue #145). Worth its own pair rather than folding into
+	// a generic policy event: enabling a captcha changes what every user of an
+	// application must do to sign in, and that is the line somebody scanning
+	// this feed after a spike in support tickets is looking for.
+	ActionAdminCaptchaPolicySet   = "admin.captcha_policy_set"
+	ActionAdminCaptchaPolicyReset = "admin.captcha_policy_reset"
+
 	// Admin — a privileged route refused the caller. Recorded because a refusal
 	// is a security signal in its own right: somebody probing for access they do
 	// not have leaves no other trace, since the handler never runs.

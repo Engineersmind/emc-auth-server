@@ -352,7 +352,12 @@ type Service struct {
 	// Service therefore keep working, at the cost of the immediate-revocation
 	// accelerator they do not exercise.
 	authSvc *auth.AuthService
-	logger  zerolog.Logger
+	// captchaPolicy is the captcha-policy resolver's cache, invalidated by this
+	// package's write path (issue #145). nil is tolerated: policy changes then
+	// take up to the resolver's cache TTL to apply, which is a delay rather than
+	// a correctness problem.
+	captchaPolicy *auth.CaptchaPolicyService
+	logger        zerolog.Logger
 }
 
 // New creates a Service.
@@ -391,6 +396,15 @@ func (s *Service) hasher() *password.Hasher {
 		}
 	}
 	return passwordHasher()
+}
+
+// WithCaptchaPolicy wires the captcha-policy resolver so an operator's change
+// applies to the next request rather than after the resolver's cache expires.
+// That matters most in the direction nobody plans for: turning the feature OFF
+// because it is blocking real users.
+func (s *Service) WithCaptchaPolicy(policy *auth.CaptchaPolicyService) *Service {
+	s.captchaPolicy = policy
+	return s
 }
 
 // WithInvitations wires the invitation service so admin-created accounts can be
