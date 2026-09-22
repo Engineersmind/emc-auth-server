@@ -76,6 +76,18 @@ const (
 // it refuses only a corrupt or hostile row. See DecodeArgon2id.
 const maxFieldLen = 1 << 20
 
+// Upper bounds on the Argon2id cost parameters a stored hash may declare.
+//
+// argon2.IDKey allocates `Memory` KiB and runs `Iterations` passes over it, so
+// these are the ceiling on what verifying one password can cost this process.
+// Roughly 20x DefaultParams (46 MiB, t=1): generous enough for a source system
+// tuned far harder than this one, small enough that a hostile or corrupt row
+// cannot exhaust the host.
+const (
+	maxArgon2Memory     = 1 << 20 // 1 GiB, expressed in KiB as the PHC `m` field is
+	maxArgon2Iterations = 32
+)
+
 // Params are the Argon2id cost parameters.
 //
 // Defaults follow OWASP's recommended configuration for Argon2id: m=46MiB, t=1,
@@ -307,6 +319,40 @@ func Identify(encodedHash string) Algorithm {
 	}
 }
 
+// ValidateStoredHash reports whether a hash is not merely recognisable but
+// actually verifiable — that `Verify` will be able to read it back.
+//
+// Identify is prefix-only by design and says so, which is right for routing but
+// wrong as an acceptance test. `$2a$10$abc` identifies as bcrypt and passes
+// every prefix check, then fails at every login attempt for the life of the
+// account: bcrypt.Cost refuses it, Verify returns a mismatch, and nothing in the
+// UI can explain why a password that was imported successfully does not work.
+//
+// Reach for this wherever a hash arrives from OUTSIDE — bulk user import is the
+// case that motivated it. Hashes this server produced are already well-formed,
+// so the normal write paths have no need of it.
+//
+// bcrypt.Cost is the library's own parser and is the whole check: it validates
+// the version, the cost field and the 53-character salt+digest tail, which is
+// everything Verify will later depend on. Argon2id defers to DecodeArgon2id,
+// which additionally bounds the cost parameters.
+func ValidateStoredHash(encodedHash string) error {
+	switch Identify(encodedHash) {
+	case AlgorithmBcrypt:
+		if _, err := bcrypt.Cost([]byte(encodedHash)); err != nil {
+			return fmt.Errorf("password: malformed bcrypt hash: %w", err)
+		}
+		return nil
+	case AlgorithmArgon2id:
+		if _, _, _, err := DecodeArgon2id(encodedHash); err != nil {
+			return err
+		}
+		return nil
+	default:
+		return errors.New("password: unrecognised hash format")
+	}
+}
+
 // DecodeArgon2id parses a PHC-encoded Argon2id hash into its parameters, salt,
 // and digest. Exported for tests and for operational tooling that needs to audit
 // stored parameters without verifying a password.
@@ -349,6 +395,29 @@ func DecodeArgon2id(encodedHash string) (Params, []byte, []byte, error) {
 	}
 	if mem == 0 || iter == 0 || par == 0 || par > 255 {
 		return Params{}, nil, nil, errors.New("password: missing or invalid parameters")
+	}
+	// Upper bounds, not just non-zero.
+	//
+	// These parameters are handed straight to argon2.IDKey, which allocates
+	// `m` KiB and runs `t` passes over it. Checking only for zero meant a stored
+	// PHC string could declare any cost it liked and the process would honour it
+	// at verification time — so a hash carrying `m=4194304` (4 GiB) turned the
+	// first login attempt against that account into an out-of-memory kill.
+	//
+	// That is reachable without a compromise: bulk user import accepts
+	// pre-hashed credentials from another identity provider, so the parameters
+	// arrive in an uploaded file. The bound belongs here rather than in the
+	// importer because every path that reads a stored hash inherits it, and a
+	// row written before this existed is refused on read instead of honoured.
+	//
+	// Ceilings are ~20x the product's own defaults (46 MiB, t=1), which leaves
+	// room for a source system tuned far more aggressively than this one while
+	// keeping the worst case survivable. A legitimate hash beyond them is
+	// refused rather than silently downgraded: verification with different
+	// parameters cannot reproduce the digest, so accepting it would be a login
+	// that always fails.
+	if mem > maxArgon2Memory || iter > maxArgon2Iterations {
+		return Params{}, nil, nil, errors.New("password: parameters exceed the supported bounds")
 	}
 
 	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
