@@ -20,7 +20,7 @@ import (
 // what lets the gate answer "does this request need a challenge, and if so with
 // which parameters" from one cached read on the login path.
 //
-// See migration 00089 for the table and for why the platform default is off.
+// See migration 00090 for the table and for why the platform default is off.
 // ---------------------------------------------------------------------------
 
 // CaptchaFlow names an authentication flow the gate can protect. The values are
@@ -68,7 +68,7 @@ func IsValidCaptchaFlow(name string) bool {
 	return false
 }
 
-// Captcha modes. See migration 00089 for why adaptive is the default.
+// Captcha modes. See migration 00090 for why adaptive is the default.
 const (
 	// CaptchaModeAdaptive demands a challenge only after repeated failures from
 	// the same origin.
@@ -150,7 +150,7 @@ func (p CaptchaPolicy) Protects(flow CaptchaFlow) bool {
 }
 
 // DefaultCaptchaPolicy mirrors the platform-default row seeded by migration
-// 00089. It is the value used when the policy table cannot be read — see
+// 00090. It is the value used when the policy table cannot be read — see
 // CaptchaPolicyService.Resolve for why that degrades to a default rather than
 // failing the request.
 //
@@ -288,7 +288,7 @@ func (s *CaptchaPolicyService) load(ctx context.Context, tenantID int64, applica
 		&p.CaseSensitive, &ttlSecs, &p.MaxAttemptsPerChallenge, &p.NoiseLevel)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The platform-default row is seeded by migration 00089, so this
+			// The platform-default row is seeded by migration 00090, so this
 			// means somebody deleted it. Defaults still apply; say so loudly
 			// rather than inventing a policy silently.
 			return DefaultCaptchaPolicy, fmt.Errorf("no captcha policy row matched (platform default missing?)")

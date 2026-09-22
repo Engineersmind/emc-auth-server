@@ -15,7 +15,7 @@ import (
 //
 // Same shape as the lockout and session policy families — most-specific-wins
 // resolution, partial updates, DELETE meaning "revert to inherit". See
-// migration 00089 for the table.
+// migration 00090 for the table.
 // ---------------------------------------------------------------------------
 
 // CaptchaPolicyView is the API representation of a captcha policy.
@@ -71,7 +71,7 @@ type CaptchaPolicyInput struct {
 	// when no such code path exists.
 }
 
-// Policy bounds, mirrored from the CHECK constraints in migration 00089.
+// Policy bounds, mirrored from the CHECK constraints in migration 00090.
 //
 // Duplicated in Go so the caller gets a readable 400 naming the offending field
 // instead of a 500 wrapping a constraint-violation string. The database keeps
@@ -116,7 +116,7 @@ func (s *Service) GetCaptchaPolicy(ctx context.Context, tenantID int64, applicat
 		&view.NoiseLevel)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The platform default is seeded by migration 00089; its absence means
+			// The platform default is seeded by migration 00090; its absence means
 			// somebody deleted it. Report the compiled-in defaults, which are what
 			// the captcha service is also falling back to, so the API and the
 			// running behaviour agree.
@@ -179,7 +179,7 @@ func (s *Service) SetCaptchaPolicy(ctx context.Context, tenantID int64, applicat
 	}
 
 	// ON CONFLICT cannot be used here: the uniqueness of a scope is expressed by
-	// three partial indexes (see migration 00089), and ON CONFLICT requires a
+	// three partial indexes (see migration 00090), and ON CONFLICT requires a
 	// single named constraint or index. An UPDATE-then-INSERT under one
 	// transaction is the portable equivalent; concurrent writes to the same scope
 	// are settled by the partial unique index, which turns the loser into an
@@ -331,7 +331,7 @@ func validateCaptchaPolicy(p CaptchaPolicyView) error {
 // also means a tenant-scoped handler cannot be talked into writing the platform
 // row by passing a zero tenant id.
 //
-// There is no platform DELETE. The row is seeded by migration 00089 and every
+// There is no platform DELETE. The row is seeded by migration 00090 and every
 // scope terminates resolution on it; removing it would make resolution come up
 // empty and push each caller onto a compiled-in fallback. Disable it with
 // enabled=false instead.

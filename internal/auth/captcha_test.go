@@ -396,7 +396,7 @@ func TestNewCaptchaService_RefusesWeakKey(t *testing.T) {
 }
 
 // TestDefaultCaptchaPolicyMatchesSeed pins the compiled-in fallback against the
-// row migration 00089 seeds. They are read by different code paths — the
+// row migration 00090 seeds. They are read by different code paths — the
 // resolver's degraded path and the admin API's fallback view — and drift between
 // them would make the API describe a policy the server is not applying.
 func TestDefaultCaptchaPolicyMatchesSeed(t *testing.T) {
