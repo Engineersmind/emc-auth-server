@@ -388,6 +388,17 @@ type OTPSession struct {
 	Email    string
 	RoleName string
 	Perms    []string
+	// ActiveRoles is the role scope requested at the password step (#146 phase 4),
+	// nil for an ordinary unscoped login.
+	//
+	// Carried through the challenge for the same reason Persistent is: the choice
+	// is made before the second factor and consumed after it. Perms alone is not
+	// enough — it is the SCOPED permission set, but the refresh-token row written
+	// at completion needs the scope itself, and a NULL there means "unscoped". A
+	// session that completed MFA would then widen to the user's full union on its
+	// first rotation, which is a privilege escalation reachable by simply having
+	// MFA enabled.
+	ActiveRoles []string
 	// AppID is the string-encoded oauth_clients.id when the login came through
 	// a registered application; "" for tenant-level logins. Carried through the
 	// challenge so the finally-issued JWT keeps its app_id claim.

@@ -98,8 +98,12 @@ func (h *AuthHandler) AssignAppUserRoles(c echo.Context) error {
 	// Attributed to the client_id, not to a user: the actor is a machine and
 	// users.id has nobody to point at. An investigation asking "which human
 	// granted this" must be able to see at once that the answer is "none".
-	h.auditEvent(c, audit.Event{
-		UserID:       &result.UserID,
+	// UserID is deliberately unset: that field is the ACTOR, and the actor here is
+	// an application with no users.id behind it. Putting the target there would
+	// make every one of these events read as the user having re-roled themselves —
+	// exactly backwards for the question an investigation asks. The target is
+	// carried by ResourceID, and the acting client by the metadata.
+	ev := audit.Event{
 		Action:       audit.ActionAppUserRolesAssigned,
 		AuthMethod:   audit.AuthMethodClientCredentials,
 		ResourceType: "user",
@@ -112,7 +116,12 @@ func (h *AuthHandler) AssignAppUserRoles(c echo.Context) error {
 			"assigned":  result.Assigned,
 			"roles":     result.Roles,
 		},
-	})
+	}
+	// Without this the event carries no tenant or application id, so it is absent
+	// from every tenant-scoped audit query — the event exists but nobody who would
+	// look for it can see it.
+	attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
+	h.auditEvent(c, ev)
 	return c.JSON(http.StatusOK, result)
 }
 

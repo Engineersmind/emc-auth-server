@@ -262,6 +262,21 @@ func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) 
 		return nil, fmt.Errorf("insert JIT user: %w", err)
 	}
 
+	// Mirror the assigned role into user_roles, in the same transaction. That
+	// table is what resolves permissions since #146 phase 2, so a JIT user with
+	// only role_id set would sign in holding none of its permissions. roleID is
+	// nullable here — an IdP-provisioned user gets a role only when the tenant
+	// defines an assignable one.
+	if roleID != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+			VALUES ($1, $2, $3, NULL)
+			ON CONFLICT (user_id, role_id) DO NOTHING
+		`, userID, *roleID, tenantIDInt); err != nil {
+			return nil, fmt.Errorf("record JIT role grant: %w", err)
+		}
+	}
+
 	// Generate a random unusable password hash so the user_credentials row exists
 	// but cannot be used for password-based login.
 	randomBytes := make([]byte, 32)

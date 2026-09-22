@@ -566,24 +566,29 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 	}
 
 	// 3. JIT provision — same default-role query as application Register.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, "", fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Read inside the transaction that consumes it, and locked, exactly as
+	// application Register does. On the pool and unlocked, a SetDefaultRole
+	// committing between this SELECT and the INSERT below left the new user on
+	// the superseded default — silently, and for the life of the account.
 	var roleID *int64
 	var tempRoleID int64
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT id FROM roles
 		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
 		  AND is_system = false AND deleted_at IS NULL
+		FOR SHARE
 	`, st.TenantID, st.AppRowID).Scan(&tempRoleID)
 	if err == nil {
 		roleID = &tempRoleID
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return 0, "", fmt.Errorf("fetch default role: %w", err)
 	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, "", fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
 
 	// email_verified=true: the provider attested the address. No
 	// user_credentials row — password login is structurally impossible for

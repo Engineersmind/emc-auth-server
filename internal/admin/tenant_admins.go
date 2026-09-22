@@ -622,6 +622,29 @@ func (s *Service) removeTenantAdmin(ctx context.Context, tenantID, adminID int64
 	); err != nil {
 		return fmt.Errorf("strip administrative role: %w", err)
 	}
+	// user_roles has to be stripped too, and it is the half that actually
+	// matters: since #146 phase 2 permissions resolve through this table, so
+	// repointing role_id alone would leave the administrative grant intact and the
+	// removal would revoke nothing. Scoped to system roles so an ordinary role the
+	// account holds in its own right survives being de-administered.
+	if _, err = tx.Exec(ctx, `
+		DELETE FROM user_roles ur
+		USING roles r
+		WHERE ur.role_id = r.id AND ur.user_id = $1 AND r.is_system = true
+	`, userID); err != nil {
+		return fmt.Errorf("strip administrative role grant: %w", err)
+	}
+	// Restore the pre-promotion role into user_roles as well, so the two stay in
+	// step. NULL previousRoleID (the fail-closed case) simply grants nothing.
+	if previousRoleID != nil {
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+			SELECT u.id, $1, u.tenant_id, NULL FROM users u WHERE u.id = $2
+			ON CONFLICT (user_id, role_id) DO NOTHING
+		`, *previousRoleID, userID); err != nil {
+			return fmt.Errorf("restore previous role grant: %w", err)
+		}
+	}
 	// The FK is ON DELETE SET NULL, which a soft delete does not trigger.
 	if _, err = tx.Exec(ctx,
 		`UPDATE tenants SET primary_admin_id = NULL WHERE id = $1 AND primary_admin_id = $2`, tenantID, adminID,

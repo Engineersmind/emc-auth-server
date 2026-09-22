@@ -119,6 +119,20 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	if res.RowsAffected() == 0 {
 		return fmt.Errorf("attach administrative role: user %d not found", userID)
 	}
+	// Mirrored into user_roles in the same transaction. Since #146 phase 2 that
+	// table is what loadPermissions resolves, so writing role_id alone would
+	// activate the grant while the account minted tokens carrying no permissions
+	// at all — precisely the failure the comment above describes, reintroduced one
+	// table over. tenant_id comes from the users row rather than the administered
+	// tenant: 00078 established those as separate axes, and user_roles is keyed to
+	// the account's home tenant like every other per-user row.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+		SELECT u.id, $1, u.tenant_id, NULL FROM users u WHERE u.id = $2
+		ON CONFLICT (user_id, role_id) DO NOTHING
+	`, roleID, userID); err != nil {
+		return fmt.Errorf("attach administrative role: record grant: %w", err)
+	}
 	// Every live session ends when a grant activates, and unlike the password
 	// branch in Accept this is unconditional.
 	//

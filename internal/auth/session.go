@@ -446,6 +446,71 @@ func (s *AuthService) DenyUserSessions(ctx context.Context, userID, tenantID int
 	}
 }
 
+// DenyManyUserSessions is DenyUserSessions for a set of accounts, pipelined.
+//
+// Deleting a role held by several thousand users would otherwise issue that many
+// sequential round trips after the commit, each one a full network latency. At a
+// realistic 1ms RTT a 5,000-holder role spends five seconds in a loop the caller
+// is blocked on, and a mid-loop Redis timeout leaves the earlier half denied, the
+// later half not, and the API returning success either way.
+//
+// Pipelining collapses it to one round trip per batch. Batched rather than one
+// giant pipeline because the command buffer is held in memory on both ends, and a
+// role held by a hundred thousand users should not become a single allocation
+// spike on the Redis server.
+//
+// Same fail-open posture as the singular form: a failure is counted and logged,
+// never returned. The durable half of a revocation is the database write that has
+// already committed; the denylist only shortens the window from fifteen minutes
+// to zero, and failing the caller here would report a role deletion that did in
+// fact happen as an error.
+//
+// Reports how many accounts it could not deny, so the caller can say so rather
+// than claiming a clean sweep.
+func (s *AuthService) DenyManyUserSessions(ctx context.Context, userIDs []int64, tenantID int64) (failed int) {
+	if s.redisCli == nil || len(userIDs) == 0 {
+		return 0
+	}
+	const batchSize = 500
+	stamp := revocationStamp()
+
+	for start := 0; start < len(userIDs); start += batchSize {
+		end := start + batchSize
+		if end > len(userIDs) {
+			end = len(userIDs)
+		}
+		batch := userIDs[start:end]
+
+		pipe := s.redisCli.Pipeline()
+		for _, uid := range batch {
+			pipe.Set(ctx, userDenyKey(uid, tenantID), stamp, AccessTokenTTL)
+		}
+		// Exec returns the first error, but every command's own result is still
+		// inspected: a partial failure within a pipeline is precisely the case
+		// where a single returned error would undercount.
+		cmds, err := pipe.Exec(ctx)
+		if err != nil && len(cmds) == 0 {
+			// Nothing in this batch landed.
+			failed += len(batch)
+			metrics.SessionDenylistErrors.WithLabelValues("write_user").Add(float64(len(batch)))
+			continue
+		}
+		for _, cmd := range cmds {
+			if cmd.Err() != nil {
+				failed++
+				metrics.SessionDenylistErrors.WithLabelValues("write_user").Inc()
+			}
+		}
+	}
+
+	if failed > 0 {
+		s.logger.Warn().
+			Int("failed", failed).Int("total", len(userIDs)).Int64("tenant_id", tenantID).
+			Msg("session denylist: bulk account-wide write partially failed; those accounts stay valid until their access tokens expire")
+	}
+	return failed
+}
+
 // revocationStamp is the value stored under an account-wide deny key: the instant
 // the revocation happened, as unix seconds.
 //

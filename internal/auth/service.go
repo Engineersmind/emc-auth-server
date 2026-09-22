@@ -1077,7 +1077,8 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		err = tx.QueryRow(ctx,
 			`SELECT id, name FROM roles
 			 WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
-			   AND is_system = false AND deleted_at IS NULL`,
+			   AND is_system = false AND deleted_at IS NULL
+			 FOR SHARE`,
 			tenantID, *appRowID,
 		).Scan(&roleID, &roleName)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -1670,7 +1671,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		perms = []string{}
 	}
 
-	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent); err != nil {
+	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent, activeRoles); err != nil {
 		return nil, err
 	} else if gate != nil {
 		return gate, nil
@@ -1717,7 +1718,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // the finally-issued session honours it. Threaded through rather than re-read at the
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
-func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool) (*LoginResult, error) {
+func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string) (*LoginResult, error) {
 	if s.totpSvc == nil || s.redisCli == nil {
 		return nil, nil
 	}
@@ -1767,7 +1768,7 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	}
 
 	if len(methods) > 0 {
-		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent)
+		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles)
 		if err != nil {
 			return nil, fmt.Errorf("create OTP session: %w", err)
 		}
@@ -1778,7 +1779,7 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// (re)enroll a permitted method before finishing login; otherwise the login
 	// proceeds (the app does not enforce MFA).
 	if appRowID != 0 && mode == MFAModeRequired {
-		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent)
+		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent, activeRoles)
 		if err != nil {
 			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
 		}
@@ -1855,8 +1856,9 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 	// an app-authenticated login keeps its app_id claim after the OTP step.
 	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
 		sessionContext{
-			persistent: session.Persistent,
-			amr:        []string{AMRPassword, AMROTP, AMRMFA},
+			persistent:  session.Persistent,
+			activeRoles: session.ActiveRoles,
+			amr:         []string{AMRPassword, AMROTP, AMRMFA},
 			// The grant is the one that began the flow. MFA is a second factor
 			// on a password login, not a grant of its own — amr already records
 			// that the OTP step happened.
@@ -1988,9 +1990,10 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 
 	tokens, err := s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
 		sessionContext{
-			persistent: session.Persistent,
-			amr:        []string{AMRPassword, AMROTP, AMRMFA},
-			grant:      GrantPassword,
+			persistent:  session.Persistent,
+			activeRoles: session.ActiveRoles,
+			amr:         []string{AMRPassword, AMROTP, AMRMFA},
+			grant:       GrantPassword,
 		}, session.AppID)
 	if err != nil {
 		return nil, session, err
@@ -2001,16 +2004,17 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 // createOTPSession stores pre-auth user state in Redis and returns a challenge
 // token. When the user's active methods include email, a one-time code is
 // minted and sent to the account's inbox alongside the challenge.
-func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool) (*OTPChallenge, error) {
+func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool, activeRoles []string) (*OTPChallenge, error) {
 	sessionToken, err := s.storePreAuthSession(ctx, otpSessionKey, OTPSessionTTL, OTPSession{
-		UserID:     userID,
-		TenantID:   tenantID,
-		Email:      email,
-		RoleName:   roleName,
-		Perms:      perms,
-		AppID:      appID,
-		Methods:    methods,
-		Persistent: persistent,
+		UserID:      userID,
+		TenantID:    tenantID,
+		Email:       email,
+		RoleName:    roleName,
+		Perms:       perms,
+		ActiveRoles: activeRoles,
+		AppID:       appID,
+		Methods:     methods,
+		Persistent:  persistent,
 	})
 	if err != nil {
 		return nil, err
@@ -2070,16 +2074,17 @@ func (s *AuthService) ResendLoginOTP(ctx context.Context, otpSessionToken string
 
 // createMFAEnrollmentSession stores pre-auth state for a forced enrollment and
 // returns the challenge handed back by Login instead of tokens.
-func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, allowedMethods []string, persistent bool) (*MFAEnrollmentChallenge, error) {
+func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, allowedMethods []string, persistent bool, activeRoles []string) (*MFAEnrollmentChallenge, error) {
 	enrollmentToken, err := s.storePreAuthSession(ctx, mfaEnrollKey, MFAEnrollmentSessionTTL, OTPSession{
-		UserID:     userID,
-		TenantID:   tenantID,
-		Email:      email,
-		RoleName:   roleName,
-		Perms:      perms,
-		AppID:      appID,
-		Methods:    allowedMethods,
-		Persistent: persistent,
+		UserID:      userID,
+		TenantID:    tenantID,
+		Email:       email,
+		RoleName:    roleName,
+		Perms:       perms,
+		ActiveRoles: activeRoles,
+		AppID:       appID,
+		Methods:     allowedMethods,
+		Persistent:  persistent,
 	})
 	if err != nil {
 		return nil, err

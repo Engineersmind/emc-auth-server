@@ -148,12 +148,19 @@ func (s *AuthService) AssignAppUserRoles(ctx context.Context, in AssignAppUserRo
 	// scope (system roles carry application_id IS NULL): defence in depth, so a
 	// future change to how system roles are scoped cannot silently open this path
 	// to owner/super_admin.
+	// FOR SHARE, not a plain read: DeleteRole soft-deletes in its own transaction,
+	// and without a lock it can commit between this validation and the INSERT
+	// below — attaching a role the operator has just deleted, with no error on
+	// either side. A share lock blocks that UPDATE until this transaction commits
+	// while still letting concurrent assignments of the same role proceed, which
+	// an exclusive lock would serialise for no benefit.
 	rows, err := tx.Query(ctx, `
 		SELECT id, name FROM roles
 		WHERE tenant_id = $1 AND application_id = $2
 		  AND name = ANY($3::TEXT[])
 		  AND is_system = false
 		  AND deleted_at IS NULL
+		FOR SHARE
 	`, tenantID, appRowID, names)
 	if err != nil {
 		return nil, fmt.Errorf("assign app user roles: resolve roles: %w", err)

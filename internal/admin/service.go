@@ -1541,9 +1541,11 @@ func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) ([]int
 		return nil, fmt.Errorf("commit delete role: %w", err)
 	}
 
-	for _, uid := range holders {
-		s.denyUserSessions(ctx, uid, tenantID, "role deleted")
-	}
+	// Pipelined rather than a loop: this endpoint explicitly supports roles held
+	// by thousands, and one round trip per holder would block the caller for
+	// seconds and leave a mid-flight Redis failure with half the holders denied
+	// and half not.
+	s.denyManyUserSessions(ctx, holders, tenantID, "role deleted")
 	return holders, nil
 }
 
@@ -2224,6 +2226,26 @@ func (s *Service) denyUserSessions(ctx context.Context, userID, tenantID int64, 
 		return
 	}
 	s.authSvc.DenyUserSessions(ctx, userID, tenantID)
+}
+
+// denyManyUserSessions is denyUserSessions for a set of accounts, pipelined.
+//
+// Separate from the singular form rather than looping it, because the loop is the
+// thing being avoided: a role held by thousands would otherwise cost one blocking
+// round trip per holder after the commit.
+func (s *Service) denyManyUserSessions(ctx context.Context, userIDs []int64, tenantID int64, reason string) {
+	if len(userIDs) == 0 {
+		return
+	}
+	if s.authSvc == nil {
+		s.logger.Warn().
+			Int("users", len(userIDs)).Int64("tenant_id", tenantID).Str("reason", reason).
+			Msg("admin: auth service not wired; sessions stay valid until their access tokens expire")
+		return
+	}
+	// The failure count is logged by the auth service, which knows how many
+	// commands it issued; surfacing it again here would double-report.
+	_ = s.authSvc.DenyManyUserSessions(ctx, userIDs, tenantID)
 }
 
 // DeleteUser soft-deletes a user (sets deleted_at, is_active = false), with

@@ -42,14 +42,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS roles_one_default_per_app
 -- +goose Down
 -- +goose StatementBegin
 
--- Restores 00043's predicate. This can fail where Up succeeded: if a
--- soft-deleted role and a live one both hold is_default = true for the same
--- application, the narrower index permits it and the original does not. That is
--- precisely the state this migration exists to allow, so clear the flag on the
--- deleted rows before rolling back:
+-- Restores 00043's predicate, which is NARROWER than the one above: it counts
+-- soft-deleted rows, so a tombstoned default sitting beside a live one collides
+-- on 23505. That is precisely the state this migration exists to permit, which
+-- would make the rollback fail exactly when it had been used.
 --
---     UPDATE roles SET is_default = false
---      WHERE deleted_at IS NOT NULL AND is_default = true;
+-- So the cleanup runs rather than being described. Clearing is_default on an
+-- already-deleted role loses nothing: the role is gone, and DeleteRole clears
+-- the flag itself for anything deleted after #146 — this only catches rows
+-- written by an older path.
+UPDATE roles SET is_default = false
+ WHERE deleted_at IS NOT NULL AND is_default = true;
+
 DROP INDEX IF EXISTS roles_one_default_per_app;
 
 CREATE UNIQUE INDEX IF NOT EXISTS roles_one_default_per_app

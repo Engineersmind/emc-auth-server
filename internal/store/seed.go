@@ -129,6 +129,20 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 	}
 	logger.Info().Str("email", "admin@emc.local").Int64("id", userID).Msg("seed user ensured")
 
+	// Mirror the seeded role into user_roles. Since #146 phase 2 that table is
+	// what loadPermissions resolves, so a seeded super-admin holding only
+	// users.role_id would sign in with no permissions at all — on a fresh
+	// deployment that is the ONLY administrative account, so the deployment would
+	// come up with nobody able to administer it. Idempotent, like every other
+	// statement in this function.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+		VALUES ($1, $2, $3, NULL)
+		ON CONFLICT (user_id, role_id) DO NOTHING
+	`, userID, roleID, tenantID); err != nil {
+		return fmt.Errorf("seed user role grant: %w", err)
+	}
+
 	// 4. Seed password for super-admin, hashed through the same package as every
 	// other credential so the seeded account is never the odd one out — a literal
 	// cost here would silently diverge the moment the parameters move, and the
