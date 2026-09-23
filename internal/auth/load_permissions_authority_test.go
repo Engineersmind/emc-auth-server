@@ -33,7 +33,8 @@ import (
 // Keep in sync with internal/auth/service.go — loadPermissions.
 const loadPermissionsSQL = `
 	WITH authority AS (
-		SELECT u.id, u.role_id, u.tenant_id
+		SELECT u.id, u.tenant_id,
+		       (u.is_active = true AND u.deleted_at IS NULL) AS live
 		FROM users u
 		WHERE u.id = $1
 		  AND (
@@ -62,7 +63,11 @@ const loadPermissionsSQL = `
 	SELECT DISTINCT p.name
 	FROM permissions p
 	JOIN role_permissions rp ON rp.permission_id = p.id
-	JOIN authority a ON a.role_id = rp.role_id
+	JOIN roles r  ON r.id = rp.role_id AND r.deleted_at IS NULL
+	JOIN user_roles ur ON ur.role_id = rp.role_id
+	JOIN authority a ON a.id = ur.user_id AND ur.tenant_id = a.tenant_id
+	WHERE a.live
+	  AND ($3::TEXT[] IS NULL OR r.name = ANY($3::TEXT[]))
 	UNION
 	SELECT DISTINCT p.name
 	FROM permissions p
@@ -86,7 +91,7 @@ func permissionsFor(t *testing.T, pool *pgxpool.Pool, userID, tenantID int64) []
 
 	// The copy is kept as a second signal — it catches the two drifting apart,
 	// which a behavioural check alone would not.
-	rows, err := pool.Query(context.Background(), loadPermissionsSQL, userID, tenantID)
+	rows, err := pool.Query(context.Background(), loadPermissionsSQL, userID, tenantID, nil)
 	if err != nil {
 		t.Fatalf("permissions query: %v", err)
 	}
@@ -383,6 +388,11 @@ func TestLoadPermissions_AppScopedTenantManageIsNotPlatformAuthority(t *testing.
 	}
 	if _, err := pool.Exec(ctx, `UPDATE users SET role_id = $1 WHERE id = $2`, roleID, f.endUser); err != nil {
 		t.Fatalf("assign app role: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES ($1, $2, $3)
+	`, f.endUser, roleID, f.otherTenant); err != nil {
+		t.Fatalf("record app role grant: %v", err)
 	}
 
 	// The impostor must reach NOTHING outside their own tenant.
