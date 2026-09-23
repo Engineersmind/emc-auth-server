@@ -308,8 +308,11 @@ func main() {
 	e.HideBanner = true
 	e.HidePort = true
 
-	// Register routes and middleware
-	api.RegisterRoutes(e, api.Deps{
+	// Register routes and middleware. The returned cleanup stops the background
+	// workers routes started; called during shutdown below, before the pool
+	// closes, so an in-flight import row finishes rather than losing its
+	// connection mid-transaction.
+	stopRouteWorkers := api.RegisterRoutes(e, api.Deps{
 		Logger: logger,
 		Pool:   pool,
 		Redis:  rdb,
@@ -349,6 +352,9 @@ func main() {
 			UntrustedIPCIDRs:                       cfg.UntrustedIPCIDRs,
 			AudienceScheme:                         cfg.AudienceScheme,
 			RequireAudience:                        cfg.RequireAudience,
+			CaptchaEnabled:                         cfg.CaptchaEnabled,
+			CaptchaHMACKey:                         cfg.CaptchaHMACKey,
+			CaptchaTTLSeconds:                      cfg.CaptchaTTLSeconds,
 		},
 	})
 
@@ -395,6 +401,10 @@ func main() {
 	if err := s.Shutdown(timeoutCtx); err != nil {
 		logger.Error().Err(err).Msg("shutdown error")
 	}
+	// Stop background workers now that no new requests can arrive. Before the
+	// deferred pool.Close(), for the same reason the audit drain is: a worker
+	// mid-row needs a live connection to release its job cleanly.
+	stopRouteWorkers()
 	// Drain buffered audit events now that no new requests can arrive —
 	// must complete before the deferred pool.Close() invalidates connections.
 	if err := auditLog.Close(timeoutCtx); err != nil {

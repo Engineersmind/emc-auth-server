@@ -428,12 +428,34 @@ func (s *AuthService) resolveRegistrationTenant(ctx context.Context) (int64, err
 // holder, making deletion a no-op against enforcement. DeleteRole also strips the
 // grants explicitly; this is the backstop for any row written before it did.
 //
-// is_active/deleted_at on the user match what every caller already checks in the
-// query immediately preceding this one (login's candidate query, all three
-// refresh reloads, magic link, both code exchanges, the passkey assertion). They
-// are defence in depth against a future caller that forgets, not a new gate — and
-// they are on the role half only, since the direct half attaches to the account
-// rather than to any role and must survive independently.
+// is_active/deleted_at on the user (the `live` column of the authority CTE) match
+// what every caller already checks in the query immediately preceding this one
+// (login's candidate query, all three refresh reloads, magic link, both code
+// exchanges, the passkey assertion). They are defence in depth against a future
+// caller that forgets, not a new gate — and they are on the role half only, since
+// the direct half attaches to the account rather than to any role and must
+// survive independently.
+//
+// tenantID is the tenant the token is being minted FOR, which is not always the
+// user's home tenant: a platform admin browsing another tenant gets a token
+// scoped to that tenant. The role join therefore matches on the user's OWN
+// tenant rather than on the target, with authority over the target established
+// separately below.
+//
+// The previous form required `u.tenant_id = $2`, so every permission vanished
+// the moment a platform admin looked at a tenant other than their own. The
+// claims came back empty, RequireAppScope's `tenant:manage` fast path could not
+// fire, and the request was refused 403 — an error the client cannot recover
+// from, because refreshing the token reproduces the same empty set. Same defect
+// as the refresh-path fix in #142, in the function that builds the claims.
+//
+// Authority over the target tenant is one of:
+//   - it IS the user's own tenant (the ordinary case), or
+//   - an activated, undeleted admin_grants row for that tenant, or
+//   - a role carrying tenant:manage, which is platform-wide by definition.
+//
+// A user with none of these gets the empty set exactly as before, so this only
+// ever adds permissions for callers the middleware would have admitted anyway.
 func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int64) ([]string, error) {
 	return s.loadPermissionsScoped(ctx, userID, tenantID, nil)
 }
@@ -457,20 +479,60 @@ func (s *AuthService) loadPermissions(ctx context.Context, userID, tenantID int6
 // implementation detail no caller should need.
 func (s *AuthService) loadPermissionsScoped(ctx context.Context, userID, tenantID int64, activeRoles []string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
+		WITH authority AS (
+			SELECT u.id, u.tenant_id,
+			       (u.is_active = true AND u.deleted_at IS NULL) AS live
+			FROM users u
+			WHERE u.id = $1
+			  AND (
+			         u.tenant_id = $2
+			      OR EXISTS (
+			             SELECT 1 FROM admin_grants g
+			             WHERE g.user_id = u.id
+			               AND g.tenant_id = $2
+			               AND g.deleted_at IS NULL
+			               AND g.activated_at IS NOT NULL
+			         )
+			      OR EXISTS (
+			             SELECT 1
+			             FROM roles pr
+			             JOIN role_permissions prp ON prp.role_id = pr.id
+			             JOIN permissions pp       ON pp.id = prp.permission_id
+			             WHERE pr.id = u.role_id
+			               AND pr.tenant_id = u.tenant_id
+			               AND pr.deleted_at IS NULL
+			               -- Tenant-level on BOTH sides, matching the platform
+			               -- definition in resolveRegistrationTenant. The name
+			               -- alone is not the platform tier: CreatePermission
+			               -- accepts any name for an application-scoped
+			               -- permission, so an app catalogue may define its own
+			               -- 'tenant:manage'. Without these predicates, holding
+			               -- an ordinary app role named that way would be read
+			               -- as unrestricted platform authority.
+			               AND pr.application_id IS NULL
+			               AND pp.application_id IS NULL
+			               AND pp.name = 'tenant:manage'
+			         )
+			  )
+		)
 		SELECT DISTINCT p.name
 		FROM permissions p
 		JOIN role_permissions rp ON rp.permission_id = p.id
 		JOIN roles r  ON r.id = rp.role_id AND r.deleted_at IS NULL
 		JOIN user_roles ur ON ur.role_id = rp.role_id
-		JOIN users u  ON u.id = ur.user_id
-		WHERE ur.user_id = $1 AND ur.tenant_id = $2
-		  AND u.is_active = true AND u.deleted_at IS NULL
+		-- Roles are held in the user's OWN tenant; authority over $2 was settled
+		-- by the CTE, so this matches a.tenant_id rather than the target.
+		JOIN authority a ON a.id = ur.user_id AND ur.tenant_id = a.tenant_id
+		WHERE a.live
 		  AND ($3::TEXT[] IS NULL OR r.name = ANY($3::TEXT[]))
 		UNION
 		SELECT DISTINCT p.name
 		FROM permissions p
 		JOIN user_permissions up ON up.permission_id = p.id
-		WHERE up.user_id = $1 AND up.tenant_id = $2
+		JOIN authority a ON a.id = up.user_id
+		-- Direct grants stay scoped to the tenant they were made in: they are
+		-- per-tenant by design, unlike a platform role.
+		WHERE up.tenant_id = $2
 		ORDER BY 1
 	`, userID, tenantID, activeRoles)
 	if err != nil {
@@ -2289,7 +2351,10 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+		WHERE u.id = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND (`+tenantAuthorityPredicate+`)
 	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2298,7 +2363,17 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("fetch user for refresh: %w", err)
 	}
 
-	perms, err := s.loadPermissionsScoped(ctx, userID, tenantID, carried.activeRoles)
+	// permissionsForRefresh, not loadPermissions: the identity check above
+	// admits a grant-holder or platform administrator acting OUTSIDE their home
+	// tenant, and loadPermissions answers from the home role regardless of the
+	// tenant asked about. Pairing a widened identity check with the narrow
+	// permission load is what produced #142 on the locking path — a granted
+	// administrator whose rotated token carried either nothing (403 on every
+	// route a quarter-hour after switching) or, for a user with a broader home
+	// role, that role's permissions inside a tenant they were granted less in.
+	// This path is POST /oauth/token with grant_type=refresh_token, so it is the
+	// common rotation, not an edge case.
+	perms, err := s.permissionsForRefresh(ctx, userID, tenantID, carried.activeRoles)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions, continuing with empty set")
 		perms = []string{}
@@ -2374,7 +2449,10 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, se
 		SELECT u.email, COALESCE(r.name, ''), u.role_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+		WHERE u.id = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND (`+tenantAuthorityPredicate+`)
 	`, userID, tenantID).Scan(&email, &roleName, &roleID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2383,7 +2461,13 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, se
 		return nil, fmt.Errorf("fetch user for grace window: %w", err)
 	}
 
-	perms, err := s.loadPermissionsScoped(ctx, userID, tenantID, activeRoles)
+	// permissionsForRefresh for the same reason as the refresh path above, and
+	// with less margin for error: GraceResult.Permissions is applied to the
+	// in-flight request directly through graceToAuthClaims, with no token
+	// minting or signature step in between. A losing side of a concurrent
+	// rotation would otherwise have the wrong permission set applied to the
+	// request it is serving right now.
+	perms, err := s.permissionsForRefresh(ctx, userID, tenantID, activeRoles)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("grace window: failed to load permissions")
 		perms = []string{}
@@ -2574,22 +2658,80 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 
 	// Fresh user load from DB — catches suspensions, role changes, or email bans
 	// that occurred during the access token's lifetime (key security gate).
+	//
+	// The user is resolved by IDENTITY and the tenant is authorised SEPARATELY.
+	//
+	// This used to be one condition, `u.id = $1 AND u.tenant_id = $2`, which
+	// silently broke every administrator who had switched tenants. A switch mints
+	// a token stamped with the TARGET tenant (SwitchTenantContext →
+	// issueTokenPair(..., targetTenantID, ...)), while `users` holds exactly one
+	// row per person, carrying their HOME tenant. So the lookup asked for a row
+	// that cannot exist: id 5866 with tenant 4730 when the row says 4542. It
+	// returned ErrNoRows, the refresh answered 500 "user not found or inactive",
+	// and the console bounced to /login the moment the 15-minute access token
+	// expired — a logout that looked like an idle timeout and was not one.
+	//
+	// tenant_context.go:141 already documents this exact trap for permissions and
+	// solved it with loadAdminPermissionsForTenant. This path had the same flaw
+	// and never got the same treatment.
+	//
+	// The three-way authority test below is what keeps that split honest, and it
+	// mirrors SwitchTenantContext's own gate so the two cannot disagree about who
+	// may act where:
+	//
+	//   home tenant   an ordinary end user, whose token tenant always equals
+	//                 their home tenant. Unchanged behaviour — this is the arm
+	//                 every non-admin refresh takes.
+	//   admin grant   a co-owner or tenant administrator acting in a tenant that
+	//                 granted them. Re-checked on EVERY rotation, so revoking a
+	//                 grant now ends the session at the next refresh instead of
+	//                 letting it ride to the absolute cap.
+	//   tenant:manage a platform administrator, who reaches every tenant by
+	//                 permission rather than by membership and therefore has no
+	//                 grant row to find. Without this arm the fix would still
+	//                 lock out exactly the account that reported the bug.
+	//
+	// Kept as one round trip rather than a load-then-authorise pair: two queries
+	// would open a window in which a grant is revoked between them, and the
+	// rotation would mint against authority that no longer exists.
 	var email, roleName string
 	var roleID, applicationID *int64
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, ''), u.role_id, u.application_id
 		FROM users u
 		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
-		WHERE u.id = $1 AND u.tenant_id = $2 AND u.is_active = true AND u.deleted_at IS NULL
+		WHERE u.id = $1
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND (`+tenantAuthorityPredicate+`)
 	`, userID, tenantID).Scan(&email, &roleName, &roleID, &applicationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			// Deliberately one message for all four ways to get here — inactive,
+			// deleted, no authority in this tenant, or no such user. A refresh
+			// client can do nothing differently with the distinction, and naming
+			// which condition failed would tell an attacker holding a stolen
+			// token whether the account exists.
 			return nil, nil, fmt.Errorf("user not found or inactive")
 		}
 		return nil, nil, fmt.Errorf("fetch user for refresh: %w", err)
 	}
 
-	perms, err := s.loadPermissionsScoped(ctx, userID, tenantID, carried.activeRoles)
+	// Permissions must be resolved the same way SwitchTenantContext resolved
+	// them, or a rotation silently changes what the session can do.
+	//
+	// A tenant administrator acting under a grant draws their permissions from
+	// the TARGET tenant's seeded owner/co_owner role — their home role is
+	// usually irrelevant and often absent. loadPermissions answers from the home
+	// role, so refreshing such a session replaced a working set of admin
+	// permissions with an empty one: 403 on every route roughly fifteen minutes
+	// after switching, which reads as a random loss of access rather than a
+	// rotation bug.
+	//
+	// Platform administrators keep the home-role answer, which is where
+	// tenant:manage lives and is exactly what loadAdminPermissionsForTenant
+	// returns for them — so that arm is unchanged.
+	perms, err := s.permissionsForRefresh(ctx, userID, tenantID, carried.activeRoles)
 	if err != nil {
 		s.logger.Warn().Err(err).Msg("refresh: failed to load permissions")
 		perms = []string{}

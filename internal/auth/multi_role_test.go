@@ -67,15 +67,6 @@ func holdRole(t *testing.T, f roleFixture, userID int64, roleID int64) {
 	}
 }
 
-func hasPerm(perms []string, want string) bool {
-	for _, p := range perms {
-		if p == want {
-			return true
-		}
-	}
-	return false
-}
-
 func TestLogin_UnionsPermissionsAcrossEveryRoleHeld(t *testing.T) {
 	f := newRoleFixture(t, "multi-role-app", "widgets:read")
 	ctx := context.Background()

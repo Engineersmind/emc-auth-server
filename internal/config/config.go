@@ -207,6 +207,29 @@ type Config struct {
 	// cannot do UV, and only where a password is still the first factor.
 	WebAuthnRequireUserVerification bool
 
+	// CaptchaEnabled is the deployment-level switch for the self-hosted CAPTCHA
+	// (issue #145). Set via CAPTCHA_ENABLED; false by default.
+	//
+	// Two switches are required, exactly as for passkeys: this one, and an
+	// enabled row in captcha_policies. The deployment decides whether the
+	// capability exists at all; a tenant decides whether it applies to their
+	// users. Neither can turn it on alone.
+	CaptchaEnabled bool
+
+	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
+	// Required when CaptchaEnabled is true — the server refuses to start
+	// without it rather than degrading to an unkeyed hash.
+	//
+	// Keyed rather than a bare hash because the answer space is small (28^6),
+	// so a plain SHA-256 in Redis would be minutes of GPU time away from being
+	// every outstanding answer in the clear. Set via CAPTCHA_HMAC_KEY.
+	CaptchaHMACKey string
+
+	// CaptchaTTLSeconds is the challenge lifetime used when no policy row
+	// supplies one, which happens only on the degraded path where the policy
+	// table could not be read. Set via CAPTCHA_TTL_SECONDS.
+	CaptchaTTLSeconds int
+
 	// GeoIPDatabasePath points to a MaxMind GeoLite2/GeoIP2-City .mmdb file used
 	// to enrich audit rows with a coarse location. Empty (the default) disables
 	// geo enrichment — the .mmdb is licensed and not shipped with the server.
@@ -353,6 +376,9 @@ func Load() *Config {
 		WebAuthnOrigins:       getEnvList("WEBAUTHN_ORIGINS", ""),
 		// Default true — see the field comment. Only an explicit "false" opts out.
 		WebAuthnRequireUserVerification: getEnv("WEBAUTHN_REQUIRE_UV", "true") != "false",
+		CaptchaEnabled:                  getEnv("CAPTCHA_ENABLED", "false") == "true",
+		CaptchaHMACKey:                  getEnv("CAPTCHA_HMAC_KEY", ""),
+		CaptchaTTLSeconds:               mustAtoi(getEnv("CAPTCHA_TTL_SECONDS", "120")),
 		GeoIPDatabasePath:               getEnv("GEOIP_DATABASE_PATH", ""),
 		UntrustedIPCIDRs:                getEnvList("UNTRUSTED_IP_CIDRS", ""),
 		BreachDetectionEnabled:          getEnv("BREACH_DETECTION_ENABLED", "false") == "true",

@@ -31,11 +31,19 @@ type AuthHandler struct {
 	totpSvc   *auth.TOTPService         // nil when TOTP not configured
 	emailSvc  *auth.EmailMFAService     // nil when email MFA not configured
 	apiKeySvc *auth.APIKeyService
-	appSvc    *auth.ApplicationService  // nil until WithApplications is called
-	invSvc    *auth.InvitationService   // nil when invitations are not configured
-	chgSvc    *auth.EmailChangeService  // nil when email change is not configured
-	blockSvc  *auth.AccountBlockService // nil when account lockout is not configured
-	jwtSvc    *auth.JWTService
+	appSvc    *auth.ApplicationService // nil until WithApplications is called
+	// authz resolves a client_id to its application, using the SAME query the
+	// captcha challenge endpoint uses. Shared deliberately — see
+	// appCaptchaScopeFor. nil until WithAuthorization is called.
+	authz    *auth.AuthorizationServer
+	invSvc   *auth.InvitationService   // nil when invitations are not configured
+	chgSvc   *auth.EmailChangeService  // nil when email change is not configured
+	blockSvc *auth.AccountBlockService // nil when account lockout is not configured
+	jwtSvc   *auth.JWTService
+	// captchaSvc gates the unauthenticated flows (issue #145). nil, or a service
+	// whose deployment switch is off, makes every gate call a no-op — which is
+	// what keeps this feature invisible until somebody turns it on.
+	captchaSvc *auth.CaptchaService
 	// adminSvc backs the end-user session self-service routes (/me/sessions).
 	//
 	// Reuses the admin service's session queries rather than duplicating them:
@@ -175,6 +183,24 @@ func (h *AuthHandler) WithJWT(jwtSvc *auth.JWTService) *AuthHandler {
 // WithRedis attaches the Redis client used by the explicit refresh endpoints to
 // acquire the per-family rotation lock (see AuthService.RefreshWithLock). When
 // nil, refresh still detects replay but cannot serialize concurrent rotations.
+// WithCaptcha wires the captcha gate. Optional: without it the protected
+// handlers behave exactly as they did before issue #145.
+// WithAuthorization attaches the AuthorizationServer so the captcha gate can
+// resolve a client_id through the same lookup the challenge endpoint uses.
+//
+// Optional: without it the gate falls back to the platform scope, which is the
+// pre-#147 behaviour and is safe — it under-applies policy rather than
+// demanding a captcha nobody can obtain.
+func (h *AuthHandler) WithAuthorization(authz *auth.AuthorizationServer) *AuthHandler {
+	h.authz = authz
+	return h
+}
+
+func (h *AuthHandler) WithCaptcha(svc *auth.CaptchaService) *AuthHandler {
+	h.captchaSvc = svc
+	return h
+}
+
 func (h *AuthHandler) WithRedis(redisCli *redis.Client) *AuthHandler {
 	h.redisCli = redisCli
 	return h
@@ -231,6 +257,13 @@ type RegisterRequest struct {
 	Password  string `json:"password"  validate:"required,min=8"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
+
+	// CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+	// and ignored unless policy demands one, so a client that predates issue
+	// #145 keeps working unchanged. When one IS demanded and these are absent,
+	// the response is 428 captcha_required and the credentials are never read.
+	CaptchaID     string `json:"captcha_id"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
 
 // LoginRequest is the JSON body for POST /api/v1/auth/login.
@@ -248,6 +281,13 @@ type LoginRequest struct {
 	// flag: the failure mode is a user signing in more often than they need to,
 	// not a month-long session on a library computer.
 	RememberMe bool `json:"remember_me"`
+
+	// CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+	// and ignored unless policy demands one, so a client that predates issue
+	// #145 keeps working unchanged. When one IS demanded and these are absent,
+	// the response is 428 captcha_required and the credentials are never read.
+	CaptchaID     string `json:"captcha_id"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
 
 // Register handles POST /api/v1/auth/register.
@@ -262,6 +302,7 @@ type LoginRequest struct {
 // @Failure      400            {object}  map[string]string
 // @Failure      404            {object}  map[string]string  "Tenant not found"
 // @Failure      409            {object}  map[string]string  "Email already registered"
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Router       /api/v1/auth/register [post]
 func (h *AuthHandler) Register(c echo.Context) error {
 	var req RegisterRequest
@@ -272,7 +313,15 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
 	}
 	if len(req.Password) < 8 {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		return fail(c, http.StatusBadRequest, "password_too_short")
+	}
+
+	// Platform scope: the tenant comes from X-Tenant-Slug, which is a header the
+	// caller controls and therefore not something to resolve policy by before it
+	// has been validated. See captchaCheck on the zero tenant.
+	registerScope := firstPartyCaptchaScope()
+	if handled, capErr := h.captchaCheck(c, registerScope, auth.CaptchaFlowRegister, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
 	}
 
 	result, err := h.svc.Register(c.Request().Context(), auth.RegisterInput{
@@ -283,12 +332,13 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		LastName:  req.LastName,
 	})
 	if err != nil {
+		h.captchaRecordFailure(c, registerScope)
 		h.logger.Error().Err(err).Str("email", req.Email).Msg("register failed")
 		if containsMsg(err, "tenant not found") {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "tenant not found"})
 		}
 		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "email already registered"})
+			return fail(c, http.StatusConflict, "email_already_registered")
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
@@ -329,7 +379,13 @@ func invalidCredentials(c echo.Context, err error) error {
 	if errors.As(err, &soft) {
 		c.Response().Header().Set("Retry-After", strconv.Itoa(soft.RetryAfterSeconds()))
 	}
-	return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+	// One code and one sentence whatever went wrong — no such account, wrong
+	// password, or correct password against a soft-locked account. Distinguishing
+	// them here is what turns a login form into an account-enumeration oracle,
+	// and the soft-lock case additionally tells an attacker their guess was
+	// right. Retry-After carries the only hint, and only to a client that
+	// already got this far.
+	return fail(c, http.StatusUnauthorized, "invalid_credentials")
 }
 
 // softLockMeta tags a login-failure audit event that was refused by a soft lock,
@@ -360,6 +416,7 @@ func softLockMeta(err error, base map[string]any) map[string]any {
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string  "Invalid credentials"
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
 	var req LoginRequest
@@ -370,6 +427,12 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
 	}
 
+	// Before the credential check, so a refused request costs no bcrypt.
+	loginScope := firstPartyCaptchaScope()
+	if handled, capErr := h.captchaCheck(c, loginScope, auth.CaptchaFlowLogin, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
+	}
+
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
 		ClientID:   clientIDFromCtx(c), // legacy X-Client-ID tagging only — no secret, no auth
 		Email:      req.Email,
@@ -377,6 +440,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		Persistent: req.RememberMe,
 	})
 	if err != nil {
+		h.captchaRecordFailure(c, loginScope)
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("login failed")
 		h.auditFailure(c, audit.Event{
 			ActorEmail:   req.Email,
@@ -390,8 +454,14 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
+
+	// Credentials were right, so this origin is not being driven by a script —
+	// release it even if MFA is still outstanding. Holding the counter until the
+	// OTP step would keep a shared address gated on the strength of somebody
+	// else's earlier typo.
+	h.captchaClearFailures(c, loginScope)
 
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
@@ -432,6 +502,13 @@ type AppRegisterRequest struct {
 	Password  string `json:"password"  validate:"required,min=8"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
+
+	// CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+	// and ignored unless policy demands one, so a client that predates issue
+	// #145 keeps working unchanged. When one IS demanded and these are absent,
+	// the response is 428 captcha_required and the credentials are never read.
+	CaptchaID     string `json:"captcha_id"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
 
 // AppLoginRequest is the JSON body for POST /api/v1/auth/apps/login.
@@ -454,6 +531,13 @@ type AppLoginRequest struct {
 	// routine work, so a mistake cannot reach permissions the operator holds but
 	// did not intend to use.
 	Roles []string `json:"roles,omitempty"`
+
+	// CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+	// and ignored unless policy demands one, so a client that predates issue
+	// #145 keeps working unchanged. When one IS demanded and these are absent,
+	// the response is 428 captcha_required and the credentials are never read.
+	CaptchaID     string `json:"captcha_id"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
 
 // appCredentialsFromRequest resolves and requires the calling application's
@@ -485,6 +569,7 @@ func appCredentialsFromRequest(c echo.Context) (clientID, clientSecret string, e
 // @Failure      400  {object}  map[string]string
 // @Failure      401  {object}  map[string]string  "Invalid application credentials"
 // @Failure      409  {object}  map[string]string  "Email already registered in this application"
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Router       /api/v1/auth/apps/register [post]
 func (h *AuthHandler) AppRegister(c echo.Context) error {
 	var req AppRegisterRequest
@@ -495,12 +580,23 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email and password are required"})
 	}
 	if len(req.Password) < 8 {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+		return fail(c, http.StatusBadRequest, "password_too_short")
 	}
 
 	clientID, clientSecret, errResp := appCredentialsFromRequest(c)
 	if errResp != nil {
 		return c.JSON(http.StatusBadRequest, errResp)
+	}
+
+	// Registration is the flow with no account to count against, which is
+	// exactly why the adaptive counter is keyed by origin rather than by user.
+	//
+	// appCaptchaScopeFor, not a bare captchaScope{ClientID: ...}: the resolver
+	// keys on tenant and application ids, so a scope carrying only a client_id
+	// resolves the platform row and the application's own policy never applies.
+	registerScope := h.appCaptchaScopeFor(c, clientID)
+	if handled, capErr := h.captchaCheck(c, registerScope, auth.CaptchaFlowRegister, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
 	}
 
 	result, err := h.svc.Register(c.Request().Context(), auth.RegisterInput{
@@ -512,12 +608,13 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		LastName:     req.LastName,
 	})
 	if err != nil {
+		h.captchaRecordFailure(c, registerScope)
 		h.logger.Error().Err(err).Str("email", req.Email).Msg("app register failed")
 		if errors.Is(err, auth.ErrInvalidClient) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 		}
 		if containsMsg(err, "duplicate") || containsMsg(err, "unique") {
-			return c.JSON(http.StatusConflict, map[string]string{"error": "email already registered in this application"})
+			return fail(c, http.StatusConflict, "email_already_registered")
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "registration failed"})
 	}
@@ -553,6 +650,7 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 // @Success      200  {object}  auth.AuthResult
 // @Failure      400  {object}  map[string]string
 // @Failure      401  {object}  map[string]string  "Invalid application or user credentials"
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Router       /api/v1/auth/apps/login [post]
 func (h *AuthHandler) AppLogin(c echo.Context) error {
 	var req AppLoginRequest
@@ -568,6 +666,21 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, errResp)
 	}
 
+	// The client SECRET is not verified until Login runs, but the policy scope
+	// only needs the public client_id: appCaptchaScopeFor turns it into the
+	// tenant and application ids the policy resolver actually keys on. Passing a
+	// bare captchaScope{ClientID: ...} here silently resolved the platform row
+	// instead, so an application policy never took effect on this endpoint — see
+	// appCaptchaScopeFor for why that is not obvious from the call site.
+	//
+	// Resolving before authentication is safe: an unknown client_id falls back to
+	// the platform scope rather than refusing differently, so this does not tell
+	// an unauthenticated caller whether a client_id exists.
+	appLoginScope := h.appCaptchaScopeFor(c, clientID)
+	if handled, capErr := h.captchaCheck(c, appLoginScope, auth.CaptchaFlowLogin, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
+	}
+
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
@@ -577,6 +690,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		Roles:        req.Roles,
 	})
 	if err != nil {
+		h.captchaRecordFailure(c, appLoginScope)
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("app login failed")
 		ev := audit.Event{
 			ActorEmail:   req.Email,
@@ -595,8 +709,17 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
+
+	// The password was correct, so release the origin's counter — the same rule
+	// Login and SessionLogin already applied, and missing here it meant a shared
+	// address stayed gated for the whole failure window even after a legitimate
+	// sign-in through this very endpoint. Worse, RecordFailure slides the TTL on
+	// every new failure, so one bad request per window kept an office NAT gated
+	// indefinitely. Cleared before the MFA branches because reaching them proves
+	// the password step passed, whatever happens at the second factor.
+	h.captchaClearFailures(c, appLoginScope)
 
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
@@ -733,7 +856,7 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 		if errors.Is(err, auth.ErrInvalidMagicLink) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "sign-in failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
 
 	if result.OTPChallenge != nil {
@@ -763,6 +886,13 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 type LoginOTPRequest struct {
 	OTPSessionToken string `json:"otp_session_token"`
 	Code            string `json:"code"`
+
+	// CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+	// and ignored unless policy demands one, so a client that predates issue
+	// #145 keeps working unchanged. When one IS demanded and these are absent,
+	// the response is 428 captcha_required and the credentials are never read.
+	CaptchaID     string `json:"captcha_id"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
 
 // LoginOTP handles POST /api/v1/auth/login/otp — completes a TOTP-gated login.
@@ -777,6 +907,7 @@ type LoginOTPRequest struct {
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
 // @Failure      429   {object}  map[string]string  "Attempt budget exhausted — restart login"
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Router       /api/v1/auth/login/otp [post]
 func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	var req LoginOTPRequest
@@ -787,11 +918,21 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "otp_session_token and code are required"})
 	}
 
+	// Gated because this is where a brute-forcer moves once the password step is
+	// covered: a 6-digit code is a far smaller space than a password. The
+	// per-session attempt cap in the service is still the hard limit; this only
+	// makes grinding through fresh OTP sessions expensive.
+	otpScope := firstPartyCaptchaScope()
+	if handled, capErr := h.captchaCheck(c, otpScope, auth.CaptchaFlowLoginOTP, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
+	}
+
 	result, err := h.svc.LoginOTP(c.Request().Context(), auth.LoginOTPInput{
 		OTPSessionToken: req.OTPSessionToken,
 		Code:            req.Code,
 	})
 	if err != nil {
+		h.captchaRecordFailure(c, otpScope)
 		h.logger.Warn().Err(err).Msg("login OTP failed")
 		action := audit.ActionAuthMFAChallengeFailed
 		metrics.MFAChallenges.WithLabelValues("mfa", "failure").Inc()
@@ -811,12 +952,22 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		}
 		if containsMsg(err, "invalid TOTP") || containsMsg(err, "invalid or expired") || containsMsg(err, "invalid backup") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired OTP code"})
+			return fail(c, http.StatusUnauthorized, "mfa_code_invalid")
 		}
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "OTP login failed"})
 	}
 
 	metrics.MFAChallenges.WithLabelValues("mfa", "success").Inc()
+
+	// Release the origin's counter. This one matters more than it looks:
+	// otpScope is the PLATFORM first-party scope, shared with /auth/login,
+	// /auth/session and tenant-level /auth/register. Without this, somebody who
+	// mistyped a TOTP code twice and then succeeded left the shared counter
+	// armed, and every other user behind that address — campus Wi-Fi, corporate
+	// NAT — kept being captcha-gated on all four flows for the rest of the
+	// window.
+	h.captchaClearFailures(c, otpScope)
+
 	tid, uid, appID := claimsFromToken(result.AccessToken)
 	h.auditEvent(c, audit.Event{
 		TenantID:      tid,
@@ -1241,10 +1392,10 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+			return fail(c, http.StatusUnauthorized, "session_terminated")
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
+			return fail(c, http.StatusUnauthorized, "refresh_token_invalid")
 		}
 		if errors.Is(err, auth.ErrServiceUnavailable) {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})
@@ -1352,6 +1503,13 @@ func (h *AuthHandler) Logout(c echo.Context) error {
 // ForgotPasswordRequest is the JSON body for POST /api/v1/auth/forgot-password.
 type ForgotPasswordRequest struct {
 	Email string `json:"email"`
+
+	// CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+	// and ignored unless policy demands one, so a client that predates issue
+	// #145 keeps working unchanged. When one IS demanded and these are absent,
+	// the response is 428 captcha_required and the credentials are never read.
+	CaptchaID     string `json:"captcha_id"`
+	CaptchaAnswer string `json:"captcha_answer"`
 }
 
 // ForgotPassword handles POST /api/v1/auth/forgot-password (RESET-01, RESET-03).
@@ -1365,6 +1523,7 @@ type ForgotPasswordRequest struct {
 // @Param        body           body      ForgotPasswordRequest  true  "Email address"
 // @Success      200            {object}  map[string]string
 // @Failure      401            {object}  map[string]string  "Invalid client credentials"
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Router       /api/v1/auth/forgot-password [post]
 func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 	genericOK := map[string]string{
@@ -1392,12 +1551,40 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 		if !errors.Is(err, auth.ErrInvalidClient) {
 			h.logger.Error().Err(err).Msg("forgot-password: client authentication failed")
 		}
+		// Count it. Without this, ForgotPassword was the one protected flow that
+		// recorded nothing at all, so under the default adaptive mode its gate
+		// could never arm however low trigger_after_failures was set — the
+		// captcha was decorative here. The generic 200 that hides whether the
+		// client_id or the secret was wrong also hid the attempt from the
+		// counter, which is exactly the traffic the counter exists to notice.
+		//
+		// Resolved from the unverified client_id, exactly as AppLogin does. It
+		// has to be: RecordFailure re-resolves policy from the tenant and
+		// application ids, so recording against a bare client_id would land on
+		// the PLATFORM policy while the gate above checks the APPLICATION one —
+		// an application running adaptive mode over a disabled platform row
+		// would count nothing and still never arm. The two must agree on scope
+		// or the counter and the gate are reading different policies.
+		h.captchaRecordFailure(c, h.appCaptchaScopeFor(c, id))
 		return c.JSON(http.StatusOK, genericOK)
 	}
 
 	var req ForgotPasswordRequest
 	if err := c.Bind(&req); err != nil || req.Email == "" {
 		return c.JSON(http.StatusOK, genericOK)
+	}
+
+	// Client authentication has already run, so this is the one protected flow
+	// where the real tenant and application scope are known at gate time.
+	//
+	// A refused captcha returns 428, NOT the generic 200. That is deliberate and
+	// it leaks nothing: the refusal depends only on this origin's recent failure
+	// count and on whether an answer was supplied — never on whether the address
+	// is registered. Answering 200 here would be worse than useless, since the
+	// caller could not tell they needed to solve anything.
+	forgotScope := appCaptchaScope(tenantID, appID, id)
+	if handled, capErr := h.captchaCheck(c, forgotScope, auth.CaptchaFlowForgotPassword, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
 	}
 
 	if err := h.resetSvc.ForgotPassword(c.Request().Context(), tenantID, &appID, req.Email); err != nil {
@@ -1452,10 +1639,10 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	})
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidResetToken) {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid or expired reset token"})
+			return fail(c, http.StatusBadRequest, "reset_link_invalid")
 		}
 		if containsMsg(err, "at least 8 characters") {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "password must be at least 8 characters"})
+			return fail(c, http.StatusBadRequest, "password_too_short")
 		}
 		h.logger.Error().Err(err).Msg("reset-password failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "password reset failed"})
@@ -1574,7 +1761,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
 		if containsMsg(err, "invalid TOTP") {
-			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid TOTP code — check your authenticator app"})
+			return fail(c, http.StatusBadRequest, "mfa_code_invalid")
 		}
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
@@ -1924,7 +2111,7 @@ func (h *AuthHandler) LoginOTPResend(c echo.Context) error {
 			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "email MFA not configured on this server"})
 		}
 		if containsMsg(err, "invalid or expired") {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired OTP session"})
+			return fail(c, http.StatusUnauthorized, "mfa_session_expired")
 		}
 		if containsMsg(err, "not an available method") {
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -2420,6 +2607,7 @@ func revokeRejectedSession(c echo.Context, svc *auth.AuthService, logger zerolog
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Router       /api/v1/auth/session [post]
 func (h *AuthHandler) SessionLogin(c echo.Context) error {
 	var req LoginRequest
@@ -2456,6 +2644,14 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		return errCookieSessionForApps(c)
 	}
 
+	// The admin console signs in here, not through /auth/login — which is why
+	// "session" is its own flow in captcha policy. Gating only /auth/login would
+	// leave the door holding the super-admin accounts the one left open.
+	sessionScope := firstPartyCaptchaScope()
+	if handled, capErr := h.captchaCheck(c, sessionScope, auth.CaptchaFlowSession, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
+	}
+
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
 		ClientID:   clientIDFromCtx(c),
 		Email:      req.Email,
@@ -2463,6 +2659,7 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		Persistent: req.RememberMe,
 	})
 	if err != nil {
+		h.captchaRecordFailure(c, sessionScope)
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("session login failed")
 		h.auditFailure(c, audit.Event{
 			ActorEmail:   req.Email,
@@ -2476,8 +2673,12 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "login failed"})
+		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
+
+	// See Login for why this is cleared before the MFA branches: credentials
+	// were right, so the origin is not being driven by a script.
+	h.captchaClearFailures(c, sessionScope)
 
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)
@@ -2558,10 +2759,10 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		h.auditFailure(c, ev, err)
 		if errors.Is(err, auth.ErrTokenReplay) {
 			clearAuthCookies(c, h.cookieCfg)
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "session terminated — security event detected"})
+			return fail(c, http.StatusUnauthorized, "session_terminated")
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
-			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or expired refresh token"})
+			return fail(c, http.StatusUnauthorized, "refresh_token_invalid")
 		}
 		if errors.Is(err, auth.ErrServiceUnavailable) {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})

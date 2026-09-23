@@ -374,7 +374,12 @@ type Service struct {
 	// Service therefore keep working, at the cost of the immediate-revocation
 	// accelerator they do not exercise.
 	authSvc *auth.AuthService
-	logger  zerolog.Logger
+	// captchaPolicy is the captcha-policy resolver's cache, invalidated by this
+	// package's write path (issue #145). nil is tolerated: policy changes then
+	// take up to the resolver's cache TTL to apply, which is a delay rather than
+	// a correctness problem.
+	captchaPolicy *auth.CaptchaPolicyService
+	logger        zerolog.Logger
 }
 
 // New creates a Service.
@@ -413,6 +418,15 @@ func (s *Service) hasher() *password.Hasher {
 		}
 	}
 	return passwordHasher()
+}
+
+// WithCaptchaPolicy wires the captcha-policy resolver so an operator's change
+// applies to the next request rather than after the resolver's cache expires.
+// That matters most in the direction nobody plans for: turning the feature OFF
+// because it is blocking real users.
+func (s *Service) WithCaptchaPolicy(policy *auth.CaptchaPolicyService) *Service {
+	s.captchaPolicy = policy
+	return s
 }
 
 // WithInvitations wires the invitation service so admin-created accounts can be
@@ -3231,4 +3245,37 @@ func containsSubstr(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// RecipientBelongsToTenant reports whether an address belongs to an active user
+// of this tenant.
+//
+// Bounds who may receive a rendered CUSTOM email template from the admin test
+// send. Template bodies are editable at the same permission level as that
+// endpoint, so allowing both an arbitrary recipient and arbitrary content would
+// make it a phishing relay from a verified sender identity. The [Test] subject
+// prefix and in-body notice are defence in depth rather than the control: the
+// template author owns the document and can hide the banner with CSS, so the
+// recipient is what actually bounds it.
+//
+// Tenant membership rather than self-only because proving deliverability to a
+// colleague or QA alias is the real use case, and those are addresses the
+// tenant already legitimately mails.
+//
+// Matched case-insensitively: addresses are stored as supplied.
+func (s *Service) RecipientBelongsToTenant(ctx context.Context, tenantID int64, email string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM users
+			WHERE tenant_id = $1
+			  AND lower(email) = lower($2)
+			  AND is_active = true
+			  AND deleted_at IS NULL
+		)
+	`, tenantID, email).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check test recipient membership: %w", err)
+	}
+	return exists, nil
 }

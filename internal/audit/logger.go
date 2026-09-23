@@ -85,6 +85,16 @@ const (
 	ActionAdminUserUnblocked      = "admin.user_unblocked"
 	ActionAdminUserSessionRevoked = "admin.user_session_revoked"
 	ActionAdminUserSessionsPurged = "admin.user_sessions_purged"
+	// A directory export leaves the building as a file. Recorded so an incident
+	// review can answer who took a copy of the user list, when, and how much of
+	// it — the same question asked of an audit-trail export.
+	ActionAdminUsersExported = "admin.users_exported"
+	// Bulk import. The dry run is audited as well as the commit: validating a
+	// file reveals which addresses already exist in the tenant, so it is a
+	// disclosure worth a record even though it writes nothing.
+	ActionAdminUsersImportValidated = "admin.users_import_validated"
+	ActionAdminUsersImported        = "admin.users_imported"
+	ActionAdminUsersImportCancelled = "admin.users_import_cancelled"
 
 	// Admin — per-app rate limit management (08-02)
 	ActionAdminAppLimitCreated = "admin.app_limit_created"
@@ -216,6 +226,13 @@ const (
 	// "who changed the lockout policy, and to what?" must be answerable afterwards.
 	ActionAdminLockoutPolicySet   = "admin.lockout_policy_set"
 	ActionAdminLockoutPolicyReset = "admin.lockout_policy_reset"
+
+	// Captcha policy (issue #145). Worth its own pair rather than folding into
+	// a generic policy event: enabling a captcha changes what every user of an
+	// application must do to sign in, and that is the line somebody scanning
+	// this feed after a spike in support tickets is looking for.
+	ActionAdminCaptchaPolicySet   = "admin.captcha_policy_set"
+	ActionAdminCaptchaPolicyReset = "admin.captcha_policy_reset"
 
 	// Admin — a privileged route refused the caller. Recorded because a refusal
 	// is a security signal in its own right: somebody probing for access they do

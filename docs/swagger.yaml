@@ -1,5 +1,73 @@
 basePath: /
 definitions:
+  admin.CaptchaPolicyInput:
+    properties:
+      case_sensitive:
+        type: boolean
+      code_length:
+        type: integer
+      enabled:
+        type: boolean
+      failure_window_seconds:
+        type: integer
+      max_attempts_per_challenge:
+        type: integer
+      mode:
+        type: string
+      noise_level:
+        type: string
+      protected_flows:
+        items:
+          type: string
+        type: array
+      trigger_after_failures:
+        type: integer
+      ttl_seconds:
+        type: integer
+    type: object
+  admin.CaptchaPolicyView:
+    properties:
+      case_sensitive:
+        type: boolean
+      code_length:
+        type: integer
+      enabled:
+        type: boolean
+      failure_window_seconds:
+        type: integer
+      inherited:
+        description: |-
+          Inherited is true when no row exists at the requested scope and these
+          values came from a broader one.
+
+          The console renders "Reset to inherited" (a DELETE) next to "Off" (enabled
+          = false), and they do opposite things. This field is what lets it tell
+          them apart.
+        type: boolean
+      max_attempts_per_challenge:
+        type: integer
+      mode:
+        type: string
+      noise_level:
+        type: string
+      protected_flows:
+        items:
+          type: string
+        type: array
+      provider:
+        type: string
+      scope:
+        description: |-
+          Scope is "platform", "tenant", or "application" — which row actually
+          answered. Without it a caller cannot tell a policy they set from an
+          inherited default, and would have no way to know that editing it creates a
+          new row rather than changing an existing one.
+        type: string
+      trigger_after_failures:
+        type: integer
+      ttl_seconds:
+        type: integer
+    type: object
   admin.CreateTenantResult:
     properties:
       owner:
@@ -887,6 +955,16 @@ definitions:
         items:
           type: string
         type: array
+      token_validation:
+        allOf:
+        - $ref: '#/definitions/auth.TokenValidationConfig'
+        description: |-
+          TokenValidation is everything a resource server needs to verify a token
+          minted for this application. Omitted when the issuer is not resolvable.
+
+          Grouped rather than three loose fields because these values are only
+          correct together: an integrator who configures the audience and skips the
+          issuer is trusting a string that is unique per tenant, not globally.
       updated_at:
         type: string
     type: object
@@ -1005,6 +1083,25 @@ definitions:
       token_type:
         type: string
     type: object
+  auth.CaptchaChallenge:
+    properties:
+      case_sensitive:
+        description: |-
+          CaseSensitive tells the client whether the answer must match case, so a
+          sign-in page can set autocapitalize and its help text from the policy
+          rather than hardcoding an assumption that may be wrong for this tenant.
+        type: boolean
+      challenge_id:
+        type: string
+      expires_at:
+        type: string
+      height:
+        type: integer
+      image:
+        type: string
+      width:
+        type: integer
+    type: object
   auth.ClientGrant:
     properties:
       application_id:
@@ -1030,11 +1127,30 @@ definitions:
       updated_at:
         type: string
     type: object
+  auth.EffectiveBranding:
+    properties:
+      logo_url:
+        type: string
+      product_name:
+        type: string
+      scope:
+        description: Scope names the sender the branding came from ("application",
+          "tenant" or "global").
+        type: string
+      subject_prefix:
+        type: string
+    type: object
   auth.EmailSenderResolution:
     properties:
       configured:
         description: Configured reports whether THIS scope has its own sender row.
         type: boolean
+      effective_branding:
+        allOf:
+        - $ref: '#/definitions/auth.EffectiveBranding'
+        description: EffectiveBranding is the branding a send from here would actually
+          use, after the application -> tenant -> global fall-through. NOT the same
+          as settings.product_name.
       settings:
         allOf:
         - $ref: '#/definitions/auth.EmailSenderSettings'
@@ -1409,6 +1525,34 @@ definitions:
       enrolled:
         type: boolean
     type: object
+  auth.TokenValidationConfig:
+    properties:
+      audience:
+        description: |-
+          Audience is this application's immutable identifier, repeated here so the
+          three values can be copied as one block.
+
+          Necessary but NOT sufficient on its own: it proves which application the
+          token was minted for, and nothing about which tenant issued it.
+        type: string
+      discovery_uri:
+        description: |-
+          DiscoveryURI lets a standards-aware library configure itself from one URL
+          instead of three literals, which is the least error-prone option when the
+          integrator's stack supports it.
+        type: string
+      issuer:
+        description: |-
+          Issuer pins the token to this tenant. Audiences are unique per tenant
+          rather than globally, so validating the audience while ignoring the
+          issuer means trusting a string another tenant could mint.
+        type: string
+      jwks_uri:
+        description: |-
+          JWKSURI is the tenant's public key set. Per-tenant because the signing
+          keys are: a single shared key set would defeat that isolation.
+        type: string
+    type: object
   auth.UserIdentityDetail:
     properties:
       created_at:
@@ -1448,6 +1592,15 @@ definitions:
     type: object
   handlers.AppLoginRequest:
     properties:
+      captcha_answer:
+        type: string
+      captcha_id:
+        description: |-
+          CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+          and ignored unless policy demands one, so a client that predates issue
+          #145 keeps working unchanged. When one IS demanded and these are absent,
+          the response is 428 captcha_required and the credentials are never read.
+        type: string
       email:
         type: string
       password:
@@ -1461,6 +1614,15 @@ definitions:
     type: object
   handlers.AppRegisterRequest:
     properties:
+      captcha_answer:
+        type: string
+      captcha_id:
+        description: |-
+          CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+          and ignored unless policy demands one, so a client that predates issue
+          #145 keeps working unchanged. When one IS demanded and these are absent,
+          the response is 428 captcha_required and the credentials are never read.
+        type: string
       email:
         type: string
       first_name:
@@ -1485,6 +1647,42 @@ definitions:
         type: string
       tenant_id:
         type: string
+    type: object
+  handlers.CaptchaChallengeRequest:
+    properties:
+      client_id:
+        description: |-
+          ClientID names the application the challenge is for.
+
+          OPTIONAL, and which way you send it must match the flow you will spend the
+          challenge on — the challenge is bound to this value, so a mismatch is
+          refused however correct the answer is:
+
+            OMIT it for the first-party flows — /auth/login, /auth/session,
+            /auth/login/otp and the tenant-level /auth/register. None of those knows
+            a tenant or an application before authenticating, so they verify against
+            the platform policy with no client binding.
+
+            SEND it for the application-authenticated flows — /auth/apps/login,
+            /auth/apps/register and /auth/forgot-password — which authenticate a
+            client first and verify against that application's policy.
+        type: string
+      previous_challenge_id:
+        description: |-
+          PreviousChallengeID, when set, is burned before the new one is issued.
+
+          This is what makes the "I can't read it" button safe. Without it a caller
+          could accumulate outstanding challenges and work through them at leisure,
+          which is precisely the position a solver farm wants to be in.
+        type: string
+      purpose:
+        description: |-
+          Purpose is the flow the challenge will be spent on — "login", "session",
+          "login_otp", "register" or "forgot_password". Bound into the challenge, so
+          one minted for the cheap register path cannot be used on login.
+        type: string
+    required:
+    - purpose
     type: object
   handlers.ChangeEmailRequest:
     properties:
@@ -1600,6 +1798,15 @@ definitions:
     type: object
   handlers.ForgotPasswordRequest:
     properties:
+      captcha_answer:
+        type: string
+      captcha_id:
+        description: |-
+          CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+          and ignored unless policy demands one, so a client that predates issue
+          #145 keeps working unchanged. When one IS demanded and these are absent,
+          the response is 428 captcha_required and the credentials are never read.
+        type: string
       email:
         type: string
     type: object
@@ -1649,6 +1856,15 @@ definitions:
     type: object
   handlers.LoginOTPRequest:
     properties:
+      captcha_answer:
+        type: string
+      captcha_id:
+        description: |-
+          CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+          and ignored unless policy demands one, so a client that predates issue
+          #145 keeps working unchanged. When one IS demanded and these are absent,
+          the response is 428 captcha_required and the credentials are never read.
+        type: string
       code:
         type: string
       otp_session_token:
@@ -1661,6 +1877,15 @@ definitions:
     type: object
   handlers.LoginRequest:
     properties:
+      captcha_answer:
+        type: string
+      captcha_id:
+        description: |-
+          CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+          and ignored unless policy demands one, so a client that predates issue
+          #145 keeps working unchanged. When one IS demanded and these are absent,
+          the response is 428 captcha_required and the credentials are never read.
+        type: string
       email:
         type: string
       password:
@@ -1866,6 +2091,15 @@ definitions:
     type: object
   handlers.RegisterRequest:
     properties:
+      captcha_answer:
+        type: string
+      captcha_id:
+        description: |-
+          CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+          and ignored unless policy demands one, so a client that predates issue
+          #145 keeps working unchanged. When one IS demanded and these are absent,
+          the response is 428 captcha_required and the credentials are never read.
+        type: string
       email:
         type: string
       first_name:
@@ -1920,6 +2154,14 @@ definitions:
     properties:
       message:
         type: string
+      marked_as_test:
+        description: true when the message was stamped with a [Test] subject prefix
+          and an in-body test notice
+        type: boolean
+      used_custom_template:
+        description: false when the built-in default was sent instead of the saved
+          override (most often a disabled template)
+        type: boolean
       provider:
         description: smtp | sendgrid | dev
         type: string
@@ -1933,6 +2175,15 @@ definitions:
     type: object
   handlers.SessionLoginRequest:
     properties:
+      captcha_answer:
+        type: string
+      captcha_id:
+        description: |-
+          CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
+          and ignored unless policy demands one, so a client that predates issue
+          #145 keeps working unchanged. When one IS demanded and these are absent,
+          the response is 428 captcha_required and the credentials are never read.
+        type: string
       email:
         type: string
       password:
@@ -3552,7 +3803,9 @@ paths:
       - admin-applications
     get:
       description: Returns one application (active or inactive) by ID. The secret
-        is never included.
+        is never included. Carries `token_validation` — the audience, issuer, JWKS
+        and discovery URIs a resource server needs to verify this application's tokens
+        — omitted when the application has no audience or the issuer cannot be resolved.
       parameters:
       - description: Application ID
         in: path
@@ -3974,6 +4227,13 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry; do NOT treat as bad credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       summary: Login an end user via application credentials
       tags:
       - AUTH
@@ -4151,6 +4411,13 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry; do NOT treat as bad credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       summary: Register an end user via application credentials
       tags:
       - AUTH
@@ -4263,6 +4530,13 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry; do NOT treat as bad credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       summary: Request password reset
       tags:
       - AUTH
@@ -4325,6 +4599,13 @@ paths:
             type: object
         "401":
           description: Invalid credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry; do NOT treat as bad credentials
           schema:
             additionalProperties:
               type: string
@@ -4491,6 +4772,13 @@ paths:
             type: object
         "401":
           description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry; do NOT treat as bad credentials
           schema:
             additionalProperties:
               type: string
@@ -5396,6 +5684,13 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry; do NOT treat as bad credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       summary: Register a new user
       tags:
       - AUTH
@@ -5487,6 +5782,13 @@ paths:
             type: object
         "401":
           description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry; do NOT treat as bad credentials
           schema:
             additionalProperties:
               type: string
@@ -5644,6 +5946,119 @@ paths:
               type: string
             type: object
       summary: Verify email address
+      tags:
+      - AUTH
+  /api/v1/captcha-policy:
+    delete:
+      description: Removes this scope's captcha override so it inherits from the tenant
+        or platform default. Distinct from setting enabled=false, which is an explicit
+        decision recorded at this scope.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Reset the CAPTCHA policy
+      tags:
+      - admin-security
+    get:
+      description: 'Returns the captcha settings in force for the tenant or application,
+        and whether they are inherited. `inherited: true` means no row exists at this
+        scope — editing creates one, and DELETE reverts to inheriting again.'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.CaptchaPolicyView'
+      security:
+      - BearerAuth: []
+      summary: Get the CAPTCHA policy
+      tags:
+      - admin-security
+    put:
+      consumes:
+      - application/json
+      description: Turns captchas on or off for this scope and sets how they behave.
+        Omitted fields are left unchanged — send only what changed, because a full-form
+        PUT on an inheriting scope converts every inherited value into an explicit
+        override and stops tracking the parent.
+      parameters:
+      - description: Policy fields to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.CaptchaPolicyInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.CaptchaPolicyView'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update the CAPTCHA policy
+      tags:
+      - admin-security
+  /api/v1/captcha/challenge:
+    post:
+      consumes:
+      - application/json
+      description: Issues a single-use image challenge. OMIT client_id for the first-party
+        flows (login, session, login_otp, tenant-level register); SEND it for the
+        application-authenticated flows (apps/login, apps/register, forgot_password).
+        The challenge is bound to whichever you chose, so a mismatch is refused however
+        correct the answer is. The image is returned inline as a PNG data URI. Answer
+        it by sending `captcha_id` and `captcha_answer` on the protected request.
+        Returns 404 when the application has no captcha policy enabled.
+      parameters:
+      - description: Application and flow
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CaptchaChallengeRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.CaptchaChallenge'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get a CAPTCHA challenge
       tags:
       - AUTH
   /api/v1/email-settings:
@@ -6230,6 +6645,54 @@ paths:
       summary: Update permission
       tags:
       - admin-rbac
+  /api/v1/platform/captcha-policy:
+    get:
+      description: The policy governing the tenant-less sign-in flows (/auth/login,
+        /auth/session, /auth/login/otp), which cannot resolve a tenant before authenticating.
+        Requires tenant:manage.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.CaptchaPolicyView'
+      security:
+      - BearerAuth: []
+      summary: Get the platform CAPTCHA policy
+      tags:
+      - admin-security
+    put:
+      consumes:
+      - application/json
+      description: Sets the policy for the tenant-less sign-in flows. This affects
+        EVERY tenant's console sign-in, so it requires tenant:manage. Omitted fields
+        are left unchanged.
+      parameters:
+      - description: Policy fields to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.CaptchaPolicyInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.CaptchaPolicyView'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Update the platform CAPTCHA policy
+      tags:
+      - admin-security
   /api/v1/roles:
     get:
       description: Returns all roles in the caller's tenant with their permission

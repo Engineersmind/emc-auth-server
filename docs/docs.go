@@ -1811,7 +1811,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns one application (active or inactive) by ID. The secret is never included.",
+                "description": "Returns one application (active or inactive) by ID. The secret is never included. Carries ` + "`" + `token_validation` + "`" + ` — the audience, issuer, JWKS and discovery URIs a resource server needs to verify this application's tokens — omitted when the application has no audience or the issuer cannot be resolved.",
                 "produces": [
                     "application/json"
                 ],
@@ -2514,6 +2514,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -2762,6 +2771,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -2925,6 +2943,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -3009,6 +3036,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Invalid credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3247,6 +3283,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4588,6 +4633,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -4720,6 +4774,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4936,6 +4999,164 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/captcha-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the captcha settings in force for the tenant or application, and whether they are inherited. ` + "`" + `inherited: true` + "`" + ` means no row exists at this scope — editing creates one, and DELETE reverts to inheriting again.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Get the CAPTCHA policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.CaptchaPolicyView"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Turns captchas on or off for this scope and sets how they behave. Omitted fields are left unchanged — send only what changed, because a full-form PUT on an inheriting scope converts every inherited value into an explicit override and stops tracking the parent.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Update the CAPTCHA policy",
+                "parameters": [
+                    {
+                        "description": "Policy fields to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.CaptchaPolicyInput"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.CaptchaPolicyView"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes this scope's captcha override so it inherits from the tenant or platform default. Distinct from setting enabled=false, which is an explicit decision recorded at this scope.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Reset the CAPTCHA policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/captcha/challenge": {
+            "post": {
+                "description": "Issues a single-use image challenge. OMIT client_id for the first-party flows (login, session, login_otp, tenant-level register); SEND it for the application-authenticated flows (apps/login, apps/register, forgot_password). The challenge is bound to whichever you chose, so a mismatch is refused however correct the answer is. The image is returned inline as a PNG data URI. Answer it by sending ` + "`" + `captcha_id` + "`" + ` and ` + "`" + `captcha_answer` + "`" + ` on the protected request. Returns 404 when the application has no captcha policy enabled.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Get a CAPTCHA challenge",
+                "parameters": [
+                    {
+                        "description": "Application and flow",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CaptchaChallengeRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.CaptchaChallenge"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5804,6 +6025,77 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/platform/captcha-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "The policy governing the tenant-less sign-in flows (/auth/login, /auth/session, /auth/login/otp), which cannot resolve a tenant before authenticating. Requires tenant:manage.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Get the platform CAPTCHA policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.CaptchaPolicyView"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets the policy for the tenant-less sign-in flows. This affects EVERY tenant's console sign-in, so it requires tenant:manage. Omitted fields are left unchanged.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Update the platform CAPTCHA policy",
+                "parameters": [
+                    {
+                        "description": "Policy fields to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.CaptchaPolicyInput"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.CaptchaPolicyView"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -9701,6 +9993,93 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "admin.CaptchaPolicyInput": {
+            "type": "object",
+            "properties": {
+                "case_sensitive": {
+                    "type": "boolean"
+                },
+                "code_length": {
+                    "type": "integer"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "failure_window_seconds": {
+                    "type": "integer"
+                },
+                "max_attempts_per_challenge": {
+                    "type": "integer"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "noise_level": {
+                    "type": "string"
+                },
+                "protected_flows": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "trigger_after_failures": {
+                    "type": "integer"
+                },
+                "ttl_seconds": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admin.CaptchaPolicyView": {
+            "type": "object",
+            "properties": {
+                "case_sensitive": {
+                    "type": "boolean"
+                },
+                "code_length": {
+                    "type": "integer"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "failure_window_seconds": {
+                    "type": "integer"
+                },
+                "inherited": {
+                    "description": "Inherited is true when no row exists at the requested scope and these\nvalues came from a broader one.\n\nThe console renders \"Reset to inherited\" (a DELETE) next to \"Off\" (enabled\n= false), and they do opposite things. This field is what lets it tell\nthem apart.",
+                    "type": "boolean"
+                },
+                "max_attempts_per_challenge": {
+                    "type": "integer"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "noise_level": {
+                    "type": "string"
+                },
+                "protected_flows": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "provider": {
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "Scope is \"platform\", \"tenant\", or \"application\" — which row actually\nanswered. Without it a caller cannot tell a policy they set from an\ninherited default, and would have no way to know that editing it creates a\nnew row rather than changing an existing one.",
+                    "type": "string"
+                },
+                "trigger_after_failures": {
+                    "type": "integer"
+                },
+                "ttl_seconds": {
+                    "type": "integer"
+                }
+            }
+        },
         "admin.CreateTenantResult": {
             "type": "object",
             "properties": {
@@ -10772,6 +11151,14 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "token_validation": {
+                    "description": "TokenValidation is everything a resource server needs to verify a token\nminted for this application. Omitted when the issuer is not resolvable.\n\nGrouped rather than three loose fields because these values are only\ncorrect together: an integrator who configures the audience and skips the\nissuer is trusting a string that is unique per tenant, not globally.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/auth.TokenValidationConfig"
+                        }
+                    ]
+                },
                 "updated_at": {
                     "type": "string"
                 }
@@ -10932,6 +11319,30 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.CaptchaChallenge": {
+            "type": "object",
+            "properties": {
+                "case_sensitive": {
+                    "description": "CaseSensitive tells the client whether the answer must match case, so a\nsign-in page can set autocapitalize and its help text from the policy\nrather than hardcoding an assumption that may be wrong for this tenant.",
+                    "type": "boolean"
+                },
+                "challenge_id": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "height": {
+                    "type": "integer"
+                },
+                "image": {
+                    "type": "string"
+                },
+                "width": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.ClientGrant": {
             "type": "object",
             "properties": {
@@ -10963,12 +11374,38 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.EffectiveBranding": {
+            "type": "object",
+            "properties": {
+                "logo_url": {
+                    "type": "string"
+                },
+                "product_name": {
+                    "type": "string"
+                },
+                "scope": {
+                    "description": "Scope names the sender the branding came from (\"application\", \"tenant\" or \"global\").",
+                    "type": "string"
+                },
+                "subject_prefix": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.EmailSenderResolution": {
             "type": "object",
             "properties": {
                 "configured": {
                     "description": "Configured reports whether THIS scope has its own sender row.",
                     "type": "boolean"
+                },
+                "effective_branding": {
+                    "description": "EffectiveBranding is the branding a send from here would actually use, after the application -> tenant -> global fall-through. NOT the same as settings.product_name.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/auth.EffectiveBranding"
+                        }
+                    ]
                 },
                 "settings": {
                     "description": "Settings is the sender row at this scope, or null when inheriting.",
@@ -11437,6 +11874,27 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.TokenValidationConfig": {
+            "type": "object",
+            "properties": {
+                "audience": {
+                    "description": "Audience is this application's immutable identifier, repeated here so the\nthree values can be copied as one block.\n\nNecessary but NOT sufficient on its own: it proves which application the\ntoken was minted for, and nothing about which tenant issued it.",
+                    "type": "string"
+                },
+                "discovery_uri": {
+                    "description": "DiscoveryURI lets a standards-aware library configure itself from one URL\ninstead of three literals, which is the least error-prone option when the\nintegrator's stack supports it.",
+                    "type": "string"
+                },
+                "issuer": {
+                    "description": "Issuer pins the token to this tenant. Audiences are unique per tenant\nrather than globally, so validating the audience while ignoring the\nissuer means trusting a string another tenant could mint.",
+                    "type": "string"
+                },
+                "jwks_uri": {
+                    "description": "JWKSURI is the tenant's public key set. Per-tenant because the signing\nkeys are: a single shared key set would defeat that isolation.",
+                    "type": "string"
+                }
+            }
+        },
         "auth.UserIdentityDetail": {
             "type": "object",
             "properties": {
@@ -11494,6 +11952,13 @@ const docTemplate = `{
                 "password"
             ],
             "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional\nand ignored unless policy demands one, so a client that predates issue\n#145 keeps working unchanged. When one IS demanded and these are absent,\nthe response is 428 captcha_required and the credentials are never read.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 },
@@ -11513,6 +11978,13 @@ const docTemplate = `{
                 "password"
             ],
             "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional\nand ignored unless policy demands one, so a client that predates issue\n#145 keeps working unchanged. When one IS demanded and these are absent,\nthe response is 428 captcha_required and the credentials are never read.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 },
@@ -11543,6 +12015,26 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "tenant_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.CaptchaChallengeRequest": {
+            "type": "object",
+            "required": [
+                "purpose"
+            ],
+            "properties": {
+                "client_id": {
+                    "description": "ClientID names the application the challenge is for.\n\nOPTIONAL, and which way you send it must match the flow you will spend the\nchallenge on — the challenge is bound to this value, so a mismatch is\nrefused however correct the answer is:\n\n  OMIT it for the first-party flows — /auth/login, /auth/session,\n  /auth/login/otp and the tenant-level /auth/register. None of those knows\n  a tenant or an application before authenticating, so they verify against\n  the platform policy with no client binding.\n\n  SEND it for the application-authenticated flows — /auth/apps/login,\n  /auth/apps/register and /auth/forgot-password — which authenticate a\n  client first and verify against that application's policy.",
+                    "type": "string"
+                },
+                "previous_challenge_id": {
+                    "description": "PreviousChallengeID, when set, is burned before the new one is issued.\n\nThis is what makes the \"I can't read it\" button safe. Without it a caller\ncould accumulate outstanding challenges and work through them at leisure,\nwhich is precisely the position a solver farm wants to be in.",
+                    "type": "string"
+                },
+                "purpose": {
+                    "description": "Purpose is the flow the challenge will be spent on — \"login\", \"session\",\n\"login_otp\", \"register\" or \"forgot_password\". Bound into the challenge, so\none minted for the cheap register path cannot be used on login.",
                     "type": "string"
                 }
             }
@@ -11700,6 +12192,13 @@ const docTemplate = `{
         "handlers.ForgotPasswordRequest": {
             "type": "object",
             "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional\nand ignored unless policy demands one, so a client that predates issue\n#145 keeps working unchanged. When one IS demanded and these are absent,\nthe response is 428 captcha_required and the credentials are never read.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 }
@@ -11754,6 +12253,13 @@ const docTemplate = `{
         "handlers.LoginOTPRequest": {
             "type": "object",
             "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional\nand ignored unless policy demands one, so a client that predates issue\n#145 keeps working unchanged. When one IS demanded and these are absent,\nthe response is 428 captcha_required and the credentials are never read.",
+                    "type": "string"
+                },
                 "code": {
                     "type": "string"
                 },
@@ -11777,6 +12283,13 @@ const docTemplate = `{
                 "password"
             ],
             "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional\nand ignored unless policy demands one, so a client that predates issue\n#145 keeps working unchanged. When one IS demanded and these are absent,\nthe response is 428 captcha_required and the credentials are never read.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 },
@@ -12046,6 +12559,13 @@ const docTemplate = `{
                 "password"
             ],
             "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional\nand ignored unless policy demands one, so a client that predates issue\n#145 keeps working unchanged. When one IS demanded and these are absent,\nthe response is 428 captcha_required and the credentials are never read.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 },
@@ -12106,6 +12626,14 @@ const docTemplate = `{
                 "message": {
                     "type": "string"
                 },
+                "marked_as_test": {
+                    "description": "true when the message was stamped with a [Test] subject prefix and an in-body test notice",
+                    "type": "boolean"
+                },
+                    "used_custom_template": {
+                        "description": "false when the built-in default was sent instead of the saved override (most often a disabled template)",
+                        "type": "boolean"
+                    },
                 "provider": {
                     "description": "smtp | sendgrid | dev",
                     "type": "string"
@@ -12129,6 +12657,13 @@ const docTemplate = `{
                 "password"
             ],
             "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional\nand ignored unless policy demands one, so a client that predates issue\n#145 keeps working unchanged. When one IS demanded and these are absent,\nthe response is 428 captcha_required and the credentials are never read.",
+                    "type": "string"
+                },
                 "email": {
                     "type": "string"
                 },
