@@ -3,6 +3,7 @@ package admin_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/engineersmind/emc-auth-server/internal/admin"
@@ -337,5 +338,61 @@ func TestListUserRoles_ReportsProvenanceAndPrimary(t *testing.T) {
 	}
 	if roles[0].GrantedBy != nil {
 		t.Error("granted_by is set on the registration-time grant; it should be unknown, not invented")
+	}
+}
+
+// The console's Roles column reads UserResult.Roles. Before it existed the list
+// carried only the primary role, so a user holding two showed one.
+func TestListAndGetUser_ReportEveryRoleHeld(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	viewer, err := f.svc.CreateRole(ctx, f.tenantID, &f.appID, "viewer", nil)
+	if err != nil {
+		t.Fatalf("CreateRole(viewer) error = %v", err)
+	}
+	editor, err := f.svc.CreateRole(ctx, f.tenantID, &f.appID, "editor", nil)
+	if err != nil {
+		t.Fatalf("CreateRole(editor) error = %v", err)
+	}
+	viewerID := parseID(t, viewer.ID)
+
+	userID := newUserOnRole(t, f, "listroles@example.com", &viewerID)
+	if err := f.svc.AddUserRole(ctx, f.tenantID, &f.appID, userID, parseID(t, editor.ID), nil); err != nil {
+		t.Fatalf("AddUserRole() error = %v", err)
+	}
+
+	// Primary first, then the rest by name.
+	want := "viewer,editor"
+
+	page, err := f.svc.ListUsers(ctx, f.tenantID, &f.appID, "listroles@", 1, 20)
+	if err != nil {
+		t.Fatalf("ListUsers() error = %v", err)
+	}
+	if len(page.Users) != 1 {
+		t.Fatalf("ListUsers() returned %d users, want 1", len(page.Users))
+	}
+	if got := strings.Join(page.Users[0].Roles, ","); got != want {
+		t.Errorf("ListUsers roles = %q, want %q", got, want)
+	}
+
+	u, err := f.svc.GetUser(ctx, f.tenantID, &f.appID, userID)
+	if err != nil {
+		t.Fatalf("GetUser() error = %v", err)
+	}
+	if got := strings.Join(u.Roles, ","); got != want {
+		t.Errorf("GetUser roles = %q, want %q", got, want)
+	}
+
+	// Deleting a role removes it from the list too.
+	if _, err := f.svc.DeleteRole(ctx, f.tenantID, parseID(t, editor.ID)); err != nil {
+		t.Fatalf("DeleteRole(editor) error = %v", err)
+	}
+	u, err = f.svc.GetUser(ctx, f.tenantID, &f.appID, userID)
+	if err != nil {
+		t.Fatalf("GetUser() after delete error = %v", err)
+	}
+	if got := strings.Join(u.Roles, ","); got != "viewer" {
+		t.Errorf("roles after deleting editor = %q, want %q", got, "viewer")
 	}
 }

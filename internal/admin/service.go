@@ -225,16 +225,19 @@ type UserRoleResult struct {
 
 // UserResult is the public representation of a user in the pool.
 type UserResult struct {
-	ID            string    `json:"id"`
-	TenantID      string    `json:"tenant_id"`
-	ApplicationID *string   `json:"application_id,omitempty"`
-	Email         string    `json:"email"`
-	FirstName     string    `json:"first_name"`
-	LastName      string    `json:"last_name"`
-	Role          string    `json:"role"`
-	RoleID        *string   `json:"role_id"`
-	IsActive      bool      `json:"is_active"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID            string  `json:"id"`
+	TenantID      string  `json:"tenant_id"`
+	ApplicationID *string `json:"application_id,omitempty"`
+	Email         string  `json:"email"`
+	FirstName     string  `json:"first_name"`
+	LastName      string  `json:"last_name"`
+	Role          string  `json:"role"`
+	RoleID        *string `json:"role_id"`
+	// Roles is every live role the user holds (#146), primary first. Role and
+	// RoleID stay as the primary for callers that predate multi-role.
+	Roles     []string  `json:"roles"`
+	IsActive  bool      `json:"is_active"`
+	CreatedAt time.Time `json:"created_at"`
 	// LastLoginAt is the most recent session activity (Auth0's "Latest Login").
 	LastLoginAt *time.Time `json:"last_login_at"`
 	// LoginsCount is the number of successful logins on record (audit-derived,
@@ -1686,7 +1689,8 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		if err := rows.Scan(&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 			&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
-			&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt); err != nil {
+			&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt,
+			&u.Roles); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		u.ID = strconv.FormatInt(id, 10)
@@ -3089,7 +3093,13 @@ const userEnrichmentColumns = `
 	               ORDER BY lp.application_id NULLS LAST, lp.tenant_id NULLS LAST
 	               LIMIT 1
 	           )
-	       END AS lock_expires_at`
+	       END AS lock_expires_at,
+	       -- Every live role the user holds (#146), primary first. u.role_id alone
+	       -- is only the primary, so the console's Roles column needs the set.
+	       (SELECT COALESCE(array_agg(ur_r.name ORDER BY (ur_r.id = u.role_id) DESC, ur_r.name), '{}')
+	        FROM user_roles ur
+	        JOIN roles ur_r ON ur_r.id = ur.role_id AND ur_r.deleted_at IS NULL
+	        WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id) AS roles`
 
 // buildConnections merges the password credential and federated providers
 // into the public Connections list ("password", "google", ...).
@@ -3120,6 +3130,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 		&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
 		&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt,
+		&u.Roles,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
