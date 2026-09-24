@@ -48,6 +48,11 @@ var ErrRoleNotInApplication = errors.New("role not available in this application
 // tenant by watching which ones return a different error.
 var ErrUserNotInApplication = errors.New("user not found in this application")
 
+// ErrNoRolesRequested is returned for an additive request that names no roles.
+// A sentinel so the handler answers 400: as a bare error it fell through to the
+// 500 branch, reporting the caller's mistake as a server failure.
+var ErrNoRolesRequested = errors.New("at least one role is required")
+
 // AssignAppUserRolesInput is one application-credentialed role assignment.
 type AssignAppUserRolesInput struct {
 	ClientID     string
@@ -115,7 +120,7 @@ func (s *AuthService) AssignAppUserRoles(ctx context.Context, in AssignAppUserRo
 	if len(names) == 0 && !in.Replace {
 		// An empty additive request would be a silent no-op that still emitted an
 		// audit event and revoked every session. Refusing names the mistake.
-		return nil, fmt.Errorf("at least one role is required")
+		return nil, ErrNoRolesRequested
 	}
 
 	tx, err := s.pool.Begin(ctx)

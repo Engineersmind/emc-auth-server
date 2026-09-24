@@ -126,6 +126,26 @@ func TestAssignAppUserRoles_RefusesWrongSecret(t *testing.T) {
 	}
 }
 
+// An additive request naming no roles is the caller's mistake, and must surface
+// as one: before the sentinel it fell through the handler's 500 branch.
+func TestAssignAppUserRoles_RefusesAnEmptyAdditiveRequest(t *testing.T) {
+	f := newAppRoleFixture(t, "app-roles-empty")
+	ctx := context.Background()
+
+	userID := f.registerUser(t, uniqueEmail("app-empty"))
+
+	_, err := f.svc.AssignAppUserRoles(ctx, auth.AssignAppUserRolesInput{
+		ClientID: f.app.ClientID, ClientSecret: f.app.ClientSecret,
+		UserID: userID, Roles: []string{" ", ""},
+	})
+	if !errors.Is(err, auth.ErrNoRolesRequested) {
+		t.Errorf("AssignAppUserRoles(no roles) error = %v, want ErrNoRolesRequested", err)
+	}
+	if held := heldRoleNamesFor(t, f.roleFixture, userID); len(held) != 1 {
+		t.Errorf("held roles = %v after a refused call, want only the registration default", held)
+	}
+}
+
 func TestAssignAppUserRoles_RefusesAnotherApplicationsUser(t *testing.T) {
 	f := newAppRoleFixture(t, "app-roles-isolation")
 	ctx := context.Background()

@@ -144,7 +144,7 @@ func (h *AuthHandler) appUserRolesError(c echo.Context, clientID string, err err
 		// application cannot enumerate a sibling application's user ids.
 		return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found in this application"})
 
-	case errors.Is(err, auth.ErrRoleNotInApplication):
+	case errors.Is(err, auth.ErrRoleNotInApplication), errors.Is(err, auth.ErrNoRolesRequested):
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 
 	default:

@@ -357,10 +357,15 @@ type LoginResult struct {
 
 // MeResult is returned by GET /api/v1/auth/me.
 type MeResult struct {
-	UserID      string   `json:"user_id"`
-	TenantID    string   `json:"tenant_id"`
-	Email       string   `json:"email"`
-	Role        string   `json:"role"`
+	UserID   string `json:"user_id"`
+	TenantID string `json:"tenant_id"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+	// Roles and ActiveRoles mirror the token's claims (#146). Role alone is only
+	// the primary, so without these a caller of /auth/apps/me could not see a
+	// user's other roles, or that the session was scoped to some of them.
+	Roles       []string `json:"roles,omitempty"`
+	ActiveRoles []string `json:"active_roles,omitempty"`
 	Permissions []string `json:"permissions"`
 	// AdminScope and AdminApps mirror the token's administrative reach (issue
 	// #97) so a client can render the same boundary the server enforces —
@@ -2264,6 +2269,8 @@ func (s *AuthService) Me(claims *Claims) *MeResult {
 		TenantID:    claims.TenantID,
 		Email:       claims.Email,
 		Role:        claims.Role,
+		Roles:       claims.Roles,
+		ActiveRoles: claims.ActiveRoles,
 		Permissions: claims.Permissions,
 		AdminScope:  claims.AdminScope,
 		AdminApps:   claims.AdminApps,
