@@ -127,6 +127,11 @@ type InvitationEmail struct {
 	InviterName string
 	Name        string
 	TTLMinutes  int
+	// AdminRole ("owner" / "co-owner") and TenantName are set when the
+	// invitation makes the recipient a tenant administrator, so the email can
+	// say what they are being invited to be. Both empty for a user invitation.
+	AdminRole  string
+	TenantName string
 }
 
 // ChangeEmailEmail carries either half of the email-change flow, selected by
@@ -438,6 +443,7 @@ func (m *mailerImpl) SendPasswordChanged(ctx context.Context, sender *SMTPConfig
 func (m *mailerImpl) SendInvitation(ctx context.Context, sender *SMTPConfig, tmpl *Template, e InvitationEmail) error {
 	err := m.dispatch(ctx, sender, tmpl, TemplateUserInvitation, e.To, TemplateData{
 		Link: e.Link, AppName: e.AppName, InviterName: e.InviterName, Name: e.Name, TTLMinutes: e.TTLMinutes,
+		AdminRole: e.AdminRole, TenantName: e.TenantName,
 	})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("invitation email sent")
@@ -533,6 +539,7 @@ func sampleTestData() TemplateData {
 		TTLMinutes:  15,
 		Name:        "Alex Doe",
 		InviterName: "Jordan Smith",
+		AdminRole:   "co-owner",
 		Reason:      BlockReasonFailedAttempts,
 		// admin_activity fields — without these the test send for that type
 		// renders a message with no subject content and empty rows.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -117,7 +118,7 @@ var ErrInvitationSuppressed = errors.New("invitation email is disabled at this s
 // A send suppressed by template configuration returns nil. Callers that cannot
 // tolerate a silently-unsent invitation should use InviteRequired.
 func (s *InvitationService) Invite(ctx context.Context, tenantID int64, appRowID *int64, userID int64, email, inviterName string, inviterID *int64) error {
-	err := s.invite(ctx, tenantID, appRowID, userID, email, inviterName, inviterID)
+	err := s.invite(ctx, tenantID, appRowID, userID, email, inviterName, inviterID, "")
 	if errors.Is(err, ErrInvitationSuppressed) {
 		return nil
 	}
@@ -129,10 +130,18 @@ func (s *InvitationService) Invite(ctx context.Context, tenantID int64, appRowID
 // ErrInvitationSuppressed instead of swallowing it, so the caller can tell the
 // operator that the account exists but nobody was told how to claim it.
 func (s *InvitationService) InviteRequired(ctx context.Context, tenantID int64, appRowID *int64, userID int64, email, inviterName string, inviterID *int64) error {
-	return s.invite(ctx, tenantID, appRowID, userID, email, inviterName, inviterID)
+	return s.invite(ctx, tenantID, appRowID, userID, email, inviterName, inviterID, "")
 }
 
-func (s *InvitationService) invite(ctx context.Context, tenantID int64, appRowID *int64, userID int64, email, inviterName string, inviterID *int64) error {
+// InviteAdmin is InviteRequired for an invitation that makes the recipient a
+// tenant administrator. role is AdminRoleOwner or AdminRoleCoOwner; the email
+// then says what they are being invited to be — "as the owner of <tenant>" —
+// rather than only what they are joining.
+func (s *InvitationService) InviteAdmin(ctx context.Context, tenantID, userID int64, email, inviterName string, inviterID *int64, role string) error {
+	return s.invite(ctx, tenantID, nil, userID, email, inviterName, inviterID, role)
+}
+
+func (s *InvitationService) invite(ctx context.Context, tenantID int64, appRowID *int64, userID int64, email, inviterName string, inviterID *int64, adminRole string) error {
 	rawToken, err := GenerateRefreshToken()
 	if err != nil {
 		return fmt.Errorf("generate invitation token: %w", err)
@@ -146,6 +155,10 @@ func (s *InvitationService) invite(ctx context.Context, tenantID int64, appRowID
 	`, userID); err != nil {
 		return fmt.Errorf("supersede prior invitations: %w", err)
 	}
+
+	// Resolved before the INSERT: invited_by references users(id), so an actor
+	// id with no row behind it must become NULL rather than fail the invitation.
+	inviterID, inviterDisplay := s.resolveInviter(ctx, inviterID, inviterName)
 
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO user_invitations (user_id, tenant_id, token_hash, invited_by, expires_at)
@@ -161,9 +174,13 @@ func (s *InvitationService) invite(ctx context.Context, tenantID int64, appRowID
 		To:          email,
 		Link:        fmt.Sprintf("%s/accept-invitation?token=%s", s.dashboardBaseURL, rawToken),
 		AppName:     appNameByRowID(ctx, s.pool, appRowID),
-		InviterName: inviterName,
+		InviterName: inviterDisplay,
 		Name:        name,
 		TTLMinutes:  int(InvitationTTL.Minutes()),
+	}
+	if adminRole != "" {
+		msg.AdminRole = humanAdminRole(adminRole)
+		msg.TenantName = tenantDisplayName(ctx, s.pool, tenantID)
 	}
 	sent, err := s.notify.Send(ctx, tenantID, appRowID, mailer.TemplateUserInvitation,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
@@ -182,6 +199,39 @@ func (s *InvitationService) invite(ctx context.Context, tenantID int64, appRowID
 	}
 	s.logger.Info().Int64("user_id", userID).Str("email", email).Msg("invitation sent")
 	return nil
+}
+
+// resolveInviter settles who the invitation is from. It returns the inviter id
+// to record as invited_by — nil when no users row stands behind it — and the
+// name the email shows: their first and last name when the account has one,
+// otherwise nothing.
+//
+// Callers pass the actor's email as inviterName, and it must not reach the
+// message. A third party's address in the body of a mail from a noreply sender
+// is a phishing signal that spam filters score heavily — it is why invitations
+// went to junk while every other message reached the inbox. An email-shaped
+// inviterName is therefore dropped rather than shown.
+func (s *InvitationService) resolveInviter(ctx context.Context, inviterID *int64, inviterName string) (*int64, string) {
+	display := strings.TrimSpace(inviterName)
+	if strings.Contains(display, "@") {
+		display = ""
+	}
+	if inviterID == nil {
+		return nil, display
+	}
+	var full string
+	if err := s.pool.QueryRow(ctx,
+		`SELECT TRIM(CONCAT(first_name, ' ', last_name)) FROM users WHERE id = $1`, *inviterID,
+	).Scan(&full); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			s.logger.Warn().Err(err).Int64("inviter_id", *inviterID).Msg("invitation: could not resolve inviter")
+		}
+		return nil, display
+	}
+	if full != "" {
+		display = full
+	}
+	return inviterID, display
 }
 
 // InvitationTarget describes the account behind a valid invitation token.
@@ -477,6 +527,27 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 // appNameByRowID resolves an application's display name for email bodies. A nil
 // scope (tenant-level user) or a lookup miss yields "", which every template
 // renders as the generic wording.
+// humanAdminRole spells an administrator role for an email: "owner" or
+// "co-owner", never the stored "co_owner".
+func humanAdminRole(role string) string {
+	if role == AdminRoleOwner {
+		return "owner"
+	}
+	return "co-owner"
+}
+
+// tenantDisplayName is the tenant's display name, falling back to its name.
+// Empty on any error, which only drops "of <tenant>" from the sentence.
+func tenantDisplayName(ctx context.Context, pool *pgxpool.Pool, tenantID int64) string {
+	var name string
+	if err := pool.QueryRow(ctx,
+		`SELECT COALESCE(NULLIF(TRIM(display_name), ''), name) FROM tenants WHERE id = $1`, tenantID,
+	).Scan(&name); err != nil {
+		return ""
+	}
+	return name
+}
+
 func appNameByRowID(ctx context.Context, pool *pgxpool.Pool, appRowID *int64) string {
 	if appRowID == nil {
 		return ""

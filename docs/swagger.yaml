@@ -1,5 +1,37 @@
 basePath: /
 definitions:
+  admin.AdminMFAPolicyInput:
+    properties:
+      allowed_methods:
+        items:
+          type: string
+        type: array
+    type: object
+  admin.AdminMFAPolicyView:
+    properties:
+      allowed_methods:
+        description: AllowedMethods, in presentation order (passkey, totp, email).
+        items:
+          type: string
+        type: array
+      inherited:
+        description: |-
+          Inherited is true when the tenant has no row of its own and the values
+          came from the platform policy.
+        type: boolean
+      mfa_required:
+        description: MFARequired is always true. Reported so a client never has to
+          assume it.
+        type: boolean
+      scope:
+        description: Scope is "platform" or "tenant" — which row answered the request.
+        type: string
+      supported_methods:
+        description: SupportedMethods is every method a policy may name.
+        items:
+          type: string
+        type: array
+    type: object
   admin.CaptchaPolicyInput:
     properties:
       case_sensitive:
@@ -1492,6 +1524,37 @@ definitions:
           being asked to confirm.
         type: string
     type: object
+  auth.MFAMethodStatus:
+    properties:
+      active:
+        description: 'Active: the caller has it enrolled.'
+        type: boolean
+      allowed:
+        description: |-
+          Allowed: the caller's policy accepts this method. Always true for a
+          non-administrator, whose methods are not governed by the admin policy.
+        type: boolean
+      always_available:
+        description: |-
+          AlwaysAvailable: usable without setup and cannot be turned off (email for
+          an administrator — codes go to the account's own address).
+        type: boolean
+      available:
+        description: 'Available: this deployment can run the method at all.'
+        type: boolean
+      backup_codes_remaining:
+        description: BackupCodesRemaining is the number of unused backup codes (totp
+          only).
+        type: integer
+      method:
+        type: string
+      required:
+        description: |-
+          Required: an administrator must keep this method set up — the
+          authenticator app wherever the policy allows it. It can be replaced (moved
+          to a new phone) but not turned off.
+        type: boolean
+    type: object
   auth.MFAPolicy:
     properties:
       allowed_methods:
@@ -1523,6 +1586,20 @@ definitions:
       updated_at:
         description: UpdatedAt is nil when no explicit policy row exists (implicit
           'optional').
+        type: string
+    type: object
+  auth.MFAStatus:
+    properties:
+      methods:
+        items:
+          $ref: '#/definitions/auth.MFAMethodStatus'
+        type: array
+      mfa_required:
+        description: |-
+          MFARequired is true when the caller is an administrator and MFA is
+          therefore mandatory for them.
+        type: boolean
+      policy_source:
         type: string
     type: object
   auth.MeResult:
@@ -1793,6 +1870,16 @@ definitions:
       provider_email:
         type: string
     type: object
+  handlers.APIError:
+    properties:
+      error:
+        description: Error is the stable machine code. Clients switch on this.
+        type: string
+      message:
+        description: Message is prose for the person who hit the failure. Never parse
+          it.
+        type: string
+    type: object
   handlers.AcceptInvitationRequest:
     properties:
       current_password:
@@ -1940,8 +2027,8 @@ definitions:
         type: string
       purpose:
         description: |-
-          Purpose is the flow the challenge will be spent on — "login", "session",
-          "login_otp", "register" or "forgot_password". Bound into the challenge, so
+          Purpose is the flow the challenge will be spent on — "login", "login_otp",
+          "register" or "forgot_password". Bound into the challenge, so
           one minted for the cheap register path cannot be used on login.
         type: string
     required:
@@ -2477,6 +2564,20 @@ definitions:
     required:
     - email
     - password
+    type: object
+  handlers.SessionMFAActivateRequest:
+    properties:
+      code:
+        type: string
+      enrollment_token:
+        type: string
+    type: object
+  handlers.SessionMFAVerifyRequest:
+    properties:
+      code:
+        type: string
+      otp_session_token:
+        type: string
     type: object
   handlers.SetTenantAdminGrantsRequest:
     properties:
@@ -5412,6 +5513,23 @@ paths:
       summary: Get current user profile
       tags:
       - AUTH
+  /api/v1/auth/me/mfa:
+    get:
+      description: Every MFA method with whether it is allowed for the caller, available
+        on this server, and enrolled. mfa_required is true for administrators, for
+        whom MFA is mandatory.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MFAStatus'
+      security:
+      - BearerAuth: []
+      summary: My MFA status
+      tags:
+      - AUTH
   /api/v1/auth/me/passkeys:
     get:
       produces:
@@ -6303,6 +6421,65 @@ paths:
       summary: Cookie session logout
       tags:
       - auth-session
+  /api/v1/auth/session/mfa/enroll/activate:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Enrollment token and first code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SessionMFAActivateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Finish MFA setup during a console sign-in
+      tags:
+      - auth-session
+  /api/v1/auth/session/mfa/verify:
+    post:
+      consumes:
+      - application/json
+      description: Completes the MFA challenge returned by POST /auth/session with
+        an authenticator code, a backup code, or the emailed code. The session is
+        set in HttpOnly cookies; no tokens are returned.
+      parameters:
+      - description: Challenge token and code
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SessionMFAVerifyRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: mfa_code_invalid or mfa_session_expired
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "429":
+          description: Too Many Requests
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Complete a console sign-in with a code
+      tags:
+      - auth-session
   /api/v1/auth/session/refresh:
     post:
       description: |-
@@ -7136,6 +7313,44 @@ paths:
       summary: Update permission
       tags:
       - admin-rbac
+  /api/v1/platform/admin-mfa-policy:
+    get:
+      description: Governs platform administrators and every tenant without its own
+        policy.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.AdminMFAPolicyView'
+      security:
+      - BearerAuth: []
+      summary: Get the platform administrator MFA policy
+      tags:
+      - admin-security
+    put:
+      consumes:
+      - application/json
+      parameters:
+      - description: Allowed methods
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.AdminMFAPolicyInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.AdminMFAPolicyView'
+      security:
+      - BearerAuth: []
+      summary: Set the platform administrator MFA policy
+      tags:
+      - admin-security
   /api/v1/platform/captcha-policy:
     get:
       description: The policy governing the tenant-less sign-in flows (/auth/login,
@@ -7921,6 +8136,75 @@ paths:
       summary: Activity feed for a target tenant
       tags:
       - admin-cross-tenant
+  /api/v1/tenants/{tid}/admin-mfa-policy:
+    delete:
+      description: Removes the tenant's own policy so it inherits the platform policy.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Reset the administrator MFA policy
+      tags:
+      - admin-security
+    get:
+      description: Which methods satisfy mandatory MFA for this tenant's administrators,
+        and whether the tenant inherits the platform policy.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.AdminMFAPolicyView'
+      security:
+      - BearerAuth: []
+      summary: Get the administrator MFA policy
+      tags:
+      - admin-security
+    put:
+      consumes:
+      - application/json
+      description: Sets which methods (passkey, totp, email) satisfy mandatory MFA
+        for this tenant's administrators. At least one method is required; MFA itself
+        cannot be turned off.
+      parameters:
+      - description: Allowed methods
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.AdminMFAPolicyInput'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.AdminMFAPolicyView'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set the administrator MFA policy
+      tags:
+      - admin-security
   /api/v1/tenants/{tid}/admins:
     get:
       description: Returns the tenant's owners and co-owners. An owner's applications
@@ -8131,6 +8415,43 @@ paths:
       security:
       - BearerAuth: []
       summary: Replace a co-owner's application grants
+      tags:
+      - admin-tenant-admins
+  /api/v1/tenants/{tid}/admins/{adminID}/mfa:
+    delete:
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: integer
+      - description: Administrator ID
+        in: path
+        name: adminID
+        required: true
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: mfa_reset_forbidden
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Reset an administrator's MFA
       tags:
       - admin-tenant-admins
   /api/v1/tenants/{tid}/app-limits:

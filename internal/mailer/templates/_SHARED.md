@@ -62,7 +62,7 @@ From `mailer.TemplateData` (internal/mailer/templates.go). A field absent for a
 template is empty, so guard every optional one with `{{if}}`:
 
 `ProductName` `LogoURL` `AppName` `Link` `Code` `TTLMinutes` `Name` `Email`
-`InviterName` `Reason` `NewEmail` `ActionLabel` `ActorEmail` `ActorRole`
+`InviterName` `AdminRole` `Reason` `NewEmail` `ActionLabel` `ActorEmail` `ActorRole`
 `TenantName` `ResourceName` `OccurredAt` `IPAddress` `Count` `RetryMinutes`
 
 `ProductName` is always set. `AppName` is empty for tenant-scope sends — hence

@@ -1702,6 +1702,10 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 	var req TOTPEnrollRequest
 	_ = c.Bind(&req) // body is optional — only needed as re-enrollment proof
 
+	if err := h.svc.AdminMethodEnrollable(c.Request().Context(), userID, tenantID, claims.Permissions, auth.MFAMethodTOTP); err != nil {
+		return adminMFAPolicyError(c, h, claims.UserID, err)
+	}
+
 	result, err := h.totpSvc.EnrollUser(c.Request().Context(), userID, tenantID, claims.Email, req.Code)
 	if err != nil {
 		switch {
@@ -1949,6 +1953,10 @@ func (h *AuthHandler) EmailMFAEnroll(c echo.Context) error {
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
 
+	if err := h.svc.AdminMethodEnrollable(c.Request().Context(), userID, tenantID, claims.Permissions, auth.MFAMethodEmail); err != nil {
+		return adminMFAPolicyError(c, h, claims.UserID, err)
+	}
+
 	if err := h.emailSvc.BeginEnrollment(c.Request().Context(), userID, tenantID, claims.Email); err != nil {
 		if resp := emailMFAErrorResponse(c, err); resp != nil {
 			return resp
@@ -2063,6 +2071,10 @@ func (h *AuthHandler) EmailMFADisable(c echo.Context) error {
 	var req EmailMFACodeRequest
 	if err := c.Bind(&req); err != nil || req.Code == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required to disable email MFA"})
+	}
+
+	if err := h.svc.AdminFactorRemovalAllowed(c.Request().Context(), userID, tenantID, claims.Permissions, auth.MFAMethodEmail); err != nil {
+		return adminMFAPolicyError(c, h, claims.UserID, err)
 	}
 
 	if err := h.emailSvc.Disable(c.Request().Context(), userID, tenantID, req.Code); err != nil {
@@ -2203,6 +2215,9 @@ func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	if err := h.svc.AdminFactorRemovalAllowed(c.Request().Context(), userID, tenantID, claims.Permissions, auth.MFAMethodTOTP); err != nil {
+		return adminMFAPolicyError(c, h, claims.UserID, err)
+	}
 	if err := h.totpSvc.DisableUser(c.Request().Context(), userID, tenantID, req.Code); err != nil {
 		if errors.Is(err, auth.ErrMFARequiredByPolicy) {
 			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
@@ -2644,14 +2659,12 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		return errCookieSessionForApps(c)
 	}
 
-	// The admin console signs in here, not through /auth/login — which is why
-	// "session" is its own flow in captcha policy. Gating only /auth/login would
-	// leave the door holding the super-admin accounts the one left open.
-	sessionScope := firstPartyCaptchaScope()
-	if handled, capErr := h.captchaCheck(c, sessionScope, auth.CaptchaFlowSession, req.CaptchaID, req.CaptchaAnswer); handled {
-		return capErr
-	}
-
+	// Deliberately not captcha-gated. The admin console signs in here, and every
+	// account that can use it is an administrator, for whom MFA is mandatory
+	// (migration 00094): a correct password alone reaches nothing but the second
+	// factor. Account lockout and the login rate limiter still bound guessing.
+	// A captcha on top would add friction for the operators without adding a
+	// control the MFA step does not already provide.
 	result, err := h.svc.Login(c.Request().Context(), auth.LoginInput{
 		ClientID:   clientIDFromCtx(c),
 		Email:      req.Email,
@@ -2659,7 +2672,6 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		Persistent: req.RememberMe,
 	})
 	if err != nil {
-		h.captchaRecordFailure(c, sessionScope)
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("session login failed")
 		h.auditFailure(c, audit.Event{
 			ActorEmail:   req.Email,
@@ -2673,12 +2685,11 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
 		}
+		if errors.Is(err, auth.ErrAdminMFAUnavailable) {
+			return fail(c, http.StatusServiceUnavailable, "mfa_unavailable")
+		}
 		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
-
-	// See Login for why this is cleared before the MFA branches: credentials
-	// were right, so the origin is not being driven by a script.
-	h.captchaClearFailures(c, sessionScope)
 
 	if result.OTPChallenge != nil {
 		return c.JSON(http.StatusOK, result.OTPChallenge)

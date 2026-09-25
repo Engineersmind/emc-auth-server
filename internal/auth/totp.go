@@ -66,7 +66,10 @@ func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID int64, email,
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      issuer,
 		AccountName: email,
-		SecretSize:  32,
+		// 160 bits, per RFC 4226 and what every mainstream authenticator expects.
+		// A longer secret buys nothing against a 6-digit code but makes the QR
+		// code denser, and dense codes fail to scan on phone cameras.
+		SecretSize: 20,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("generate TOTP key: %w", err)

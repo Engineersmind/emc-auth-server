@@ -1191,36 +1191,8 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 		return nil, ErrWebAuthnVerification
 	}
 
-	// Possession of the private key is now proven, so a mismatch here is evidence
-	// about the authenticator rather than about the caller, and containment is
-	// safe to run.
-	//
-	// Backup Eligible is fixed for the life of a credential. A change means the
-	// private key exists somewhere it did not before — a clone or a swapped
-	// authenticator.
-	if assertedFlags.HasBackupEligible() != storedRow.be {
-		s.logger.Error().Int64("credential_row", storedRow.rowID).
-			Int64("user_id", resolved.userID).
-			Bool("stored_be", storedRow.be).Bool("asserted_be", assertedFlags.HasBackupEligible()).
-			Msg("webauthn: backup-eligibility flag changed — possible cloned credential")
-		return nil, s.clonedError(ctx, resolved, storedRow, "backup_eligibility_changed")
-	}
-
-	// A signature counter that fails to advance means two copies of the key are in
-	// use. Only a stored non-zero value gives us anything to compare against:
-	// counters that stay at zero are normal, because most platform authenticators
-	// (Apple, Google) never increment. Once a credential HAS reported a non-zero
-	// counter, any value at or below it is a regression — including a drop to
-	// zero, which is the signal a second authenticator that does not keep a
-	// counter would produce. Which also means this control is inert for the
-	// majority of real passkeys; backup-eligibility above is the one that will
-	// actually fire.
-	if storedRow.signCount > 0 && assertedCount <= storedRow.signCount {
-		s.logger.Error().Int64("credential_row", storedRow.rowID).
-			Int64("user_id", resolved.userID).
-			Int64("stored", storedRow.signCount).Int64("asserted", assertedCount).
-			Msg("webauthn: signature counter did not advance — possible cloned credential")
-		return nil, s.clonedError(ctx, resolved, storedRow, "sign_count_regression")
+	if err := s.cloneSignals(ctx, resolved, storedRow, assertedFlags.HasBackupEligible(), assertedCount); err != nil {
+		return nil, err
 	}
 
 	// The account is now known, so policy can be evaluated against the scope the
@@ -1254,17 +1226,7 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 		return nil, ErrUserVerificationRequired
 	}
 
-	if _, err := s.pool.Exec(ctx, `
-		UPDATE webauthn_credentials
-		SET sign_count = $1, backup_state = $2, last_used_at = NOW()
-		WHERE id = $3
-	`, assertedCount, cred.Flags.BackupState, storedRow.rowID); err != nil {
-		// The sign-in itself already verified. Failing it now because a
-		// bookkeeping write failed would lock the user out over a non-security
-		// problem; log and continue.
-		s.logger.Warn().Err(err).Int64("credential_row", storedRow.rowID).
-			Msg("webauthn: failed to update credential usage")
-	}
+	s.recordUse(ctx, storedRow, assertedCount, cred.Flags.BackupState)
 
 	return &WebAuthnIdentity{
 		UserID:          resolved.userID,
@@ -1276,6 +1238,60 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 		CredentialRowID: storedRow.rowID,
 		CredentialLabel: storedRow.label,
 	}, nil
+}
+
+// cloneSignals compares a VERIFIED assertion against the stored credential and
+// contains a suspected clone. It must only run after the signature has been
+// verified — see LoginComplete for why containment on unverified input would be
+// a sign-out-anyone primitive.
+func (s *WebAuthnService) cloneSignals(ctx context.Context, u *webauthnUser, row credentialRow, assertedBE bool, assertedCount int64) error {
+	// Possession of the private key is proven, so a mismatch here is evidence
+	// about the authenticator rather than about the caller, and containment is
+	// safe to run.
+	//
+	// Backup Eligible is fixed for the life of a credential. A change means the
+	// private key exists somewhere it did not before — a clone or a swapped
+	// authenticator.
+	if assertedBE != row.be {
+		s.logger.Error().Int64("credential_row", row.rowID).
+			Int64("user_id", u.userID).
+			Bool("stored_be", row.be).Bool("asserted_be", assertedBE).
+			Msg("webauthn: backup-eligibility flag changed — possible cloned credential")
+		return s.clonedError(ctx, u, row, "backup_eligibility_changed")
+	}
+
+	// A signature counter that fails to advance means two copies of the key are in
+	// use. Only a stored non-zero value gives us anything to compare against:
+	// counters that stay at zero are normal, because most platform authenticators
+	// (Apple, Google) never increment. Once a credential HAS reported a non-zero
+	// counter, any value at or below it is a regression — including a drop to
+	// zero, which is the signal a second authenticator that does not keep a
+	// counter would produce. Which also means this control is inert for the
+	// majority of real passkeys; backup-eligibility above is the one that will
+	// actually fire.
+	if row.signCount > 0 && assertedCount <= row.signCount {
+		s.logger.Error().Int64("credential_row", row.rowID).
+			Int64("user_id", u.userID).
+			Int64("stored", row.signCount).Int64("asserted", assertedCount).
+			Msg("webauthn: signature counter did not advance — possible cloned credential")
+		return s.clonedError(ctx, u, row, "sign_count_regression")
+	}
+	return nil
+}
+
+// recordUse advances the stored counter and backup state after a verified
+// assertion. A failed write is logged, never returned: the sign-in already
+// verified, and refusing it over bookkeeping would lock the user out over a
+// non-security problem.
+func (s *WebAuthnService) recordUse(ctx context.Context, row credentialRow, assertedCount int64, backupState bool) {
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE webauthn_credentials
+		SET sign_count = $1, backup_state = $2, last_used_at = NOW()
+		WHERE id = $3
+	`, assertedCount, backupState, row.rowID); err != nil {
+		s.logger.Warn().Err(err).Int64("credential_row", row.rowID).
+			Msg("webauthn: failed to update credential usage")
+	}
 }
 
 // clonedError deactivates the credential and builds the typed error.
@@ -1504,6 +1520,14 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 	if err != nil {
 		s.logger.Warn().Err(err).Int64("user_id", id.UserID).Msg("webauthn login: failed to load permissions")
 		perms = []string{}
+	}
+
+	// Mandatory administrator MFA: a passwordless passkey satisfies it only
+	// when the authenticator verified the user (possession + biometric/PIN) and
+	// the administrator's policy accepts passkeys. Refused before minting, for
+	// the same reason as the application-scoped refusal above.
+	if err := s.requireAdminPasskeyMFA(ctx, id, perms); err != nil {
+		return nil, id, err
 	}
 
 	amr := []string{AMRWebAuthn}

@@ -113,6 +113,13 @@ var errorMessages = map[string]string{
 	"mfa_unavailable":      "Two-factor authentication isn't available on this server. Contact your administrator.",
 	"backup_code_invalid":  "That backup code wasn't recognised. Each code works only once — try a different one.",
 
+	// Administrator MFA (migration 00094): mandatory, so every dead end names
+	// the way forward — sign in again, pick another method, or ask an owner.
+	"mfa_step_up_required":   "Sign in again with two-factor authentication to open this organization.",
+	"mfa_method_not_allowed": "Your organization doesn't allow that sign-in method for administrators. Choose another method.",
+	"mfa_required_by_policy": "Two-factor authentication is required for administrators. Add another method before removing this one.",
+	"mfa_reset_forbidden":    "You can't reset two-factor authentication for this administrator. Ask an owner or a platform administrator.",
+
 	// --- Passwords -------------------------------------------------------
 	"password_too_short":    "Choose a password of at least 8 characters.",
 	"password_incorrect":    "That isn't your current password.",

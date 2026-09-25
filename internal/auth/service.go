@@ -69,7 +69,11 @@ type AuthService struct {
 	// exactly the pre-#131 state this issue exists to leave behind — and it
 	// would be invisible until a resource server refused a token.
 	audienceSvc *AudienceService
-	logger      zerolog.Logger
+	// adminMFA resolves administrator MFA policy. nil leaves administrator
+	// sign-in as it was; set, MFA is mandatory for every administrator (see
+	// admin_mfa_policy.go and migration 00094).
+	adminMFA *AdminMFAPolicyService
+	logger   zerolog.Logger
 }
 
 // NewAuthService creates an AuthService.
@@ -331,6 +335,10 @@ type OTPChallenge struct {
 	OTPSessionToken string   `json:"otp_session_token"`
 	Methods         []string `json:"methods"`
 	ExpiresIn       int      `json:"expires_in"`
+	// EmailCodeSent reports whether a code has already been mailed. False while
+	// "email" is still in Methods means the code is sent on request
+	// (POST /auth/login/otp/resend) — the administrator fallback shape.
+	EmailCodeSent bool `json:"email_code_sent"`
 }
 
 // MFAEnrollmentChallenge is returned by Login when the user's application has
@@ -1786,6 +1794,20 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
 func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string) (*LoginResult, error) {
+	// Administrators first: for them MFA is mandatory, so this branch runs even
+	// on a deployment where the per-application gate below would return early.
+	// Only a tenant-level login (appRowID 0) can be an administrator's — an
+	// application-scoped account never reaches the console.
+	if s.adminMFA != nil && appRowID == 0 {
+		admin, platform, err := s.administratorKind(ctx, userID, perms)
+		if err != nil {
+			return nil, err
+		}
+		if admin {
+			return s.adminMFAGate(ctx, userID, tenantID, platform, appID, email, roleName, perms, persistent, activeRoles)
+		}
+	}
+
 	if s.totpSvc == nil || s.redisCli == nil {
 		return nil, nil
 	}
@@ -2072,6 +2094,15 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 // token. When the user's active methods include email, a one-time code is
 // minted and sent to the account's inbox alongside the challenge.
 func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool, activeRoles []string) (*OTPChallenge, error) {
+	return s.createOTPSessionWith(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, true)
+}
+
+// createOTPSessionWith is createOTPSession with control over the emailed code.
+// sendEmailNow false leaves email as an on-demand choice: the code is sent only
+// when the user picks it (POST /auth/login/otp/resend). That is the
+// administrator shape, where email is a fallback beside a passkey or an
+// authenticator app and mailing a code on every sign-in would be noise.
+func (s *AuthService) createOTPSessionWith(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool, activeRoles []string, sendEmailNow bool) (*OTPChallenge, error) {
 	sessionToken, err := s.storePreAuthSession(ctx, otpSessionKey, OTPSessionTTL, OTPSession{
 		UserID:      userID,
 		TenantID:    tenantID,
@@ -2087,7 +2118,8 @@ func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int
 		return nil, err
 	}
 
-	if methodAllowed(methods, MFAMethodEmail) && s.emailSvc != nil {
+	emailSent := false
+	if sendEmailNow && methodAllowed(methods, MFAMethodEmail) && s.emailSvc != nil {
 		appName := s.appNameByID(ctx, appID)
 		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(sessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL); err != nil {
 			// If email is the ONLY method the challenge would be uncompletable —
@@ -2097,7 +2129,9 @@ func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int
 				s.clearOTPSession(ctx, otpSessionKey(sessionToken))
 				return nil, fmt.Errorf("send email OTP: %w", err)
 			}
-			s.logger.Warn().Err(err).Msg("login: email OTP send failed, TOTP still available")
+			s.logger.Warn().Err(err).Msg("login: email OTP send failed, another method is still available")
+		} else {
+			emailSent = true
 		}
 	}
 
@@ -2105,6 +2139,7 @@ func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int
 		RequiresOTP:     true,
 		OTPSessionToken: sessionToken,
 		Methods:         methods,
+		EmailCodeSent:   emailSent,
 		ExpiresIn:       int(OTPSessionTTL.Seconds()),
 	}, nil
 }

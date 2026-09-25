@@ -420,8 +420,10 @@ func TestInvitation_FullFlow(t *testing.T) {
 	if len(e.mail.invitations) != 1 || e.mail.invitations[0].To != email {
 		t.Fatalf("invitations = %+v, want 1 to %s", e.mail.invitations, email)
 	}
-	if e.mail.invitations[0].InviterName != "admin@emc.local" {
-		t.Errorf("InviterName = %q, want the inviting admin", e.mail.invitations[0].InviterName)
+	// An email-shaped inviter with no account to name them is dropped: a third
+	// party's address in the message is what sent invitations to junk.
+	if got := e.mail.invitations[0].InviterName; got != "" {
+		t.Errorf("InviterName = %q, want the inviter's address withheld", got)
 	}
 
 	raw := tokenFromLink(t, e.mail.invitations[0].Link)
@@ -452,6 +454,29 @@ func TestInvitation_FullFlow(t *testing.T) {
 	// Single use.
 	if _, err := invSvc.Accept(e.ctx, raw, auth.AcceptOptions{NewPassword: "AnotherPassword123!"}); !errors.Is(err, auth.ErrInvalidInvitation) {
 		t.Errorf("second Accept = %v, want ErrInvalidInvitation", err)
+	}
+}
+
+// TestInvitation_InviterNamedByDisplayName proves an inviter with an account is
+// named by first and last name, never by the address the caller passed.
+func TestInvitation_InviterNamedByDisplayName(t *testing.T) {
+	e := newFlowEnv(t)
+	invSvc := auth.NewInvitationService(e.pool, e.mail, testDashboardURL, testhelper.TestLogger()).
+		WithTemplates(e.tmplSvc)
+
+	inviterEmail := uniqueEmail("inviter")
+	inviterID := e.seedUser(t, inviterEmail, "")
+	email := uniqueEmail("invitee")
+	userID := e.seedUser(t, email, "")
+
+	if err := invSvc.Invite(e.ctx, e.tenantID, nil, userID, email, inviterEmail, &inviterID); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	if len(e.mail.invitations) != 1 {
+		t.Fatalf("invitations = %+v, want 1", e.mail.invitations)
+	}
+	if got := e.mail.invitations[0].InviterName; got != "Flow User" {
+		t.Errorf("InviterName = %q, want the inviter's display name %q", got, "Flow User")
 	}
 }
 
