@@ -578,7 +578,9 @@ func (h *AdminHandler) DeactivateTenant(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to deactivate tenant"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminTenantDeactivated, "tenant", strconv.FormatInt(tenantID, 10))
+	// Filed under the deactivated tenant, not the platform admin's own: its
+	// administrators are the people to tell, and its log is where it belongs.
+	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminTenantDeactivated, "tenant", strconv.FormatInt(tenantID, 10), nil, nil)
 	return c.NoContent(http.StatusNoContent)
 }
 
@@ -3305,7 +3307,10 @@ func (h *AdminHandler) RotateApplicationSecret(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to rotate secret"})
 	}
 
-	h.auditAdminApp(c, claims, audit.ActionAdminApplicationSecretRotated, "application", result.ID, appIDFromClaim(result.ID))
+	// Filed under the tenant that owns the application, not the caller's JWT
+	// tenant: a platform admin rotating another tenant's secret must notify THAT
+	// tenant's administrators, and appear in its logs.
+	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminApplicationSecretRotated, "application", result.ID, appIDFromClaim(result.ID), nil)
 	return c.JSON(http.StatusOK, result)
 }
 

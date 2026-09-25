@@ -122,6 +122,10 @@ type TemplateData struct {
 	Name        string // recipient display name (may be empty)
 	Email       string // recipient address
 	InviterName string // who sent an invitation (user_invitation; may be empty)
+	// AdminRole is the administrator role an invitation confers, spelled for
+	// humans — "owner" or "co-owner" — with TenantName naming the tenant.
+	// Empty for an ordinary user invitation (user_invitation only).
+	AdminRole string
 	// Reason selects a variant within a template that covers several events: one
 	// of the BlockReason* values for blocked_account, or EmailChangeApplied for
 	// change_email. Empty in every other template.
@@ -303,6 +307,13 @@ const button = `<p><a href="{{.Link}}" style="display:inline-block;padding:10px 
 
 func shell(inner string) string { return htmlShellHead + inner + htmlShellFoot }
 
+// invitationLead is the invitation's opening sentence (without its full stop),
+// shared by the text body and the HTML fallback; the embedded HTML carries the
+// same wording from build.sh. An administrator invitation names the role and
+// tenant; a user invitation names only what they are joining.
+const invitationLead = `You have been invited to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}` +
+	`{{if .AdminRole}} as {{if eq .AdminRole "owner"}}the owner{{else}}a co-owner{{end}}{{if .TenantName}} of {{.TenantName}}{{end}}{{end}}`
+
 // builtinTemplates holds the default Template for every TemplateType.
 var builtinTemplates = map[TemplateType]Template{
 	// Diagnostic only — see TemplateProviderTest. Contains no links and no
@@ -401,17 +412,27 @@ If you did not make this change, contact support immediately.
 - {{.ProductName}}`,
 	},
 	TemplateUserInvitation: {
-		Subject: "{{if .InviterName}}{{.InviterName}} invited you to {{end}}{{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}",
+		// The subject always says what the mail is. The previous one rendered as
+		// the bare product name ("EMC Auth") whenever there was no inviter — a
+		// tenant-owner invite — which is the sender's own display name repeated
+		// and nothing else; spam filters junked it while every other message,
+		// each with a descriptive subject, reached the inbox. No part of the
+		// default names the inviter: "<someone> invited you to <app>" is the
+		// phishing-lure shape, so owner, co-owner and user invitations all read
+		// the same.
+		Subject: "You're invited to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}",
 		HTML: shell(`<h2>You've been invited</h2>
-<p>{{if .InviterName}}{{.InviterName}} has invited you{{else}}You have been invited{{end}} to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}.</p>
-<p>Accept the invitation to set up your account. This link is valid for {{.TTLMinutes}} minutes.</p>
+<p>` + invitationLead + `.</p>
+<p>Accept the invitation to set up your account.</p>
 ` + fmt.Sprintf(button, "Accept invitation") + `
 <p>If you were not expecting this invitation, you can safely ignore this email.</p>`),
-		Text: `{{if .InviterName}}{{.InviterName}} has invited you{{else}}You have been invited{{end}} to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}.
+		// The expiry ladder mirrors ttl() in build.sh: "4320 minutes" reads like
+		// a machine wrote it, and there is no FuncMap to divide with.
+		Text: invitationLead + `. Accept the invitation to set your password and activate your account:
 
 {{.Link}}
 
-This link is valid for {{.TTLMinutes}} minutes. If you were not expecting this, ignore this email.
+This invitation expires in {{if ge .TTLMinutes 5760}}4 days or more{{else if ge .TTLMinutes 4320}}3 days{{else if ge .TTLMinutes 2880}}2 days{{else if ge .TTLMinutes 1440}}24 hours{{else if ge .TTLMinutes 720}}12 hours{{else if ge .TTLMinutes 120}}a couple of hours{{else if ge .TTLMinutes 60}}1 hour{{else}}{{.TTLMinutes}} minutes{{end}}. If you were not expecting this, you can ignore this email.
 
 - {{.ProductName}}`,
 	},

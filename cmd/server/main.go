@@ -275,7 +275,6 @@ func main() {
 		}),
 		auth.NewEmailTemplateService(pool, logger),
 		cfg.DashboardBaseURL,
-		cfg.PlatformNotifyEmails,
 		logger,
 	)
 	defer notifySink.Close()

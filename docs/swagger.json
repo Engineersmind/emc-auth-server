@@ -3831,6 +3831,31 @@
                 }
             }
         },
+        "/api/v1/auth/me/mfa": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Every MFA method with whether it is allowed for the caller, available on this server, and enrolled. mfa_required is true for administrators, for whom MFA is mandatory.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "My MFA status",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MFAStatus"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/me/passkeys": {
             "get": {
                 "security": [
@@ -5145,6 +5170,94 @@
                 }
             }
         },
+        "/api/v1/auth/session/mfa/enroll/activate": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-session"
+                ],
+                "summary": "Finish MFA setup during a console sign-in",
+                "parameters": [
+                    {
+                        "description": "Enrollment token and first code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SessionMFAActivateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/session/mfa/verify": {
+            "post": {
+                "description": "Completes the MFA challenge returned by POST /auth/session with an authenticator code, a backup code, or the emailed code. The session is set in HttpOnly cookies; no tokens are returned.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-session"
+                ],
+                "summary": "Complete a console sign-in with a code",
+                "parameters": [
+                    {
+                        "description": "Challenge token and code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SessionMFAVerifyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "mfa_code_invalid or mfa_session_expired",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "429": {
+                        "description": "Too Many Requests",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/session/refresh": {
             "post": {
                 "description": "Rotates the access and refresh tokens using the refresh cookie.\n409 (`concurrent_refresh`) signals a sibling request already rotated the family within the grace window (the fresh cookies are on that sibling's response); 503 signals the session store (Redis) is temporarily unavailable — retry.",
@@ -6359,6 +6472,67 @@
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/platform/admin-mfa-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Governs platform administrators and every tenant without its own policy.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Get the platform administrator MFA policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.AdminMFAPolicyView"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Set the platform administrator MFA policy",
+                "parameters": [
+                    {
+                        "description": "Allowed methods",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.AdminMFAPolicyInput"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.AdminMFAPolicyView"
                         }
                     }
                 }
@@ -7605,6 +7779,112 @@
                 }
             }
         },
+        "/api/v1/tenants/{tid}/admin-mfa-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Which methods satisfy mandatory MFA for this tenant's administrators, and whether the tenant inherits the platform policy.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Get the administrator MFA policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.AdminMFAPolicyView"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Sets which methods (passkey, totp, email) satisfy mandatory MFA for this tenant's administrators. At least one method is required; MFA itself cannot be turned off.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Set the administrator MFA policy",
+                "parameters": [
+                    {
+                        "description": "Allowed methods",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.AdminMFAPolicyInput"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.AdminMFAPolicyView"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes the tenant's own policy so it inherits the platform policy.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Reset the administrator MFA policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/admins": {
             "get": {
                 "security": [
@@ -7871,6 +8151,64 @@
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/admins/{adminID}/mfa": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-tenant-admins"
+                ],
+                "summary": "Reset an administrator's MFA",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Administrator ID",
+                        "name": "adminID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "mfa_reset_forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     },
                     "404": {
@@ -10495,6 +10833,48 @@
         }
     },
     "definitions": {
+        "admin.AdminMFAPolicyInput": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "admin.AdminMFAPolicyView": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "description": "AllowedMethods, in presentation order (passkey, totp, email).",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "inherited": {
+                    "description": "Inherited is true when the tenant has no row of its own and the values\ncame from the platform policy.",
+                    "type": "boolean"
+                },
+                "mfa_required": {
+                    "description": "MFARequired is always true. Reported so a client never has to assume it.",
+                    "type": "boolean"
+                },
+                "scope": {
+                    "description": "Scope is \"platform\" or \"tenant\" — which row answered the request.",
+                    "type": "string"
+                },
+                "supported_methods": {
+                    "description": "SupportedMethods is every method a policy may name.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
         "admin.CaptchaPolicyInput": {
             "type": "object",
             "properties": {
@@ -12296,6 +12676,38 @@
                 }
             }
         },
+        "auth.MFAMethodStatus": {
+            "type": "object",
+            "properties": {
+                "active": {
+                    "description": "Active: the caller has it enrolled.",
+                    "type": "boolean"
+                },
+                "allowed": {
+                    "description": "Allowed: the caller's policy accepts this method. Always true for a\nnon-administrator, whose methods are not governed by the admin policy.",
+                    "type": "boolean"
+                },
+                "always_available": {
+                    "description": "AlwaysAvailable: usable without setup and cannot be turned off (email for\nan administrator — codes go to the account's own address).",
+                    "type": "boolean"
+                },
+                "available": {
+                    "description": "Available: this deployment can run the method at all.",
+                    "type": "boolean"
+                },
+                "backup_codes_remaining": {
+                    "description": "BackupCodesRemaining is the number of unused backup codes (totp only).",
+                    "type": "integer"
+                },
+                "method": {
+                    "type": "string"
+                },
+                "required": {
+                    "description": "Required: an administrator must keep this method set up — the\nauthenticator app wherever the policy allows it. It can be replaced (moved\nto a new phone) but not turned off.",
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.MFAPolicy": {
             "type": "object",
             "properties": {
@@ -12333,6 +12745,24 @@
                 },
                 "updated_at": {
                     "description": "UpdatedAt is nil when no explicit policy row exists (implicit 'optional').",
+                    "type": "string"
+                }
+            }
+        },
+        "auth.MFAStatus": {
+            "type": "object",
+            "properties": {
+                "methods": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.MFAMethodStatus"
+                    }
+                },
+                "mfa_required": {
+                    "description": "MFARequired is true when the caller is an administrator and MFA is\ntherefore mandatory for them.",
+                    "type": "boolean"
+                },
+                "policy_source": {
                     "type": "string"
                 }
             }
@@ -12663,6 +13093,19 @@
                 }
             }
         },
+        "handlers.APIError": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "description": "Error is the stable machine code. Clients switch on this.",
+                    "type": "string"
+                },
+                "message": {
+                    "description": "Message is prose for the person who hit the failure. Never parse it.",
+                    "type": "string"
+                }
+            }
+        },
         "handlers.AcceptInvitationRequest": {
             "type": "object",
             "required": [
@@ -12812,7 +13255,7 @@
                     "type": "string"
                 },
                 "purpose": {
-                    "description": "Purpose is the flow the challenge will be spent on — \"login\", \"session\",\n\"login_otp\", \"register\" or \"forgot_password\". Bound into the challenge, so\none minted for the cheap register path cannot be used on login.",
+                    "description": "Purpose is the flow the challenge will be spent on — \"login\", \"login_otp\",\n\"register\" or \"forgot_password\". Bound into the challenge, so\none minted for the cheap register path cannot be used on login.",
                     "type": "string"
                 }
             }
@@ -13451,6 +13894,28 @@
                 "remember_me": {
                     "description": "RememberMe asks for a persistent session — the tenant's longer idle timeout\ninstead of the short one meant for shared machines. Honoured only when the\ntenant's session policy allows persistent sessions.\n\nAbsent means false, so a client that has not been updated keeps getting the\nshorter session. That is the right default for an omitted security-relevant\nflag: the failure mode is a user signing in more often than they need to,\nnot a month-long session on a library computer.",
                     "type": "boolean"
+                }
+            }
+        },
+        "handlers.SessionMFAActivateRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                },
+                "enrollment_token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SessionMFAVerifyRequest": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                },
+                "otp_session_token": {
+                    "type": "string"
                 }
             }
         },

@@ -931,3 +931,43 @@ func TestListTenantAdmins_ReportsRoleGrantsAndPrimary(t *testing.T) {
 		}
 	}
 }
+
+// TestAdminInvitations_StateRoleAndTenant proves the owner seeded by
+// CreateTenant and a co-owner added later are each told what they are being
+// made, and of which tenant, while a plain user invitation carries neither.
+func TestAdminInvitations_StateRoleAndTenant(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	last := func(t *testing.T) (role, tenant string) {
+		t.Helper()
+		inv := f.mail.Invitations()
+		if len(inv) == 0 {
+			t.Fatal("no invitation was sent")
+		}
+		return inv[len(inv)-1].AdminRole, inv[len(inv)-1].TenantName
+	}
+
+	res, err := f.svc.CreateTenant(ctx, admin.CreateTenantInput{
+		Name: "role-tenant", Slug: "role-tenant", DisplayName: "Role Tenant Inc",
+		OwnerEmail: "owner@role-tenant.example",
+	})
+	if err != nil {
+		t.Fatalf("CreateTenant: %v", err)
+	}
+	if role, tenant := last(t); role != "owner" || tenant != "Role Tenant Inc" {
+		t.Errorf("owner invitation role/tenant = %q/%q, want owner/Role Tenant Inc", role, tenant)
+	}
+
+	tenantID := parseID(t, res.Tenant.ID)
+	app := newTenantApp(t, f, tenantID, "role-tenant-app")
+	if _, err := f.svc.InviteTenantAdmin(ctx, admin.InviteTenantAdminInput{
+		TenantID: tenantID, Email: "co@role-tenant.example",
+		Role: auth.AdminRoleCoOwner, ApplicationIDs: []int64{app},
+	}); err != nil {
+		t.Fatalf("InviteTenantAdmin: %v", err)
+	}
+	if role, tenant := last(t); role != "co-owner" || tenant != "Role Tenant Inc" {
+		t.Errorf("co-owner invitation role/tenant = %q/%q, want co-owner/Role Tenant Inc", role, tenant)
+	}
+}

@@ -396,7 +396,8 @@ func TestNewCaptchaService_RefusesWeakKey(t *testing.T) {
 }
 
 // TestDefaultCaptchaPolicyMatchesSeed pins the compiled-in fallback against the
-// row migration 00090 seeds. They are read by different code paths — the
+// row migration 00090 seeds (less the console's "session" flow, which
+// migration 00094 removed: administrators are protected by mandatory MFA). They are read by different code paths — the
 // resolver's degraded path and the admin API's fallback view — and drift between
 // them would make the API describe a policy the server is not applying.
 func TestDefaultCaptchaPolicyMatchesSeed(t *testing.T) {
@@ -418,8 +419,8 @@ func TestDefaultCaptchaPolicyMatchesSeed(t *testing.T) {
 		t.Errorf("max_attempts_per_challenge = %d, seed is 1", d.MaxAttemptsPerChallenge)
 	case d.NoiseLevel != CaptchaNoiseMedium:
 		t.Errorf("noise_level = %q, seed is 'medium'", d.NoiseLevel)
-	case len(d.ProtectedFlows) != 5:
-		t.Errorf("protected_flows has %d entries, seed has 5", len(d.ProtectedFlows))
+	case len(d.ProtectedFlows) != 4:
+		t.Errorf("protected_flows has %d entries, seed has 4", len(d.ProtectedFlows))
 	}
 	for _, f := range d.ProtectedFlows {
 		if !IsValidCaptchaFlow(f) {

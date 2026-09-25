@@ -56,7 +56,6 @@ type EmailSink struct {
 	notifier       auth.EmailNotifier
 	mailer         mailer.Mailer
 	consoleBaseURL string
-	platformEmails []string
 	logger         zerolog.Logger
 
 	// collapseWindow and flushTick are fields rather than constants so tests can
@@ -101,7 +100,6 @@ func NewEmailSink(
 	m mailer.Mailer,
 	tmplSvc *auth.EmailTemplateService,
 	consoleBaseURL string,
-	platformEmails []string,
 	logger zerolog.Logger,
 ) *EmailSink {
 	s := &EmailSink{
@@ -109,7 +107,6 @@ func NewEmailSink(
 		notifier:       auth.NewEmailNotifier(m, logger).WithTemplates(tmplSvc),
 		mailer:         m,
 		consoleBaseURL: strings.TrimRight(consoleBaseURL, "/"),
-		platformEmails: platformEmails,
 		logger:         logger,
 		collapseWindow: defaultCollapseWindow,
 		flushTick:      defaultFlushTick,
@@ -147,7 +144,7 @@ func (s *EmailSink) Emit(events []audit.Event) {
 	// there is no reason to copy events nobody will be told about.
 	var keep []audit.Event
 	for _, e := range events {
-		if _, ok := label(e.Action); !ok {
+		if _, ok := lookup(e.Action); !ok {
 			continue
 		}
 		// Status is the raw value the caller set; the writer's "" → success
@@ -270,11 +267,12 @@ func (s *EmailSink) deliver(n *notice) {
 	defer cancel()
 
 	if n.ev.TenantID == nil {
-		return // a cross-tenant event has no owner tier to notify
+		return // a cross-tenant event has no administrators to notify
 	}
 	tenantID := *n.ev.TenantID
+	appID := eventApplication(n.ev.ApplicationID, n.ev.ResourceType, n.ev.ResourceID)
 
-	aud, err := s.resolveAudience(ctx, tenantID, n.ev.UserID, n.ev.ActorEmail, n.ev.Action)
+	aud, err := s.resolveAudience(ctx, tenantID, appID, n.ev.UserID, n.ev.ActorEmail, n.ev.Action)
 	if err != nil {
 		metrics.AuditEnrichmentErrors.WithLabelValues("notify_recipients").Inc()
 		s.logger.Error().Err(err).Str("action", n.ev.Action).Msg("notify: could not resolve recipients")
@@ -284,24 +282,18 @@ func (s *EmailSink) deliver(n *notice) {
 		return
 	}
 
-	phrase, _ := label(n.ev.Action)
-	appName := s.applicationName(ctx, n.ev.ApplicationID, n.ev.ResourceType, n.ev.ResourceID)
+	entry, _ := lookup(n.ev.Action)
 	msg := mailer.AdminActivityEmail{
 		ActorEmail:   n.ev.ActorEmail,
 		ActorRole:    aud.actorRole,
-		ActionLabel:  phrase,
+		ActionLabel:  entry.phrase,
 		TenantName:   s.tenantName(ctx, tenantID),
-		ResourceName: appName,
+		ResourceName: s.applicationName(ctx, appID),
 		OccurredAt:   n.ev.CreatedAt().UTC().Format("2 Jan 2006, 15:04 MST"),
 		IPAddress:    n.ev.IPAddress,
 		Link:         s.monitoringLink(tenantID),
 		Count:        n.count,
 	}
-
-	// The person the change was made TO, when it was an access change. They are
-	// not in the tier-up audience — that reports upward — and without this they
-	// would learn of it only by being refused something they could do yesterday.
-	s.notifySubject(ctx, n, tenantID, aud.actorRole, msg.TenantName)
 
 	for _, addr := range aud.to {
 		if !s.allow(addr) {
@@ -325,67 +317,6 @@ func (s *EmailSink) deliver(n *notice) {
 		default:
 			s.recordSent(ctx, tenantID, addr, n.ev.Action, n.count)
 		}
-	}
-}
-
-// notifySubject tells somebody their own administrative access changed.
-//
-// A no-op for every action that is not an access change, which is most of them.
-// The actor is never the subject here: somebody adjusting their own grants
-// already knows, and they get the actor copy anyway.
-func (s *EmailSink) notifySubject(ctx context.Context, n *notice, tenantID int64, actorRole, tenantName string) {
-	phrase, ok := subjectLabel(n.ev.Action)
-	if !ok {
-		return
-	}
-	to, apps, activated := s.accessChangeSubject(ctx, tenantID, n.ev.ResourceType, n.ev.ResourceID)
-	if to == "" || strings.EqualFold(to, n.ev.ActorEmail) {
-		return
-	}
-
-	// A grant the recipient has not accepted yet is announced by the INVITATION,
-	// not by this notice.
-	//
-	// Two emails used to land together for one invitation: "You have been invited,
-	// click to accept" and "Your access has changed … you will see the change the
-	// next time you sign in". The second is wrong twice over for a pending grant —
-	// nothing has changed until they accept, and a brand-new invitee has no
-	// account to sign in to, so the instruction is impossible to follow. It also
-	// undercuts the invitation, which is the one mail that carries the link they
-	// actually need.
-	//
-	// Scoped to the invited action alone. A grants change or a withdrawal on a
-	// still-pending row is a genuine change to something already communicated, and
-	// a withdrawal in particular is the most important message this feature sends.
-	if !activated && n.ev.Action == audit.ActionAdminTenantAdminInvited {
-		return
-	}
-	if !s.allow(to) {
-		s.recordSuppressed(ctx, tenantID, to, n.ev.Action, "hourly_cap")
-		return
-	}
-
-	msg := mailer.AccessChangedEmail{
-		To:           to,
-		ActionLabel:  phrase,
-		ActorEmail:   n.ev.ActorEmail,
-		ActorRole:    actorRole,
-		TenantName:   tenantName,
-		ResourceName: apps,
-		OccurredAt:   n.ev.CreatedAt().UTC().Format("2 Jan 2006, 15:04 MST"),
-	}
-	sent, err := s.notifier.Send(ctx, tenantID, nil, mailer.TemplateAccessChanged,
-		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
-			return s.mailer.SendAccessChanged(ctx, sender, tmpl, msg)
-		})
-	switch {
-	case err != nil:
-		metrics.AuditEnrichmentErrors.WithLabelValues("notify_send").Inc()
-		s.logger.Error().Err(err).Str("to", to).Msg("notify: access-changed notice failed")
-	case !sent:
-		s.recordSuppressed(ctx, tenantID, to, n.ev.Action, "template_disabled")
-	default:
-		s.recordSent(ctx, tenantID, to, n.ev.Action, 1)
 	}
 }
 

@@ -382,7 +382,10 @@ type Service struct {
 	// take up to the resolver's cache TTL to apply, which is a delay rather than
 	// a correctness problem.
 	captchaPolicy *auth.CaptchaPolicyService
-	logger        zerolog.Logger
+	// adminMFAPolicy is the administrator MFA policy resolver, invalidated on
+	// every write so a change takes effect at the next sign-in.
+	adminMFAPolicy *auth.AdminMFAPolicyService
+	logger         zerolog.Logger
 }
 
 // New creates a Service.
@@ -730,7 +733,7 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// back because mail failed would be worse than reporting the failure. The
 	// caller gets 201 with invite_sent=false and can resend.
 	// s.invSvc is non-nil: checked before any row was written.
-	if err := s.invSvc.InviteRequired(ctx, tenantID, nil, userID, ownerEmail, "", nil); err != nil {
+	if err := s.invSvc.InviteAdmin(ctx, tenantID, userID, ownerEmail, "", nil, auth.AdminRoleOwner); err != nil {
 		owner.InviteError = err.Error()
 		s.logger.Error().Err(err).
 			Str("owner_email", ownerEmail).
