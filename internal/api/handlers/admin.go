@@ -1128,7 +1128,7 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 // DeleteRole handles DELETE /api/v1/admin/roles/:id.
 //
 // @Summary      Delete role
-// @Description  Deletes a non-system role from the tenant. Users assigned this role will have their role cleared. Requires admin:access.
+// @Description  Soft-deletes a non-system role. The role stops being listed, assignable, and grantable at registration, and its permissions are revoked: every user holding it has their role cleared and their active sessions signed out, so the loss of permissions takes effect immediately. The response reports how many users were detached, and the audit record names them. Requires admin:access.
 // @Tags         admin-rbac
 // @Produce      json
 // @Security     BearerAuth
@@ -1147,15 +1147,52 @@ func (h *AdminHandler) DeleteRole(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
 
-	if err := h.svc.DeleteRole(c.Request().Context(), tenantID, roleID); err != nil {
+	holders, err := h.svc.DeleteRole(c.Request().Context(), tenantID, roleID)
+	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found or is a system role"})
 		}
 		h.logger.Error().Err(err).Msg("admin: delete role failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
 	}
-	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", strconv.FormatInt(roleID, 10))
-	return c.JSON(http.StatusOK, map[string]string{"message": "role deleted"})
+	h.auditRoleDeleted(c, claims, roleID, holders)
+	return c.JSON(http.StatusOK, map[string]string{
+		"message":        "role deleted",
+		"users_detached": strconv.Itoa(len(holders)),
+	})
+}
+
+// auditRoleDeleted records a role deletion together with the accounts it
+// stripped.
+//
+// The holder list is the point. Deleting a role takes permissions away from
+// everyone holding it, and without recording who that was at the moment of
+// deletion the question "what did this account lose, and when" has no answer
+// afterwards — users.role_id has already been detached and the role_permissions
+// rows are gone. The event itself already existed; what it lacked was the blast
+// radius.
+//
+// Truncated at 100 ids. A role held by thousands would otherwise write an audit
+// row large enough to matter, and the count carries the magnitude for anything
+// past that; the individual accounts are recoverable from the deny entries and
+// the session log.
+func (h *AdminHandler) auditRoleDeleted(c echo.Context, claims *auth.Claims, roleID int64, holders []int64) {
+	const maxLogged = 100
+	meta := map[string]any{"users_detached": len(holders)}
+	if len(holders) > 0 {
+		logged := holders
+		if len(logged) > maxLogged {
+			logged = logged[:maxLogged]
+			meta["user_ids_truncated"] = true
+		}
+		ids := make([]string, 0, len(logged))
+		for _, id := range logged {
+			ids = append(ids, strconv.FormatInt(id, 10))
+		}
+		meta["user_ids"] = ids
+	}
+	h.auditAdminAppMeta(c, claims, audit.ActionAdminRoleDeleted, "role",
+		strconv.FormatInt(roleID, 10), nil, meta)
 }
 
 // ---------------------------------------------------------------------------
@@ -1463,8 +1500,17 @@ func (h *AdminHandler) UpdateAdminUser(c echo.Context) error {
 
 // AssignUserRole handles PUT /api/v1/admin/users/:id/role.
 //
-// @Summary      Assign role to user
-// @Description  Sets the user's role within the tenant. Requires admin:access.
+// REPLACES the user's role; it does not add one. The name reads additive and the
+// four routes that reach it are all PUT on a singular noun, which is the honest
+// signal — but a caller who sends two roles expecting both keeps only the second,
+// with no error. There is no additive form today; the schema holds one role.
+//
+// Every live session for the user is denied once the change commits, so the new
+// permissions take effect on the next request rather than whenever the old access
+// token happens to expire. See admin.AssignUserRole.
+//
+// @Summary      Replace a user's role
+// @Description  Replaces the user's role within the tenant. This is a replacement, not an addition: the user ends up holding exactly the role given, and any role they held before is discarded. Sending two roles in sequence leaves only the second. Every active session for the user is signed out so the change takes effect immediately; clients holding a refresh token can obtain a correctly-scoped token without the user re-authenticating. Requires admin:access.
 // @Tags         admin-users
 // @Accept       json
 // @Produce      json
@@ -1499,7 +1545,7 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
 	}
 
-	if err := h.svc.AssignUserRole(c.Request().Context(), tenantID, appScope, userID, roleID); err != nil {
+	if err := h.svc.AssignUserRole(c.Request().Context(), tenantID, appScope, userID, roleID, actorUserID(claims)); err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "user or role not found"})
 		}
@@ -1526,6 +1572,168 @@ func (h *AdminHandler) AssignUserRole(c echo.Context) error {
 	}
 	h.auditAdmin(c, claims, audit.ActionAdminUserRoleAssigned, "user", strconv.FormatInt(userID, 10))
 	return c.JSON(http.StatusOK, map[string]string{"message": "role assigned"})
+}
+
+// roleGrantTarget resolves the tenant, application scope, user and role that a
+// role-collection request names, answering the request itself on any failure.
+//
+// Shared by the add and remove handlers because both take the same four path
+// pieces under four route shapes each, and duplicating the parsing is how one of
+// them ends up missing the application-scope resolution the other has.
+func (h *AdminHandler) roleGrantTarget(c echo.Context, roleParam string) (tenantID int64, appScope *int64, userID, roleID int64, claims *auth.Claims, ok bool) {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		_ = c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return 0, nil, 0, 0, nil, false
+	}
+	appScope, scopeOK := h.optionalAppScope(c, tenantID)
+	if !scopeOK {
+		return 0, nil, 0, 0, nil, false
+	}
+	userID, err = userIDFromPath(c)
+	if err != nil {
+		_ = c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+		return 0, nil, 0, 0, nil, false
+	}
+	roleID, err = strconv.ParseInt(c.Param(roleParam), 10, 64)
+	if err != nil {
+		_ = c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
+		return 0, nil, 0, 0, nil, false
+	}
+	return tenantID, appScope, userID, roleID, claims, true
+}
+
+// roleGrantError maps the service's refusals onto responses, shared by the add
+// and remove handlers so the two cannot disagree about what a 403 means.
+func (h *AdminHandler) roleGrantError(c echo.Context, claims *auth.Claims, userID, roleID int64, err error, what string) error {
+	switch {
+	case errors.Is(err, admin.ErrNotFound):
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "user or role not found"})
+	case errors.Is(err, admin.ErrRoleScope):
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+	case errors.Is(err, admin.ErrSystemRole):
+		// 403, not 400: the request is well-formed and the role exists. What is
+		// refused is the privilege transfer. Recorded as access_denied so it
+		// reaches the notifier, exactly as the replacement path does.
+		h.auditPrivilegeRefused(c, claims, "user", strconv.FormatInt(userID, 10),
+			"grant of system role "+strconv.FormatInt(roleID, 10))
+		return c.JSON(http.StatusForbidden, map[string]string{
+			"error": "administrative roles are granted by invitation, not by assignment",
+		})
+	default:
+		h.logger.Error().Err(err).Msg("admin: " + what + " failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to " + what})
+	}
+}
+
+// AddUserRole handles POST /api/v1/admin/users/:id/roles.
+//
+// ADDITIVE, and a POST to a plural collection rather than a PUT on a singular
+// noun, so the verb and the path say what the operation does. The replacing form
+// remains at PUT .../role for the callers that depend on it.
+//
+// Idempotent: granting a role the user already holds returns 200, not a conflict.
+// A client retrying a timed-out request must not have to distinguish "it worked"
+// from "it already worked".
+//
+// @Summary      Grant a role to a user
+// @Description  Grants a role to the user in addition to the roles they already hold. Unlike PUT /users/{id}/role this does not replace anything. Idempotent — granting a role the user already holds succeeds without changing it. Administrative (system) roles are refused; those are granted by invitation. Every active session is signed out so the new permissions take effect immediately. Requires users:write.
+// @Tags         admin-users
+// @Accept       json
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id    path      string            true  "User ID"
+// @Param        body  body      AssignRoleRequest true  "Role ID to grant"
+// @Success      200   {object}  map[string]string
+// @Failure      400   {object}  map[string]string
+// @Failure      403   {object}  map[string]string
+// @Failure      404   {object}  map[string]string
+// @Router       /api/v1/users/{id}/roles [post]
+func (h *AdminHandler) AddUserRole(c echo.Context) error {
+	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	var req AssignRoleRequest
+	if err := c.Bind(&req); err != nil || req.RoleID == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "role_id is required"})
+	}
+	roleID, err := strconv.ParseInt(req.RoleID, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role_id"})
+	}
+
+	if err := h.svc.AddUserRole(c.Request().Context(), tenantID, appScope, userID, roleID, actorUserID(claims)); err != nil {
+		return h.roleGrantError(c, claims, userID, roleID, err, "grant role")
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserRoleAssigned, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "role granted"})
+}
+
+// RemoveUserRole handles DELETE /api/v1/admin/users/:id/roles/:rid.
+//
+// @Summary      Revoke a role from a user
+// @Description  Revokes one role from the user, leaving every other role they hold. Returns 404 if the user did not hold the role. If the revoked role was their primary, the earliest surviving grant is promoted in its place. Every active session is signed out so the loss of permissions takes effect immediately. Requires users:write.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Param        rid  path      string  true  "Role ID"
+// @Success      200  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/roles/{rid} [delete]
+func (h *AdminHandler) RemoveUserRole(c echo.Context) error {
+	tenantID, appScope, userID, roleID, claims, ok := h.roleGrantTarget(c, "rid")
+	if !ok {
+		return nil
+	}
+	if err := h.svc.RemoveUserRole(c.Request().Context(), tenantID, appScope, userID, roleID); err != nil {
+		return h.roleGrantError(c, claims, userID, roleID, err, "revoke role")
+	}
+	h.auditAdmin(c, claims, audit.ActionAdminUserRoleRevoked, "user", strconv.FormatInt(userID, 10))
+	return c.JSON(http.StatusOK, map[string]string{"message": "role revoked"})
+}
+
+// ListUserRoles handles GET /api/v1/admin/users/:id/roles.
+//
+// @Summary      List a user's roles
+// @Description  Returns every role the user holds, in grant order, each with who granted it and when. The role matching users.role_id is flagged is_primary — that is the one the deprecated `role` JWT claim carries. Requires users:read.
+// @Tags         admin-users
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id   path      string  true  "User ID"
+// @Success      200  {array}   admin.UserRoleResult
+// @Failure      404  {object}  map[string]string
+// @Router       /api/v1/users/{id}/roles [get]
+func (h *AdminHandler) ListUserRoles(c echo.Context) error {
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+	}
+	appScope, ok := h.optionalAppScope(c, tenantID)
+	if !ok {
+		return nil
+	}
+	userID, err := userIDFromPath(c)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid user id"})
+	}
+
+	roles, err := h.svc.ListUserRoles(c.Request().Context(), tenantID, appScope, userID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("admin: list user roles failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to list user roles"})
+	}
+	return c.JSON(http.StatusOK, roles)
 }
 
 // DeleteAdminUser handles DELETE /api/v1/admin/users/:id.
@@ -2700,7 +2908,7 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 // TenantDeleteRole handles DELETE /api/v1/admin/tenants/:tid/roles/:rid.
 //
 // @Summary      Delete a role from a target tenant
-// @Description  Permanently deletes a role from the target tenant. Requires tenant:manage.
+// @Description  Soft-deletes a role from the target tenant. The role stops being listed, assignable, and grantable at registration, and its permissions are revoked: every user holding it has their role cleared and their active sessions signed out. The response reports how many users were detached, and the audit record names them. Requires tenant:manage.
 // @Tags         admin-cross-tenant
 // @Produce      json
 // @Security     BearerAuth
@@ -2718,7 +2926,8 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid role id"})
 	}
-	if err := h.svc.DeleteRole(c.Request().Context(), tid, rid); err != nil {
+	holders, err := h.svc.DeleteRole(c.Request().Context(), tid, rid)
+	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found or is a system role"})
 		}
@@ -2726,8 +2935,11 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
 	}
 	claims, _ := claimsFromCtx(c)
-	h.auditAdmin(c, claims, audit.ActionAdminRoleDeleted, "role", strconv.FormatInt(rid, 10))
-	return c.JSON(http.StatusOK, map[string]string{"message": "role deleted"})
+	h.auditRoleDeleted(c, claims, rid, holders)
+	return c.JSON(http.StatusOK, map[string]string{
+		"message":        "role deleted",
+		"users_detached": strconv.Itoa(len(holders)),
+	})
 }
 
 // --- Users under a tenant ---

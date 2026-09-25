@@ -689,6 +689,19 @@ func (s *Service) insertImportedUser(ctx context.Context, tenantID int64, applic
 		return err
 	}
 
+	// Permissions resolve through user_roles, not users.role_id (#146), so the
+	// primary role must be recorded there too or the imported user would log in
+	// holding nothing. granted_by is NULL: the job acts for no single user row.
+	if roleID != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO user_roles (user_id, role_id, tenant_id)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (user_id, role_id) DO NOTHING
+		`, userID, *roleID, tenantID); err != nil {
+			return err
+		}
+	}
+
 	// Exactly one of the two is set — validation rejects a row carrying both.
 	storedHash := u.PasswordHash
 	if storedHash == "" && u.Password != "" {
@@ -781,8 +794,19 @@ func displayRole(name string) string {
 // has no default. Worse for a system role: the importer refuses to GRANT one
 // (importRoleMap loads is_system = false only), so an unconditional write could
 // strip an owner of a tier the import path could never put back.
+//
+// When the role IS written it replaces the user's whole role set, matching
+// AssignUserRole: role_id is the primary role and user_roles the full set that
+// permissions resolve from (#146), so the two change together in one transaction
+// or a reader would resolve permissions that match neither.
 func (s *Service) updateImportedUser(ctx context.Context, tenantID, userID int64, u ImportUser, role amendedRole) error {
-	_, err := s.pool.Exec(ctx, `
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("import: begin update tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	ct, err := tx.Exec(ctx, `
 		UPDATE users SET
 		    role_id    = CASE WHEN $1 THEN $2 ELSE role_id END,
 		    first_name = CASE WHEN $3 = '' THEN first_name ELSE $3 END,
@@ -793,7 +817,24 @@ func (s *Service) updateImportedUser(ctx context.Context, tenantID, userID int64
 	if err != nil {
 		return fmt.Errorf("import: update user: %w", err)
 	}
-	return nil
+
+	if role.set && ct.RowsAffected() > 0 {
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM user_roles WHERE user_id = $1 AND tenant_id = $2`,
+			userID, tenantID); err != nil {
+			return fmt.Errorf("import: clear roles: %w", err)
+		}
+		if role.id != nil {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO user_roles (user_id, role_id, tenant_id)
+				VALUES ($1, $2, $3)
+				ON CONFLICT (user_id, role_id) DO NOTHING
+			`, userID, *role.id, tenantID); err != nil {
+				return fmt.Errorf("import: record role: %w", err)
+			}
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // amendedRole is the role half of an update: whether to write role_id at all,

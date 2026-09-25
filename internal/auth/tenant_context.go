@@ -157,7 +157,8 @@ func (s *AuthService) SwitchTenantContext(ctx context.Context, userID, currentTe
 	if platformAdmin {
 		if err = s.pool.QueryRow(ctx, `
 			SELECT COALESCE(r.name, '') FROM users u
-			LEFT JOIN roles r ON r.id = u.role_id WHERE u.id = $1
+			LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
+			WHERE u.id = $1
 		`, userID).Scan(&claimRole); err != nil {
 			return nil, fmt.Errorf("load platform admin role: %w", err)
 		}
@@ -493,7 +494,14 @@ func (s *AuthService) SwitchTenantContextForClaims(
 // caller already treats a permission error as "empty set and carry on", and a
 // refresh that 500s is worse than one that returns a reduced token the next
 // request will re-authorise.
-func (s *AuthService) permissionsForRefresh(ctx context.Context, userID, tenantID int64) ([]string, error) {
+//
+// activeRoles is the session's role scope (#146), carried on the refresh token.
+// It narrows the two arms that answer from the user's own roles, so a rotation
+// never widens a scoped session back to the full union. The grant arm ignores
+// it: those permissions come from the target tenant's owner/co_owner role, not
+// from any role the user holds, so there is nothing for a home-role name to
+// select.
+func (s *AuthService) permissionsForRefresh(ctx context.Context, userID, tenantID int64, activeRoles []string) ([]string, error) {
 	var homeTenant int64
 	if err := s.pool.QueryRow(ctx,
 		`SELECT tenant_id FROM users WHERE id = $1`, userID,
@@ -503,7 +511,7 @@ func (s *AuthService) permissionsForRefresh(ctx context.Context, userID, tenantI
 
 	// Acting in their own tenant: nothing tenant-crossing is involved.
 	if homeTenant == tenantID {
-		return s.loadPermissions(ctx, userID, tenantID)
+		return s.loadPermissionsScoped(ctx, userID, tenantID, activeRoles)
 	}
 
 	// Outside the home tenant, a grant is what decides the answer. A platform
@@ -518,7 +526,7 @@ func (s *AuthService) permissionsForRefresh(ctx context.Context, userID, tenantI
 
 	// No grant: a platform administrator reaching another tenant by permission.
 	// Their authority lives on their home role, which is where tenant:manage is.
-	return s.loadPermissions(ctx, userID, homeTenant)
+	return s.loadPermissionsScoped(ctx, userID, homeTenant, activeRoles)
 }
 
 // tenantAuthorityPredicate is the SQL condition that decides whether a user may

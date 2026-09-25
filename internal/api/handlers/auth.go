@@ -518,6 +518,19 @@ type AppLoginRequest struct {
 	Password string `json:"password" validate:"required"`
 	// RememberMe asks for a persistent session. See LoginRequest.RememberMe.
 	RememberMe bool `json:"remember_me"`
+	// Roles narrows the session to a subset of the roles this user holds (#146
+	// phase 4). Omitted — the normal case — means the session carries the full
+	// union of their roles and nothing changes.
+	//
+	// NARROWING ONLY. Every name is checked against what the account actually
+	// holds, and a role it does not hold refuses the login with the same generic
+	// error a wrong password gives. Without that check this field would be a
+	// privilege escalation with a friendly name.
+	//
+	// Useful for a console that wants an explicitly low-privilege session for
+	// routine work, so a mistake cannot reach permissions the operator holds but
+	// did not intend to use.
+	Roles []string `json:"roles,omitempty"`
 
 	// CaptchaID and CaptchaAnswer carry a solved challenge. Both are optional
 	// and ignored unless policy demands one, so a client that predates issue
@@ -674,6 +687,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		Email:        req.Email,
 		Password:     req.Password,
 		Persistent:   req.RememberMe,
+		Roles:        req.Roles,
 	})
 	if err != nil {
 		h.captchaRecordFailure(c, appLoginScope)

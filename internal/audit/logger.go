@@ -64,10 +64,22 @@ const (
 	ActionAdminRoleDefaultSet         = "admin.role_default_set"
 
 	// Admin — user pool management
-	ActionAdminUserCreated        = "admin.user_created"
-	ActionAdminUserUpdated        = "admin.user_updated"
-	ActionAdminUserDeleted        = "admin.user_deleted"
-	ActionAdminUserRoleAssigned   = "admin.user_role_assigned"
+	ActionAdminUserCreated      = "admin.user_created"
+	ActionAdminUserUpdated      = "admin.user_updated"
+	ActionAdminUserDeleted      = "admin.user_deleted"
+	ActionAdminUserRoleAssigned = "admin.user_role_assigned"
+	// ActionAdminUserRoleRevoked covers removing ONE role from a user who may
+	// still hold others (#146 phase 2). Distinct from user_role_assigned because
+	// a revocation is the event an investigation looks for, and folding it into
+	// the assignment action would hide it behind the far noisier grant.
+	ActionAdminUserRoleRevoked = "admin.user_role_revoked"
+	// ActionAppUserRolesAssigned is a role grant made by an APPLICATION's own
+	// backend using its client credentials, rather than by an administrator
+	// (#146). Kept separate from the admin actions because the actor is a machine
+	// with no users.id behind it: the grant is attributed to a client_id in the
+	// event metadata, and an investigation asking "which human did this" needs to
+	// see immediately that the answer is "none".
+	ActionAppUserRolesAssigned    = "app.user_roles_assigned"
 	ActionAdminForcePasswordReset = "admin.force_password_reset"
 	ActionAdminUserBlocked        = "admin.user_blocked"
 	ActionAdminUserUnblocked      = "admin.user_unblocked"

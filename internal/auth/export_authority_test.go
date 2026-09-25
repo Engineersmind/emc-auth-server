@@ -30,7 +30,7 @@ func ExportedLoadPermissions(pool *pgxpool.Pool, logger zerolog.Logger, ctx cont
 // the branch that keeps a rotation from silently changing what a session can
 // do.
 func ExportedPermissionsForRefresh(pool *pgxpool.Pool, logger zerolog.Logger, ctx context.Context, userID, tenantID int64) ([]string, error) {
-	return NewAuthService(pool, nil, logger).permissionsForRefresh(ctx, userID, tenantID)
+	return NewAuthService(pool, nil, logger).permissionsForRefresh(ctx, userID, tenantID, nil)
 }
 
 // ExportedCheckGraceWindow calls the production checkGraceWindow.
@@ -45,7 +45,7 @@ func ExportedPermissionsForRefresh(pool *pgxpool.Pool, logger zerolog.Logger, ct
 // the in-flight request directly through graceToAuthClaims, with no token
 // minting or signature verification in between.
 func ExportedCheckGraceWindow(pool *pgxpool.Pool, logger zerolog.Logger, ctx context.Context, userID, tenantID, sessionID int64) ([]string, error) {
-	res, err := NewAuthService(pool, nil, logger).checkGraceWindow(ctx, userID, tenantID, sessionID)
+	res, err := NewAuthService(pool, nil, logger).checkGraceWindow(ctx, userID, tenantID, sessionID, nil)
 	if err != nil {
 		return nil, err
 	}

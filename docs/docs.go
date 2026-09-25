@@ -55,6 +55,273 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/admin/users/export": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "text/csv"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Export users (CSV)",
+                "responses": {
+                    "200": {
+                        "description": "CSV",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/users/import": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "List user import jobs",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/admin.ImportJob"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Queue a user import",
+                "parameters": [
+                    {
+                        "description": "Users to import",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.ImportDocument"
+                        }
+                    }
+                ],
+                "responses": {
+                    "202": {
+                        "description": "Accepted",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ImportJob"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/users/import/validate": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Validate a user import (dry run)",
+                "parameters": [
+                    {
+                        "description": "Users to validate",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.ImportDocument"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ImportResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/users/import/{jobID}": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Get a user import job",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.ImportJob"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Cancel a user import job",
+                "responses": {
+                    "204": {
+                        "description": "Cancelled"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/admin/users/import/{jobID}/rows": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Get user import job rows",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/admin.ImportRowResult"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/administrators": {
             "get": {
                 "security": [
@@ -2774,6 +3041,74 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/users/roles": {
+            "post": {
+                "description": "Attaches roles to one of the calling application's own users. Application credentials via Authorization: Basic header only. Roles are given by name and must already exist in this application; unknown, system, or other applications' roles are refused and nothing is written. mode=add (the default) keeps the roles the user already holds, mode=replace discards them. Every active session for the user is signed out so the change takes effect on their next request. SERVER-SIDE USE ONLY — the client secret must never be shipped in a browser or mobile client.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Assign roles to an application user",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "User and role names",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AssignAppUserRolesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AssignAppUserRolesResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Invalid application credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "User not found in this application",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -6196,7 +6531,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Deletes a non-system role from the tenant. Users assigned this role will have their role cleared. Requires admin:access.",
+                "description": "Soft-deletes a non-system role. The role stops being listed, assignable, and grantable at registration, and its permissions are revoked: every user holding it has their role cleared and their active sessions signed out, so the loss of permissions takes effect immediately. The response reports how many users were detached, and the audit record names them. Requires admin:access.",
                 "produces": [
                     "application/json"
                 ],
@@ -8232,7 +8567,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Permanently deletes a role from the target tenant. Requires tenant:manage.",
+                "description": "Soft-deletes a role from the target tenant. The role stops being listed, assignable, and grantable at registration, and its permissions are revoked: every user holding it has their role cleared and their active sessions signed out. The response reports how many users were detached, and the audit record names them. Requires tenant:manage.",
                 "produces": [
                     "application/json"
                 ],
@@ -8934,7 +9269,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sets the user's role within the tenant. Requires admin:access.",
+                "description": "Replaces the user's role within the tenant. This is a replacement, not an addition: the user ends up holding exactly the role given, and any role they held before is discarded. Sending two roles in sequence leaves only the second. Every active session for the user is signed out so the change takes effect immediately; clients holding a refresh token can obtain a correctly-scoped token without the user re-authenticating. Requires admin:access.",
                 "consumes": [
                     "application/json"
                 ],
@@ -8944,7 +9279,7 @@ const docTemplate = `{
                 "tags": [
                     "admin-users"
                 ],
-                "summary": "Assign role to user",
+                "summary": "Replace a user's role",
                 "parameters": [
                     {
                         "type": "string",
@@ -8975,6 +9310,179 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/users/{id}/roles": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns every role the user holds, in grant order, each with who granted it and when. The role matching users.role_id is flagged is_primary — that is the one the deprecated ` + "`" + `role` + "`" + ` JWT claim carries. Requires users:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "List a user's roles",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/admin.UserRoleResult"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Grants a role to the user in addition to the roles they already hold. Unlike PUT /users/{id}/role this does not replace anything. Idempotent — granting a role the user already holds succeeds without changing it. Administrative (system) roles are refused; those are granted by invitation. Every active session is signed out so the new permissions take effect immediately. Requires users:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Grant a role to a user",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Role ID to grant",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AssignRoleRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/users/{id}/roles/{rid}": {
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Revokes one role from the user, leaving every other role they hold. Returns 404 if the user did not hold the role. If the revoked role was their primary, the earliest surviving grant is promoted in its place. Every active session is signed out so the loss of permissions takes effect immediately. Requires users:write.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Revoke a role from a user",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User ID",
+                        "name": "id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Role ID",
+                        "name": "rid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -10091,6 +10599,178 @@ const docTemplate = `{
                 }
             }
         },
+        "admin.ImportDocument": {
+            "type": "object",
+            "properties": {
+                "update_existing": {
+                    "description": "UpdateExisting amends users that already exist instead of skipping them.\n\nOFF by default, and deliberately so. A file is a snapshot of somebody's\nexport — possibly stale, possibly hand-edited — and an operator who\nre-uploads it to fix three rejected rows does not expect the other two\nhundred to be rewritten from whatever that file happened to contain.\nAuth0 takes the same position (upsert defaults to false) and routes\ncorrections through a separate assignment endpoint.\n\nWhen on, only the ROLE and PROFILE fields are amended. Credentials are\nnever touched: a file that could overwrite password_hash on existing\naccounts is a credential-stuffing primitive, and no migration needs it.",
+                    "type": "boolean"
+                },
+                "users": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.ImportUser"
+                    }
+                }
+            }
+        },
+        "admin.ImportIdentity": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string"
+                },
+                "provider_email": {
+                    "type": "string"
+                },
+                "provider_sub": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.ImportJob": {
+            "type": "object",
+            "properties": {
+                "actor_email": {
+                    "type": "string"
+                },
+                "application_id": {
+                    "type": "string"
+                },
+                "created": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "error": {
+                    "type": "string"
+                },
+                "finished_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "processed_rows": {
+                    "type": "integer"
+                },
+                "rejected": {
+                    "type": "integer"
+                },
+                "skipped": {
+                    "type": "integer"
+                },
+                "started_at": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                },
+                "total_rows": {
+                    "type": "integer"
+                },
+                "update_existing": {
+                    "type": "boolean"
+                },
+                "updated": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admin.ImportResult": {
+            "type": "object",
+            "properties": {
+                "created": {
+                    "type": "integer"
+                },
+                "dry_run": {
+                    "type": "boolean"
+                },
+                "rejected": {
+                    "type": "integer"
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.ImportRowResult"
+                    }
+                },
+                "skipped": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                },
+                "updated": {
+                    "type": "integer"
+                }
+            }
+        },
+        "admin.ImportRowResult": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "index": {
+                    "type": "integer"
+                },
+                "outcome": {
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.ImportUser": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "email_verified": {
+                    "description": "EmailVerified carries the source IdP's verification state. Defaulting it\nto false would re-challenge every migrated user for an address their old\nprovider already proved, which is the kind of friction that makes a\nmigration visible to end users.",
+                    "type": "boolean"
+                },
+                "first_name": {
+                    "type": "string"
+                },
+                "identities": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.ImportIdentity"
+                    }
+                },
+                "is_active": {
+                    "description": "IsActive defaults to true when the field is absent — see UnmarshalJSON.",
+                    "type": "boolean"
+                },
+                "last_name": {
+                    "type": "string"
+                },
+                "password": {
+                    "description": "Password is a plaintext password, for the source systems that cannot\nexport digests. Hashed by the import worker with current parameters.\n\nMutually exclusive with PasswordHash. A row carrying both is ambiguous\nabout which credential is authoritative, and silently preferring one\nwould mean an operator who made a mistake in their export script gets an\naccount whose password is not the one they think it is.\n\nCosts ~65ms of Argon2id per row against a process-wide concurrency cap,\nwhich is why a document containing any plaintext runs as a background job\nrather than inside the request.",
+                    "type": "string"
+                },
+                "password_changed_at": {
+                    "description": "PasswordChangedAt is when the password was last set in the SOURCE system.\nuser_credentials.password_changed_at defaults to NOW(), which for an\nimported credential is false — it would report every migrated user as\nhaving just rotated, and any future password-age policy would read that.",
+                    "type": "string"
+                },
+                "password_hash": {
+                    "description": "PasswordHash is a bcrypt or Argon2id PHC digest from the source system.\nEmpty is allowed when the row carries a Password or at least one identity.",
+                    "type": "string"
+                },
+                "role": {
+                    "description": "Role is the role NAME. Ids are not accepted: an id in an uploaded file is\nan opaque integer the operator cannot check and an attacker can guess, and\nit means nothing outside this database.",
+                    "type": "string"
+                }
+            }
+        },
         "admin.InviteTenantAdminResult": {
             "type": "object",
             "properties": {
@@ -10631,6 +11311,13 @@ const docTemplate = `{
                 "role_id": {
                     "type": "string"
                 },
+                "roles": {
+                    "description": "Roles is every live role the user holds (#146), primary first. Role and\nRoleID stay as the primary for callers that predate multi-role.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "tenant_id": {
                     "type": "string"
                 },
@@ -10727,7 +11414,42 @@ const docTemplate = `{
                 "role_id": {
                     "type": "string"
                 },
+                "roles": {
+                    "description": "Roles is every live role the user holds (#146), primary first. Role and\nRoleID stay as the primary for callers that predate multi-role.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "tenant_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.UserRoleResult": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string"
+                },
+                "granted_at": {
+                    "type": "string"
+                },
+                "granted_by": {
+                    "description": "GrantedBy is nil for grants that predate this table (the 00092 backfill\ncould not invent a grantor) and for grants made by a service token, which\nhas no user behind it.",
+                    "type": "string"
+                },
+                "granted_by_email": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "is_primary": {
+                    "description": "IsPrimary marks the role users.role_id points at — the one the deprecated\n` + "`" + `role` + "`" + ` JWT claim carries.",
+                    "type": "boolean"
+                },
+                "name": {
                     "type": "string"
                 }
             }
@@ -11279,6 +12001,28 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AssignAppUserRolesResult": {
+            "type": "object",
+            "properties": {
+                "assigned": {
+                    "description": "Assigned lists only the roles this call added, so a caller can tell a\nchange from a no-op without diffing.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "roles": {
+                    "description": "Roles is every role the user holds after the call, in grant order.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "user_id": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.AudienceEntry": {
             "type": "object",
             "properties": {
@@ -11384,7 +12128,7 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "scope": {
-                    "description": "Scope names the sender the branding came from (\"application\", \"tenant\" or \"global\").",
+                    "description": "Scope names the sender the branding came from (\"application\", \"tenant\" or\n\"global\"), so the UI can say WHY the brand is what it is instead of just\nasserting it.",
                     "type": "string"
                 },
                 "subject_prefix": {
@@ -11400,7 +12144,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "effective_branding": {
-                    "description": "EffectiveBranding is the branding a send from here would actually use, after the application -> tenant -> global fall-through. NOT the same as settings.product_name.",
+                    "description": "EffectiveBranding is the branding a send from here would actually use,\nafter the application → tenant → global fall-through and the platform\ndefault.\n\nIt is NOT the same as Settings.ProductName, and the difference is the\npoint. ProductName is stored per sender row, so a screen that reads its\nown scope's row shows a product name the send may never use: an\napplication that has a row of its own but delivers through the platform's\ndefault sender is branded with the platform's name. A template preview\nbuilt from Settings therefore shows the wrong brand with full confidence,\nwhich is worse than showing a placeholder.",
                     "allOf": [
                         {
                             "$ref": "#/definitions/auth.EffectiveBranding"
@@ -11602,6 +12346,12 @@ const docTemplate = `{
         "auth.MeResult": {
             "type": "object",
             "properties": {
+                "active_roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "admin_apps": {
                     "type": "array",
                     "items": {
@@ -11623,6 +12373,13 @@ const docTemplate = `{
                 },
                 "role": {
                     "type": "string"
+                },
+                "roles": {
+                    "description": "Roles and ActiveRoles mirror the token's claims (#146). Role alone is only\nthe primary, so without these a caller of /auth/apps/me could not see a\nuser's other roles, or that the session was scoped to some of them.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "tenant_id": {
                     "type": "string"
@@ -11968,6 +12725,13 @@ const docTemplate = `{
                 "remember_me": {
                     "description": "RememberMe asks for a persistent session. See LoginRequest.RememberMe.",
                     "type": "boolean"
+                },
+                "roles": {
+                    "description": "Roles narrows the session to a subset of the roles this user holds (#146\nphase 4). Omitted — the normal case — means the session carries the full\nunion of their roles and nothing changes.\n\nNARROWING ONLY. Every name is checked against what the account actually\nholds, and a role it does not hold refuses the login with the same generic\nerror a wrong password gives. Without that check this field would be a\nprivilege escalation with a friendly name.\n\nUseful for a console that wants an explicitly low-privilege session for\nroutine work, so a mistake cannot reach permissions the operator holds but\ndid not intend to use.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },
@@ -11997,6 +12761,26 @@ const docTemplate = `{
                 "password": {
                     "type": "string",
                     "minLength": 8
+                }
+            }
+        },
+        "handlers.AssignAppUserRolesRequest": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "description": "Mode is \"add\" (default) or \"replace\". Add is the safe default: a retried\nrequest is then harmless, whereas a defaulted replace would silently strip\nroles from a caller who simply omitted the field.",
+                    "type": "string"
+                },
+                "roles": {
+                    "description": "Roles are role names defined in this application.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "user_id": {
+                    "description": "UserID is the application's own user, as returned by /auth/apps/register.",
+                    "type": "string"
                 }
             }
         },
@@ -12611,11 +13395,11 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "template_type": {
-                    "description": "TemplateType selects which template to render (empty = email_verification).",
+                    "description": "TemplateType selects which template to render. Empty means the built-in\nprovider diagnostic (mailer.TemplateProviderTest) — a bare provider check,\nNOT email_verification, which was the default until #91 and delivered a\nreal-looking verification mail containing a dead sample link.",
                     "type": "string"
                 },
                 "to": {
-                    "description": "To is the recipient. Empty = the requesting admin's own address.\n\nINVARIANT: a recipient other than the caller's own address always gets the\nbuilt-in diagnostic template, never a per-scope override — see the\nenforcement in SendTestEmail. Template bodies are editable at this same\npermission level, so allowing both an arbitrary recipient and arbitrary\ncontent would make this a phishing relay from a verified sender identity.\nSee PR #91 for the full threat model.",
+                    "description": "To is the recipient. Empty = the requesting admin's own address.\n\nAny valid address is accepted. The message is always stamped as a test —\n[Test] subject prefix plus an in-body notice, applied after rendering so a\ncustom template cannot suppress it — so it cannot pass as a genuine\nproduct email regardless of who receives it or what the body says.",
                     "type": "string"
                 }
             }
@@ -12623,17 +13407,13 @@ const docTemplate = `{
         "handlers.SendTestEmailResponse": {
             "type": "object",
             "properties": {
+                "marked_as_test": {
+                    "description": "MarkedAsTest reports that the message was stamped with a [Test] subject\nprefix and an in-body test notice. Always true for this endpoint; sent\nexplicitly so the UI can say so, rather than leaving an admin to wonder\nwhy the mail they received does not match the template they saved.",
+                    "type": "boolean"
+                },
                 "message": {
                     "type": "string"
                 },
-                "marked_as_test": {
-                    "description": "true when the message was stamped with a [Test] subject prefix and an in-body test notice",
-                    "type": "boolean"
-                },
-                    "used_custom_template": {
-                        "description": "false when the built-in default was sent instead of the saved override (most often a disabled template)",
-                        "type": "boolean"
-                    },
                 "provider": {
                     "description": "smtp | sendgrid | dev",
                     "type": "string"
@@ -12647,6 +13427,10 @@ const docTemplate = `{
                 },
                 "to": {
                     "type": "string"
+                },
+                "used_custom_template": {
+                    "description": "UsedCustomTemplate distinguishes \"your saved template was sent\" from \"the\nbuilt-in default was sent instead\".\n\nThe second happens for a reason that is invisible from the send itself: a\nstored template with is_active = false is skipped by Resolve, so an admin\nwho saved a customisation while its Status toggle was off receives the\ndefault and concludes the save failed. The template screen turns this into\nan explanation rather than a mystery.",
+                    "type": "boolean"
                 }
             }
         },

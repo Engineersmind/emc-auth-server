@@ -160,6 +160,15 @@ func newAuthorityFixture(t *testing.T, pool *pgxpool.Pool) authorityFixture {
 		`, email, tenantID, roleID).Scan(&id); err != nil {
 			t.Fatalf("insert user %s: %v", email, err)
 		}
+		// Mirrors production writes: role_id is the primary role, and
+		// loadPermissions resolves roles from user_roles (#146).
+		if roleID != nil {
+			if _, err := pool.Exec(ctx, `
+				INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES ($1, $2, $3)
+			`, id, *roleID, tenantID); err != nil {
+				t.Fatalf("insert user_roles %s: %v", email, err)
+			}
+		}
 		return id
 	}
 

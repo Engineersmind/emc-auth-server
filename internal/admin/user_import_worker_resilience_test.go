@@ -45,7 +45,7 @@ func TestImportWorker_ReportsRoleChangeWithoutAuthService(t *testing.T) {
 		`SELECT id FROM roles WHERE name = 'Manager' AND tenant_id = $1`, f.tenantID).Scan(&mgrID); err != nil {
 		t.Fatalf("read Manager id: %v", err)
 	}
-	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, parseID(t, u.ID), mgrID); err != nil {
+	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID, parseID(t, u.ID), mgrID, nil); err != nil {
 		t.Fatalf("AssignUserRole() error = %v", err)
 	}
 

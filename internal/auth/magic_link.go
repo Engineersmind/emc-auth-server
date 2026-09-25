@@ -198,7 +198,7 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.email, COALESCE(r.name, '')
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		JOIN tenants t ON t.id = u.tenant_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.application_id = $3
 		  AND u.is_active = true AND u.deleted_at IS NULL AND t.is_active = true
@@ -219,7 +219,7 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 	appID := strconv.FormatInt(appRowID, 10)
 	// Never persistent — see the issueTokenPair call below for why a magic link
 	// does not grant a remembered device.
-	if gate, err := s.mfaGate(ctx, sess.UserID, tenantID, appRowID, appID, email, roleName, perms, false); err != nil {
+	if gate, err := s.mfaGate(ctx, sess.UserID, tenantID, appRowID, appID, email, roleName, perms, false, nil); err != nil {
 		return nil, err
 	} else if gate != nil {
 		return gate, nil

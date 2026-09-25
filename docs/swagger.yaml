@@ -75,6 +75,157 @@ definitions:
       tenant:
         $ref: '#/definitions/admin.TenantResult'
     type: object
+  admin.ImportDocument:
+    properties:
+      update_existing:
+        description: |-
+          UpdateExisting amends users that already exist instead of skipping them.
+
+          OFF by default, and deliberately so. A file is a snapshot of somebody's
+          export — possibly stale, possibly hand-edited — and an operator who
+          re-uploads it to fix three rejected rows does not expect the other two
+          hundred to be rewritten from whatever that file happened to contain.
+          Auth0 takes the same position (upsert defaults to false) and routes
+          corrections through a separate assignment endpoint.
+
+          When on, only the ROLE and PROFILE fields are amended. Credentials are
+          never touched: a file that could overwrite password_hash on existing
+          accounts is a credential-stuffing primitive, and no migration needs it.
+        type: boolean
+      users:
+        items:
+          $ref: '#/definitions/admin.ImportUser'
+        type: array
+    type: object
+  admin.ImportIdentity:
+    properties:
+      provider:
+        type: string
+      provider_email:
+        type: string
+      provider_sub:
+        type: string
+    type: object
+  admin.ImportJob:
+    properties:
+      actor_email:
+        type: string
+      application_id:
+        type: string
+      created:
+        type: integer
+      created_at:
+        type: string
+      error:
+        type: string
+      finished_at:
+        type: string
+      id:
+        type: string
+      processed_rows:
+        type: integer
+      rejected:
+        type: integer
+      skipped:
+        type: integer
+      started_at:
+        type: string
+      status:
+        type: string
+      tenant_id:
+        type: string
+      total_rows:
+        type: integer
+      update_existing:
+        type: boolean
+      updated:
+        type: integer
+    type: object
+  admin.ImportResult:
+    properties:
+      created:
+        type: integer
+      dry_run:
+        type: boolean
+      rejected:
+        type: integer
+      rows:
+        items:
+          $ref: '#/definitions/admin.ImportRowResult'
+        type: array
+      skipped:
+        type: integer
+      total:
+        type: integer
+      updated:
+        type: integer
+    type: object
+  admin.ImportRowResult:
+    properties:
+      email:
+        type: string
+      index:
+        type: integer
+      outcome:
+        type: string
+      reason:
+        type: string
+    type: object
+  admin.ImportUser:
+    properties:
+      email:
+        type: string
+      email_verified:
+        description: |-
+          EmailVerified carries the source IdP's verification state. Defaulting it
+          to false would re-challenge every migrated user for an address their old
+          provider already proved, which is the kind of friction that makes a
+          migration visible to end users.
+        type: boolean
+      first_name:
+        type: string
+      identities:
+        items:
+          $ref: '#/definitions/admin.ImportIdentity'
+        type: array
+      is_active:
+        description: IsActive defaults to true when the field is absent — see UnmarshalJSON.
+        type: boolean
+      last_name:
+        type: string
+      password:
+        description: |-
+          Password is a plaintext password, for the source systems that cannot
+          export digests. Hashed by the import worker with current parameters.
+
+          Mutually exclusive with PasswordHash. A row carrying both is ambiguous
+          about which credential is authoritative, and silently preferring one
+          would mean an operator who made a mistake in their export script gets an
+          account whose password is not the one they think it is.
+
+          Costs ~65ms of Argon2id per row against a process-wide concurrency cap,
+          which is why a document containing any plaintext runs as a background job
+          rather than inside the request.
+        type: string
+      password_changed_at:
+        description: |-
+          PasswordChangedAt is when the password was last set in the SOURCE system.
+          user_credentials.password_changed_at defaults to NOW(), which for an
+          imported credential is false — it would report every migrated user as
+          having just rotated, and any future password-age policy would read that.
+        type: string
+      password_hash:
+        description: |-
+          PasswordHash is a bcrypt or Argon2id PHC digest from the source system.
+          Empty is allowed when the row carries a Password or at least one identity.
+        type: string
+      role:
+        description: |-
+          Role is the role NAME. Ids are not accepted: an id in an uploaded file is
+          an opaque integer the operator cannot check and an attacker can guess, and
+          it means nothing outside this database.
+        type: string
+    type: object
   admin.InviteTenantAdminResult:
     properties:
       action:
@@ -516,6 +667,13 @@ definitions:
         type: string
       role_id:
         type: string
+      roles:
+        description: |-
+          Roles is every live role the user holds (#146), primary first. Role and
+          RoleID stay as the primary for callers that predate multi-role.
+        items:
+          type: string
+        type: array
       tenant_id:
         type: string
       updated_at:
@@ -599,7 +757,38 @@ definitions:
         type: string
       role_id:
         type: string
+      roles:
+        description: |-
+          Roles is every live role the user holds (#146), primary first. Role and
+          RoleID stay as the primary for callers that predate multi-role.
+        items:
+          type: string
+        type: array
       tenant_id:
+        type: string
+    type: object
+  admin.UserRoleResult:
+    properties:
+      application_id:
+        type: string
+      granted_at:
+        type: string
+      granted_by:
+        description: |-
+          GrantedBy is nil for grants that predate this table (the 00092 backfill
+          could not invent a grantor) and for grants made by a service token, which
+          has no user behind it.
+        type: string
+      granted_by_email:
+        type: string
+      id:
+        type: string
+      is_primary:
+        description: |-
+          IsPrimary marks the role users.role_id points at — the one the deprecated
+          `role` JWT claim carries.
+        type: boolean
+      name:
         type: string
     type: object
   admin.UserSession:
@@ -1053,6 +1242,23 @@ definitions:
       total_pages:
         type: integer
     type: object
+  auth.AssignAppUserRolesResult:
+    properties:
+      assigned:
+        description: |-
+          Assigned lists only the roles this call added, so a caller can tell a
+          change from a no-op without diffing.
+        items:
+          type: string
+        type: array
+      roles:
+        description: Roles is every role the user holds after the call, in grant order.
+        items:
+          type: string
+        type: array
+      user_id:
+        type: integer
+    type: object
   auth.AudienceEntry:
     properties:
       application_id:
@@ -1134,8 +1340,10 @@ definitions:
       product_name:
         type: string
       scope:
-        description: Scope names the sender the branding came from ("application",
-          "tenant" or "global").
+        description: |-
+          Scope names the sender the branding came from ("application", "tenant" or
+          "global"), so the UI can say WHY the brand is what it is instead of just
+          asserting it.
         type: string
       subject_prefix:
         type: string
@@ -1148,9 +1356,18 @@ definitions:
       effective_branding:
         allOf:
         - $ref: '#/definitions/auth.EffectiveBranding'
-        description: EffectiveBranding is the branding a send from here would actually
-          use, after the application -> tenant -> global fall-through. NOT the same
-          as settings.product_name.
+        description: |-
+          EffectiveBranding is the branding a send from here would actually use,
+          after the application → tenant → global fall-through and the platform
+          default.
+
+          It is NOT the same as Settings.ProductName, and the difference is the
+          point. ProductName is stored per sender row, so a screen that reads its
+          own scope's row shows a product name the send may never use: an
+          application that has a row of its own but delivers through the platform's
+          default sender is branded with the platform's name. A template preview
+          built from Settings therefore shows the wrong brand with full confidence,
+          which is worse than showing a placeholder.
       settings:
         allOf:
         - $ref: '#/definitions/auth.EmailSenderSettings'
@@ -1310,6 +1527,10 @@ definitions:
     type: object
   auth.MeResult:
     properties:
+      active_roles:
+        items:
+          type: string
+        type: array
       admin_apps:
         items:
           type: string
@@ -1330,6 +1551,14 @@ definitions:
         type: array
       role:
         type: string
+      roles:
+        description: |-
+          Roles and ActiveRoles mirror the token's claims (#146). Role alone is only
+          the primary, so without these a caller of /auth/apps/me could not see a
+          user's other roles, or that the session was scoped to some of them.
+        items:
+          type: string
+        type: array
       tenant_id:
         type: string
       user_id:
@@ -1608,6 +1837,23 @@ definitions:
       remember_me:
         description: RememberMe asks for a persistent session. See LoginRequest.RememberMe.
         type: boolean
+      roles:
+        description: |-
+          Roles narrows the session to a subset of the roles this user holds (#146
+          phase 4). Omitted — the normal case — means the session carries the full
+          union of their roles and nothing changes.
+
+          NARROWING ONLY. Every name is checked against what the account actually
+          holds, and a role it does not hold refuses the login with the same generic
+          error a wrong password gives. Without that check this field would be a
+          privilege escalation with a friendly name.
+
+          Useful for a console that wants an explicitly low-privilege session for
+          routine work, so a mistake cannot reach permissions the operator holds but
+          did not intend to use.
+        items:
+          type: string
+        type: array
     required:
     - email
     - password
@@ -1635,6 +1881,23 @@ definitions:
     required:
     - email
     - password
+    type: object
+  handlers.AssignAppUserRolesRequest:
+    properties:
+      mode:
+        description: |-
+          Mode is "add" (default) or "replace". Add is the safe default: a retried
+          request is then harmless, whereas a defaulted replace would silently strip
+          roles from a caller who simply omitted the field.
+        type: string
+      roles:
+        description: Roles are role names defined in this application.
+        items:
+          type: string
+        type: array
+      user_id:
+        description: UserID is the application's own user, as returned by /auth/apps/register.
+        type: string
     type: object
   handlers.AssignRoleRequest:
     properties:
@@ -2136,32 +2399,33 @@ definitions:
           tenant's or the platform's. Default false; see PR #91 for the reasoning.
         type: boolean
       template_type:
-        description: TemplateType selects which template to render (empty = email_verification).
+        description: |-
+          TemplateType selects which template to render. Empty means the built-in
+          provider diagnostic (mailer.TemplateProviderTest) — a bare provider check,
+          NOT email_verification, which was the default until #91 and delivered a
+          real-looking verification mail containing a dead sample link.
         type: string
       to:
         description: |-
           To is the recipient. Empty = the requesting admin's own address.
 
-          INVARIANT: a recipient other than the caller's own address always gets the
-          built-in diagnostic template, never a per-scope override — see the
-          enforcement in SendTestEmail. Template bodies are editable at this same
-          permission level, so allowing both an arbitrary recipient and arbitrary
-          content would make this a phishing relay from a verified sender identity.
-          See PR #91 for the full threat model.
+          Any valid address is accepted. The message is always stamped as a test —
+          [Test] subject prefix plus an in-body notice, applied after rendering so a
+          custom template cannot suppress it — so it cannot pass as a genuine
+          product email regardless of who receives it or what the body says.
         type: string
     type: object
   handlers.SendTestEmailResponse:
     properties:
+      marked_as_test:
+        description: |-
+          MarkedAsTest reports that the message was stamped with a [Test] subject
+          prefix and an in-body test notice. Always true for this endpoint; sent
+          explicitly so the UI can say so, rather than leaving an admin to wonder
+          why the mail they received does not match the template they saved.
+        type: boolean
       message:
         type: string
-      marked_as_test:
-        description: true when the message was stamped with a [Test] subject prefix
-          and an in-body test notice
-        type: boolean
-      used_custom_template:
-        description: false when the built-in default was sent instead of the saved
-          override (most often a disabled template)
-        type: boolean
       provider:
         description: smtp | sendgrid | dev
         type: string
@@ -2172,6 +2436,17 @@ definitions:
         type: string
       to:
         type: string
+      used_custom_template:
+        description: |-
+          UsedCustomTemplate distinguishes "your saved template was sent" from "the
+          built-in default was sent instead".
+
+          The second happens for a reason that is invisible from the send itself: a
+          stored template with is_active = false is skipped by Resolve, so an admin
+          who saved a customisation while its Status toggle was off receives the
+          default and concludes the save failed. The template screen turns this into
+          an explanation rather than a mystery.
+        type: boolean
     type: object
   handlers.SessionLoginRequest:
     properties:
@@ -2590,6 +2865,170 @@ paths:
       summary: List tenants the caller administers
       tags:
       - admin
+  /api/v1/admin/users/export:
+    get:
+      produces:
+      - text/csv
+      responses:
+        "200":
+          description: CSV
+          schema:
+            type: string
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Export users (CSV)
+      tags:
+      - admin-users
+  /api/v1/admin/users/import:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.ImportJob'
+            type: array
+      security:
+      - BearerAuth: []
+      summary: List user import jobs
+      tags:
+      - admin-users
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Users to import
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.ImportDocument'
+      produces:
+      - application/json
+      responses:
+        "202":
+          description: Accepted
+          schema:
+            $ref: '#/definitions/admin.ImportJob'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "413":
+          description: Request Entity Too Large
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Queue a user import
+      tags:
+      - admin-users
+  /api/v1/admin/users/import/{jobID}:
+    delete:
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: Cancelled
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Cancel a user import job
+      tags:
+      - admin-users
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.ImportJob'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get a user import job
+      tags:
+      - admin-users
+  /api/v1/admin/users/import/{jobID}/rows:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.ImportRowResult'
+            type: array
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get user import job rows
+      tags:
+      - admin-users
+  /api/v1/admin/users/import/validate:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Users to validate
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.ImportDocument'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.ImportResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "413":
+          description: Request Entity Too Large
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Validate a user import (dry run)
+      tags:
+      - admin-users
   /api/v1/administrators:
     get:
       description: Lists owners and co-owners in EVERY tenant, for platform oversight
@@ -4419,6 +4858,58 @@ paths:
               type: string
             type: object
       summary: Register an end user via application credentials
+      tags:
+      - AUTH
+  /api/v1/auth/apps/users/roles:
+    post:
+      consumes:
+      - application/json
+      description: 'Attaches roles to one of the calling application''s own users.
+        Application credentials via Authorization: Basic header only. Roles are given
+        by name and must already exist in this application; unknown, system, or other
+        applications'' roles are refused and nothing is written. mode=add (the default)
+        keeps the roles the user already holds, mode=replace discards them. Every
+        active session for the user is signed out so the change takes effect on their
+        next request. SERVER-SIDE USE ONLY — the client secret must never be shipped
+        in a browser or mobile client.'
+      parameters:
+      - description: Basic base64(client_id:client_secret)
+        in: header
+        name: Authorization
+        required: true
+        type: string
+      - description: User and role names
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AssignAppUserRolesRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AssignAppUserRolesResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Invalid application credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: User not found in this application
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Assign roles to an application user
       tags:
       - AUTH
   /api/v1/auth/change-email:
@@ -6749,8 +7240,11 @@ paths:
       - admin-rbac
   /api/v1/roles/{id}:
     delete:
-      description: Deletes a non-system role from the tenant. Users assigned this
-        role will have their role cleared. Requires admin:access.
+      description: 'Soft-deletes a non-system role. The role stops being listed, assignable,
+        and grantable at registration, and its permissions are revoked: every user
+        holding it has their role cleared and their active sessions signed out, so
+        the loss of permissions takes effect immediately. The response reports how
+        many users were detached, and the audit record names them. Requires admin:access.'
       parameters:
       - description: Role ID
         in: path
@@ -8090,7 +8584,11 @@ paths:
       - admin-cross-tenant
   /api/v1/tenants/{tid}/roles/{rid}:
     delete:
-      description: Permanently deletes a role from the target tenant. Requires tenant:manage.
+      description: 'Soft-deletes a role from the target tenant. The role stops being
+        listed, assignable, and grantable at registration, and its permissions are
+        revoked: every user holding it has their role cleared and their active sessions
+        signed out. The response reports how many users were detached, and the audit
+        record names them. Requires tenant:manage.'
       parameters:
       - description: Target tenant ID
         in: path
@@ -8603,7 +9101,12 @@ paths:
     put:
       consumes:
       - application/json
-      description: Sets the user's role within the tenant. Requires admin:access.
+      description: 'Replaces the user''s role within the tenant. This is a replacement,
+        not an addition: the user ends up holding exactly the role given, and any
+        role they held before is discarded. Sending two roles in sequence leaves only
+        the second. Every active session for the user is signed out so the change
+        takes effect immediately; clients holding a refresh token can obtain a correctly-scoped
+        token without the user re-authenticating. Requires admin:access.'
       parameters:
       - description: User ID
         in: path
@@ -8639,7 +9142,129 @@ paths:
             type: object
       security:
       - BearerAuth: []
-      summary: Assign role to user
+      summary: Replace a user's role
+      tags:
+      - admin-users
+  /api/v1/users/{id}/roles:
+    get:
+      description: Returns every role the user holds, in grant order, each with who
+        granted it and when. The role matching users.role_id is flagged is_primary
+        — that is the one the deprecated `role` JWT claim carries. Requires users:read.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/admin.UserRoleResult'
+            type: array
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: List a user's roles
+      tags:
+      - admin-users
+    post:
+      consumes:
+      - application/json
+      description: Grants a role to the user in addition to the roles they already
+        hold. Unlike PUT /users/{id}/role this does not replace anything. Idempotent
+        — granting a role the user already holds succeeds without changing it. Administrative
+        (system) roles are refused; those are granted by invitation. Every active
+        session is signed out so the new permissions take effect immediately. Requires
+        users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Role ID to grant
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AssignRoleRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Grant a role to a user
+      tags:
+      - admin-users
+  /api/v1/users/{id}/roles/{rid}:
+    delete:
+      description: Revokes one role from the user, leaving every other role they hold.
+        Returns 404 if the user did not hold the role. If the revoked role was their
+        primary, the earliest surviving grant is promoted in its place. Every active
+        session is signed out so the loss of permissions takes effect immediately.
+        Requires users:write.
+      parameters:
+      - description: User ID
+        in: path
+        name: id
+        required: true
+        type: string
+      - description: Role ID
+        in: path
+        name: rid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Revoke a role from a user
       tags:
       - admin-users
   /api/v1/users/{id}/sessions:

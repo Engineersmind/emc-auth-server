@@ -23,11 +23,40 @@ import (
 // It is omitted from the JSON payload when empty so existing tokens without
 // it remain valid — the Verify path ignores missing optional claims.
 type Claims struct {
-	UserID      string   `json:"user_id"`
-	TenantID    string   `json:"tenant_id"`
-	AppID       string   `json:"app_id,omitempty"`
-	Email       string   `json:"email"`
-	Role        string   `json:"role"`
+	UserID   string `json:"user_id"`
+	TenantID string `json:"tenant_id"`
+	AppID    string `json:"app_id,omitempty"`
+	Email    string `json:"email"`
+	// Role is the PRIMARY role, and is deprecated in favour of Roles (#146).
+	//
+	// Retained through a deprecation window because it is the claim every existing
+	// relying party reads, and removing it would break them at the same moment
+	// multi-role arrived. It carries the primary role — the one registration
+	// assigned, or the earliest surviving grant — rather than an arbitrary member
+	// of Roles, so it stays stable as other roles are added and removed around it.
+	//
+	// A consumer that needs to know everything a user holds must read Roles; Role
+	// alone stopped being the whole answer the moment a user could hold two.
+	Role string `json:"role"`
+
+	// Roles is every role the user holds, in grant order (primary first).
+	//
+	// Modelled as a list from the start even though most users hold one, because
+	// the alternative is another breaking claim change the first time somebody
+	// holds two. Omitted when empty so a token for a roleless user is unchanged
+	// on the wire.
+	Roles []string `json:"roles,omitempty"`
+
+	// ActiveRoles is the subset of Roles this session was narrowed to at login,
+	// empty when the session carries the user's full set.
+	//
+	// Present so a relying party can tell "this user holds only support" from
+	// "this user holds support and admin but asked for a support-scoped session".
+	// Permissions already reflects the narrowing; this claim explains WHY they are
+	// narrower than the account's full grant, which is otherwise unanswerable from
+	// the token alone.
+	ActiveRoles []string `json:"active_roles,omitempty"`
+
 	Permissions []string `json:"permissions"`
 	// AdminScope and AdminApps describe how far the caller's tenant-administration
 	// rights reach across the tenant's applications (issue #97). Permissions say

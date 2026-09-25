@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -378,6 +379,26 @@ func TestMe_ReturnsClaims(t *testing.T) {
 	}
 	if len(result.Permissions) != len(claims.Permissions) {
 		t.Errorf("Me() Permissions len = %d, want %d", len(result.Permissions), len(claims.Permissions))
+	}
+}
+
+// /auth/apps/me must report every role, not just the primary `role`, and say
+// when the session was scoped to fewer.
+func TestMe_ReturnsEveryRoleAndTheSessionScope(t *testing.T) {
+	svc, cleanup := newServiceForTest(t)
+	defer cleanup()
+
+	result := svc.Me(&auth.Claims{
+		UserID:      "uid-123",
+		Role:        "viewer",
+		Roles:       []string{"viewer", "editor"},
+		ActiveRoles: []string{"viewer"},
+	})
+	if got := strings.Join(result.Roles, ","); got != "viewer,editor" {
+		t.Errorf("Me() Roles = %q, want %q", got, "viewer,editor")
+	}
+	if got := strings.Join(result.ActiveRoles, ","); got != "viewer" {
+		t.Errorf("Me() ActiveRoles = %q, want %q", got, "viewer")
 	}
 }
 

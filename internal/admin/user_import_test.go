@@ -1117,7 +1117,7 @@ func TestImport_UpdateExisting_AbsentRoleKeepsCurrentRole(t *testing.T) {
 		t.Fatalf("CreateUser() error = %v", err)
 	}
 	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID,
-		parseID(t, u.ID), parseID(t, elevated.ID)); err != nil {
+		parseID(t, u.ID), parseID(t, elevated.ID), nil); err != nil {
 		t.Fatalf("AssignUserRole() error = %v", err)
 	}
 
@@ -1217,7 +1217,7 @@ func TestImport_UpdateExisting_NamedRoleStillChanges(t *testing.T) {
 		t.Fatalf("CreateUser() error = %v", err)
 	}
 	if err := f.svc.AssignUserRole(ctx, f.tenantID, &f.appID,
-		parseID(t, u.ID), parseID(t, from.ID)); err != nil {
+		parseID(t, u.ID), parseID(t, from.ID), nil); err != nil {
 		t.Fatalf("AssignUserRole() error = %v", err)
 	}
 

@@ -201,18 +201,43 @@ type RoleResult struct {
 	CreatedAt     time.Time          `json:"created_at"`
 }
 
+// UserRoleResult is one role a user holds, with the provenance of the grant
+// (#146 phase 2).
+//
+// GrantedBy answers "who gave them this", which a single role_id column could
+// never record. It is what makes "revoke what the security team granted, leave
+// what support granted" a question with an answer, and it is why a join table
+// beats widening the scalar column into an array.
+type UserRoleResult struct {
+	ID            string  `json:"id"`
+	Name          string  `json:"name"`
+	ApplicationID *string `json:"application_id,omitempty"`
+	// IsPrimary marks the role users.role_id points at — the one the deprecated
+	// `role` JWT claim carries.
+	IsPrimary bool `json:"is_primary"`
+	// GrantedBy is nil for grants that predate this table (the 00092 backfill
+	// could not invent a grantor) and for grants made by a service token, which
+	// has no user behind it.
+	GrantedBy      *string   `json:"granted_by,omitempty"`
+	GrantedByEmail *string   `json:"granted_by_email,omitempty"`
+	GrantedAt      time.Time `json:"granted_at"`
+}
+
 // UserResult is the public representation of a user in the pool.
 type UserResult struct {
-	ID            string    `json:"id"`
-	TenantID      string    `json:"tenant_id"`
-	ApplicationID *string   `json:"application_id,omitempty"`
-	Email         string    `json:"email"`
-	FirstName     string    `json:"first_name"`
-	LastName      string    `json:"last_name"`
-	Role          string    `json:"role"`
-	RoleID        *string   `json:"role_id"`
-	IsActive      bool      `json:"is_active"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID            string  `json:"id"`
+	TenantID      string  `json:"tenant_id"`
+	ApplicationID *string `json:"application_id,omitempty"`
+	Email         string  `json:"email"`
+	FirstName     string  `json:"first_name"`
+	LastName      string  `json:"last_name"`
+	Role          string  `json:"role"`
+	RoleID        *string `json:"role_id"`
+	// Roles is every live role the user holds (#146), primary first. Role and
+	// RoleID stay as the primary for callers that predate multi-role.
+	Roles     []string  `json:"roles"`
+	IsActive  bool      `json:"is_active"`
+	CreatedAt time.Time `json:"created_at"`
 	// LastLoginAt is the most recent session activity (Auth0's "Latest Login").
 	LastLoginAt *time.Time `json:"last_login_at"`
 	// LoginsCount is the number of successful logins on record (audit-derived,
@@ -1279,6 +1304,7 @@ func (s *Service) ListRoles(ctx context.Context, tenantID int64, applicationID *
 		FROM roles
 		WHERE tenant_id = $1
 		  AND ($2::BIGINT IS NULL OR application_id = $2)
+		  AND deleted_at IS NULL
 		ORDER BY name
 	`, tenantID, applicationID)
 	if err != nil {
@@ -1334,7 +1360,10 @@ func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID in
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var roleAppID *int64
-	err = tx.QueryRow(ctx, `SELECT application_id FROM roles WHERE id = $1 AND tenant_id = $2`, roleID, tenantID).Scan(&roleAppID)
+	err = tx.QueryRow(ctx,
+		`SELECT application_id FROM roles
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		roleID, tenantID).Scan(&roleAppID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -1372,6 +1401,7 @@ func (s *Service) UpdateRoleName(ctx context.Context, tenantID, applicationID, r
 	ct, err := s.pool.Exec(ctx, `
 		UPDATE roles SET name = $1, updated_at = NOW()
 		WHERE id = $2 AND tenant_id = $3 AND application_id = $4 AND is_system = false
+		  AND deleted_at IS NULL
 	`, name, roleID, tenantID, applicationID)
 	if err != nil {
 		if isDuplicateErr(err) {
@@ -1385,18 +1415,155 @@ func (s *Service) UpdateRoleName(ctx context.Context, tenantID, applicationID, r
 	return s.getRoleByID(ctx, tenantID, roleID)
 }
 
-// DeleteRole removes a role from the tenant.
-func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) error {
-	ct, err := s.pool.Exec(ctx, `
-		DELETE FROM roles WHERE id = $1 AND tenant_id = $2 AND is_system = false
+// DeleteRole soft-deletes a role and detaches everything that pointed at it,
+// returning the ids of the users who held it.
+//
+// Soft, not hard, for the reason roles.deleted_at was added in 00020 and the
+// reason resolveRegistrationTenant already filters on it: a real DELETE leaves no
+// record of what the holders held. Dropping 500 users to zero permissions in one
+// statement, with no way to answer "what did this role grant, and to whom" a day
+// later, is not an operation an identity provider should offer. The returned ids
+// are what lets the caller audit the blast radius.
+//
+// The cost of going soft is that every FK cascade stops firing, so this does
+// their work explicitly, in one transaction:
+//
+//   - role_permissions was ON DELETE CASCADE (00006). Without the explicit
+//     DELETE the grants survive, and because loadPermissions resolves
+//     users.role_id -> role_permissions the role would go on granting its full
+//     permission set to every holder — deleting a role would GRANT permissions
+//     rather than revoke them. This is the single most dangerous consequence of
+//     the change and the reason the DELETE is not optional.
+//   - users.role_id was ON DELETE SET NULL (00008). Without the explicit UPDATE
+//     holders keep pointing at the tombstone, and the twelve
+//     `LEFT JOIN roles r ON r.id = u.role_id` sites emit a deleted role's name
+//     into the `role` JWT claim.
+//   - tenant_admins.previous_role_id was ON DELETE SET NULL (00063). Without the
+//     explicit UPDATE, RemoveTenantAdmin restores a deleted role onto a
+//     de-administered user, defeating the escalation fix 00063 exists to provide.
+//
+// is_default is cleared in the same UPDATE so the tombstone stops occupying the
+// one-default-per-application slot; 00091 also narrows that index, and both are
+// deliberate — see the migration.
+//
+// Sessions are denied for every holder after the commit, on the same reasoning
+// as AssignUserRole: their tokens carry permissions this role no longer grants.
+func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) ([]int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin delete role tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Soft-delete first: its RowsAffected is what distinguishes "no such role",
+	// "already deleted", and "system role" from a live one, and doing it before
+	// the detaching writes means an ineligible role costs nothing.
+	ct, err := tx.Exec(ctx, `
+		UPDATE roles SET deleted_at = NOW(), is_default = false, updated_at = NOW()
+		WHERE id = $1 AND tenant_id = $2 AND is_system = false AND deleted_at IS NULL
 	`, roleID, tenantID)
 	if err != nil {
-		return fmt.Errorf("delete role: %w", err)
+		return nil, fmt.Errorf("delete role: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	return nil
+
+	// Collected before the detach, for the same reason RevokeAllUserSessions
+	// counts before revoking: afterwards there is nobody left to collect.
+	// Soft-deleted users are excluded — they hold no sessions to deny and do not
+	// belong in an audit record of who was affected.
+	// Both sources, unioned: users.role_id names the holders for whom this was the
+	// primary role, user_roles names everyone who holds it at all. Reading only
+	// the scalar column would miss every user who holds the role
+	// non-primarily — since #146 phase 2 that is most of them — and leave their
+	// sessions un-revoked and their names out of the audit record.
+	rows, err := tx.Query(ctx, `
+		SELECT u.id FROM users u
+		WHERE u.tenant_id = $2 AND u.deleted_at IS NULL
+		  AND (u.role_id = $1
+		       OR EXISTS (SELECT 1 FROM user_roles ur
+		                  WHERE ur.user_id = u.id AND ur.role_id = $1))
+		ORDER BY u.id
+	`, roleID, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("delete role: collect holders: %w", err)
+	}
+	holders := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("delete role: scan holder: %w", err)
+		}
+		holders = append(holders, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("delete role: iterate holders: %w", err)
+	}
+
+	// Standing in for FK2, ON DELETE CASCADE.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM role_permissions WHERE role_id = $1`, roleID); err != nil {
+		return nil, fmt.Errorf("delete role: strip permissions: %w", err)
+	}
+
+	// Standing in for FK1, ON DELETE SET NULL. Not scoped to the holders read
+	// above: that read excludes soft-deleted users, and leaving their role_id
+	// dangling would resurrect the deleted role's name on their next admin-API
+	// appearance.
+	if _, err := tx.Exec(ctx,
+		`UPDATE users SET role_id = NULL, updated_at = NOW()
+		 WHERE role_id = $1 AND tenant_id = $2`, roleID, tenantID); err != nil {
+		return nil, fmt.Errorf("delete role: detach holders: %w", err)
+	}
+
+	// user_roles has its own ON DELETE CASCADE, which a soft delete does not fire
+	// either. Left in place the grants would outlive the role and keep resolving:
+	// loadPermissions filters r.deleted_at so the permissions would not flow, but
+	// the role would still be listed as held, and any later un-delete would
+	// silently restore every grant. Removing them makes deletion mean deletion.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM user_roles WHERE role_id = $1 AND tenant_id = $2`,
+		roleID, tenantID); err != nil {
+		return nil, fmt.Errorf("delete role: revoke grants: %w", err)
+	}
+
+	// Promote a surviving grant for anyone whose primary this was, so a user who
+	// still holds other roles does not drop to no primary at all.
+	if _, err := tx.Exec(ctx, `
+		UPDATE users u SET role_id = (
+			SELECT ur.role_id FROM user_roles ur
+			JOIN roles r ON r.id = ur.role_id AND r.deleted_at IS NULL
+			WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+			ORDER BY ur.granted_at, ur.role_id
+			LIMIT 1
+		), updated_at = NOW()
+		WHERE u.tenant_id = $1 AND u.role_id IS NULL
+		  AND EXISTS (SELECT 1 FROM user_roles ur2 WHERE ur2.user_id = u.id)
+	`, tenantID); err != nil {
+		return nil, fmt.Errorf("delete role: repoint primaries: %w", err)
+	}
+
+	// Standing in for FK3, ON DELETE SET NULL. NULL is 00063's documented
+	// fail-closed restore value.
+	if _, err := tx.Exec(ctx,
+		`UPDATE tenant_admins SET previous_role_id = NULL
+		 WHERE previous_role_id = $1 AND tenant_id = $2`, roleID, tenantID); err != nil {
+		return nil, fmt.Errorf("delete role: clear previous-role references: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit delete role: %w", err)
+	}
+
+	// Pipelined rather than a loop: this endpoint explicitly supports roles held
+	// by thousands, and one round trip per holder would block the caller for
+	// seconds and leave a mid-flight Redis failure with half the holders denied
+	// and half not.
+	s.denyManyUserSessions(ctx, holders, tenantID, "role deleted")
+	return holders, nil
 }
 
 // SetDefaultRole marks roleID as the default role for applicationID, clearing
@@ -1412,8 +1579,11 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 
 	var isSystem bool
 	var appID *int64
+	// deleted_at IS NULL: a soft-deleted role must not become an application's
+	// default, which would hand it to every user who registers afterwards.
 	err = tx.QueryRow(ctx, `
-		SELECT is_system, application_id FROM roles WHERE id = $1 AND tenant_id = $2
+		SELECT is_system, application_id FROM roles
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, roleID, tenantID).Scan(&isSystem, &appID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1425,6 +1595,13 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 		return ErrSystemRole
 	}
 
+	// Deliberately NOT filtered on deleted_at, unlike every other statement in
+	// this function. This is what frees the one-default-per-application slot, and
+	// a soft-deleted row that still carried is_default = true would hold that slot
+	// against the UPDATE below. DeleteRole clears the flag and 00091 narrows the
+	// index, so such a row should not exist — but this statement is the only thing
+	// that can unstick one written before either landed, and filtering it here
+	// would turn that stale row into a permanent 23505 on this application.
 	_, err = tx.Exec(ctx, `
 		UPDATE roles SET is_default = false
 		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
@@ -1435,7 +1612,7 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 
 	_, err = tx.Exec(ctx, `
 		UPDATE roles SET is_default = true
-		WHERE id = $1 AND tenant_id = $2 AND application_id = $3
+		WHERE id = $1 AND tenant_id = $2 AND application_id = $3 AND deleted_at IS NULL
 	`, roleID, tenantID, applicationID)
 	if err != nil {
 		return fmt.Errorf("set default role: %w", err)
@@ -1489,7 +1666,7 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at,
 		       `+userEnrichmentColumns+`
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.tenant_id = $1
 		  AND u.deleted_at IS NULL
 		  AND ($2::BIGINT IS NULL OR u.application_id = $2)
@@ -1512,7 +1689,8 @@ func (s *Service) ListUsers(ctx context.Context, tenantID int64, applicationID *
 		if err := rows.Scan(&id, &tid, &appID, &u.Email, &u.FirstName, &u.LastName,
 			&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 			&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
-			&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt); err != nil {
+			&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt,
+			&u.Roles); err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		u.ID = strconv.FormatInt(id, 10)
@@ -1560,8 +1738,11 @@ func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID 
 	if roleID != nil {
 		var roleAppID *int64
 		var roleIsSystem bool
+		// deleted_at IS NULL for the same reason as AssignUserRole: creating a user
+		// straight onto a soft-deleted role is the same defect by another door.
 		err := s.pool.QueryRow(ctx,
-			`SELECT application_id, is_system FROM roles WHERE id = $1 AND tenant_id = $2`,
+			`SELECT application_id, is_system FROM roles
+			 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 			*roleID, tenantID,
 		).Scan(&roleAppID, &roleIsSystem)
 		if err != nil {
@@ -1600,6 +1781,21 @@ func (s *Service) CreateUser(ctx context.Context, tenantID int64, applicationID 
 			return nil, ErrAlreadyExists
 		}
 		return nil, fmt.Errorf("insert user: %w", err)
+	}
+
+	// Mirror the initial role into user_roles, in the same transaction that wrote
+	// role_id. Since #146 phase 2 the join table is what resolution reads, so a
+	// user created with a role but no row here would hold it according to
+	// users.role_id and hold nothing according to every permission query — a user
+	// who appears to have a role and can do nothing with it.
+	if roleID != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (user_id, role_id) DO NOTHING
+		`, userID, *roleID, tenantID, nil); err != nil {
+			return nil, fmt.Errorf("record initial role grant: %w", err)
+		}
 	}
 
 	_, err = tx.Exec(ctx, `
@@ -1730,18 +1926,111 @@ func (s *Service) UpdateUser(ctx context.Context, tenantID int64, applicationID 
 // is "super_admin", so the same call would confer tenant:manage — authority over
 // every tenant.
 // applicationID optionally pins the user lookup to one application.
-func (s *Service) AssignUserRole(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64) error {
+//
+// REPLACEMENT, NOT ADDITION. The user ends up holding exactly roleID; whatever
+// they held before is discarded. The route is a PUT on a singular noun, which
+// says so, but the name reads like "add a role" and the schema permits only one
+// — so calling this twice with two different roles leaves the user holding the
+// second alone, with no error and no warning. There is no additive form. When
+// one arrives it will be a POST to a plural collection, not this.
+//
+// Every live session is denied once the new role is committed. Permissions are
+// baked into the JWT at login by loadPermissions and read from claims.Permissions
+// by the middleware; nothing re-reads the database per request. Without the deny,
+// a demotion is invisible to enforcement until the access token expires, so a
+// user demoted from admin to viewer goes on exercising admin permissions for the
+// remainder of its TTL (#146).
+// grantedBy is the acting administrator's users.id, recorded as the grant's
+// provenance; nil when the caller has no user behind it (a service token).
+func (s *Service) AssignUserRole(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64, grantedBy *int64) error {
+	// Live role, non-system, matching application scope — the same three rules
+	// AddUserRole and CreateUser enforce, in one place so they cannot drift.
+	if err := s.validateRoleForUser(ctx, tenantID, applicationID, userID, roleID); err != nil {
+		return err
+	}
+
+	// Transactional because role_id and user_roles must agree: role_id is the
+	// primary role and user_roles is the full set, and a reader that saw one
+	// updated without the other would resolve permissions that match neither.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin assign role tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	ct, err := tx.Exec(ctx, `
+		UPDATE users SET role_id = $1, updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
+	`, roleID, userID, tenantID)
+	if err != nil {
+		return fmt.Errorf("assign role: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+
+	// REPLACE, matching this endpoint's contract: everything the user held goes,
+	// and roleID is what remains. AddUserRole is the additive form; this one is
+	// deliberately not, because four PUT routes have meant replacement since long
+	// before user_roles existed and quietly turning them additive would change
+	// what every existing caller does.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM user_roles WHERE user_id = $1 AND tenant_id = $2`,
+		userID, tenantID); err != nil {
+		return fmt.Errorf("assign role: clear roles: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (user_id, role_id) DO NOTHING
+	`, userID, roleID, tenantID, grantedBy); err != nil {
+		return fmt.Errorf("assign role: record grant: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit assign role: %w", err)
+	}
+
+	// After the write lands, never before: the denylist entry cannot be rolled
+	// back, so denying sessions for a role change that then failed would sign a
+	// user out on the strength of a write that never happened. Same ordering and
+	// same reasoning as RevokeAllUserSessions.
+	//
+	// Deliberately NOT a users.token_version bump. That counter reads like the
+	// account-wide kill switch and is written by nine paths, but nothing in this
+	// codebase verifies it — it has never affected token validity. The denylist
+	// is the only mechanism that invalidates an issued access token.
+	//
+	// The entry is account-wide, so this signs the user out of every device, not
+	// just the one whose permissions changed. That is the correct blast radius:
+	// the stale permissions are in every token the account holds. It is not a
+	// forced re-login — the entry stores the revocation instant, so tokens minted
+	// afterwards pass, and the refresh path re-reads permissions from the database
+	// and mints a correctly-scoped token without the user re-authenticating.
+	s.denyUserSessions(ctx, userID, tenantID, "role assignment")
+	return nil
+}
+
+// validateRoleForUser applies the three rules every role grant must satisfy: the
+// role must be live, it must not be a system role, and its application scope must
+// match the user's.
+//
+// Extracted because AssignUserRole, AddUserRole, and CreateUser each enforced the
+// same three checks with their own copy of the SQL — which is how CreateUser came
+// to be missing the deleted_at predicate the other two had. One implementation
+// means the next rule lands in one place.
+func (s *Service) validateRoleForUser(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64) error {
 	var roleAppID *int64
 	var roleIsSystem bool
 	err := s.pool.QueryRow(ctx,
-		`SELECT application_id, is_system FROM roles WHERE id = $1 AND tenant_id = $2`,
+		`SELECT application_id, is_system FROM roles
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		roleID, tenantID,
 	).Scan(&roleAppID, &roleIsSystem)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
-		return fmt.Errorf("assign role: lookup role: %w", err)
+		return fmt.Errorf("validate role: lookup role: %w", err)
 	}
 	if roleIsSystem {
 		return ErrSystemRole
@@ -1757,24 +2046,224 @@ func (s *Service) AssignUserRole(ctx context.Context, tenantID int64, applicatio
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
 		}
-		return fmt.Errorf("assign role: lookup user: %w", err)
+		return fmt.Errorf("validate role: lookup user: %w", err)
 	}
-
 	if !int64PtrEqual(roleAppID, userAppID) {
 		return ErrRoleScope
 	}
+	return nil
+}
 
-	ct, err := s.pool.Exec(ctx, `
-		UPDATE users SET role_id = $1, updated_at = NOW()
-		WHERE id = $2 AND tenant_id = $3 AND deleted_at IS NULL
-	`, roleID, userID, tenantID)
+// AddUserRole grants roleID to the user IN ADDITION to whatever they already
+// hold — issue #146, phase 2.
+//
+// The additive counterpart to AssignUserRole, and a separate method rather than a
+// flag because the two have genuinely different contracts: this one composes,
+// that one replaces. Idempotent, so a client that retries a timed-out request does
+// not fail on the second attempt; re-granting a held role refreshes nothing and
+// returns success.
+//
+// The same three rules as replacement apply — live role, non-system, matching
+// application scope. is_system in particular stays refused here: administrative
+// roles are acquired by accepting an invitation, which writes the tenant_admins
+// row that records the grant, and an additive path would otherwise be a second
+// door to the same escalation AssignUserRole already closes.
+//
+// users.role_id is promoted when the user had none, so an account that held
+// nothing gains a primary role rather than holding roles with no primary among
+// them. An existing primary is left alone: it is what the `role` claim carries,
+// and reshuffling it because an unrelated role was added would make that claim
+// flap for consumers that have not yet migrated to `roles`.
+func (s *Service) AddUserRole(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64, grantedBy *int64) error {
+	if err := s.validateRoleForUser(ctx, tenantID, applicationID, userID, roleID); err != nil {
+		return err
+	}
+
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("assign role: %w", err)
+		return fmt.Errorf("begin add role tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (user_id, role_id) DO NOTHING
+	`, userID, roleID, tenantID, grantedBy); err != nil {
+		return fmt.Errorf("add role: %w", err)
+	}
+
+	// Promotion, not replacement: only fires when role_id IS NULL.
+	if _, err := tx.Exec(ctx, `
+		UPDATE users SET role_id = $1, updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND role_id IS NULL AND deleted_at IS NULL
+	`, roleID, userID, tenantID); err != nil {
+		return fmt.Errorf("add role: promote primary: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit add role: %w", err)
+	}
+
+	// Additive changes need revocation as much as removals do: the user's existing
+	// tokens carry the OLD permission set, so without this the new role does
+	// nothing until they expire — the same defect #146 fixed for replacement.
+	s.denyUserSessions(ctx, userID, tenantID, "role added")
+	return nil
+}
+
+// RemoveUserRole revokes one role from a user, leaving the rest — issue #146,
+// phase 2.
+//
+// ErrNotFound when the user did not hold the role, rather than a silent success:
+// an operator removing a role that was never there has a stale picture of who
+// holds what, and reporting success would confirm a belief that is wrong.
+//
+// When the removed role was the primary, the earliest surviving grant is promoted
+// in its place. Leaving role_id pointing at a revoked role would keep its name in
+// the `role` claim, and NULLing it would drop a user who still holds roles to no
+// primary at all — so the rule is "promote the next one", and only when nothing
+// survives does role_id become NULL.
+func (s *Service) RemoveUserRole(ctx context.Context, tenantID int64, applicationID *int64, userID, roleID int64) error {
+	// Scope check by the same rules as granting: an administrator confined to one
+	// application must not be able to strip a role from a user outside it.
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM users
+			WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			  AND ($3::BIGINT IS NULL OR application_id = $3)
+		)
+	`, userID, tenantID, applicationID).Scan(&exists); err != nil {
+		return fmt.Errorf("remove role: lookup user: %w", err)
+	}
+	if !exists {
+		return ErrNotFound
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin remove role tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	ct, err := tx.Exec(ctx,
+		`DELETE FROM user_roles WHERE user_id = $1 AND role_id = $2 AND tenant_id = $3`,
+		userID, roleID, tenantID)
+	if err != nil {
+		return fmt.Errorf("remove role: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
 		return ErrNotFound
 	}
+
+	// Promote the earliest surviving grant when the primary is what just went.
+	// Soft-deleted roles are excluded from the candidates, so a tombstone cannot
+	// be promoted into the claim a live role just vacated.
+	if _, err := tx.Exec(ctx, `
+		UPDATE users u SET role_id = (
+			SELECT ur.role_id FROM user_roles ur
+			JOIN roles r ON r.id = ur.role_id AND r.deleted_at IS NULL
+			WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+			ORDER BY ur.granted_at, ur.role_id
+			LIMIT 1
+		), updated_at = NOW()
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.role_id = $3
+	`, userID, tenantID, roleID); err != nil {
+		return fmt.Errorf("remove role: repoint primary: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit remove role: %w", err)
+	}
+
+	s.denyUserSessions(ctx, userID, tenantID, "role removed")
 	return nil
+}
+
+// ListUserRoles returns every live role a user holds, with its provenance.
+func (s *Service) ListUserRoles(ctx context.Context, tenantID int64, applicationID *int64, userID int64) ([]UserRoleResult, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT r.id, r.name, r.application_id, ur.granted_by, g.email, ur.granted_at,
+		       (u.role_id = r.id) AS is_primary
+		FROM user_roles ur
+		JOIN roles r ON r.id = ur.role_id AND r.deleted_at IS NULL
+		JOIN users u ON u.id = ur.user_id
+		LEFT JOIN users g ON g.id = ur.granted_by
+		WHERE ur.user_id = $1 AND ur.tenant_id = $2
+		  AND u.deleted_at IS NULL
+		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
+		ORDER BY ur.granted_at, r.id
+	`, userID, tenantID, applicationID)
+	if err != nil {
+		return nil, fmt.Errorf("list user roles: %w", err)
+	}
+	defer rows.Close()
+
+	out := []UserRoleResult{}
+	for rows.Next() {
+		var (
+			id, appID    *int64
+			grantedBy    *int64
+			grantedEmail *string
+			r            UserRoleResult
+		)
+		if err := rows.Scan(&id, &r.Name, &appID, &grantedBy, &grantedEmail, &r.GrantedAt, &r.IsPrimary); err != nil {
+			return nil, fmt.Errorf("scan user role: %w", err)
+		}
+		if id != nil {
+			r.ID = strconv.FormatInt(*id, 10)
+		}
+		if appID != nil {
+			s := strconv.FormatInt(*appID, 10)
+			r.ApplicationID = &s
+		}
+		if grantedBy != nil {
+			s := strconv.FormatInt(*grantedBy, 10)
+			r.GrantedBy = &s
+		}
+		r.GrantedByEmail = grantedEmail
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// denyUserSessions ends every live session for an account after a change to what
+// that account may do.
+//
+// Wrapped rather than called directly because authSvc is optional — a Service
+// built without WithAuthService (as several tests are) would otherwise skip
+// revocation silently, which is the exact failure this package keeps re-learning.
+// The warning names the deployment mistake rather than leaving a security control
+// quietly disabled.
+func (s *Service) denyUserSessions(ctx context.Context, userID, tenantID int64, reason string) {
+	if s.authSvc == nil {
+		s.logger.Warn().
+			Int64("user_id", userID).Int64("tenant_id", tenantID).Str("reason", reason).
+			Msg("admin: auth service not wired; sessions stay valid until the access token expires")
+		return
+	}
+	s.authSvc.DenyUserSessions(ctx, userID, tenantID)
+}
+
+// denyManyUserSessions is denyUserSessions for a set of accounts, pipelined.
+//
+// Separate from the singular form rather than looping it, because the loop is the
+// thing being avoided: a role held by thousands would otherwise cost one blocking
+// round trip per holder after the commit.
+func (s *Service) denyManyUserSessions(ctx context.Context, userIDs []int64, tenantID int64, reason string) {
+	if len(userIDs) == 0 {
+		return
+	}
+	if s.authSvc == nil {
+		s.logger.Warn().
+			Int("users", len(userIDs)).Int64("tenant_id", tenantID).Str("reason", reason).
+			Msg("admin: auth service not wired; sessions stay valid until their access tokens expire")
+		return
+	}
+	// The failure count is logged by the auth service, which knows how many
+	// commands it issued; surfacing it again here would double-report.
+	_ = s.authSvc.DenyManyUserSessions(ctx, userIDs, tenantID)
 }
 
 // DeleteUser soft-deletes a user (sets deleted_at, is_active = false), with
@@ -2468,13 +2957,13 @@ func (s *Service) ListOwnedTenants(ctx context.Context, email string) ([]OwnedTe
 			-- switcher and this table never report different numbers for one
 			-- tenant.
 			--
-			-- role_count takes no deleted_at filter, and matches ListRoles, which
-			-- takes none either: roles are hard-DELETEd (see DeleteRole), so the
-			-- deleted_at column migration 00020 added to the table is never
-			-- written. Filtering on it would only imply a soft-delete path that
-			-- does not exist.
+			-- role_count filters deleted_at and matches ListRoles, which filters it
+			-- too. Both took no filter until #146: DeleteRole hard-DELETEd, so the
+			-- column 00020 added was never written and filtering on it would only
+			-- have implied a soft-delete path that did not exist. It exists now, and
+			-- an unfiltered count here would report tombstones as live roles.
 			(SELECT COUNT(*) FROM users        WHERE tenant_id = t.id AND deleted_at IS NULL) AS user_count,
-			(SELECT COUNT(*) FROM roles        WHERE tenant_id = t.id)                        AS role_count,
+			(SELECT COUNT(*) FROM roles        WHERE tenant_id = t.id AND deleted_at IS NULL) AS role_count,
 			(SELECT COUNT(*) FROM oauth_clients WHERE tenant_id = t.id AND deleted_at IS NULL) AS app_count
 		FROM admin_grants g
 		JOIN users u   ON u.id = g.user_id
@@ -2604,7 +3093,13 @@ const userEnrichmentColumns = `
 	               ORDER BY lp.application_id NULLS LAST, lp.tenant_id NULLS LAST
 	               LIMIT 1
 	           )
-	       END AS lock_expires_at`
+	       END AS lock_expires_at,
+	       -- Every live role the user holds (#146), primary first. u.role_id alone
+	       -- is only the primary, so the console's Roles column needs the set.
+	       (SELECT COALESCE(array_agg(ur_r.name ORDER BY (ur_r.id = u.role_id) DESC, ur_r.name), '{}')
+	        FROM user_roles ur
+	        JOIN roles ur_r ON ur_r.id = ur.role_id AND ur_r.deleted_at IS NULL
+	        WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id) AS roles`
 
 // buildConnections merges the password credential and federated providers
 // into the public Connections list ("password", "google", ...).
@@ -2627,7 +3122,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 		       COALESCE(r.name, '') as role_name, u.role_id, u.is_active, u.created_at,
 		       `+userEnrichmentColumns+`
 		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
 		  AND ($3::BIGINT IS NULL OR u.application_id = $3)
 	`, userID, tenantID, applicationID).Scan(
@@ -2635,6 +3130,7 @@ func (s *Service) getUserByID(ctx context.Context, tenantID int64, applicationID
 		&u.Role, &roleID, &u.IsActive, &u.CreatedAt,
 		&u.LastLoginAt, &u.LoginsCount, &hasPassword, &providers,
 		&u.BlockedAt, &u.BlockReason, &u.FailedLoginAttempts, &u.LockExpiresAt,
+		&u.Roles,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -2662,7 +3158,7 @@ func (s *Service) getRoleByID(ctx context.Context, tenantID, roleID int64) (*Rol
 	var appID *int64
 	err := s.pool.QueryRow(ctx, `
 		SELECT id, tenant_id, application_id, name, is_system, is_default, created_at
-		FROM roles WHERE id = $1 AND tenant_id = $2
+		FROM roles WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
 	`, roleID, tenantID).Scan(&id, &tid, &appID, &r.Name, &r.IsSystem, &r.IsDefault, &r.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

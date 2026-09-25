@@ -566,23 +566,29 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 	}
 
 	// 3. JIT provision — same default-role query as application Register.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, "", fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Read inside the transaction that consumes it, and locked, exactly as
+	// application Register does. On the pool and unlocked, a SetDefaultRole
+	// committing between this SELECT and the INSERT below left the new user on
+	// the superseded default — silently, and for the life of the account.
 	var roleID *int64
 	var tempRoleID int64
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT id FROM roles
-		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true AND is_system = false
+		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
+		  AND is_system = false AND deleted_at IS NULL
+		FOR SHARE
 	`, st.TenantID, st.AppRowID).Scan(&tempRoleID)
 	if err == nil {
 		roleID = &tempRoleID
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		return 0, "", fmt.Errorf("fetch default role: %w", err)
 	}
-
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return 0, "", fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
 
 	// email_verified=true: the provider attested the address. No
 	// user_credentials row — password login is structurally impossible for
@@ -594,6 +600,19 @@ func (s *OAuthLoginService) resolveUser(ctx context.Context, st *OAuthState, ide
 	`, st.TenantID, ident.Email, ident.FirstName, ident.LastName, roleID, st.AppRowID).Scan(&userID)
 	if err != nil {
 		return 0, "", fmt.Errorf("insert JIT user: %w", err)
+	}
+
+	// Mirror into user_roles, as application Register does: the join table is what
+	// resolution reads since #146 phase 2, and a JIT user with only role_id set
+	// would sign in carrying none of that role's permissions.
+	if roleID != nil {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
+			VALUES ($1, $2, $3, NULL)
+			ON CONFLICT (user_id, role_id) DO NOTHING
+		`, userID, *roleID, st.TenantID); err != nil {
+			return 0, "", fmt.Errorf("record JIT default role grant: %w", err)
+		}
 	}
 
 	_, err = tx.Exec(ctx, `
@@ -711,7 +730,7 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 		SELECT u.email, COALESCE(r.name, ''), oc.id
 		FROM   users u
 		JOIN   oauth_clients oc ON oc.client_id = $3 AND oc.tenant_id = $2 AND oc.deleted_at IS NULL
-		LEFT   JOIN roles r ON r.id = u.role_id
+		LEFT   JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
 		WHERE  u.id = $1 AND u.tenant_id = $2
 		  AND  u.is_active = true AND u.deleted_at IS NULL
 	`, userID, tenantID, clientID).Scan(&email, &roleName, &appRowID)
