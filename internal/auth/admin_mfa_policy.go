@@ -145,11 +145,12 @@ func NewAdminMFAPolicyService(pool *pgxpool.Pool, logger zerolog.Logger) *AdminM
 // Resolve returns the policy for a tenant's administrators, or for platform
 // administrators when tenantID is 0.
 //
-// Never fails. A read error falls back to the shipped default and logs: the
-// requirement is mandatory whatever this returns, so the fallback only decides
-// WHICH factors satisfy it, never WHETHER one is needed. Refusing every
-// administrator sign-in because a settings table was briefly unreadable would
-// turn a transient fault into an outage with no security benefit.
+// Never returns an error, but fails CLOSED: when the policy cannot be read it
+// allows no method at all, so sign-in answers 503 mfa_unavailable. Falling back
+// to the default instead would re-admit a method the tenant had deliberately
+// switched off (email, say) for as long as the database is struggling. Only a
+// missing platform row — no restriction configured anywhere — resolves to the
+// shipped default. Failures are not cached, so recovery is immediate.
 func (s *AdminMFAPolicyService) Resolve(ctx context.Context, tenantID int64) AdminMFAPolicy {
 	if s == nil || s.pool == nil {
 		return AdminMFAPolicy{AllowedMethods: DefaultAdminMFAMethods(), Source: "default"}
@@ -163,10 +164,12 @@ func (s *AdminMFAPolicyService) Resolve(ctx context.Context, tenantID int64) Adm
 	}
 
 	policy, err := s.load(ctx, tenantID)
-	if err != nil {
-		s.logger.Warn().Err(err).Int64("tenant_id", tenantID).
-			Msg("admin MFA policy: resolve failed, using the shipped default methods")
-		return AdminMFAPolicy{AllowedMethods: DefaultAdminMFAMethods(), Source: "default"}
+	if errors.Is(err, errNoAdminMFAPolicyRow) {
+		policy = AdminMFAPolicy{AllowedMethods: DefaultAdminMFAMethods(), Source: "default"}
+	} else if err != nil {
+		s.logger.Error().Err(err).Int64("tenant_id", tenantID).
+			Msg("admin MFA policy: resolve failed — no method is allowed until it can be read")
+		return AdminMFAPolicy{AllowedMethods: nil, Source: "unavailable"}
 	}
 
 	s.mu.Lock()
@@ -174,6 +177,10 @@ func (s *AdminMFAPolicyService) Resolve(ctx context.Context, tenantID int64) Adm
 	s.mu.Unlock()
 	return policy
 }
+
+// errNoAdminMFAPolicyRow means neither the tenant nor the platform has a row:
+// nothing is configured, as opposed to a read that failed.
+var errNoAdminMFAPolicyRow = errors.New("no admin MFA policy row (platform row missing)")
 
 // load reads the most specific row: the tenant's own, else the platform row.
 func (s *AdminMFAPolicyService) load(ctx context.Context, tenantID int64) (AdminMFAPolicy, error) {
@@ -188,7 +195,7 @@ func (s *AdminMFAPolicyService) load(ctx context.Context, tenantID int64) (Admin
 	`, tenantID).Scan(&methods, &isPlatform)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return AdminMFAPolicy{}, fmt.Errorf("no admin MFA policy row matched (platform row missing?)")
+			return AdminMFAPolicy{}, errNoAdminMFAPolicyRow
 		}
 		return AdminMFAPolicy{}, fmt.Errorf("load admin MFA policy: %w", err)
 	}
@@ -247,15 +254,40 @@ func (s *AuthService) administratorKind(ctx context.Context, userID int64, perms
 	if admin {
 		return true, false, nil
 	}
+	// perms is only a fast path. It can come back empty because the permission
+	// load failed (callers degrade that to an empty set), or narrowed by a
+	// session role scope, and neither may be taken as proof that the account is
+	// not an administrator: a platform administrator has no admin_grants row, so
+	// trusting perms alone would let either case sign in without MFA. The
+	// database is asked directly — every role the user holds, their direct
+	// grants, and admin_grants — and an error here fails the sign-in.
+	var grant, platformRole, adminRole bool
 	if err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM admin_grants
-			WHERE user_id = $1 AND deleted_at IS NULL AND activated_at IS NOT NULL
+		WITH held AS (
+			SELECT p.name
+			FROM user_roles ur
+			JOIN roles r            ON r.id = ur.role_id AND r.deleted_at IS NULL AND r.application_id IS NULL
+			JOIN role_permissions rp ON rp.role_id = r.id
+			JOIN permissions p      ON p.id = rp.permission_id AND p.application_id IS NULL
+			WHERE ur.user_id = $1
+			UNION
+			SELECT p.name
+			FROM user_permissions up
+			JOIN permissions p ON p.id = up.permission_id AND p.application_id IS NULL
+			WHERE up.user_id = $1
 		)
-	`, userID).Scan(&admin); err != nil {
-		return false, false, fmt.Errorf("check administrator grants: %w", err)
+		SELECT
+			EXISTS (SELECT 1 FROM admin_grants
+			        WHERE user_id = $1 AND deleted_at IS NULL AND activated_at IS NOT NULL),
+			EXISTS (SELECT 1 FROM held WHERE name = 'tenant:manage'),
+			EXISTS (SELECT 1 FROM held WHERE name = 'admin:access')
+	`, userID).Scan(&grant, &platformRole, &adminRole); err != nil {
+		return false, false, fmt.Errorf("check administrator standing: %w", err)
 	}
-	return admin, false, nil
+	if platformRole {
+		return true, true, nil
+	}
+	return grant || adminRole, false, nil
 }
 
 // AdminMFAPolicyFor resolves the policy governing one administrator: the

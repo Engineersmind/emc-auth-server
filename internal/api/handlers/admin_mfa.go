@@ -252,7 +252,7 @@ func (h *AdminHandler) GetAdminMFAPolicy(c echo.Context) error {
 // UpdateAdminMFAPolicy handles PUT /api/v1/tenants/:tid/admin-mfa-policy.
 //
 // @Summary      Set the administrator MFA policy
-// @Description  Sets which methods (passkey, totp, email) satisfy mandatory MFA for this tenant's administrators. At least one method is required; MFA itself cannot be turned off.
+// @Description  Sets which methods (totp, email) satisfy mandatory MFA for this tenant's administrators. At least one method is required; MFA itself cannot be turned off.
 // @Tags         admin-security
 // @Accept       json
 // @Produce      json
@@ -366,8 +366,9 @@ func (h *AdminHandler) setAdminMFAPolicy(c echo.Context, claims *auth.Claims, te
 // Removes every factor the administrator has (TOTP and backup codes, email
 // MFA, passkeys) and signs them out everywhere; their next sign-in enrolls
 // again. Nobody may reset their own MFA — that would let a stolen session
-// replace the factor it was missing. Co-owners never reach this route: it is
-// tenant-level, and the route guard refuses application-scoped callers.
+// replace the factor it was missing. The caller needs the standing to remove
+// the administrator (AssertMayRemove): a platform administrator, or an owner
+// acting on a co-owner. users:write alone is not enough.
 //
 // @Summary      Reset an administrator's MFA
 // @Tags         admin-tenant-admins
@@ -378,6 +379,7 @@ func (h *AdminHandler) setAdminMFAPolicy(c echo.Context, claims *auth.Claims, te
 // @Success      200  {object}  map[string]string
 // @Failure      403  {object}  APIError  "mfa_reset_forbidden"
 // @Failure      404  {object}  map[string]string
+// @Failure      503  {object}  map[string]string  "reset, but sessions could not be revoked — retry"
 // @Router       /api/v1/tenants/{tid}/admins/{adminID}/mfa [delete]
 func (h *AdminHandler) ResetAdministratorMFA(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
@@ -393,16 +395,18 @@ func (h *AdminHandler) ResetAdministratorMFA(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
-	targetID, homeTenant, err := h.svc.AdministratorForReset(ctx, tenantID, adminID)
+	targetID, homeTenant, err := h.svc.AdministratorForReset(ctx, tenantID, adminID, grantActorFromClaims(claims))
 	if err != nil {
-		if errors.Is(err, admin.ErrNotFound) {
+		switch {
+		case errors.Is(err, admin.ErrNotFound):
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "administrator not found"})
+		case errors.Is(err, admin.ErrCannotModifyOwnGrant),
+			errors.Is(err, admin.ErrOwnerCannotRemoveOwner),
+			errors.Is(err, admin.ErrForbiddenGrantWrite):
+			return fail(c, http.StatusForbidden, "mfa_reset_forbidden")
 		}
 		h.logger.Error().Err(err).Msg("admin: resolve administrator for MFA reset failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to reset MFA"})
-	}
-	if actor := actorUserID(claims); actor != nil && *actor == targetID {
-		return fail(c, http.StatusForbidden, "mfa_reset_forbidden")
 	}
 
 	if err := h.totpSvc.ResetUserMFA(ctx, homeTenant, nil, targetID); err != nil {
@@ -416,8 +420,14 @@ func (h *AdminHandler) ResetAdministratorMFA(c echo.Context) error {
 	// the reset a recovery rather than a new factor next to a live compromise.
 	revoked, err := h.svc.RevokeAllUserSessions(ctx, homeTenant, nil, targetID)
 	if err != nil {
+		// Do not report a sign-out that did not happen: a live session left
+		// behind is the very thing this recovery exists to end. The factor reset
+		// is idempotent, so retrying the request is safe.
 		h.logger.Error().Err(err).Int64("user_id", targetID).
 			Msg("admin: administrator MFA was reset but sessions could not be revoked")
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{
+			"error": "MFA was reset but the administrator could not be signed out — retry the request",
+		})
 	}
 
 	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUserMFAReset, "user",

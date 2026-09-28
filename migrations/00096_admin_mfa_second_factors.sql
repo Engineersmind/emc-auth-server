@@ -9,21 +9,17 @@
 -- that ran those drafts to the final shape; on a fresh database 00094 already
 -- creates it and every statement below is a no-op.
 
+-- In one statement: removing 'passkey' from a policy that listed nothing else
+-- would leave it empty, which the non-empty CHECK refuses mid-update. Such a
+-- policy gets both second factors instead. Every other selection is kept as the
+-- operator set it.
 UPDATE admin_mfa_policies
-SET allowed_methods = array_remove(allowed_methods, 'passkey'), updated_at = NOW()
+SET allowed_methods = CASE
+        WHEN cardinality(array_remove(allowed_methods, 'passkey')) = 0 THEN '{totp,email}'::TEXT[]
+        ELSE array_remove(allowed_methods, 'passkey')
+    END,
+    updated_at = NOW()
 WHERE 'passkey' = ANY (allowed_methods);
-
--- A policy that listed only passkeys would now allow nothing, which the
--- requirement cannot survive. Give it both second factors.
-UPDATE admin_mfa_policies
-SET allowed_methods = '{totp,email}', updated_at = NOW()
-WHERE cardinality(allowed_methods) = 0;
-
--- The platform default is both second factors, so an administrator always has
--- a fallback when one is not to hand.
-UPDATE admin_mfa_policies
-SET allowed_methods = '{totp,email}', updated_at = NOW()
-WHERE tenant_id IS NULL;
 
 INSERT INTO admin_mfa_policies (tenant_id, allowed_methods)
 SELECT NULL, '{totp,email}'

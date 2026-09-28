@@ -7815,7 +7815,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sets which methods (passkey, totp, email) satisfy mandatory MFA for this tenant's administrators. At least one method is required; MFA itself cannot be turned off.",
+                "description": "Sets which methods (totp, email) satisfy mandatory MFA for this tenant's administrators. At least one method is required; MFA itself cannot be turned off.",
                 "consumes": [
                     "application/json"
                 ],
@@ -8219,6 +8219,15 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "reset, but sessions could not be revoked — retry",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -10854,7 +10863,7 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "allowed_methods": {
-                    "description": "AllowedMethods, in presentation order (passkey, totp, email).",
+                    "description": "AllowedMethods, in presentation order (totp, email).",
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -12693,10 +12702,6 @@ const docTemplate = `{
                     "description": "Allowed: the caller's policy accepts this method. Always true for a\nnon-administrator, whose methods are not governed by the admin policy.",
                     "type": "boolean"
                 },
-                "always_available": {
-                    "description": "AlwaysAvailable: usable without setup and cannot be turned off (email for\nan administrator — codes go to the account's own address).",
-                    "type": "boolean"
-                },
                 "available": {
                     "description": "Available: this deployment can run the method at all.",
                     "type": "boolean"
@@ -12707,10 +12712,6 @@ const docTemplate = `{
                 },
                 "method": {
                     "type": "string"
-                },
-                "required": {
-                    "description": "Required: an administrator must keep this method set up — the\nauthenticator app wherever the policy allows it. It can be replaced (moved\nto a new phone) but not turned off.",
-                    "type": "boolean"
                 }
             }
         },

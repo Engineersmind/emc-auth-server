@@ -79,6 +79,13 @@ ALTER TABLE captcha_policies
 
 -- +goose Down
 -- +goose StatementBegin
+-- Give every policy that protects password sign-in its console flow back, as
+-- before Up removed it. Which rows had it cannot be known after the fact; the
+-- old default put it beside login, so that is the closest restoration.
+UPDATE captcha_policies
+SET protected_flows = array_append(protected_flows, 'session')
+WHERE 'login' = ANY (protected_flows) AND NOT ('session' = ANY (protected_flows));
+
 ALTER TABLE captcha_policies
     ALTER COLUMN protected_flows SET DEFAULT '{login,session,login_otp,register,forgot_password}';
 DROP TABLE IF EXISTS admin_mfa_policies;

@@ -27,7 +27,7 @@ type AdminMFAPolicyView struct {
 	Inherited bool `json:"inherited"`
 	// MFARequired is always true. Reported so a client never has to assume it.
 	MFARequired bool `json:"mfa_required"`
-	// AllowedMethods, in presentation order (passkey, totp, email).
+	// AllowedMethods, in presentation order (totp, email).
 	AllowedMethods []string `json:"allowed_methods"`
 	// SupportedMethods is every method a policy may name.
 	SupportedMethods []string `json:"supported_methods"`
@@ -146,7 +146,7 @@ var ErrInvalidAdminMFAPolicy = auth.ErrInvalidAdminMFAPolicy
 // and its home tenant, where its factors and sessions live. A tenant
 // administrator's account is often homed in a different tenant from the one
 // granting them access. Removed records are not found.
-func (s *Service) AdministratorForReset(ctx context.Context, tenantID, adminID int64) (userID, homeTenant int64, err error) {
+func (s *Service) AdministratorForReset(ctx context.Context, tenantID, adminID int64, actor GrantActor) (userID, homeTenant int64, err error) {
 	err = s.pool.QueryRow(ctx, `
 		SELECT u.id, u.tenant_id
 		FROM tenant_admins ta
@@ -159,6 +159,14 @@ func (s *Service) AdministratorForReset(ctx context.Context, tenantID, adminID i
 			return 0, 0, ErrNotFound
 		}
 		return 0, 0, fmt.Errorf("resolve administrator: %w", err)
+	}
+	// The same standing as removing the administrator: a platform administrator,
+	// or an owner of this tenant acting on a co-owner — never on a peer owner,
+	// and never on oneself. Stripping someone's factors and sessions is as
+	// consequential as removing them, and users:write alone admits tenant-wide
+	// roles that are neither.
+	if err := AssertMayRemove(ctx, s.pool, actor, tenantID, userID); err != nil {
+		return 0, 0, err
 	}
 	return userID, homeTenant, nil
 }

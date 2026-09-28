@@ -109,14 +109,38 @@ func TestAdministratorForReset_ScopedToTheTenant(t *testing.T) {
 	tenantA, adminA := newAdminTenant(t, f, "admin-mfa-reset-a")
 	tenantB, _ := newAdminTenant(t, f, "admin-mfa-reset-b")
 
-	userID, home, err := f.svc.AdministratorForReset(ctx, tenantA, adminA)
+	platform := admin.GrantActor{UserID: -1, IsPlatformAdmin: true}
+
+	userID, home, err := f.svc.AdministratorForReset(ctx, tenantA, adminA, platform)
 	if err != nil {
 		t.Fatalf("AdministratorForReset: %v", err)
 	}
 	if userID == 0 || home != tenantA {
 		t.Errorf("resolved user=%d home=%d, want a user homed in tenant %d", userID, home, tenantA)
 	}
-	if _, _, err := f.svc.AdministratorForReset(ctx, tenantB, adminA); !errors.Is(err, admin.ErrNotFound) {
+	if _, _, err := f.svc.AdministratorForReset(ctx, tenantB, adminA, platform); !errors.Is(err, admin.ErrNotFound) {
 		t.Errorf("tenant B resolving tenant A's administrator: err = %v, want ErrNotFound", err)
+	}
+}
+
+// Resetting another administrator's factors needs the standing to remove them:
+// users:write alone is not enough, and nobody may reset themselves.
+func TestAdministratorForReset_RequiresRemovalStanding(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+	tenantID, adminID := newAdminTenant(t, f, "admin-mfa-reset-authz")
+
+	target, _, err := f.svc.AdministratorForReset(ctx, tenantID, adminID, admin.GrantActor{UserID: -1, IsPlatformAdmin: true})
+	if err != nil {
+		t.Fatalf("AdministratorForReset(platform): %v", err)
+	}
+
+	// A caller holding no owner grant in the tenant: refused.
+	if _, _, err := f.svc.AdministratorForReset(ctx, tenantID, adminID, admin.GrantActor{UserID: -2}); !errors.Is(err, admin.ErrForbiddenGrantWrite) {
+		t.Errorf("non-owner caller: err = %v, want ErrForbiddenGrantWrite", err)
+	}
+	// The administrator themselves: refused.
+	if _, _, err := f.svc.AdministratorForReset(ctx, tenantID, adminID, admin.GrantActor{UserID: target}); !errors.Is(err, admin.ErrCannotModifyOwnGrant) {
+		t.Errorf("self-reset: err = %v, want ErrCannotModifyOwnGrant", err)
 	}
 }
