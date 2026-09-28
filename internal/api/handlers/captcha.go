@@ -56,8 +56,8 @@ type CaptchaChallengeRequest struct {
 	//   /auth/apps/register and /auth/forgot-password — which authenticate a
 	//   client first and verify against that application's policy.
 	ClientID string `json:"client_id"`
-	// Purpose is the flow the challenge will be spent on — "login", "session",
-	// "login_otp", "register" or "forgot_password". Bound into the challenge, so
+	// Purpose is the flow the challenge will be spent on — "login", "login_otp",
+	// "register" or "forgot_password". Bound into the challenge, so
 	// one minted for the cheap register path cannot be used on login.
 	Purpose string `json:"purpose" validate:"required"`
 	// PreviousChallengeID, when set, is burned before the new one is issued.

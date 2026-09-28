@@ -16,22 +16,12 @@ import (
 // captureMailer records admin-activity mail instead of sending it. Only the one
 // method is exercised here; the rest satisfy the interface.
 type captureMailer struct {
-	mu     sync.Mutex
-	sent   []mailer.AdminActivityEmail
-	access []mailer.AccessChangedEmail
+	mu   sync.Mutex
+	sent []mailer.AdminActivityEmail
 }
 
-func (m *captureMailer) SendAccessChanged(_ context.Context, _ *mailer.SMTPConfig, _ *mailer.Template, e mailer.AccessChangedEmail) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.access = append(m.access, e)
+func (m *captureMailer) SendAccessChanged(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.AccessChangedEmail) error {
 	return nil
-}
-
-func (m *captureMailer) accessNotices() []mailer.AccessChangedEmail {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return append([]mailer.AccessChangedEmail(nil), m.access...)
 }
 
 func (m *captureMailer) SendAdminActivity(_ context.Context, _ *mailer.SMTPConfig, _ *mailer.Template, e mailer.AdminActivityEmail) error {
@@ -94,7 +84,6 @@ func (f notifyFixture) liveSink(t *testing.T, m mailer.Mailer) *EmailSink {
 		notifier:       auth.NewEmailNotifier(m, testhelper.TestLogger()),
 		mailer:         m,
 		consoleBaseURL: "https://console.test",
-		platformEmails: []string{f.platform},
 		logger:         testhelper.TestLogger(),
 		collapseWindow: 40 * time.Millisecond,
 		flushTick:      10 * time.Millisecond,
@@ -118,9 +107,26 @@ func event(tenantID int64, actor, action, resourceType, resourceID string) audit
 	}
 }
 
-// The worked example end to end: an owner rotates a secret, and the platform
-// tier is told which tenant and which application.
-func TestEmit_OwnerSecretRotationReachesPlatform(t *testing.T) {
+func byRecipient(msgs []mailer.AdminActivityEmail) map[string]mailer.AdminActivityEmail {
+	out := map[string]mailer.AdminActivityEmail{}
+	for _, msg := range msgs {
+		out[msg.To] = msg
+	}
+	return out
+}
+
+func recipients(msgs []mailer.AdminActivityEmail) []string {
+	out := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, msg.To)
+	}
+	return out
+}
+
+// The worked example end to end: a secret is rotated, and every administrator
+// of that application — the owner and its co-owner — is told which tenant and
+// which application. A co-owner of a different application is not.
+func TestEmit_SecretRotationReachesTheApplicationsAdministrators(t *testing.T) {
 	f := newNotifyFixture(t)
 	m := &captureMailer{}
 	s := f.liveSink(t, m)
@@ -131,32 +137,83 @@ func TestEmit_OwnerSecretRotationReachesPlatform(t *testing.T) {
 	s.Close()
 
 	msgs := m.messages()
-	// Two: the platform tier, plus the actor — secret rotation is sensitive.
-	if len(msgs) != 2 {
-		t.Fatalf("sent %d messages, want 2 (platform + actor)", len(msgs))
+	if want := []string{f.owner, f.coOwner}; !equal(recipients(msgs), want) {
+		t.Fatalf("recipients = %v, want %v", sorted(recipients(msgs)), sorted(want))
 	}
-	got := map[string]mailer.AdminActivityEmail{}
-	for _, msg := range msgs {
-		got[msg.To] = msg
+	msg := byRecipient(msgs)[f.coOwner]
+	if msg.TenantName != "Notify Co" {
+		t.Errorf("TenantName = %q, want the tenant display name", msg.TenantName)
 	}
-	platform, ok := got[f.platform]
-	if !ok {
-		t.Fatalf("platform address was not notified; recipients were %v", keysOf(got))
+	if msg.ResourceName != "Web Dashboard" {
+		t.Errorf("ResourceName = %q, want the application name", msg.ResourceName)
 	}
-	if _, ok := got[f.owner]; !ok {
-		t.Errorf("actor did not get their own copy of a sensitive action")
+	if msg.ActorRole != "owner" {
+		t.Errorf("ActorRole = %q, want owner", msg.ActorRole)
 	}
-	if platform.TenantName != "Notify Co" {
-		t.Errorf("TenantName = %q, want the tenant display name", platform.TenantName)
+	if msg.ActionLabel != "rotated a client secret" {
+		t.Errorf("ActionLabel = %q", msg.ActionLabel)
 	}
-	if platform.ResourceName != "Web Dashboard" {
-		t.Errorf("ResourceName = %q, want the application name", platform.ResourceName)
+}
+
+// A deactivated tenant reaches every one of its administrators.
+func TestEmit_TenantDeactivationReachesEveryAdministrator(t *testing.T) {
+	f := newNotifyFixture(t)
+	m := &captureMailer{}
+	s := f.liveSink(t, m)
+
+	s.Emit([]audit.Event{
+		event(f.tenantID, "superadmin@platform.test", audit.ActionAdminTenantDeactivated, "tenant", itoa(f.tenantID)),
+	})
+	s.Close()
+
+	msgs := m.messages()
+	if want := []string{f.owner, f.coOwner, f.otherCoOwn}; !equal(recipients(msgs), want) {
+		t.Fatalf("recipients = %v, want %v", sorted(recipients(msgs)), sorted(want))
 	}
-	if platform.ActorRole != "owner" {
-		t.Errorf("ActorRole = %q, want owner", platform.ActorRole)
+	msg := byRecipient(msgs)[f.owner]
+	if msg.ActionLabel != "deactivated the tenant" {
+		t.Errorf("ActionLabel = %q", msg.ActionLabel)
 	}
-	if platform.ActionLabel != "rotated a client secret" {
-		t.Errorf("ActionLabel = %q", platform.ActionLabel)
+	if msg.ActorRole != "platform administrator" {
+		t.Errorf("ActorRole = %q, want platform administrator", msg.ActorRole)
+	}
+	if msg.ResourceName != "" {
+		t.Errorf("ResourceName = %q, want none for a tenant-level action", msg.ResourceName)
+	}
+}
+
+// The actions withdrawn from the catalogue send nothing, including the "your
+// access changed" notice that used to accompany administrator changes.
+func TestEmit_WithdrawnActionsSendNothing(t *testing.T) {
+	f := newNotifyFixture(t)
+	m := &captureMailer{}
+	s := f.liveSink(t, m)
+
+	var events []audit.Event
+	for _, action := range []string{
+		audit.ActionAdminApplicationCreated,
+		audit.ActionAdminApplicationDeleted,
+		audit.ActionAdminMFAPolicyUpdated,
+		audit.ActionAdminRolePermissionsUpdated,
+		audit.ActionAdminRoleDeleted,
+		audit.ActionAdminPermissionCreated,
+		audit.ActionAdminPermissionUpdated,
+		audit.ActionAdminPermissionDeleted,
+	} {
+		events = append(events, event(f.tenantID, f.coOwner, action, "application", itoa(f.appID)))
+	}
+	for _, action := range []string{
+		audit.ActionAdminTenantAdminInvited,
+		audit.ActionAdminTenantAdminGrantsSet,
+		audit.ActionAdminTenantAdminRemoved,
+	} {
+		events = append(events, event(f.tenantID, f.owner, action, "tenant_admin", "1"))
+	}
+	s.Emit(events)
+	s.Close()
+
+	if got := m.messages(); len(got) != 0 {
+		t.Errorf("sent %d messages for withdrawn actions, want none: %+v", len(got), got)
 	}
 }
 
@@ -169,20 +226,19 @@ func TestEmit_CollapsesRepeatedActions(t *testing.T) {
 
 	for i := 0; i < 4; i++ {
 		s.Emit([]audit.Event{
-			event(f.tenantID, f.coOwner, audit.ActionAdminApplicationDeleted, "application", itoa(f.appID)),
+			event(f.tenantID, f.coOwner, audit.ActionAdminApplicationSecretRotated, "application", itoa(f.appID)),
 		})
 	}
 	s.Close()
 
 	msgs := m.messages()
-	if len(msgs) != 1 {
-		t.Fatalf("sent %d messages, want 1 collapsed message", len(msgs))
+	if want := []string{f.owner, f.coOwner}; !equal(recipients(msgs), want) {
+		t.Fatalf("recipients = %v, want one collapsed message each to %v", sorted(recipients(msgs)), sorted(want))
 	}
-	if msgs[0].Count != 4 {
-		t.Errorf("Count = %d, want 4 — a collapsed message must say how many", msgs[0].Count)
-	}
-	if msgs[0].To != f.owner {
-		t.Errorf("recipient = %s, want the owner", msgs[0].To)
+	for _, msg := range msgs {
+		if msg.Count != 4 {
+			t.Errorf("Count to %s = %d, want 4 — a collapsed message must say how many", msg.To, msg.Count)
+		}
 	}
 }
 
@@ -194,13 +250,19 @@ func TestEmit_DoesNotCollapseAcrossResources(t *testing.T) {
 	s := f.liveSink(t, m)
 
 	s.Emit([]audit.Event{
-		event(f.tenantID, f.coOwner, audit.ActionAdminApplicationDeleted, "application", "101"),
-		event(f.tenantID, f.coOwner, audit.ActionAdminApplicationDeleted, "application", "102"),
+		event(f.tenantID, f.owner, audit.ActionAdminApplicationSecretRotated, "application", itoa(f.appID)),
+		event(f.tenantID, f.owner, audit.ActionAdminApplicationSecretRotated, "application", itoa(f.otherAppID)),
 	})
 	s.Close()
 
-	if got := len(m.messages()); got != 2 {
-		t.Errorf("sent %d messages, want 2 — separate resources are separate decisions", got)
+	var toOwner int
+	for _, msg := range m.messages() {
+		if msg.To == f.owner {
+			toOwner++
+		}
+	}
+	if toOwner != 2 {
+		t.Errorf("owner received %d messages, want 2 — separate resources are separate decisions", toOwner)
 	}
 }
 
@@ -211,7 +273,7 @@ func TestEmit_IgnoresUninterestingEvents(t *testing.T) {
 	m := &captureMailer{}
 	s := f.liveSink(t, m)
 
-	failed := event(f.tenantID, f.coOwner, audit.ActionAdminApplicationDeleted, "application", itoa(f.appID))
+	failed := event(f.tenantID, f.coOwner, audit.ActionAdminApplicationSecretRotated, "application", itoa(f.appID))
 	failed.Status = audit.StatusFailure
 
 	s.Emit([]audit.Event{
@@ -242,7 +304,7 @@ func TestEmit_DropsRatherThanBlockingWhenFull(t *testing.T) {
 		closed:         make(chan struct{}),
 	}
 
-	ev := []audit.Event{event(f.tenantID, f.owner, audit.ActionAdminApplicationDeleted, "application", "1")}
+	ev := []audit.Event{event(f.tenantID, f.owner, audit.ActionAdminApplicationSecretRotated, "application", "1")}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -258,79 +320,9 @@ func TestEmit_DropsRatherThanBlockingWhenFull(t *testing.T) {
 	}
 }
 
-// The gap this closes: an owner changes a co-owner's applications, the platform
-// tier and the owner both hear about it, and the co-owner — the only person
-// whose access actually changed — used to hear nothing. They would discover it
-// by being refused something they could do yesterday.
-func TestEmit_TellsTheSubjectTheirAccessChanged(t *testing.T) {
-	f := newNotifyFixture(t)
-	m := &captureMailer{}
-	s := f.liveSink(t, m)
-
-	// The tenant_admins row of the co-owner, which is what the handler logs as
-	// the resource — the audit event carries the actor, never the subject.
-	var adminID int64
-	if err := f.pool.QueryRow(f.ctx,
-		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
-		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.coOwner).Scan(&adminID); err != nil {
-		t.Fatalf("find co-owner admin row: %v", err)
-	}
-
-	s.Emit([]audit.Event{
-		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminGrantsSet, "tenant_admin", itoa(adminID)),
-	})
-	s.Close()
-
-	notices := m.accessNotices()
-	if len(notices) != 1 {
-		t.Fatalf("sent %d access notices, want 1 to the co-owner", len(notices))
-	}
-	if notices[0].To != f.coOwner {
-		t.Errorf("notice went to %s, want the co-owner %s", notices[0].To, f.coOwner)
-	}
-	if notices[0].ActionLabel != "The applications you administer were changed" {
-		t.Errorf("ActionLabel = %q, want second-person phrasing", notices[0].ActionLabel)
-	}
-	if notices[0].ActorEmail != f.owner {
-		t.Errorf("ActorEmail = %q, want the acting owner", notices[0].ActorEmail)
-	}
-
-	// The tier-up copies still go out — this is in addition, not instead.
-	if len(m.messages()) == 0 {
-		t.Error("no admin-activity notification was sent alongside the access notice")
-	}
-}
-
-// Somebody adjusting their own grants already knows. They still get the actor
-// copy of the activity notice; a second "your access changed" would be noise.
-func TestEmit_DoesNotTellTheSubjectAboutTheirOwnChange(t *testing.T) {
-	f := newNotifyFixture(t)
-	m := &captureMailer{}
-	s := f.liveSink(t, m)
-
-	var adminID int64
-	if err := f.pool.QueryRow(f.ctx,
-		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
-		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.owner).Scan(&adminID); err != nil {
-		t.Fatalf("find owner admin row: %v", err)
-	}
-
-	s.Emit([]audit.Event{
-		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminGrantsSet, "tenant_admin", itoa(adminID)),
-	})
-	s.Close()
-
-	if got := m.accessNotices(); len(got) != 0 {
-		t.Errorf("sent %d access notices to the actor about their own change: %+v", len(got), got)
-	}
-}
-
-// Failures are not mailed at all, refusals included.
-//
-// A refused privileged request is still audited — it is a probe's only trace —
-// but the notice is withdrawn from email because failure volume is chosen by
-// whoever is probing, not by how much work an operator did. See the note above
-// notableActions.
+// Failures are not mailed at all, refusals included. A refused privileged
+// request is still audited, but failure volume is chosen by whoever is probing,
+// not by how much work an operator did.
 func TestEmit_DoesNotMailDeniedPrivilegedRequests(t *testing.T) {
 	f := newNotifyFixture(t)
 	m := &captureMailer{}
@@ -347,134 +339,21 @@ func TestEmit_DoesNotMailDeniedPrivilegedRequests(t *testing.T) {
 	}
 }
 
-// A failed attempt at an action that IS notable on success stays unmailed too,
-// which is the rule the refusal case is now simply an instance of.
+// A failed deactivation is not news either: nothing changed.
 func TestEmit_DoesNotMailFailedNotableActions(t *testing.T) {
 	f := newNotifyFixture(t)
 	m := &captureMailer{}
 	s := f.liveSink(t, m)
 
-	failed := event(f.tenantID, f.coOwner, audit.ActionAdminApplicationSecretRotated, "application", "9")
+	failed := event(f.tenantID, f.owner, audit.ActionAdminTenantDeactivated, "tenant", itoa(f.tenantID))
 	failed.Status = audit.StatusFailure
 
 	s.Emit([]audit.Event{failed})
 	s.Close()
 
 	if msgs := m.messages(); len(msgs) != 0 {
-		t.Errorf("sent %d messages for a failed rotation, want 0: %+v", len(msgs), msgs)
+		t.Errorf("sent %d messages for a failed deactivation, want 0: %+v", len(msgs), msgs)
 	}
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
-
-func keysOf(m map[string]mailer.AdminActivityEmail) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-
-// An invitation announces itself. A second "your access has changed" mail
-// alongside it said nothing had changed yet was already true, and closed with
-// "you will see the change the next time you sign in" — an instruction a
-// brand-new invitee cannot follow, because they have no account until they
-// accept. It also competed with the invitation, the one mail carrying the link
-// they actually need.
-func TestEmit_DoesNotTellAPendingInviteeTheirAccessChanged(t *testing.T) {
-	f := newNotifyFixture(t)
-	m := &captureMailer{}
-	s := f.liveSink(t, m)
-
-	// A tenant_admins row that has NOT been accepted, which is the state every
-	// invitation starts in.
-	var adminID int64
-	if err := f.pool.QueryRow(f.ctx,
-		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
-		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.coOwner).Scan(&adminID); err != nil {
-		t.Fatalf("find co-owner admin row: %v", err)
-	}
-	if _, err := f.pool.Exec(f.ctx,
-		`UPDATE tenant_admins SET activated_at = NULL WHERE id = $1`, adminID); err != nil {
-		t.Fatalf("make the grant pending: %v", err)
-	}
-
-	s.Emit([]audit.Event{
-		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminInvited, "tenant_admin", itoa(adminID)),
-	})
-	s.Close()
-
-	if got := m.accessNotices(); len(got) != 0 {
-		t.Errorf("sent %d access notices to a pending invitee, want 0 — the invitation covers it", len(got))
-	}
-	// The tier-up copies still go out: the people who oversee the tenant do need
-	// to know an invitation was issued.
-	if len(m.messages()) == 0 {
-		t.Error("no admin-activity notification was sent; the tier-up audience must still hear about it")
-	}
-}
-
-// The inverse: once the grant is live, an invitation event that WIDENS it is a
-// real change to something the recipient already holds, so it is announced.
-func TestEmit_TellsAnActiveAdminWhenAnInvitationWidensTheirGrant(t *testing.T) {
-	f := newNotifyFixture(t)
-	m := &captureMailer{}
-	s := f.liveSink(t, m)
-
-	var adminID int64
-	if err := f.pool.QueryRow(f.ctx,
-		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
-		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.coOwner).Scan(&adminID); err != nil {
-		t.Fatalf("find co-owner admin row: %v", err)
-	}
-	if _, err := f.pool.Exec(f.ctx,
-		`UPDATE tenant_admins SET activated_at = NOW() WHERE id = $1`, adminID); err != nil {
-		t.Fatalf("activate the grant: %v", err)
-	}
-
-	s.Emit([]audit.Event{
-		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminInvited, "tenant_admin", itoa(adminID)),
-	})
-	s.Close()
-
-	notices := m.accessNotices()
-	if len(notices) != 1 {
-		t.Fatalf("sent %d access notices, want 1 to the already-active administrator", len(notices))
-	}
-	if notices[0].To != f.coOwner {
-		t.Errorf("notice went to %s, want %s", notices[0].To, f.coOwner)
-	}
-}
-
-// A withdrawal must reach a pending invitee too: it is the most consequential
-// message this feature sends, and suppressing it would leave somebody believing
-// an invitation is still open.
-func TestEmit_TellsAPendingInviteeTheirAccessWasWithdrawn(t *testing.T) {
-	f := newNotifyFixture(t)
-	m := &captureMailer{}
-	s := f.liveSink(t, m)
-
-	var adminID int64
-	if err := f.pool.QueryRow(f.ctx,
-		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id
-		 WHERE ta.tenant_id = $1 AND u.email = $2`, f.tenantID, f.coOwner).Scan(&adminID); err != nil {
-		t.Fatalf("find co-owner admin row: %v", err)
-	}
-	if _, err := f.pool.Exec(f.ctx,
-		`UPDATE tenant_admins SET activated_at = NULL WHERE id = $1`, adminID); err != nil {
-		t.Fatalf("make the grant pending: %v", err)
-	}
-
-	s.Emit([]audit.Event{
-		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminRemoved, "tenant_admin", itoa(adminID)),
-	})
-	s.Close()
-
-	notices := m.accessNotices()
-	if len(notices) != 1 {
-		t.Fatalf("sent %d access notices for a withdrawal, want 1 even though the grant was pending", len(notices))
-	}
-	if notices[0].ActionLabel != "Your administrator access was withdrawn" {
-		t.Errorf("ActionLabel = %q, want the withdrawal phrasing", notices[0].ActionLabel)
-	}
-}

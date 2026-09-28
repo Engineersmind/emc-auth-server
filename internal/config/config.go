@@ -75,16 +75,6 @@ type Config struct {
 	// deployment where the console is not on localhost must set it explicitly.
 	DashboardBaseURL string
 
-	// PlatformNotifyEmails receive the admin-activity notifications raised when a
-	// tenant OWNER takes a privileged action — the platform tier's oversight
-	// mail. Comma-separated; set via PLATFORM_NOTIFY_EMAIL.
-	//
-	// When empty the notifier falls back to every active super_admin user, so
-	// the feature works unconfigured. Naming an address is preferable in a real
-	// deployment: it survives super_admin churn and routes to a shared mailbox
-	// or a ticket queue rather than fanning out to individuals.
-	PlatformNotifyEmails []string
-
 	// TOTPEncryptionKey is a 32-byte hex-encoded key used to AES-256-GCM encrypt
 	// TOTP secrets at rest. Generate with: openssl rand -hex 32
 	// Required when TOTP is used. Must be exactly 64 hex characters.
@@ -346,7 +336,6 @@ func Load() *Config {
 		SMTPTLS:                                getEnv("SMTP_TLS", ""),
 		AppBaseURL:                             getEnv("APP_BASE_URL", "http://localhost:9090"),
 		DashboardBaseURL:                       getEnv("DASHBOARD_BASE_URL", "http://localhost:5173"),
-		PlatformNotifyEmails:                   getEnvList("PLATFORM_NOTIFY_EMAIL", ""),
 		TOTPEncryptionKey:                      getEnv("TOTP_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKey:         getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY", ""),
 		OAuthClientSecretEncryptionKeyPrevious: getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS", ""),

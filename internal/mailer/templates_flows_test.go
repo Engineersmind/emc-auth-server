@@ -246,7 +246,7 @@ func TestSendNewFlowEmails(t *testing.T) {
 	if len(tr.msgs) != 4 {
 		t.Fatalf("messages = %d, want 4", len(tr.msgs))
 	}
-	wants := []string{"Jordan", "https://x/confirm?token=t", "https://x/unblock?token=t", "https://x/forgot"}
+	wants := []string{"https://x/invite?token=t", "https://x/confirm?token=t", "https://x/unblock?token=t", "https://x/forgot"}
 	for i, want := range wants {
 		if !strings.Contains(tr.msgs[i].Text, want) && !strings.Contains(tr.msgs[i].HTML, want) {
 			t.Errorf("message %d missing %q", i, want)
@@ -254,5 +254,55 @@ func TestSendNewFlowEmails(t *testing.T) {
 		if tr.msgs[i].Subject == "" {
 			t.Errorf("message %d has an empty subject", i)
 		}
+	}
+
+	// The default invitation never names the inviter — "<someone> invited you"
+	// from a noreply address is scored as phishing — and states its expiry in
+	// days, not "4320 minutes".
+	inv := tr.msgs[0]
+	for part, s := range map[string]string{"subject": inv.Subject, "HTML": inv.HTML, "text": inv.Text} {
+		if strings.Contains(s, "Jordan") {
+			t.Errorf("invitation %s names the inviter:\n%s", part, s)
+		}
+	}
+	if strings.Contains(inv.Text, "4320") || !strings.Contains(inv.Text, "3 days") {
+		t.Errorf("invitation text should state the expiry as 3 days:\n%s", inv.Text)
+	}
+}
+
+// TestInvitation_StatesTheAdminRole proves the invitation says what an
+// administrator is being made, in both the HTML and the text body, and that a
+// user invitation — and the recipient's name — stay out of that sentence.
+func TestInvitation_StatesTheAdminRole(t *testing.T) {
+	cases := []struct {
+		name string
+		e    InvitationEmail
+		want string
+	}{
+		{"owner", InvitationEmail{AdminRole: "owner", TenantName: "EMC Insurance Sandbox", Name: "Owner emc-insurance-sandbox"},
+			"You have been invited to join EMC Auth as the owner of EMC Insurance Sandbox."},
+		{"co-owner", InvitationEmail{AdminRole: "co-owner", TenantName: "EMC Insurance Sandbox", Name: "Priya Nair"},
+			"You have been invited to join EMC Auth as a co-owner of EMC Insurance Sandbox."},
+		{"user", InvitationEmail{AppName: "EMC Insurance", Name: "Ravi Kumar"},
+			"You have been invited to join EMC Insurance."},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m, tr := newCapturingMailer()
+			c.e.To, c.e.Link, c.e.TTLMinutes = "u@example.com", "https://x/invite?token=t", 4320
+			if err := m.SendInvitation(context.Background(), nil, nil, c.e); err != nil {
+				t.Fatalf("SendInvitation: %v", err)
+			}
+			msg := tr.msgs[0]
+			if !strings.Contains(msg.Text, c.want) {
+				t.Errorf("text body missing %q:\n%s", c.want, msg.Text)
+			}
+			if !strings.Contains(msg.HTML, c.want) {
+				t.Errorf("HTML body missing %q", c.want)
+			}
+			if strings.Contains(msg.HTML+msg.Text, c.e.Name) {
+				t.Errorf("recipient name %q should not be in the invitation", c.e.Name)
+			}
+		})
 	}
 }

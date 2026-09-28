@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 
 	"github.com/labstack/echo/v4"
@@ -208,8 +209,11 @@ func (h *AuthHandler) TenantContext(c echo.Context) error {
 
 	result, err := h.svc.SwitchTenantContextForClaims(
 		c.Request().Context(), userID, currentTenant, targetTenant, platformAdmin, claims.SessionID,
+		slices.Contains(auth.HumanGrants, claims.Gty),
 	)
 	switch {
+	case errors.Is(err, auth.ErrMFAStepUpRequired):
+		return fail(c, http.StatusForbidden, "mfa_step_up_required")
 	case errors.Is(err, auth.ErrSameTenant):
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "already in the requested tenant"})
 	case errors.Is(err, auth.ErrNoGrantInTenant):
