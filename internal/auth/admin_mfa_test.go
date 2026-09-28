@@ -163,10 +163,22 @@ func TestAdminMFA_FirstSignInCanChooseEmail(t *testing.T) {
 
 	// Email is now set up: the next sign-in is an email challenge, with the code
 	// mailed up front because it is the only method.
+	sentBefore := f.mail.codeCount()
 	again := f.tenantLogin(t, email)
 	if again.OTPChallenge == nil || !slices.Equal(again.OTPChallenge.Methods, []string{auth.MFAMethodEmail}) ||
 		!again.OTPChallenge.EmailCodeSent {
-		t.Errorf("next sign-in = %+v, want an email challenge with the code sent", again.OTPChallenge)
+		t.Fatalf("next sign-in = %+v, want an email challenge with the code sent", again.OTPChallenge)
+	}
+	// The code goes out in the background, so the response is not held up by
+	// SMTP; once it has, it completes the sign-in.
+	f.authSvc.WaitForBackgroundSends()
+	if f.mail.codeCount() != sentBefore+1 {
+		t.Fatalf("codes mailed = %d, want %d", f.mail.codeCount(), sentBefore+1)
+	}
+	if _, err := f.authSvc.LoginOTPForCookieSession(f.ctx, auth.LoginOTPInput{
+		OTPSessionToken: again.OTPChallenge.OTPSessionToken, Code: f.mail.lastCode(t).Code,
+	}); err != nil {
+		t.Fatalf("LoginOTPForCookieSession(emailed code): %v", err)
 	}
 }
 

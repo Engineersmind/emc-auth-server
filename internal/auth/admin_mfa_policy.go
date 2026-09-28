@@ -335,9 +335,17 @@ func (s *AuthService) adminMFAGate(ctx context.Context, userID, tenantID int64, 
 		if !slices.Contains(methods, MFAMethodEmail) && slices.Contains(usable, MFAMethodEmail) {
 			methods = append(methods, MFAMethodEmail)
 		}
-		challenge, err := s.createOTPSessionWith(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, sendEmailNow)
+		challenge, err := s.createOTPSessionWith(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, false)
 		if err != nil {
 			return nil, fmt.Errorf("create OTP session: %w", err)
+		}
+		if sendEmailNow {
+			// Mailed in the background: SMTP can take seconds (longer with the
+			// white-label → global sender retry), and the password step should not
+			// wait on it. The challenge screen says a code is on its way and offers
+			// Resend, so a failed delivery is recoverable without starting over.
+			challenge.EmailCodeSent = true
+			s.sendLoginEmailInBackground(ctx, challenge.OTPSessionToken, email, appID, tenantID)
 		}
 		return &LoginResult{OTPChallenge: challenge}, nil
 	}
@@ -348,6 +356,32 @@ func (s *AuthService) adminMFAGate(ctx context.Context, userID, tenantID int64, 
 	}
 	return &LoginResult{MFAEnrollment: challenge}, nil
 }
+
+// loginEmailSendTimeout bounds a background sign-in code send, so a hung SMTP
+// server cannot pile up goroutines.
+const loginEmailSendTimeout = 30 * time.Second
+
+// sendLoginEmailInBackground mints and mails the sign-in code for an OTP
+// challenge without holding up the response. The request context is detached
+// from cancellation (the response is sent before the mail) but keeps its values.
+func (s *AuthService) sendLoginEmailInBackground(ctx context.Context, otpSessionToken, email, appID string, tenantID int64) {
+	bg := context.WithoutCancel(ctx)
+	s.bgSends.Add(1)
+	go func() {
+		defer s.bgSends.Done()
+		ctx, cancel := context.WithTimeout(bg, loginEmailSendTimeout)
+		defer cancel()
+		appName := s.appNameByID(ctx, appID)
+		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(otpSessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL); err != nil {
+			s.logger.Warn().Err(err).Int64("tenant_id", tenantID).
+				Msg("admin sign-in: emailing the code failed — the user can ask for a new one")
+		}
+	}()
+}
+
+// WaitForBackgroundSends blocks until every background sign-in email has been
+// handed to the mailer. For tests, and for a graceful shutdown.
+func (s *AuthService) WaitForBackgroundSends() { s.bgSends.Wait() }
 
 // factorActive reports whether the administrator has set method up.
 //

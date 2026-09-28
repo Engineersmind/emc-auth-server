@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
@@ -40,6 +41,7 @@ type AuthService struct {
 	jwtSvc   *JWTService
 	totpSvc  *TOTPService         // nil when TOTP not configured
 	emailSvc *EmailMFAService     // nil when email MFA not configured
+	bgSends  sync.WaitGroup       // background sign-in code emails (admin MFA)
 	redisCli *redis.Client        // used for OTP session storage
 	appSvc   *ApplicationService  // nil when application context is not needed
 	verifSvc *VerificationService // nil when email verification is not configured
