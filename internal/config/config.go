@@ -392,7 +392,8 @@ func Load() *Config {
 }
 
 // Validate refuses a deployed configuration that would leave cookie sessions
-// broken at runtime rather than at boot.
+// broken at runtime rather than at boot, or that would encrypt secrets at rest
+// under the publicly known development key.
 //
 // Both checks became boot-critical with the portal's move to cookie sessions:
 // the CSRF middleware fails closed, so a misconfiguration here is not a degraded
@@ -409,6 +410,12 @@ func (c *Config) Validate() error {
 	}
 	if slices.Contains(c.GlobalCORSOrigins, "*") {
 		return errors.New("GLOBAL_CORS_ORIGINS must name the portal origin explicitly when ENV=production or staging: a wildcard suppresses Access-Control-Allow-Credentials, so the browser will never send the session cookies")
+	}
+	// GHSA-92p3-fj5f-8gx7: without this the TOTP service fell back to the
+	// all-zero key, and every TOTP seed, SMTP password and email-provider API
+	// key was encrypted under a key anyone can read in this repository.
+	if strings.Trim(c.TOTPEncryptionKey, "0") == "" {
+		return errors.New("TOTP_ENCRYPTION_KEY must be set to a real key when ENV=production or staging: TOTP seeds, SMTP passwords and email-provider API keys would otherwise be encrypted under the publicly known all-zero key (generate one with openssl rand -hex 32)")
 	}
 	return nil
 }

@@ -131,7 +131,7 @@ func newTestSendEnv(t *testing.T) *testSendEnv {
 
 	// The sender service reuses the TOTP encryption key; a fixed all-zero dev
 	// key keeps these tests independent of the environment.
-	totpSvc, err := auth.NewTOTPService(pool, strings.Repeat("0", 64), logger)
+	totpSvc, err := auth.NewTOTPService(pool, strings.Repeat("0", 64), "development", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
