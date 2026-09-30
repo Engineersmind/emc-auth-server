@@ -21,6 +21,20 @@ func TestValidate(t *testing.T) {
 			cfg:  Config{Env: "development"},
 		},
 		{
+			name: "test tolerates an empty cookie domain and TOTP key",
+			cfg:  Config{Env: "test"},
+		},
+		{
+			name:    "misspelled ENV is refused rather than treated as development",
+			cfg:     Config{Env: "prodution"},
+			wantErr: true,
+		},
+		{
+			name:    "empty ENV is refused",
+			cfg:     Config{Env: ""},
+			wantErr: true,
+		},
+		{
 			name: "production with everything set",
 			cfg:  Config{Env: "production", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}, TOTPEncryptionKey: realTOTPKey},
 		},

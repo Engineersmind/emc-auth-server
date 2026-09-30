@@ -17,8 +17,11 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   API key (the email sender reuses the same key), was then encrypted under a key anyone
   can read in this repository. The server now **refuses to boot** with `ENV=production` or
   `staging` if the key is unset or all zeros: `Config.Validate` checks it, and
-  `NewTOTPService` takes `env` with the same contract as `NewSecretBox`. Development
-  keeps its zero-key fallback.
+  `NewTOTPService` takes `env` with the same contract as `NewSecretBox`. Only
+  `development` and `test` keep the zero-key fallback.
+  - **`ENV` must now be one of `development`, `test`, `staging`, `production`.** Any other
+    value (e.g. a misspelt `prodution`) refuses to boot instead of silently running with
+    development defaults — insecure cookies, no CSRF check, and the zero TOTP key.
   - **Before upgrading:** confirm `TOTP_ENCRYPTION_KEY` is present in the deployment secret
     (AWS Secrets Manager), or the new container will not start.
   - **If a deployment ever ran without the key**, treat those TOTP seeds and email

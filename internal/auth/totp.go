@@ -39,17 +39,21 @@ var ErrTOTPZeroKey = errors.New("TOTP_ENCRYPTION_KEY is the all-zero development
 
 // NewTOTPService creates a TOTPService. encKeyHex must be a 64-character hex string (32 bytes).
 //
-// env gives it the NewSecretBox contract (GHSA-92p3-fj5f-8gx7): in "production"
-// and "staging" a missing key is a hard error rather than a silent fallback to
-// the zero key, and so is the zero key itself. The key protects every TOTP seed
-// and, through EncryptionKey, every tenant's SMTP password and email-provider
-// API key, so a publicly known key hands all of them to anyone who can read the
-// database.
+// env gives it the NewSecretBox contract (GHSA-92p3-fj5f-8gx7): a missing key is
+// a hard error rather than a silent fallback to the zero key, and so is the zero
+// key itself. The key protects every TOTP seed and, through EncryptionKey, every
+// tenant's SMTP password and email-provider API key, so a publicly known key
+// hands all of them to anyone who can read the database.
+//
+// The fallback is allowed only for the two environments named as non-deployed,
+// "development" and "test". Any other value — "production", "staging", or a
+// misspelling such as "prodution" — fails closed, so a typo in ENV cannot
+// quietly re-enable the zero key.
 func NewTOTPService(pool *pgxpool.Pool, encKeyHex, env string, logger zerolog.Logger) (*TOTPService, error) {
-	deployed := env == "production" || env == "staging"
+	deployed := env != "development" && env != "test"
 	if encKeyHex == "" {
 		if deployed {
-			return nil, fmt.Errorf("TOTP_ENCRYPTION_KEY: %w", ErrEncryptionKeyRequired)
+			return nil, fmt.Errorf("TOTP_ENCRYPTION_KEY (ENV=%q): %w", env, ErrEncryptionKeyRequired)
 		}
 		logger.Warn().Msg("TOTP_ENCRYPTION_KEY not set — using insecure zero key (dev only)")
 		encKeyHex = strings.Repeat("0", 64)

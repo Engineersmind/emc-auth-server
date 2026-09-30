@@ -10,9 +10,9 @@ import (
 )
 
 // GHSA-92p3-fj5f-8gx7: NewTOTPService must follow the NewSecretBox contract —
-// fail closed on a missing key in production/staging instead of encrypting
-// every seed under the all-zero key, and refuse that key when it is set
-// explicitly. Development keeps its zero-key fallback. No database is needed:
+// fail closed on a missing key instead of encrypting every seed under the
+// all-zero key, and refuse that key when it is set explicitly. Only development
+// and test keep the zero-key fallback. No database is needed:
 // the constructor does not touch the pool.
 func TestNewTOTPService_KeyPolicy(t *testing.T) {
 	const realKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -32,6 +32,12 @@ func TestNewTOTPService_KeyPolicy(t *testing.T) {
 		{name: "staging with the zero key", key: zeroKey, env: "staging", wantErr: auth.ErrTOTPZeroKey},
 		{name: "development without a key falls back", key: "", env: "development"},
 		{name: "development with the zero key", key: zeroKey, env: "development"},
+		{name: "test without a key falls back", key: "", env: "test"},
+		// Only the named non-deployed environments may fall back: a misspelt or
+		// unknown ENV must fail closed, not behave like development.
+		{name: "misspelled env without a key", key: "", env: "prodution", wantErr: auth.ErrEncryptionKeyRequired},
+		{name: "misspelled env with the zero key", key: zeroKey, env: "prodution", wantErr: auth.ErrTOTPZeroKey},
+		{name: "empty env without a key", key: "", env: "", wantErr: auth.ErrEncryptionKeyRequired},
 	}
 
 	for _, tc := range tests {

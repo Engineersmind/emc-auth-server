@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strconv"
@@ -401,9 +402,17 @@ func Load() *Config {
 // surfacing as scattered 403s rather than as a failed deploy. Development is
 // exempt: it runs on SameSite=Lax with no cookie domain, and the CSRF check is
 // skipped entirely there.
+//
+// An unrecognised ENV is refused outright. Every check here, and the TOTP key
+// check in NewTOTPService, keys off ENV; a misspelling such as "prodution" would
+// otherwise skip all of them and boot a deployment with development defaults.
 func (c *Config) Validate() error {
-	if c.Env != "production" && c.Env != "staging" {
+	switch c.Env {
+	case "development", "test":
 		return nil
+	case "production", "staging":
+	default:
+		return fmt.Errorf("ENV=%q is not recognised: it must be development, test, staging or production", c.Env)
 	}
 	if c.CookieDomain == "" {
 		return errors.New("COOKIE_DOMAIN must be set when ENV=production or staging: cookie sessions and the CSRF trusted-origin check both derive from it, and the CSRF check fails closed without it")
