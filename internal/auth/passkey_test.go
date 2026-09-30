@@ -1029,7 +1029,7 @@ func TestPasskeyResetUserMFADeactivatesPasskeys(t *testing.T) {
 	dev := newVirtualAuthenticator(t)
 	f.register(t, dev, "Lost laptop")
 
-	totpSvc, err := auth.NewTOTPService(f.pool, totpEnvKey(), testhelper.TestLogger())
+	totpSvc, err := auth.NewTOTPService(f.pool, totpEnvKey(), "development", testhelper.TestLogger())
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}

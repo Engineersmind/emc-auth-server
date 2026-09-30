@@ -235,6 +235,7 @@ FATAL schema incompatibility: tenants.id is type 'uuid' but this release require
 |---------|-------------|-----|
 | `database connection failed after 10 attempts` | Wrong DATABASE_URL or DB unreachable | Check `DATABASE_URL`, verify `pg_isready` from container network |
 | `TOTP_ENCRYPTION_KEY must be 64-char hex` | Wrong key format or length | Regenerate with `openssl rand -hex 32` (produces exactly 64 hex chars) |
+| `TOTP_ENCRYPTION_KEY must be set to a real key when ENV=production or staging` | Key missing from the deployment secret, or set to the all-zero dev key | Add a real key to the secret (`openssl rand -hex 32`). Do not generate a new one if the deployment already had a key — existing TOTP enrolments and email credentials only decrypt under the original |
 | `jwt_secret is empty` | Tenant row has empty jwt_secret | Reseed: update the tenant row in the database directly |
 | `429 Too Many Requests` on login at high load | Rate limiter active (5 req/min/IP) — expected | Normal behavior under load test. Only 5xx is a problem. |
 | `429 Too Many Requests` on non-login routes | Per-app rate limit misconfigured | Check app-limits table via `/api/v1/admin/app-limits` |

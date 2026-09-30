@@ -266,7 +266,7 @@ func newMFAFixture(t *testing.T) *mfaFixture {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	totpSvc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	totpSvc, err := auth.NewTOTPService(pool, totpEnvKey(), "development", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}

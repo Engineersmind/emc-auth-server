@@ -33,9 +33,28 @@ type TOTPService struct {
 	logger zerolog.Logger
 }
 
+// ErrTOTPZeroKey is returned when TOTP_ENCRYPTION_KEY is the all-zero dev key
+// in an environment that must not use it.
+var ErrTOTPZeroKey = errors.New("TOTP_ENCRYPTION_KEY is the all-zero development key, which is publicly known — generate a real one (openssl rand -hex 32)")
+
 // NewTOTPService creates a TOTPService. encKeyHex must be a 64-character hex string (32 bytes).
-func NewTOTPService(pool *pgxpool.Pool, encKeyHex string, logger zerolog.Logger) (*TOTPService, error) {
+//
+// env gives it the NewSecretBox contract (GHSA-92p3-fj5f-8gx7): a missing key is
+// a hard error rather than a silent fallback to the zero key, and so is the zero
+// key itself. The key protects every TOTP seed and, through EncryptionKey, every
+// tenant's SMTP password and email-provider API key, so a publicly known key
+// hands all of them to anyone who can read the database.
+//
+// The fallback is allowed only for the two environments named as non-deployed,
+// "development" and "test". Any other value — "production", "staging", or a
+// misspelling such as "prodution" — fails closed, so a typo in ENV cannot
+// quietly re-enable the zero key.
+func NewTOTPService(pool *pgxpool.Pool, encKeyHex, env string, logger zerolog.Logger) (*TOTPService, error) {
+	deployed := env != "development" && env != "test"
 	if encKeyHex == "" {
+		if deployed {
+			return nil, fmt.Errorf("TOTP_ENCRYPTION_KEY (ENV=%q): %w", env, ErrEncryptionKeyRequired)
+		}
 		logger.Warn().Msg("TOTP_ENCRYPTION_KEY not set — using insecure zero key (dev only)")
 		encKeyHex = strings.Repeat("0", 64)
 	}
@@ -43,7 +62,19 @@ func NewTOTPService(pool *pgxpool.Pool, encKeyHex string, logger zerolog.Logger)
 	if err != nil || len(key) != 32 {
 		return nil, fmt.Errorf("TOTP_ENCRYPTION_KEY must be a 64-character hex string (32 bytes): %w", err)
 	}
+	if deployed && isZeroKey(key) {
+		return nil, ErrTOTPZeroKey
+	}
 	return &TOTPService{pool: pool, encKey: key, logger: logger}, nil
+}
+
+func isZeroKey(key []byte) bool {
+	for _, b := range key {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // EnrollResult is returned by Enroll.
