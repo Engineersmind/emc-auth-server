@@ -20,6 +20,7 @@ This runbook covers first-time production deployment, environment configuration,
 | APP_BASE_URL | Yes | `http://localhost:8080` | Same as JWT_ISSUER — prepended to password-reset link URLs in emails |
 | SEED_ADMIN_PASSWORD | Yes | `ChangeMe123!` | First-run super-admin password — **change after first login** |
 | TOTP_ENCRYPTION_KEY | Yes | — | 64-char hex AES-256 key for TOTP secret encryption. Generate: `openssl rand -hex 32` |
+| TRUSTED_PROXIES | Yes (production/staging) | — | Comma-separated CIDRs of **this server's own** reverse proxies; `X-Forwarded-For` is believed only from them. The server refuses to start without it outside development. See [Client IP and trusted proxies](#client-ip-and-trusted-proxies) |
 | PORT | No | `8080` | HTTP listen port |
 | ENV | No | `development` | Set to `production` to enable HTTPS redirect and production mailer |
 | LOG_LEVEL | No | `info` | Zerolog level: `debug` / `info` / `warn` / `error` |
@@ -126,6 +127,47 @@ livenessProbe:
 - [ ] Container runs as non-root (distroless:nonroot uid 65532)
 - [ ] Rotate `TOTP_ENCRYPTION_KEY` via your secrets manager rotation policy
 - [ ] `.env.production` file is in `.gitignore`
+- [ ] `TRUSTED_PROXIES` names only this server's own proxy hop, and nginx sets `X-Forwarded-For $remote_addr` (overwrite, not append) — see below
+
+## Client IP and trusted proxies
+
+Every per-IP rate limiter, the adaptive CAPTCHA, audit-log IPs and the risk engine key on the client IP. The server takes it from `X-Forwarded-For`, walking right to left and stopping at the first hop that is **not** a trusted proxy. A direct peer that is not trusted has its header ignored. Without this (GHSA-3rxg-g9v9-4gh8), any client could name its own IP on every request and bypass all of those controls.
+
+Two settings must agree:
+
+1. **nginx overwrites the header.** nginx is the first hop, so anything the client sent in `X-Forwarded-For` is forged:
+   ```nginx
+   proxy_set_header X-Forwarded-For $remote_addr;
+   ```
+   If a load balancer or CDN is ever placed in front of nginx, switch back to `$proxy_add_x_forwarded_for` and add that hop's range to `TRUSTED_PROXIES`.
+2. **`TRUSTED_PROXIES` names the hop the app actually sees.** Loopback is always trusted; nothing else is unless listed.
+
+| Setup | `TRUSTED_PROXIES` |
+|---|---|
+| nginx on the host, app in Docker (the EC2 deployment) | the app's Docker network subnet, e.g. `172.18.0.0/16` |
+| nginx on the host, app running directly on the host | `127.0.0.1/32` |
+| AWS ALB in front of the app | the VPC subnets the ALB runs in |
+| Kubernetes ingress | the ingress controller / pod CIDR |
+
+In the Docker case nginx does **not** arrive as `127.0.0.1`: Docker's port forwarding rewrites the source to the network gateway. Find the subnet on the host:
+
+```bash
+docker network inspect emc-auth-net --format '{{.Name}} subnet={{range .IPAM.Config}}{{.Subnet}}{{end}} gateway={{range .IPAM.Config}}{{.Gateway}}{{end}}'
+```
+
+The gateway must fall inside the configured range. If the network is ever recreated, Docker may assign a new subnet — update the value, or every user will share one rate-limit bucket.
+
+**Never** list an integrating application's servers, `0.0.0.0/0` (refused at boot) or broad ranges like `10.0.0.0/8`: each lets that host name any client IP it likes. A tenant backend that logs users in server-side sees its own IP on every login; the fix for that is the hosted OAuth flow, not a trust entry.
+
+**Verify** from outside AWS — seven logins with a different forged IP each must start returning `429` after five:
+
+```bash
+for i in 1 2 3 4 5 6 7; do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST "https://<domain>/api/v1/auth/login" \
+    -H "X-Forwarded-For: 9.9.9.$i" -H "Content-Type: application/json" \
+    -d "{\"email\":\"spoof$i@example.com\",\"password\":\"wrong\"}"
+done
+```
 
 ## Monitoring
 

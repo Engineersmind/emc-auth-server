@@ -31,7 +31,8 @@ const maxUserAgentLen = 512
 // RequestInfo is the calling client's network identity.
 type RequestInfo struct {
 	// IPAddress is the client address as resolved by the HTTP edge (echo's
-	// RealIP, which honours the configured trusted-proxy chain). Empty when the
+	// RealIP, driven by middleware.ClientIPExtractor, which believes
+	// X-Forwarded-For only from TRUSTED_PROXIES hops). Empty when the
 	// request did not come through HTTP — a background job, a test, a cron task.
 	IPAddress string
 	// UserAgent is the raw User-Agent header, truncated to maxUserAgentLen.

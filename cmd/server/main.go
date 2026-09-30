@@ -34,6 +34,7 @@ import (
 
 	"github.com/engineersmind/emc-auth-server/docs" // swagger generated docs
 	"github.com/engineersmind/emc-auth-server/internal/api"
+	"github.com/engineersmind/emc-auth-server/internal/api/middleware"
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/config"
@@ -307,6 +308,17 @@ func main() {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
+
+	// Client IP resolution. Without this Echo trusts the leftmost
+	// X-Forwarded-For entry — client-written — and every per-IP limiter, the
+	// CAPTCHA trigger, audit IPs and risk signals become attacker-chosen
+	// (GHSA-3rxg-g9v9-4gh8). Validate has already required TRUSTED_PROXIES in
+	// production; in development it is empty and only loopback is trusted.
+	trustedProxies, err := cfg.TrustedProxyNets()
+	if err != nil {
+		logger.Fatal().Err(err).Msg("invalid TRUSTED_PROXIES")
+	}
+	e.IPExtractor = middleware.ClientIPExtractor(trustedProxies)
 
 	// Register routes and middleware. The returned cleanup stops the background
 	// workers routes started; called during shutdown below, before the pool

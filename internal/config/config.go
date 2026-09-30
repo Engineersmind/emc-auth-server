@@ -2,6 +2,8 @@ package config
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"slices"
 	"strconv"
@@ -241,6 +243,22 @@ type Config struct {
 	// Comma-separated via UNTRUSTED_IP_CIDRS; empty disables the check.
 	UntrustedIPCIDRs []string
 
+	// TrustedProxies lists the CIDR ranges of the reverse proxies in front of
+	// this server whose X-Forwarded-For entries are believed when resolving the
+	// client IP (GHSA-3rxg-g9v9-4gh8). Comma-separated via TRUSTED_PROXIES.
+	//
+	// Loopback is always trusted; nothing else is unless listed here. In the EC2
+	// deployment nginx reaches the container through Docker's port forwarding, so
+	// the peer the app sees is the Docker network gateway, NOT 127.0.0.1 — this
+	// must name that network's subnet. Left empty in production, every request
+	// would resolve to the gateway and all users would share one rate-limit
+	// bucket, which is why Validate refuses to boot without it.
+	//
+	// Only the server's OWN proxies belong here. An integrating application's
+	// server must never be listed: that would let it name any client IP it likes,
+	// for its own users and everyone else's, which is the bug this closes.
+	TrustedProxies []string
+
 	// BreachDetectionEnabled turns on breached-password warnings, which check
 	// each accepted password against the Have I Been Pwned corpus via the
 	// k-anonymous range API (only a 5-character hash prefix leaves the server —
@@ -381,6 +399,7 @@ func Load() *Config {
 		CaptchaTTLSeconds:               mustAtoi(getEnv("CAPTCHA_TTL_SECONDS", "120")),
 		GeoIPDatabasePath:               getEnv("GEOIP_DATABASE_PATH", ""),
 		UntrustedIPCIDRs:                getEnvList("UNTRUSTED_IP_CIDRS", ""),
+		TrustedProxies:                  getEnvList("TRUSTED_PROXIES", ""),
 		BreachDetectionEnabled:          getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
 		AuditCaptureResponseBody:        getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
 		AuditRetentionDays:              mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
@@ -410,7 +429,31 @@ func (c *Config) Validate() error {
 	if slices.Contains(c.GlobalCORSOrigins, "*") {
 		return errors.New("GLOBAL_CORS_ORIGINS must name the portal origin explicitly when ENV=production or staging: a wildcard suppresses Access-Control-Allow-Credentials, so the browser will never send the session cookies")
 	}
+	if len(c.TrustedProxies) == 0 {
+		return errors.New("TRUSTED_PROXIES must be set when ENV=production or staging: without it the client IP resolves to the reverse proxy for every request, so all users share one rate-limit bucket")
+	}
+	if _, err := c.TrustedProxyNets(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// TrustedProxyNets parses TrustedProxies. A /0 range is refused: trusting every
+// peer would let any client write its own IP again, which is the bug this
+// setting exists to close.
+func (c *Config) TrustedProxyNets() ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(c.TrustedProxies))
+	for _, s := range c.TrustedProxies {
+		_, n, err := net.ParseCIDR(s)
+		if err != nil {
+			return nil, fmt.Errorf("TRUSTED_PROXIES: %q is not a CIDR range (e.g. 172.18.0.0/16): %w", s, err)
+		}
+		if ones, _ := n.Mask.Size(); ones == 0 {
+			return nil, fmt.Errorf("TRUSTED_PROXIES: %q trusts every address", s)
+		}
+		nets = append(nets, n)
+	}
+	return nets, nil
 }
 
 // mustAtoi parses an integer env value, returning 0 on any parse error so a

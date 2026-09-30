@@ -239,9 +239,8 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			// Determine client IP. Echo's RealIP() respects X-Real-IP and
-			// X-Forwarded-For (set by reverse proxy). In production, ensure
-			// the proxy is trusted (configure Echo's TrustProxies if needed).
+			// Client IP as resolved by e.IPExtractor (see ClientIPExtractor):
+			// X-Forwarded-For is believed only from TRUSTED_PROXIES hops.
 			ip := c.RealIP()
 			if ip == "" {
 				ip = c.Request().RemoteAddr
