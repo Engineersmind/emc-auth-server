@@ -25,6 +25,13 @@ func TestValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// The CSRF allowlist reads this list, so empty is not "no CORS" —
+			// it is every cookie write 403ing at runtime, including login.
+			name:    "production without any global CORS origin",
+			cfg:     Config{Env: "production", CookieDomain: ".engineersmind.com"},
+			wantErr: true,
+		},
+		{
 			name:    "staging without a cookie domain",
 			cfg:     Config{Env: "staging", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
 			wantErr: true,
