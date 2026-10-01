@@ -329,7 +329,10 @@ func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
 		Port:                                   getEnv("PORT", "9090"),
-		DatabaseURL:                            getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
+		// GHSA-jv2c-x735-vff7 (L-06): no committed DSN default — the old fallback
+		// embedded credentials and sslmode=disable. DATABASE_URL must be set
+		// explicitly; Validate() refuses to boot without it.
+		DatabaseURL:                            getEnv("DATABASE_URL", ""),
 		RedisURL:                               getEnv("REDIS_URL", "redis://localhost:6379/0"),
 		LogLevel:                               getEnv("LOG_LEVEL", "info"),
 		Env:                                    getEnv("ENV", "development"),
@@ -401,8 +404,17 @@ func Load() *Config {
 // exempt: it runs on SameSite=Lax with no cookie domain, and the CSRF check is
 // skipped entirely there.
 func (c *Config) Validate() error {
+	// GHSA-jv2c-x735-vff7 (L-06): DATABASE_URL is required in every environment —
+	// there is no committed fallback anymore, and an empty DSN would only fail
+	// later at pool-connect with a less obvious error.
+	if c.DatabaseURL == "" {
+		return errors.New("DATABASE_URL must be set: there is no default DSN (committed defaults previously embedded credentials and sslmode=disable)")
+	}
 	if c.Env != "production" && c.Env != "staging" {
 		return nil
+	}
+	if strings.Contains(c.DatabaseURL, "sslmode=disable") {
+		return errors.New("DATABASE_URL must not use sslmode=disable when ENV=production or staging: use sslmode=require or verify-full")
 	}
 	if c.CookieDomain == "" {
 		return errors.New("COOKIE_DOMAIN must be set when ENV=production or staging: cookie sessions and the CSRF trusted-origin check both derive from it, and the CSRF check fails closed without it")

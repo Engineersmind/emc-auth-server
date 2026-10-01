@@ -13,25 +13,37 @@ func TestValidate(t *testing.T) {
 	}{
 		{
 			name: "development tolerates an empty cookie domain",
-			cfg:  Config{Env: "development"},
+			cfg:  Config{Env: "development", DatabaseURL: "postgres://u:p@localhost/db?sslmode=disable"},
 		},
 		{
 			name: "production with both set",
-			cfg:  Config{Env: "production", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+			cfg:  Config{Env: "production", DatabaseURL: "postgres://u:p@db/db?sslmode=require", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+		},
+		{
+			name:    "empty DATABASE_URL is rejected in every environment",
+			cfg:     Config{Env: "development"},
+			wantErr: true,
+		},
+		{
+			// GHSA-jv2c-x735-vff7 (L-06): plaintext transport to the database
+			// must not be reachable by default in production.
+			name:    "sslmode=disable is rejected in production",
+			cfg:     Config{Env: "production", DatabaseURL: "postgres://u:p@db/db?sslmode=disable", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+			wantErr: true,
 		},
 		{
 			name:    "production without a cookie domain",
-			cfg:     Config{Env: "production", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+			cfg:     Config{Env: "production", DatabaseURL: "postgres://u:p@db/db?sslmode=require", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
 			wantErr: true,
 		},
 		{
 			name:    "staging without a cookie domain",
-			cfg:     Config{Env: "staging", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+			cfg:     Config{Env: "staging", DatabaseURL: "postgres://u:p@db/db?sslmode=require", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
 			wantErr: true,
 		},
 		{
 			name:    "production with a wildcard CORS origin",
-			cfg:     Config{Env: "production", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com", "*"}},
+			cfg:     Config{Env: "production", DatabaseURL: "postgres://u:p@db/db?sslmode=require", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com", "*"}},
 			wantErr: true,
 		},
 	}
