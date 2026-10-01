@@ -30,6 +30,11 @@ const secretBoxVersionPrefix = "v1:"
 type SecretBox struct {
 	key     []byte
 	prevKey []byte // optional previous key accepted for decryption during rotation
+	// zeroKey records that the box was built on the development all-zero
+	// fallback. Callers that persist ciphertext must not write under it — the
+	// moment a real key is configured, zero-key ciphertext is unreadable
+	// (GHSA-4x5m-3gph-938r review).
+	zeroKey bool
 }
 
 // ErrEncryptionKeyRequired is returned when a required encryption key is
@@ -54,7 +59,14 @@ func NewSecretBox(keyHex, env, keyName string, logger zerolog.Logger) (*SecretBo
 	if err != nil || len(key) != 32 {
 		return nil, fmt.Errorf("%s must be a 64-character hex string (32 bytes)", keyName)
 	}
-	return &SecretBox{key: key}, nil
+	return &SecretBox{key: key, zeroKey: keyHex == strings.Repeat("0", 64)}, nil
+}
+
+// UsesInsecureZeroKey reports whether the box encrypts under the development
+// all-zero key. Writers of persistent ciphertext should skip writing when this
+// is true — the value would become undecryptable as soon as a real key is set.
+func (b *SecretBox) UsesInsecureZeroKey() bool {
+	return b != nil && b.zeroKey
 }
 
 // WithPreviousKey accepts the previous 64-character hex key for decryption

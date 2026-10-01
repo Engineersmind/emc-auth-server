@@ -667,11 +667,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	if skErr != nil {
 		deps.Logger.Fatal().Err(skErr).Msg("JWT signing key service init failed")
 	}
-	// Switch signing to RS256. Verification continues to accept legacy HS256
-	// tokens (no kid) until the Phase 4 cutover, so no live session breaks here.
-	jwtSvc.WithSigningKeys(signingKeySvc).WithLegacyHS256(deps.Config.JWTAllowLegacyHS256)
-	if !deps.Config.JWTAllowLegacyHS256 {
-		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=false — HS256 tokens are REJECTED (issue #95 Phase 4 cutover). Any token minted before RS256 signing went live will fail; tenants.jwt_secret is now unused and can be dropped.")
+	// Switch signing to RS256. Verification rejects legacy HS256 tokens (no kid)
+	// unless JWT_ALLOW_LEGACY_HS256 is explicitly enabled for a migration window.
+	jwtSvc.WithSigningKeys(signingKeySvc).WithLegacyHS256(deps.Config.JWTAllowLegacyHS256).
+		WithSecretBox(signingKeyBox)
+	if deps.Config.JWTAllowLegacyHS256 {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=true — HS256 tokens are still ACCEPTED (issue #95 Phase 4 migration window). Set to false once emc_auth_legacy_hs256_verifications_total has been flat at zero.")
 	}
 
 	// Backfill keys for tenants that predate this feature so their JWKS endpoint is
@@ -683,6 +684,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		deps.Logger.Error().Err(err).Msg("signing key backfill failed — keys will be generated lazily")
 	} else if created > 0 {
 		deps.Logger.Info().Int("tenants", created).Msg("backfilled JWT signing keys")
+	}
+
+	// Encrypt plaintext tenants.jwt_secret rows in place (GHSA-4x5m-3gph-938r).
+	// Non-fatal for the same reason as the key backfill: tenantSecret falls back
+	// to the plaintext column until this pass reaches the row.
+	if encrypted, err := jwtSvc.EncryptAllTenantSecrets(startupCtx); err != nil {
+		deps.Logger.Error().Err(err).Msg("jwt_secret encryption backfill failed — plaintext secrets remain until next startup")
+	} else if encrypted > 0 {
+		deps.Logger.Info().Int("tenants", encrypted).Msg("encrypted tenant jwt_secret values at rest")
 	}
 
 	// Drop retired keys whose grace window has elapsed. Without this every rotation
@@ -707,8 +717,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	signingKeyHandler := handlers.NewSigningKeyHandler(deps.Pool, signingKeySvc, deps.Config.AppBaseURL, auditLog, deps.Logger)
 
 	// Give newly created tenants their key pair up front rather than lazily on
-	// first login.
-	adminSvc.WithSigningKeys(signingKeySvc)
+	// first login. The secret box rides along so their jwt_secret is stored
+	// encrypted from the first write (GHSA-4x5m-3gph-938r).
+	adminSvc.WithSigningKeys(signingKeySvc).WithSecretBox(signingKeyBox)
 
 	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Config.AppBaseURL, deps.Logger)
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)
