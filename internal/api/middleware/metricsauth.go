@@ -8,10 +8,12 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
-// MetricsAuth optionally gates the Prometheus scrape endpoint behind a bearer
-// token. An empty token disables the check entirely, preserving the endpoint's
-// original contract (bind to localhost, restrict at the reverse proxy) so
-// enabling this is a deliberate act that cannot silently break a live scrape.
+// MetricsAuth gates the Prometheus scrape endpoint behind a bearer token.
+// An empty token disables the check entirely — that permissive branch is only
+// reachable in development/test, where RegisterRoutes still registers the
+// endpoint without a token. In production/staging the route is not registered
+// unless METRICS_TOKEN is set, so this middleware's empty-token pass-through
+// cannot be reached there (GHSA-4r4c-348x-w452, L-02).
 //
 // This is defence in depth, not the primary control. The network-level
 // restriction is easy to omit — a catch-all `location /` in nginx publishes
