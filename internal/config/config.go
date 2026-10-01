@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -346,8 +347,11 @@ type Config struct {
 func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
-		Port:                                   getEnv("PORT", "9090"),
-		DatabaseURL:                            getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
+		Port: getEnv("PORT", "9090"),
+		// GHSA-jv2c-x735-vff7 (L-06): no committed DSN default — the old fallback
+		// embedded credentials and sslmode=disable. DATABASE_URL must be set
+		// explicitly; Validate() refuses to boot without it.
+		DatabaseURL:                            getEnv("DATABASE_URL", ""),
 		RedisURL:                               getEnv("REDIS_URL", "redis://localhost:6379/0"),
 		LogLevel:                               getEnv("LOG_LEVEL", "info"),
 		Env:                                    getEnv("ENV", "development"),
@@ -429,12 +433,27 @@ func Load() *Config {
 // check in NewTOTPService, keys off ENV; a misspelling such as "prodution" would
 // otherwise skip all of them and boot a deployment with development defaults.
 func (c *Config) Validate() error {
+	// GHSA-jv2c-x735-vff7 (L-06): DATABASE_URL is required in every environment —
+	// there is no committed fallback anymore, and an empty DSN would only fail
+	// later at pool-connect with a less obvious error.
+	if c.DatabaseURL == "" {
+		return errors.New("DATABASE_URL must be set: there is no default DSN (committed defaults previously embedded credentials and sslmode=disable)")
+	}
 	switch c.Env {
 	case "development", "test":
 		return nil
 	case "production", "staging":
 	default:
 		return fmt.Errorf("ENV=%q is not recognised: it must be development, test, staging or production", c.Env)
+	}
+	// GHSA-jv2c-x735-vff7 (L-06): the TLS requirement is checked on the parsed
+	// sslmode value, not a substring — a missing sslmode defaults to "prefer",
+	// which silently falls back to plaintext, and allow/prefer/disable all
+	// permit an unencrypted hop to the database.
+	switch sslModeOf(c.DatabaseURL) {
+	case "require", "verify-ca", "verify-full":
+	default:
+		return errors.New("DATABASE_URL must set sslmode=require, verify-ca or verify-full when ENV=production or staging: a missing sslmode defaults to prefer, which falls back to an unencrypted connection")
 	}
 	if c.CookieDomain == "" {
 		return errors.New("COOKIE_DOMAIN must be set when ENV=production or staging: cookie sessions and the CSRF trusted-origin check both derive from it, and the CSRF check fails closed without it")
@@ -483,6 +502,29 @@ func (c *Config) TrustedProxyNets() ([]*net.IPNet, error) {
 		nets = append(nets, n)
 	}
 	return nets, nil
+}
+
+// sslModeOf extracts the sslmode from a PostgreSQL DSN in either form —
+// URL ("postgres://...?sslmode=require") or keyword/value
+// ("host=db sslmode=verify-full"). Returns "" when unset or unparseable,
+// which the caller treats as unsafe (pgx/libpq defaults to "prefer").
+func sslModeOf(dsn string) string {
+	if strings.Contains(dsn, "://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return ""
+		}
+		return strings.ToLower(u.Query().Get("sslmode"))
+	}
+	// Keyword/value form: space-separated key=value pairs; values may be
+	// single-quoted. pgconn's own parser is not exported at the level we need,
+	// and a full kwparser is overkill — sslmode values are bare words.
+	for _, field := range strings.Fields(dsn) {
+		if k, v, ok := strings.Cut(field, "="); ok && strings.EqualFold(strings.TrimSpace(k), "sslmode") {
+			return strings.ToLower(strings.Trim(v, "'"))
+		}
+	}
+	return ""
 }
 
 // mustAtoi parses an integer env value, returning 0 on any parse error so a
