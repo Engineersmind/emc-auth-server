@@ -543,11 +543,13 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
 	}
-	// Encrypt the secret for storage when a box is wired; the plaintext column
-	// then carries '' — never a usable key (GHSA-4x5m-3gph-938r).
+	// Encrypt the secret for storage when a box with a real key is wired; the
+	// plaintext column then carries '' — never a usable key
+	// (GHSA-4x5m-3gph-938r). A box on the development zero key must NOT write:
+	// that ciphertext becomes undecryptable the moment a real key is set.
 	storedSecret := secret
 	var secretEnc any
-	if s.secretBox != nil {
+	if s.secretBox != nil && !s.secretBox.UsesInsecureZeroKey() {
 		if secretEnc, err = s.secretBox.Encrypt(secret); err != nil {
 			return nil, fmt.Errorf("encrypt jwt secret: %w", err)
 		}
