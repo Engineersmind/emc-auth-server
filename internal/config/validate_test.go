@@ -74,6 +74,27 @@ func TestValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// L-06 review: a missing sslmode is not safe — pgx defaults to
+			// "prefer", which silently falls back to an unencrypted hop.
+			name:    "missing sslmode is rejected in production",
+			cfg:     Config{Env: "production", DatabaseURL: "postgres://u:p@db/db", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+			wantErr: true,
+		},
+		{
+			name:    "sslmode=prefer is rejected in production",
+			cfg:     Config{Env: "production", DatabaseURL: "postgres://u:p@db/db?sslmode=prefer", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+			wantErr: true,
+		},
+		{
+			name:    "sslmode=allow is rejected in staging",
+			cfg:     Config{Env: "staging", DatabaseURL: "host=db user=u password=p sslmode=allow", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+			wantErr: true,
+		},
+		{
+			name: "keyword DSN with verify-full passes in production",
+			cfg:  Config{Env: "production", DatabaseURL: "host=db user=u password=p sslmode=verify-full", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}},
+		},
+		{
 			name:    "production without a cookie domain",
 			cfg:     Config{Env: "production", DatabaseURL: goodDSN, GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}, TOTPEncryptionKey: realTOTPKey, TrustedProxies: []string{"172.18.0.0/16"}},
 			wantErr: true,
