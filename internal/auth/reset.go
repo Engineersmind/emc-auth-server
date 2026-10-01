@@ -29,6 +29,14 @@ type ResetService struct {
 	tmplSvc    *EmailTemplateService
 	audit      *audit.Logger
 	appBaseURL string
+	// dashboardBaseURL is the admin-console origin used for the emailed reset
+	// link (GHSA-2267-r48x-9fh7). The link must open the reset-password PAGE,
+	// not the API endpoint: the page reads the token out of the URL and POSTs
+	// it in the request body, so the credential never transits an API access
+	// log, proxy log, or Referer header as a query parameter. Falls back to
+	// appBaseURL when unset so a deployment without a console still mails a
+	// link that reaches a working endpoint.
+	dashboardBaseURL string
 	// hasher writes the new credential on a completed reset. Defaulted by the
 	// constructor so a caller that forgets WithHasher still writes a correctly
 	// hashed password.
@@ -53,6 +61,15 @@ func NewResetService(pool *pgxpool.Pool, m mailer.Mailer, appBaseURL string, log
 func (s *ResetService) WithHasher(h *password.Hasher) *ResetService {
 	if h != nil {
 		s.hasher = h
+	}
+	return s
+}
+
+// WithDashboardURL points emailed reset links at the admin console's reset
+// page rather than the API (see the dashboardBaseURL field comment).
+func (s *ResetService) WithDashboardURL(base string) *ResetService {
+	if base != "" {
+		s.dashboardBaseURL = base
 	}
 	return s
 }
@@ -151,7 +168,14 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 		return fmt.Errorf("persist reset token: %w", err)
 	}
 
-	resetLink := fmt.Sprintf("%s/api/v1/auth/reset-password?token=%s", s.appBaseURL, rawToken)
+	// The link goes to the dashboard reset page, not the API endpoint — a query
+	// param on the API URL would land the token in access/proxy logs and
+	// Referer headers (GHSA-2267-r48x-9fh7). The page POSTs it in the body.
+	linkBase := s.dashboardBaseURL
+	if linkBase == "" {
+		linkBase = s.appBaseURL
+	}
+	resetLink := fmt.Sprintf("%s/reset-password?token=%s", linkBase, rawToken)
 	msg := mailer.ResetEmail{
 		To:        email,
 		ResetLink: resetLink,
