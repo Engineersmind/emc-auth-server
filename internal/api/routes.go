@@ -318,9 +318,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// that is missing — a catch-all `location /` in nginx publishes this
 	// endpoint alongside the API, and the registry exposes tenant identifiers,
 	// login/token volumes, lockout and risk-signal counts, and the route table.
-	// Unset (the default) preserves the previous open behaviour so enabling the
-	// guard is a deliberate act that cannot silently break an existing scrape.
-	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()), mw.MetricsAuth(deps.Config.MetricsToken))
+	//
+	// GHSA-4r4c-348x-w452 (L-02): in production/staging the endpoint is not
+	// registered at all unless METRICS_TOKEN is set — defence in depth cannot
+	// depend on an empty-string bypass. Development/test keeps the open
+	// endpoint so local scraping keeps working without a token.
+	if deps.Config.MetricsToken != "" || (deps.Config.Env != "production" && deps.Config.Env != "staging") {
+		e.GET("/metrics", echo.WrapHandler(promhttp.Handler()), mw.MetricsAuth(deps.Config.MetricsToken))
+	} else {
+		deps.Logger.Warn().Msg("METRICS_TOKEN unset — /metrics endpoint DISABLED in production/staging; set METRICS_TOKEN to expose it behind bearer auth")
+	}
 
 	// Swagger UI — available at /swagger/index.html
 	// Override CSP for Swagger: its bundled JS uses inline scripts that require
