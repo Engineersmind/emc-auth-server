@@ -34,6 +34,17 @@ func TestValidate(t *testing.T) {
 			cfg:     Config{Env: "production", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com", "*"}},
 			wantErr: true,
 		},
+		{
+			// A misspelled ENV must not silently get the lax development
+			// posture — security branches compare against "production".
+			name:    "unrecognised ENV is rejected",
+			cfg:     Config{Env: "prod"},
+			wantErr: true,
+		},
+		{
+			name: "test env is accepted",
+			cfg:  Config{Env: "test"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -43,5 +54,17 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestLoad_EnvDefaultsToProduction locks in GHSA-vgf9-64q8-gj87 (M-03): an
+// unset ENV must resolve to the strict posture, not development. A deploy that
+// forgets ENV then trips Validate()'s COOKIE_DOMAIN requirement instead of
+// silently shipping lax cookies, no CSRF check, and no HTTPS redirect.
+func TestLoad_EnvDefaultsToProduction(t *testing.T) {
+	t.Setenv("ENV", "")
+	cfg := Load()
+	if cfg.Env != "production" {
+		t.Errorf("unset ENV: Env = %q, want %q", cfg.Env, "production")
 	}
 }

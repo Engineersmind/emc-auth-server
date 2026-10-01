@@ -260,6 +260,7 @@ jobs:
             -e JWT_ISSUER=https://auth.emc.local \
             -e APP_BASE_URL=http://localhost:8080 \
             -e PORT=8080 \
+            -e ENV=development \
             -e SEED_ADMIN_PASSWORD=ChangeMe123! \
             -e TOTP_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 \
             -d --name emc-auth-ci emc-auth-server:ci

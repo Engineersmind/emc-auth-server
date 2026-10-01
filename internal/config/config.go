@@ -328,11 +328,19 @@ type Config struct {
 func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
-		Port:                                   getEnv("PORT", "9090"),
-		DatabaseURL:                            getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
-		RedisURL:                               getEnv("REDIS_URL", "redis://localhost:6379/0"),
-		LogLevel:                               getEnv("LOG_LEVEL", "info"),
-		Env:                                    getEnv("ENV", "development"),
+		Port:        getEnv("PORT", "9090"),
+		DatabaseURL: getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
+		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379/0"),
+		LogLevel:    getEnv("LOG_LEVEL", "info"),
+		// GHSA-vgf9-64q8-gj87 (M-03): unset ENV must mean the STRICT posture, not
+		// development. With "development" as the default a deploy that forgets
+		// ENV ships SameSite=Lax insecure cookies, no CSRF check, and no HTTPS
+		// redirect — silently. Defaulting to production makes the omission loud:
+		// Validate() refuses to boot without COOKIE_DOMAIN, so the operator is
+		// forced to choose rather than inheriting the lax path. Local dev is
+		// unaffected — .env.example and docker-compose set ENV=development
+		// explicitly.
+		Env:                                    getEnv("ENV", "production"),
 		MetricsToken:                           getEnv("METRICS_TOKEN", ""),
 		JWTIssuer:                              getEnv("JWT_ISSUER", "https://auth.emc.local"),
 		EmailProvider:                          getEnv("EMAIL_PROVIDER", ""),
@@ -401,6 +409,14 @@ func Load() *Config {
 // exempt: it runs on SameSite=Lax with no cookie domain, and the CSRF check is
 // skipped entirely there.
 func (c *Config) Validate() error {
+	// A misspelled ENV ("prod", "live") must not silently get the lax
+	// development posture — security branches compare Env == "production", so
+	// anything outside the known set refuses to boot.
+	switch c.Env {
+	case "development", "test", "staging", "production":
+	default:
+		return errors.New("ENV must be one of development|test|staging|production — a misspelled value would silently get development-mode security")
+	}
 	if c.Env != "production" && c.Env != "staging" {
 		return nil
 	}
