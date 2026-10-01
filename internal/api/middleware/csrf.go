@@ -144,8 +144,15 @@ func checkTrustedOrigin(c echo.Context, cfg CookieConfig) (rejection error, bloc
 		return csrfRejected(c), true
 	}
 
-	// Fail-closed: secure cookies with no allowlist is a misconfiguration, not
-	// a signal to accept every origin.
+	// Deliberately GLOBAL_CORS_ORIGINS only — per-tenant cors_origins rows are
+	// NOT consulted here. CORS is a read-protection (which origins may read
+	// responses); CSRF is a write-protection (which origins may drive the
+	// browser's ambient credential). The session cookies this guards are set
+	// by the portal, which lives at the global origin — tenant SPAs carry
+	// Bearer tokens, whose security does not depend on this list at all.
+	// Widening the allowlist to every tenant's cors_origins would let any
+	// tenant-controlled origin CSRF the admin session: a cross-tenant
+	// privilege escalation.
 	if len(cfg.TrustedOrigins) == 0 {
 		return c.JSON(http.StatusForbidden, map[string]string{
 			"error": "CSRF check misconfigured: GLOBAL_CORS_ORIGINS must be set in production",
