@@ -171,6 +171,16 @@ type Config struct {
 	// per-tenant CORS lookups don't apply. Comma-separated via GLOBAL_CORS_ORIGINS.
 	GlobalCORSOrigins []string
 
+	// TrustedProxies are the CIDR ranges of reverse proxies allowed to set
+	// the client-IP header (X-Forwarded-For), comma-separated via
+	// TRUSTED_PROXIES (e.g. "10.0.0.0/8,172.16.0.0/12").
+	//
+	// Empty (the default) means the server trusts NO forwarded headers: the
+	// client IP is always the direct connection address. That is the only
+	// safe default — blindly honouring XFF lets any client spoof the IP used
+	// for rate limiting, CAPTCHA, and audit/risk logging.
+	TrustedProxies []string
+
 	// WebAuthnRPID is the WebAuthn Relying Party ID: the registrable domain that
 	// passkeys are bound to, with no scheme and no port ("localhost",
 	// "insurance.acme.com"). Empty (the default) disables passkeys entirely —
@@ -371,6 +381,7 @@ func Load() *Config {
 		OIDCIssuerBaseURL:     getEnv("OIDC_ISSUER_BASE_URL", getEnv("APP_BASE_URL", "http://localhost:9090")),
 		CookieDomain:          getEnv("COOKIE_DOMAIN", ""),
 		GlobalCORSOrigins:     getEnvList("GLOBAL_CORS_ORIGINS", ""),
+		TrustedProxies:        getEnvList("TRUSTED_PROXIES", ""),
 		WebAuthnRPID:          getEnv("WEBAUTHN_RP_ID", ""),
 		WebAuthnRPDisplayName: getEnv("WEBAUTHN_RP_DISPLAY_NAME", "EMC Auth"),
 		WebAuthnOrigins:       getEnvList("WEBAUTHN_ORIGINS", ""),

@@ -308,6 +308,13 @@ func main() {
 	e.HideBanner = true
 	e.HidePort = true
 
+	// Client-IP extraction: trust X-Forwarded-For only when the
+	// direct peer is a configured trusted proxy (TRUSTED_PROXIES). Echo's
+	// default RealIP() honours those headers unconditionally, letting any
+	// client spoof the IP used for rate limiting, CAPTCHA and audit/risk
+	// logging — so without proxies configured we take the connection address.
+	e.IPExtractor = api.NewIPExtractor(cfg.TrustedProxies, logger)
+
 	// Register routes and middleware. The returned cleanup stops the background
 	// workers routes started; called during shutdown below, before the pool
 	// closes, so an in-flight import row finishes rather than losing its
