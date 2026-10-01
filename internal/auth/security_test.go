@@ -34,7 +34,7 @@ func newSecurityTestServices(t *testing.T) (*auth.AuthService, *auth.ResetServic
 	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
 
 	totpEncKey := os.Getenv("TOTP_ENCRYPTION_KEY")
-	totpSvc, err := auth.NewTOTPService(pool, totpEncKey, logger)
+	totpSvc, err := auth.NewTOTPService(pool, totpEncKey, "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestTOTPBypass_InvalidCode(t *testing.T) {
 	}
 
 	totpEncKey := os.Getenv("TOTP_ENCRYPTION_KEY")
-	totpSvc, err := auth.NewTOTPService(pool, totpEncKey, logger)
+	totpSvc, err := auth.NewTOTPService(pool, totpEncKey, "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}

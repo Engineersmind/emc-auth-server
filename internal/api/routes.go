@@ -414,7 +414,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithAudiences(audienceSvc)
 
 	// TOTP service — requires encryption key; logs warning in dev if missing.
-	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Logger)
+	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Config.Env, deps.Logger)
 	if totpErr != nil {
 		deps.Logger.Fatal().Err(totpErr).Msg("TOTP service init failed — check TOTP_ENCRYPTION_KEY")
 	}
