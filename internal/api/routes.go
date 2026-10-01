@@ -639,7 +639,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 
 	// SAML service (Phase 4) — lightweight SP, no external dependencies.
 	samlService := samlsvc.New(deps.Pool, deps.Config.AppBaseURL, deps.Logger)
-	samlHandler := handlers.NewSAMLHandler(samlService, jwtSvc, deps.Logger)
+	samlHandler := handlers.NewSAMLHandler(samlService, deps.Logger)
 
 	// Social login (issue #64 Google, issue #66 GitHub) — OAuth for app-scoped end users.
 	// The secret box fails hard in production/staging when the key is unset;
