@@ -99,6 +99,97 @@ func TestJWTService_SignAndVerify(t *testing.T) {
 	}
 }
 
+// TestJWTService_TenantSecretEncryptedAtRest locks in GHSA-4x5m-3gph-938r:
+// tenants.jwt_secret must not sit in the table as usable plaintext once the
+// secret-box backfill has run. The seed rows start plaintext (legacy shape);
+// EncryptAllTenantSecrets encrypts them and blanks the column, after which
+// signing must still work by decrypting jwt_secret_enc.
+func TestJWTService_TenantSecretEncryptedAtRest(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	testhelper.CleanupTables(t, pool)
+
+	ctx := context.Background()
+	logger := testhelper.TestLogger()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	box, err := auth.NewSecretBox(strings.Repeat("ab", 32), "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox: %v", err)
+	}
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local").WithSecretBox(box)
+
+	// Plaintext is present before the backfill (seed writes the legacy shape).
+	var plainBefore string
+	if err := pool.QueryRow(ctx, `SELECT jwt_secret FROM tenants WHERE id = $1`, tenantID).Scan(&plainBefore); err != nil {
+		t.Fatalf("fetch plaintext jwt_secret: %v", err)
+	}
+	if plainBefore == "" {
+		t.Fatal("seed wrote empty jwt_secret — fixture assumption broken")
+	}
+
+	migrated, err := jwtSvc.EncryptAllTenantSecrets(ctx)
+	if err != nil {
+		t.Fatalf("EncryptAllTenantSecrets() error = %v", err)
+	}
+	if migrated != 1 {
+		t.Errorf("EncryptAllTenantSecrets migrated = %d, want 1", migrated)
+	}
+
+	var plainAfter, encAfter string
+	if err := pool.QueryRow(ctx,
+		`SELECT jwt_secret, COALESCE(jwt_secret_enc, '') FROM tenants WHERE id = $1`, tenantID,
+	).Scan(&plainAfter, &encAfter); err != nil {
+		t.Fatalf("fetch post-backfill secret columns: %v", err)
+	}
+	if plainAfter != "" {
+		t.Error("jwt_secret still plaintext after backfill — column should be blanked")
+	}
+	if encAfter == "" {
+		t.Fatal("jwt_secret_enc empty after backfill")
+	}
+
+	// Signing must still work — the service now reads through the enc column.
+	token, err := jwtSvc.Sign(ctx, tenantID, auth.AudienceAPI, auth.GrantPassword, &auth.Claims{
+		UserID:   "1",
+		TenantID: strconv.FormatInt(tenantID, 10),
+		Email:    "admin@emc.local",
+	})
+	if err != nil {
+		t.Fatalf("Sign() after encryption error = %v", err)
+	}
+	parsed, _, err := jwt.NewParser().ParseUnverified(token, &auth.Claims{})
+	if err != nil {
+		t.Fatalf("ParseUnverified() error = %v", err)
+	}
+	if got := parsed.Header["alg"]; got != "HS256" {
+		t.Errorf("alg = %v, want HS256 (legacy path decrypts tenant secret)", got)
+	}
+
+	// The decrypted value must round-trip to the original plaintext —
+	// verified by signing a token externally with the pre-backfill secret and
+	// having it verify through the enc-read path.
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": "1", "tenant_id": strconv.FormatInt(tenantID, 10),
+		"iss": "https://auth.emc.local",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+	signed, err := tok.SignedString([]byte(plainBefore))
+	if err != nil {
+		t.Fatalf("external sign: %v", err)
+	}
+	if _, err := jwtSvc.WithLegacyHS256(true).Verify(ctx, signed); err != nil {
+		t.Fatalf("Verify() of token signed with original plaintext secret failed: %v", err)
+	}
+}
+
 func TestJWTService_Verify_ExpiredToken(t *testing.T) {
 	pool := testhelper.NewTestDB(t)
 	testhelper.CleanupTables(t, pool)
