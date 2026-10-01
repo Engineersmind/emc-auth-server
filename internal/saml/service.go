@@ -11,8 +11,6 @@ import (
 
 	"strconv"
 
-	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
@@ -49,15 +47,11 @@ type ACSService struct {
 	Index    string `xml:"index,attr"`
 }
 
-// User is a lightweight user record returned by JIT provisioning.
-type User struct {
-	ID       string
-	Email    string
-	TenantID string
-	Role     string
-}
-
-// Service provides SAML config storage, metadata generation, and JIT provisioning.
+// Service provides SAML config storage and SP metadata/AuthnRequest
+// generation. There is deliberately no response-parsing or JIT provisioning
+// here: GHSA-jv2c-x735-vff7 (L-01) removed the dormant implementation because
+// it minted sessions from assertions whose IdP signature was never verified.
+// ACS returns 501 until signature verification is implemented end to end.
 type Service struct {
 	pool    *pgxpool.Pool
 	baseURL string
@@ -162,144 +156,4 @@ func (s *Service) BuildAuthnRequest(tenantID, ssoURL string) (string, error) {
 	)
 
 	return base64.StdEncoding.EncodeToString([]byte(authnReq)), nil
-}
-
-// ParseACSResponse parses a base64-encoded SAMLResponse and extracts the NameID.
-//
-// NOTE: This is a simplified parser — it does NOT verify the IdP signature.
-// In production, use a library that performs full XML signature validation
-// (e.g., crewjam/saml or russellhaering/gosaml2). Signature verification is
-// a known gap and must be addressed before handling real IdP assertions.
-func (s *Service) ParseACSResponse(samlResponse string) (email string, attrs map[string]string, err error) {
-	xmlBytes, err := base64.StdEncoding.DecodeString(samlResponse)
-	if err != nil {
-		return "", nil, fmt.Errorf("failed to decode SAMLResponse: %w", err)
-	}
-
-	// Minimal XML structs for extracting the NameID from the Assertion.
-	type nameID struct {
-		Value string `xml:",chardata"`
-	}
-	type subject struct {
-		NameID nameID `xml:"NameID"`
-	}
-	type assertion struct {
-		Subject subject `xml:"Subject"`
-	}
-	type responseDoc struct {
-		Assertion assertion `xml:"Assertion"`
-	}
-
-	var resp responseDoc
-	if xmlErr := xml.Unmarshal(xmlBytes, &resp); xmlErr != nil {
-		return "", nil, fmt.Errorf("failed to parse SAMLResponse XML: %w", xmlErr)
-	}
-
-	email = resp.Assertion.Subject.NameID.Value
-	if email == "" {
-		return "", nil, fmt.Errorf("NameID (email) not found in SAMLResponse")
-	}
-
-	return email, map[string]string{}, nil
-}
-
-// FindOrCreateUser performs JIT provisioning: looks up a user by tenant+email,
-// creating one if not found. The created user has no usable password (SAML-only login).
-func (s *Service) FindOrCreateUser(ctx context.Context, tenantID, email string) (*User, error) {
-	// IdPs vary in how they case the NameID between assertions; without this an
-	// IdP that changes casing JIT-provisions a second account for one person.
-	email = emailaddr.Normalize(email)
-
-	tenantIDInt, err := strconv.ParseInt(tenantID, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid tenant_id: %w", err)
-	}
-
-	// Try to find existing user.
-	var userID int64
-	var roleName string
-	err = s.pool.QueryRow(ctx, `
-		SELECT u.id, COALESCE(r.name, '')
-		FROM users u
-		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
-		WHERE u.tenant_id = $1 AND u.email = $2 AND u.is_active = true AND u.deleted_at IS NULL
-	`, tenantIDInt, email).Scan(&userID, &roleName)
-	if err == nil {
-		return &User{ID: strconv.FormatInt(userID, 10), Email: email, TenantID: tenantID, Role: roleName}, nil
-	}
-	if err != pgx.ErrNoRows {
-		return nil, fmt.Errorf("lookup user: %w", err)
-	}
-
-	// User not found — JIT provision.
-	// Fetch default (non-system) role for the tenant.
-	var roleID *int64
-	var tempRoleID int64
-	err = s.pool.QueryRow(ctx,
-		`SELECT id, name FROM roles WHERE tenant_id = $1 AND is_system = false AND deleted_at IS NULL ORDER BY name LIMIT 1`,
-		tenantIDInt,
-	).Scan(&tempRoleID, &roleName)
-	if err == nil {
-		roleID = &tempRoleID
-	} else if err != pgx.ErrNoRows {
-		return nil, fmt.Errorf("fetch default role: %w", err)
-	}
-
-	// Insert user + a locked credential row (random bytes — cannot be used for password login).
-	// users.id is GENERATED ALWAYS AS IDENTITY — do not supply an explicit value.
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck
-
-	err = tx.QueryRow(ctx, `
-		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, is_active)
-		VALUES ($1, $2, '', '', $3, true)
-		RETURNING id
-	`, tenantIDInt, email, roleID).Scan(&userID)
-	if err != nil {
-		return nil, fmt.Errorf("insert JIT user: %w", err)
-	}
-
-	// Mirror the assigned role into user_roles, in the same transaction. That
-	// table is what resolves permissions since #146 phase 2, so a JIT user with
-	// only role_id set would sign in holding none of its permissions. roleID is
-	// nullable here — an IdP-provisioned user gets a role only when the tenant
-	// defines an assignable one.
-	if roleID != nil {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
-			VALUES ($1, $2, $3, NULL)
-			ON CONFLICT (user_id, role_id) DO NOTHING
-		`, userID, *roleID, tenantIDInt); err != nil {
-			return nil, fmt.Errorf("record JIT role grant: %w", err)
-		}
-	}
-
-	// Generate a random unusable password hash so the user_credentials row exists
-	// but cannot be used for password-based login.
-	randomBytes := make([]byte, 32)
-	if _, randErr := rand.Read(randomBytes); randErr != nil {
-		return nil, fmt.Errorf("generate random credential: %w", randErr)
-	}
-	lockedHash := "saml:" + base64.StdEncoding.EncodeToString(randomBytes)
-
-	_, err = tx.Exec(ctx, `
-		INSERT INTO user_credentials (user_id, tenant_id, password_hash)
-		VALUES ($1, $2, $3)
-	`, userID, tenantIDInt, lockedHash)
-	if err != nil {
-		return nil, fmt.Errorf("insert JIT credentials: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit JIT provision: %w", err)
-	}
-
-	userIDStr := strconv.FormatInt(userID, 10)
-	s.logger.Info().Str("user_id", userIDStr).Str("email", email).
-		Str("tenant_id", tenantID).Msg("saml: JIT provisioned new user")
-
-	return &User{ID: userIDStr, Email: email, TenantID: tenantID, Role: roleName}, nil
 }
