@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -413,8 +414,14 @@ func (c *Config) Validate() error {
 	if c.Env != "production" && c.Env != "staging" {
 		return nil
 	}
-	if strings.Contains(c.DatabaseURL, "sslmode=disable") {
-		return errors.New("DATABASE_URL must not use sslmode=disable when ENV=production or staging: use sslmode=require or verify-full")
+	// GHSA-jv2c-x735-vff7 (L-06): the TLS requirement is checked on the parsed
+	// sslmode value, not a substring — a missing sslmode defaults to "prefer",
+	// which silently falls back to plaintext, and allow/prefer/disable all
+	// permit an unencrypted hop to the database.
+	switch sslModeOf(c.DatabaseURL) {
+	case "require", "verify-ca", "verify-full":
+	default:
+		return errors.New("DATABASE_URL must set sslmode=require, verify-ca or verify-full when ENV=production or staging: a missing sslmode defaults to prefer, which falls back to an unencrypted connection")
 	}
 	if c.CookieDomain == "" {
 		return errors.New("COOKIE_DOMAIN must be set when ENV=production or staging: cookie sessions and the CSRF trusted-origin check both derive from it, and the CSRF check fails closed without it")
@@ -423,6 +430,29 @@ func (c *Config) Validate() error {
 		return errors.New("GLOBAL_CORS_ORIGINS must name the portal origin explicitly when ENV=production or staging: a wildcard suppresses Access-Control-Allow-Credentials, so the browser will never send the session cookies")
 	}
 	return nil
+}
+
+// sslModeOf extracts the sslmode from a PostgreSQL DSN in either form —
+// URL ("postgres://...?sslmode=require") or keyword/value
+// ("host=db sslmode=verify-full"). Returns "" when unset or unparseable,
+// which the caller treats as unsafe (pgx/libpq defaults to "prefer").
+func sslModeOf(dsn string) string {
+	if strings.Contains(dsn, "://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return ""
+		}
+		return strings.ToLower(u.Query().Get("sslmode"))
+	}
+	// Keyword/value form: space-separated key=value pairs; values may be
+	// single-quoted. pgconn's own parser is not exported at the level we need,
+	// and a full kwparser is overkill — sslmode values are bare words.
+	for _, field := range strings.Fields(dsn) {
+		if k, v, ok := strings.Cut(field, "="); ok && strings.EqualFold(strings.TrimSpace(k), "sslmode") {
+			return strings.ToLower(strings.Trim(v, "'"))
+		}
+	}
+	return ""
 }
 
 // mustAtoi parses an integer env value, returning 0 on any parse error so a
