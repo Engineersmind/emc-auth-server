@@ -34,8 +34,17 @@ type TOTPService struct {
 }
 
 // NewTOTPService creates a TOTPService. encKeyHex must be a 64-character hex string (32 bytes).
-func NewTOTPService(pool *pgxpool.Pool, encKeyHex string, logger zerolog.Logger) (*TOTPService, error) {
+//
+// env controls the missing-key behaviour, matching NewSecretBox: in
+// "production" (and "staging") a missing key is a hard error so the server
+// can never silently encrypt MFA secrets with a public key; in development
+// it falls back to an insecure zero key with a loud warning so local setups
+// keep working.
+func NewTOTPService(pool *pgxpool.Pool, encKeyHex, env string, logger zerolog.Logger) (*TOTPService, error) {
 	if encKeyHex == "" {
+		if env == "production" || env == "staging" {
+			return nil, fmt.Errorf("TOTP_ENCRYPTION_KEY: %w", ErrEncryptionKeyRequired)
+		}
 		logger.Warn().Msg("TOTP_ENCRYPTION_KEY not set — using insecure zero key (dev only)")
 		encKeyHex = strings.Repeat("0", 64)
 	}

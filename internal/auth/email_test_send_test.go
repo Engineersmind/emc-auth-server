@@ -36,7 +36,7 @@ func newSenderTestEnv(t *testing.T) (*auth.EmailSenderService, int64, int64, con
 		t.Fatalf("seed application: %v", err)
 	}
 
-	totpSvc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	totpSvc, err := auth.NewTOTPService(pool, totpEnvKey(), "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}

@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
@@ -45,7 +46,7 @@ func newTOTPService(t *testing.T) (*auth.TOTPService, context.Context, *pgxpool.
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -89,6 +90,32 @@ func secretFromOTPURI(t *testing.T, uri string) string {
 	return secret
 }
 
+func TestNewTOTPService_FailsClosedOnMissingKey(t *testing.T) {
+	logger := testhelper.TestLogger()
+
+	// Production/staging must refuse to start without an encryption key —
+	// silently falling back to the zero key would store MFA secrets
+	// decryptable by anyone.
+	for _, env := range []string{"production", "staging"} {
+		svc, err := auth.NewTOTPService(nil, "", env, logger)
+		if err == nil {
+			t.Errorf("env %q: expected error for missing TOTP_ENCRYPTION_KEY, got service %v", env, svc)
+		}
+		if !errors.Is(err, auth.ErrEncryptionKeyRequired) {
+			t.Errorf("env %q: error = %v, want ErrEncryptionKeyRequired", env, err)
+		}
+	}
+
+	// Development keeps the loud zero-key fallback so local setups work.
+	svc, err := auth.NewTOTPService(nil, "", "development", logger)
+	if err != nil {
+		t.Errorf("development: unexpected error = %v", err)
+	}
+	if svc == nil {
+		t.Error("development: expected service with dev zero key, got nil")
+	}
+}
+
 func TestTOTPService_Enroll_ReturnsURIAndCodes(t *testing.T) {
 	svc, ctx, pool, tenantID := newTOTPService(t)
 
@@ -126,7 +153,7 @@ func TestTOTPService_VerifyAndActivate(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -173,7 +200,7 @@ func TestTOTPService_Verify_InvalidCode(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -217,7 +244,7 @@ func TestTOTPService_VerifyBackupCode_ConsumesCode(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -263,7 +290,7 @@ func TestTOTPService_Disable(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}

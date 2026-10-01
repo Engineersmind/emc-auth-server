@@ -112,7 +112,7 @@ func TestForgotPassword_UsesTenantSender(t *testing.T) {
 		t.Fatalf("tenant id: %v", err)
 	}
 
-	totpSvc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	totpSvc, err := auth.NewTOTPService(pool, totpEnvKey(), "test", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
