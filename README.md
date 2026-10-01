@@ -238,7 +238,7 @@ ENV=development          # set to "production" to enable HTTPS redirect
 LOG_LEVEL=info
 
 # PostgreSQL
-DATABASE_URL=postgres://emc_auth:password@localhost:5432/emc_auth?sslmode=disable
+DATABASE_URL=postgres://emc_auth:local-dev-only@localhost:5432/emc_auth?sslmode=disable
 
 # Redis
 REDIS_URL=redis://localhost:6379/0
