@@ -33,9 +33,8 @@ type ResetService struct {
 	// link (GHSA-2267-r48x-9fh7). The link must open the reset-password PAGE,
 	// not the API endpoint: the page reads the token out of the URL and POSTs
 	// it in the request body, so the credential never transits an API access
-	// log, proxy log, or Referer header as a query parameter. Falls back to
-	// appBaseURL when unset so a deployment without a console still mails a
-	// link that reaches a working endpoint.
+	// log, proxy log, or Referer header as a query parameter. Unset keeps the
+	// legacy API-path link for deployments without a console.
 	dashboardBaseURL string
 	// hasher writes the new credential on a completed reset. Defaulted by the
 	// constructor so a caller that forgets WithHasher still writes a correctly
@@ -171,11 +170,11 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 	// The link goes to the dashboard reset page, not the API endpoint — a query
 	// param on the API URL would land the token in access/proxy logs and
 	// Referer headers (GHSA-2267-r48x-9fh7). The page POSTs it in the body.
-	linkBase := s.dashboardBaseURL
-	if linkBase == "" {
-		linkBase = s.appBaseURL
+	// Deployments without a console keep the legacy API-path link unchanged.
+	resetLink := fmt.Sprintf("%s/api/v1/auth/reset-password?token=%s", s.appBaseURL, rawToken)
+	if s.dashboardBaseURL != "" {
+		resetLink = fmt.Sprintf("%s/reset-password?token=%s", s.dashboardBaseURL, rawToken)
 	}
-	resetLink := fmt.Sprintf("%s/reset-password?token=%s", linkBase, rawToken)
 	msg := mailer.ResetEmail{
 		To:        email,
 		ResetLink: resetLink,
