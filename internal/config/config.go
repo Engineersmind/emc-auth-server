@@ -410,6 +410,12 @@ func (c *Config) Validate() error {
 	if slices.Contains(c.GlobalCORSOrigins, "*") {
 		return errors.New("GLOBAL_CORS_ORIGINS must name the portal origin explicitly when ENV=production or staging: a wildcard suppresses Access-Control-Allow-Credentials, so the browser will never send the session cookies")
 	}
+	// The CSRF check (GHSA-jv2c-x735-vff7) allowlists cookie-authenticated
+	// writes against this list, so an empty list is no longer "no CORS" — it
+	// is every login and portal write 403ing at runtime. Fail at boot instead.
+	if len(c.GlobalCORSOrigins) == 0 {
+		return errors.New("GLOBAL_CORS_ORIGINS must list at least the portal origin when ENV=production or staging: it is now the CSRF trusted-origin allowlist, and empty fails every cookie-authenticated write at runtime")
+	}
 	return nil
 }
 

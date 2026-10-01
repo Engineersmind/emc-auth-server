@@ -14,6 +14,12 @@ type CookieConfig struct {
 	Domain   string
 	Secure   bool
 	SameSite http.SameSite
+
+	// TrustedOrigins is the explicit allowlist of browser origins permitted to
+	// make cookie-authenticated writes — populated from GLOBAL_CORS_ORIGINS
+	// (GHSA-jv2c-x735-vff7). Exact-match only: trusting every subdomain of the
+	// cookie domain meant any attacker-controlled subdomain could CSRF.
+	TrustedOrigins []string
 }
 
 // BuildCookieConfig derives cookie settings from the runtime environment:
@@ -23,21 +29,19 @@ type CookieConfig struct {
 //
 //	staging / production — HTTPS, frontend on a different domain.
 //	                        SameSite=None (required for cross-domain AJAX), Secure=true.
-func BuildCookieConfig(env, domain string) CookieConfig {
+func BuildCookieConfig(env, domain string, trustedOrigins ...string) CookieConfig {
+	cfg := CookieConfig{TrustedOrigins: trustedOrigins}
 	switch env {
 	case "staging", "production":
-		return CookieConfig{
-			Domain:   domain,
-			Secure:   true,
-			SameSite: http.SameSiteNoneMode,
-		}
+		cfg.Domain = domain
+		cfg.Secure = true
+		cfg.SameSite = http.SameSiteNoneMode
 	default:
-		return CookieConfig{
-			Domain:   "",
-			Secure:   false,
-			SameSite: http.SameSiteLaxMode,
-		}
+		cfg.Domain = ""
+		cfg.Secure = false
+		cfg.SameSite = http.SameSiteLaxMode
 	}
+	return cfg
 }
 
 // Cookie Path scopes. The two credentials are deliberately scoped differently:
