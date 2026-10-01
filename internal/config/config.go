@@ -409,6 +409,14 @@ func Load() *Config {
 // exempt: it runs on SameSite=Lax with no cookie domain, and the CSRF check is
 // skipped entirely there.
 func (c *Config) Validate() error {
+	// A misspelled ENV ("prod", "live") must not silently get the lax
+	// development posture — security branches compare Env == "production", so
+	// anything outside the known set refuses to boot.
+	switch c.Env {
+	case "development", "test", "staging", "production":
+	default:
+		return errors.New("ENV must be one of development|test|staging|production — a misspelled value would silently get development-mode security")
+	}
 	if c.Env != "production" && c.Env != "staging" {
 		return nil
 	}

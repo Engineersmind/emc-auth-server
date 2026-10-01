@@ -34,6 +34,17 @@ func TestValidate(t *testing.T) {
 			cfg:     Config{Env: "production", CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com", "*"}},
 			wantErr: true,
 		},
+		{
+			// A misspelled ENV must not silently get the lax development
+			// posture — security branches compare against "production".
+			name:    "unrecognised ENV is rejected",
+			cfg:     Config{Env: "prod"},
+			wantErr: true,
+		},
+		{
+			name: "test env is accepted",
+			cfg:  Config{Env: "test"},
+		},
 	}
 
 	for _, tc := range tests {
