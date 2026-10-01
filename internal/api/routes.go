@@ -558,7 +558,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// config (default "failures") and always redacts secrets + PII.
 	e.Use(mw.AuditCapture(auditLog, deps.Config.AuditCaptureResponseBody))
 
-	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain)
+	// TrustedOrigins carry GLOBAL_CORS_ORIGINS into the CSRF check — the same
+	// origins allowed credentialed CORS are the ones allowed to do
+	// cookie-authenticated writes (GHSA-jv2c-x735-vff7).
+	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain, deps.Config.GlobalCORSOrigins...)
 
 	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
 		WithTOTP(totpSvc).
