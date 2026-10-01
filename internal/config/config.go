@@ -154,10 +154,11 @@ type Config struct {
 	// JWTAllowLegacyIssuer keeps tokens carrying the old global JWT_ISSUER
 	// verifiable during the migration to per-tenant issuers (issue #7).
 	//
-	// Same shape and same discipline as JWTAllowLegacyHS256: defaults to true so
-	// the switch does not invalidate tokens minted seconds earlier, and is flipped
-	// to false only once emc_auth_legacy_issuer_verifications_total has been flat
-	// at zero. The longest-lived affected token is the 1 h agent token.
+	// GHSA-jv2c-x735-vff7 (L-05): defaults to false — the legacy issuer is
+	// rejected unless an operator explicitly sets JWT_ALLOW_LEGACY_ISSUER=true
+	// for a migration window. Flip it back to false once
+	// emc_auth_legacy_issuer_verifications_total has been flat at zero. The
+	// longest-lived affected token is the 1 h agent token.
 	JWTAllowLegacyIssuer bool
 
 	// CookieDomain sets the Domain attribute on auth cookies.
@@ -314,7 +315,10 @@ type Config struct {
 	// fallback code is a separate, later release, once this flag has stayed on
 	// without incident for longer than a refresh token's lifetime.
 	//
-	// Set via REQUIRE_AUDIENCE. Defaults to false.
+	// Set via REQUIRE_AUDIENCE. GHSA-jv2c-x735-vff7 (L-05): defaults to true —
+	// the backstop is on unless an operator explicitly sets it false to stage
+	// the per-client rollout. Set it back to true as soon as the clients that
+	// matter enforce on their own flag.
 	RequireAudience bool
 
 	// AuditSIEMWebhookSecret, when set, signs every outbound SIEM payload with
@@ -356,15 +360,16 @@ func Load() *Config {
 		// exact string "false" disables legacy verification, so a typo cannot
 		// accidentally reject every live token.
 		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
-		// Same fail-towards-compatibility rule as JWT_ALLOW_LEGACY_HS256 above.
-		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "true") != "false",
-		// The same fail-towards-COMPATIBILITY rule as the two legacy flags
-		// above, with the polarity mirrored: those default true and only the
-		// exact string "false" tightens them, whereas this defaults false and
-		// only the exact string "true" tightens it. Either way a typo leaves
-		// every live token working rather than refusing all of them, which is
-		// the only direction a misread env var may fail in.
-		RequireAudience: getEnv("REQUIRE_AUDIENCE", "false") == "true",
+		// GHSA-jv2c-x735-vff7 (L-05): the legacy issuer is now opt-IN, not
+		// opt-out — only the exact string "true" re-accepts old global
+		// JWT_ISSUER tokens during a migration window. An unset or mistyped
+		// variable rejects them rather than silently widening verification.
+		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "false") == "true",
+		// GHSA-jv2c-x735-vff7 (L-05): audience enforcement defaults ON
+		// server-wide; only the exact string "false" opens the per-client
+		// rollout window. An unset or mistyped variable enforces rather than
+		// silently accepting audience-less tokens.
+		RequireAudience: getEnv("REQUIRE_AUDIENCE", "true") != "false",
 		// Defaults to APP_BASE_URL: in the single-binary deployment the auth server
 		// and the origin used for email links are the same host, so requiring both
 		// to be set would be a config trap with one obviously correct answer.
