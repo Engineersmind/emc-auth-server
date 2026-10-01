@@ -172,7 +172,7 @@ type Config struct {
 	GlobalCORSOrigins []string
 
 	// TrustedProxies are the CIDR ranges of reverse proxies allowed to set
-	// client-IP headers (X-Forwarded-For / X-Real-IP), comma-separated via
+	// the client-IP header (X-Forwarded-For), comma-separated via
 	// TRUSTED_PROXIES (e.g. "10.0.0.0/8,172.16.0.0/12").
 	//
 	// Empty (the default) means the server trusts NO forwarded headers: the

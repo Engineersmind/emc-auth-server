@@ -11,7 +11,7 @@ import (
 // rate-limit, CAPTCHA, and audit/risk decision in the service.
 //
 // trustedProxies is the operator-configured list of CIDRs (or bare IPs) whose
-// X-Forwarded-For / X-Real-IP headers may be believed. When it is empty the
+// X-Forwarded-For header may be believed. When it is empty the
 // extractor is ExtractIPDirect: the connection address is the client IP and
 // forwarded headers are ignored entirely. That is the only safe default —
 // Echo's built-in RealIP honours XFF unconditionally, which lets any client
