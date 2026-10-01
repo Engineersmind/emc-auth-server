@@ -45,6 +45,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     change. Replay detection and the `409 concurrent_refresh` grace path are untouched.
   - Reported by the EMC Insurance Platform integrator, 2026-08-11.
 
+### Security
+- **Client IP is resolved only through trusted proxy hops** (#154). `X-Forwarded-For` is
+  walked right to left and believed only from hops listed in the new `TRUSTED_PROXIES`
+  setting (loopback is always trusted); a direct peer that is not trusted has its header
+  ignored. Every per-IP rate limiter, the adaptive CAPTCHA trigger, audit-log IPs and risk
+  signals now key on that value.
+  - **Deploy prerequisite:** with `ENV=production` or `staging` the server **refuses to
+    start** unless `TRUSTED_PROXIES` is set to valid CIDRs (a `/0` range is rejected). Behind
+    nginx with the app in Docker this is the app's Docker network subnet, not `127.0.0.1`.
+    Development needs no configuration.
+  - nginx templates (`deploy.sh`, `scripts/03-nginx-certbot.sh`) now overwrite
+    `X-Forwarded-For` with `$remote_addr` instead of appending to the client's value.
+  - Setup table and verification steps: `docs/DEPLOYMENT.md` → "Client IP and trusted proxies".
+
 ### In Progress
 - Phase 7: Full unit test suite (≥80% coverage gate)
 - Phase 7: Security test suite (auth bypass, injection, privilege escalation)
