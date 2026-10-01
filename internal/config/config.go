@@ -124,17 +124,15 @@ type Config struct {
 	JWTSigningKeyEncryptionKeyPrevious string
 
 	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable during the
-	// migration to RS256. Set JWT_ALLOW_LEGACY_HS256=false to perform the Phase 4
-	// cutover (issue #95).
+	// migration to RS256 (issue #95).
 	//
-	// Defaults to true so upgrading to RS256 signing does not invalidate tokens
-	// minted seconds earlier. Setting it false is what actually removes the forging
-	// risk: while HS256 verifies, any holder of a tenant's jwt_secret can still mint
-	// a token for any user in that tenant.
-	//
-	// Flip it only once emc_auth_legacy_hs256_verifications_total has been flat at
-	// zero — that counter, not a stopwatch, is the evidence. The longest-lived
-	// symmetric token is the 1 h agent token.
+	// Defaults to FALSE (GHSA-4x5m-3gph-938r): while HS256 verifies, any holder
+	// of a tenant's jwt_secret can mint a token for any user in that tenant.
+	// Deployments that still have live HS256 tokens in circulation — minted
+	// before the RS256 switch — must set JWT_ALLOW_LEGACY_HS256=true explicitly
+	// for one token-lifetime window (the longest-lived symmetric token is the
+	// 1 h agent token), then remove it. The evidence for removing it is
+	// emc_auth_legacy_hs256_verifications_total sitting at zero.
 	JWTAllowLegacyHS256 bool
 
 	// OIDCIssuerBaseURL is the public origin used to build each tenant's OIDC
@@ -370,11 +368,13 @@ func Load() *Config {
 		OAuthClientSecretEncryptionKeyPrevious: getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS", ""),
 		JWTSigningKeyEncryptionKey:             getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY", ""),
 		JWTSigningKeyEncryptionKeyPrevious:     getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS", ""),
+		// Secure by default (GHSA-4x5m-3gph-938r): legacy HS256 verification is
+		// opt-in for the duration of a migration window, not something a
+		// misconfigured deploy gets for free.
+		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "false") == "true",
 		// Fails closed towards COMPATIBILITY, not towards strictness: only the
 		// exact string "false" disables legacy verification, so a typo cannot
 		// accidentally reject every live token.
-		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
-		// Same fail-towards-compatibility rule as JWT_ALLOW_LEGACY_HS256 above.
 		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "true") != "false",
 		// The same fail-towards-COMPATIBILITY rule as the two legacy flags
 		// above, with the polarity mirrored: those default true and only the
