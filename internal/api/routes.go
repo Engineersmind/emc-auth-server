@@ -448,7 +448,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		Logger:         deps.Logger,
 	})
 	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
-		WithHasher(passwordHasher)
+		WithHasher(passwordHasher).
+		// Reset links open the console's reset-password page, not the API —
+		// the page POSTs the token in the body so it never lands in URL logs
+		// (GHSA-2267-r48x-9fh7).
+		WithDashboardURL(deps.Config.DashboardBaseURL)
 
 	// White-label email senders (issue #63 follow-on) — transactional emails
 	// resolve their sender application → tenant → global. Providers: SMTP or SendGrid.
@@ -841,7 +845,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
 		identityAudience)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
-	authGroup.POST("/reset-password", authHandler.ResetPassword)
+	// GHSA-2267-r48x-9fh7 (L-03): reset-password consumes a bearer credential —
+	// without a limiter it is an online brute-force oracle on reset tokens.
+	// Same limiter as forgot-password: per-user keying once claims exist,
+	// per-IP before they do.
+	authGroup.POST("/reset-password", authHandler.ResetPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
 	// Email verification — link is clicked (GET) from the email; resend is
 	// rate-limited and enumeration-safe (tenant via X-Tenant-Slug).
