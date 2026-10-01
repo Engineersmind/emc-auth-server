@@ -675,12 +675,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	if skErr != nil {
 		deps.Logger.Fatal().Err(skErr).Msg("JWT signing key service init failed")
 	}
-	// Switch signing to RS256. Verification continues to accept legacy HS256
-	// tokens (no kid) until the Phase 4 cutover, so no live session breaks here.
+	// Switch signing to RS256. Verification rejects legacy HS256 tokens (no kid)
+	// unless JWT_ALLOW_LEGACY_HS256 is explicitly enabled for a migration window.
 	jwtSvc.WithSigningKeys(signingKeySvc).WithLegacyHS256(deps.Config.JWTAllowLegacyHS256).
 		WithSecretBox(signingKeyBox)
-	if !deps.Config.JWTAllowLegacyHS256 {
-		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=false — HS256 tokens are REJECTED (issue #95 Phase 4 cutover). Any token minted before RS256 signing went live will fail; tenants.jwt_secret is now unused and can be dropped.")
+	if deps.Config.JWTAllowLegacyHS256 {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=true — HS256 tokens are still ACCEPTED (issue #95 Phase 4 migration window). Set to false once emc_auth_legacy_hs256_verifications_total has been flat at zero.")
 	}
 
 	// Backfill keys for tenants that predate this feature so their JWKS endpoint is

@@ -666,11 +666,12 @@ func (s *JWTService) tenantSecret(ctx context.Context, tenantID int64) (string, 
 // EncryptAllTenantSecrets encrypts every plaintext tenants.jwt_secret into
 // jwt_secret_enc and blanks the plaintext column. Runs at startup, right after
 // the signing-key backfill — same "backfill so rows that predate the column
-// work immediately" contract. Without a wired SecretBox it is a no-op: the
-// box only fails to exist when the encryption key env var was unset in dev,
-// which is precisely the situation where plaintext dev secrets are tolerated.
+// work immediately" contract. No-ops when no box is wired, and when the box is
+// built on the development all-zero key: encrypting under it would make the
+// rows undecryptable the moment a real JWT_SIGNING_KEY_ENCRYPTION_KEY is set,
+// so dev secrets stay plaintext until then (the read path tolerates both).
 func (s *JWTService) EncryptAllTenantSecrets(ctx context.Context) (int, error) {
-	if s.secretBox == nil {
+	if s.secretBox == nil || s.secretBox.UsesInsecureZeroKey() {
 		return 0, nil
 	}
 	rows, err := s.pool.Query(ctx,

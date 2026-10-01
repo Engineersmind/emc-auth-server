@@ -179,6 +179,7 @@ func TestJWTService_TenantSecretEncryptedAtRest(t *testing.T) {
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "1", "tenant_id": strconv.FormatInt(tenantID, 10),
 		"iss": "https://auth.emc.local",
+		"gty": "password", "aud": "emc-auth-api",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 	signed, err := tok.SignedString([]byte(plainBefore))
