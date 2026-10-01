@@ -45,3 +45,15 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+// TestLoad_EnvDefaultsToProduction locks in GHSA-vgf9-64q8-gj87 (M-03): an
+// unset ENV must resolve to the strict posture, not development. A deploy that
+// forgets ENV then trips Validate()'s COOKIE_DOMAIN requirement instead of
+// silently shipping lax cookies, no CSRF check, and no HTTPS redirect.
+func TestLoad_EnvDefaultsToProduction(t *testing.T) {
+	t.Setenv("ENV", "")
+	cfg := Load()
+	if cfg.Env != "production" {
+		t.Errorf("unset ENV: Env = %q, want %q", cfg.Env, "production")
+	}
+}
