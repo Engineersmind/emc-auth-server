@@ -49,7 +49,7 @@ type ACSService struct {
 
 // Service provides SAML config storage and SP metadata/AuthnRequest
 // generation. There is deliberately no response-parsing or JIT provisioning
-// here: GHSA-jv2c-x735-vff7 (L-01) removed the dormant implementation because
+// here: GHSA-x432-mmvf-jvqf (L-01) removed the dormant implementation because
 // it minted sessions from assertions whose IdP signature was never verified.
 // ACS returns 501 until signature verification is implemented end to end.
 type Service struct {

@@ -74,7 +74,7 @@ func TestSign_RefusesEmptyGrantType(t *testing.T) {
 // it and they all break at once.
 //
 // There is no SAML mint site to cover — the dormant unsigned implementation
-// was removed (GHSA-jv2c-x735-vff7, L-01); it returns when SAML ships with IdP
+// was removed (GHSA-x432-mmvf-jvqf, L-01); it returns when SAML ships with IdP
 // signature verification. TestEveryMintSitePassesAGrantConstant also covers
 // mint sites that do not exist yet.
 func TestMintSites_EmitGty(t *testing.T) {
@@ -490,7 +490,7 @@ func TestEveryMintSitePassesAGrantConstant(t *testing.T) {
 
 	// The mint sites named in issue #130's surface inventory: the shared
 	// chokepoint and IssueServiceToken. The SAML handler's Sign call was
-	// removed with the dormant unsigned-assertion path (GHSA-jv2c-x735-vff7,
+	// removed with the dormant unsigned-assertion path (GHSA-x432-mmvf-jvqf,
 	// L-01) — it returns to three when SAML ships with signature verification.
 	// A count that drops means a mint path was removed or reshaped, and this
 	// test stopped covering it — which would otherwise look identical to

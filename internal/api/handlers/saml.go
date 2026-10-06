@@ -19,7 +19,7 @@ type SAMLHandler struct {
 // NewSAMLHandler creates a SAMLHandler with the SAML service required for
 // metadata, SP-initiated login, and admin config endpoints. The ACS endpoint
 // stays gated at 501 — no token-minting code exists to wire it to
-// (GHSA-jv2c-x735-vff7, L-01).
+// (GHSA-x432-mmvf-jvqf, L-01).
 func NewSAMLHandler(svc *samlsvc.Service, logger zerolog.Logger) *SAMLHandler {
 	return &SAMLHandler{svc: svc, logger: logger}
 }
