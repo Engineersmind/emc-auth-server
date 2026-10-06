@@ -156,7 +156,7 @@ type Config struct {
 	// JWTAllowLegacyIssuer keeps tokens carrying the old global JWT_ISSUER
 	// verifiable during the migration to per-tenant issuers (issue #7).
 	//
-	// GHSA-jv2c-x735-vff7 (L-05): defaults to false — the legacy issuer is
+	// GHSA-6fcw-g2xw-v42w (L-05): defaults to false — the legacy issuer is
 	// rejected unless an operator explicitly sets JWT_ALLOW_LEGACY_ISSUER=true
 	// for a migration window. Flip it back to false once
 	// emc_auth_legacy_issuer_verifications_total has been flat at zero. The
@@ -333,7 +333,7 @@ type Config struct {
 	// fallback code is a separate, later release, once this flag has stayed on
 	// without incident for longer than a refresh token's lifetime.
 	//
-	// Set via REQUIRE_AUDIENCE. GHSA-jv2c-x735-vff7 (L-05): defaults to true —
+	// Set via REQUIRE_AUDIENCE. GHSA-6fcw-g2xw-v42w (L-05): defaults to true —
 	// the backstop is on unless an operator explicitly sets it false to stage
 	// the per-client rollout. Set it back to true as soon as the clients that
 	// matter enforce on their own flag.
@@ -378,12 +378,12 @@ func Load() *Config {
 		// exact string "false" disables legacy verification, so a typo cannot
 		// accidentally reject every live token.
 		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
-		// GHSA-jv2c-x735-vff7 (L-05): the legacy issuer is now opt-IN, not
+		// GHSA-6fcw-g2xw-v42w (L-05): the legacy issuer is now opt-IN, not
 		// opt-out — only the exact string "true" re-accepts old global
 		// JWT_ISSUER tokens during a migration window. An unset or mistyped
 		// variable rejects them rather than silently widening verification.
 		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "false") == "true",
-		// GHSA-jv2c-x735-vff7 (L-05): audience enforcement defaults ON
+		// GHSA-6fcw-g2xw-v42w (L-05): audience enforcement defaults ON
 		// server-wide; only the exact string "false" opens the per-client
 		// rollout window. An unset or mistyped variable enforces rather than
 		// silently accepting audience-less tokens.

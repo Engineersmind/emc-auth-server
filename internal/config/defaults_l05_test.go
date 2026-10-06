@@ -2,7 +2,7 @@ package config
 
 import "testing"
 
-// TestLoad_SecureDefaults_L05 pins GHSA-jv2c-x735-vff7: the legacy issuer and
+// TestLoad_SecureDefaults_L05 pins GHSA-6fcw-g2xw-v42w: the legacy issuer and
 // the audience backstop both default to the STRICT posture, and only the
 // exact opt-in/opt-out strings open a migration window.
 func TestLoad_SecureDefaults_L05(t *testing.T) {
