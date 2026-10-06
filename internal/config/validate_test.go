@@ -11,7 +11,7 @@ const realTOTPKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789a
 // all-zero TOTP key encrypts secrets at rest under a public key
 // (GHSA-92p3-fj5f-8gx7). Refuse to boot instead.
 func TestValidate(t *testing.T) {
-	// goodDSN satisfies the DATABASE_URL-required check (GHSA-jv2c-x735-vff7)
+	// goodDSN satisfies the DATABASE_URL-required check (GHSA-hv5j-m2r7-r4cr)
 	// so each case actually reaches the rule it is named for.
 	const goodDSN = "postgres://u:p@db/db?sslmode=require"
 	tests := []struct {
@@ -46,7 +46,7 @@ func TestValidate(t *testing.T) {
 			name: "production with everything set",
 			cfg:  Config{Env: "production", DatabaseURL: goodDSN, CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}, TOTPEncryptionKey: realTOTPKey, TrustedProxies: []string{"172.18.0.0/16"}},
 		},
-		// GHSA-jv2c-x735-vff7 (L-06): plaintext transport to the database must
+		// GHSA-hv5j-m2r7-r4cr (L-06): plaintext transport to the database must
 		// not be reachable by default in production — the parsed sslmode must
 		// be require/verify-ca/verify-full, not merely "not the word disable".
 		{

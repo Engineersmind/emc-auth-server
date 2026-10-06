@@ -6,7 +6,7 @@ services:
       POSTGRES_DB: emc_auth
       POSTGRES_USER: emc_auth
       # Local-dev only — override via POSTGRES_PASSWORD in your shell or .env.
-      # Never reuse this fallback anywhere shared (GHSA-jv2c-x735-vff7).
+      # Never reuse this fallback anywhere shared (GHSA-hv5j-m2r7-r4cr).
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-dev-only}
     ports:
       # Host port 5433: a native Windows PostgreSQL commonly occupies 5432 on

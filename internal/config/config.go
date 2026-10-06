@@ -348,7 +348,7 @@ func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
 		Port: getEnv("PORT", "9090"),
-		// GHSA-jv2c-x735-vff7 (L-06): no committed DSN default — the old fallback
+		// GHSA-hv5j-m2r7-r4cr (L-06): no committed DSN default — the old fallback
 		// embedded credentials and sslmode=disable. DATABASE_URL must be set
 		// explicitly; Validate() refuses to boot without it.
 		DatabaseURL:                            getEnv("DATABASE_URL", ""),
@@ -433,7 +433,7 @@ func Load() *Config {
 // check in NewTOTPService, keys off ENV; a misspelling such as "prodution" would
 // otherwise skip all of them and boot a deployment with development defaults.
 func (c *Config) Validate() error {
-	// GHSA-jv2c-x735-vff7 (L-06): DATABASE_URL is required in every environment —
+	// GHSA-hv5j-m2r7-r4cr (L-06): DATABASE_URL is required in every environment —
 	// there is no committed fallback anymore, and an empty DSN would only fail
 	// later at pool-connect with a less obvious error.
 	if c.DatabaseURL == "" {
@@ -446,7 +446,7 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("ENV=%q is not recognised: it must be development, test, staging or production", c.Env)
 	}
-	// GHSA-jv2c-x735-vff7 (L-06): the TLS requirement is checked on the parsed
+	// GHSA-hv5j-m2r7-r4cr (L-06): the TLS requirement is checked on the parsed
 	// sslmode value, not a substring — a missing sslmode defaults to "prefer",
 	// which silently falls back to plaintext, and allow/prefer/disable all
 	// permit an unencrypted hop to the database.
