@@ -30,7 +30,7 @@ type ResetService struct {
 	audit      *audit.Logger
 	appBaseURL string
 	// dashboardBaseURL is the admin-console origin used for the emailed reset
-	// link (GHSA-2267-r48x-9fh7). The link must open the reset-password PAGE,
+	// link (GHSA-2267-r48x-9fh2). The link must open the reset-password PAGE,
 	// not the API endpoint: the page reads the token out of the URL and POSTs
 	// it in the request body, so the credential never transits an API access
 	// log, proxy log, or Referer header as a query parameter. Unset keeps the
@@ -169,7 +169,7 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 
 	// The link goes to the dashboard reset page, not the API endpoint — a query
 	// param on the API URL would land the token in access/proxy logs and
-	// Referer headers (GHSA-2267-r48x-9fh7). The page POSTs it in the body.
+	// Referer headers (GHSA-2267-r48x-9fh2). The page POSTs it in the body.
 	// Deployments without a console keep the legacy API-path link unchanged.
 	resetLink := fmt.Sprintf("%s/api/v1/auth/reset-password?token=%s", s.appBaseURL, rawToken)
 	if s.dashboardBaseURL != "" {

@@ -452,7 +452,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithHasher(passwordHasher).
 		// Reset links open the console's reset-password page, not the API —
 		// the page POSTs the token in the body so it never lands in URL logs
-		// (GHSA-2267-r48x-9fh7).
+		// (GHSA-2267-r48x-9fh2).
 		WithDashboardURL(deps.Config.DashboardBaseURL)
 
 	// White-label email senders (issue #63 follow-on) — transactional emails
@@ -853,7 +853,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
 		identityAudience)
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
-	// GHSA-2267-r48x-9fh7 (L-03): reset-password consumes a bearer credential —
+	// GHSA-2267-r48x-9fh2 (L-03): reset-password consumes a bearer credential —
 	// without a limiter it is an online brute-force oracle on reset tokens.
 	// Same limiter as forgot-password: per-user keying once claims exist,
 	// per-IP before they do.
