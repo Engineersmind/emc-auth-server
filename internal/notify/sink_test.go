@@ -13,15 +13,25 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
 
-// captureMailer records admin-activity mail instead of sending it. Only the one
-// method is exercised here; the rest satisfy the interface.
+// captureMailer records admin-activity and access-change mail instead of
+// sending it; the rest satisfy the interface.
 type captureMailer struct {
-	mu   sync.Mutex
-	sent []mailer.AdminActivityEmail
+	mu     sync.Mutex
+	sent   []mailer.AdminActivityEmail
+	access []mailer.AccessChangedEmail
 }
 
-func (m *captureMailer) SendAccessChanged(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.AccessChangedEmail) error {
+func (m *captureMailer) SendAccessChanged(_ context.Context, _ *mailer.SMTPConfig, _ *mailer.Template, e mailer.AccessChangedEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.access = append(m.access, e)
 	return nil
+}
+
+func (m *captureMailer) accessChanges() []mailer.AccessChangedEmail {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]mailer.AccessChangedEmail(nil), m.access...)
 }
 
 func (m *captureMailer) SendAdminActivity(_ context.Context, _ *mailer.SMTPConfig, _ *mailer.Template, e mailer.AdminActivityEmail) error {
@@ -155,8 +165,10 @@ func TestEmit_SecretRotationReachesTheApplicationsAdministrators(t *testing.T) {
 	}
 }
 
-// A deactivated tenant reaches every one of its administrators.
-func TestEmit_TenantDeactivationReachesEveryAdministrator(t *testing.T) {
+// A deactivated tenant reaches its owners only — co-owners were never in this
+// audience. (The platform oversight tier resolves empty here: no super_admin
+// is seeded and no PLATFORM_NOTIFY_EMAIL is configured on the fixture.)
+func TestEmit_TenantDeactivationReachesOwnersOnly(t *testing.T) {
 	f := newNotifyFixture(t)
 	m := &captureMailer{}
 	s := f.liveSink(t, m)
@@ -167,8 +179,8 @@ func TestEmit_TenantDeactivationReachesEveryAdministrator(t *testing.T) {
 	s.Close()
 
 	msgs := m.messages()
-	if want := []string{f.owner, f.coOwner, f.otherCoOwn}; !equal(recipients(msgs), want) {
-		t.Fatalf("recipients = %v, want %v", sorted(recipients(msgs)), sorted(want))
+	if want := []string{f.owner}; !equal(recipients(msgs), want) {
+		t.Fatalf("recipients = %v, want owners only %v", sorted(recipients(msgs)), sorted(want))
 	}
 	msg := byRecipient(msgs)[f.owner]
 	if msg.ActionLabel != "deactivated the tenant" {
@@ -182,8 +194,41 @@ func TestEmit_TenantDeactivationReachesEveryAdministrator(t *testing.T) {
 	}
 }
 
-// The actions withdrawn from the catalogue send nothing, including the "your
-// access changed" notice that used to accompany administrator changes.
+// An access change mails the person it was made TO — through the subject
+// channel, not the observer audience. The administrators get no copy.
+func TestEmit_AccessChangeMailsTheSubject(t *testing.T) {
+	f := newNotifyFixture(t)
+	m := &captureMailer{}
+	s := f.liveSink(t, m)
+
+	var adminID int64
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT ta.id FROM tenant_admins ta JOIN users u ON u.id = ta.user_id WHERE u.email = $1`,
+		f.coOwner).Scan(&adminID); err != nil {
+		t.Fatalf("find co-owner admin row: %v", err)
+	}
+
+	s.Emit([]audit.Event{
+		event(f.tenantID, f.owner, audit.ActionAdminTenantAdminGrantsSet, "tenant_admin", itoa(adminID)),
+	})
+	s.Close()
+
+	if got := m.messages(); len(got) != 0 {
+		t.Errorf("sent %d observer messages for an access change, want none: %+v", len(got), got)
+	}
+	changes := m.accessChanges()
+	if len(changes) != 1 || changes[0].To != f.coOwner {
+		t.Fatalf("access-change mail = %+v, want exactly one to %s", changes, f.coOwner)
+	}
+	if changes[0].ActionLabel != "The applications you administer were changed" {
+		t.Errorf("ActionLabel = %q", changes[0].ActionLabel)
+	}
+}
+
+// The actions withdrawn from the catalogue send nothing. Access-change actions
+// are not withdrawn — they live on the subject channel — but a resource id
+// that resolves to no administrator leaves nobody to tell, so they still send
+// nothing here.
 func TestEmit_WithdrawnActionsSendNothing(t *testing.T) {
 	f := newNotifyFixture(t)
 	m := &captureMailer{}
@@ -202,6 +247,8 @@ func TestEmit_WithdrawnActionsSendNothing(t *testing.T) {
 	} {
 		events = append(events, event(f.tenantID, f.coOwner, action, "application", itoa(f.appID)))
 	}
+	// tenant_admin id 1 belongs to a different fixture entirely (or nobody), so
+	// accessChangeSubject resolves nothing and no subject mail goes out either.
 	for _, action := range []string{
 		audit.ActionAdminTenantAdminInvited,
 		audit.ActionAdminTenantAdminGrantsSet,
@@ -214,6 +261,9 @@ func TestEmit_WithdrawnActionsSendNothing(t *testing.T) {
 
 	if got := m.messages(); len(got) != 0 {
 		t.Errorf("sent %d messages for withdrawn actions, want none: %+v", len(got), got)
+	}
+	if got := m.accessChanges(); len(got) != 0 {
+		t.Errorf("sent %d access-change messages to an unresolvable subject, want none: %+v", len(got), got)
 	}
 }
 
