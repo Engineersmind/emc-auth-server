@@ -73,10 +73,10 @@ func TestSign_RefusesEmptyGrantType(t *testing.T) {
 // legacy-shaped tokens that keep working through the fallback until #132 removes
 // it and they all break at once.
 //
-// The SAML mint site is not here — there is no SAML handler test fixture in this
-// repo at all, and standing up an IdP assertion for one claim is out of
-// proportion. TestEveryMintSitePassesAGrantConstant covers it structurally
-// instead, which also covers mint sites that do not exist yet.
+// There is no SAML mint site to cover — the dormant unsigned implementation
+// was removed (GHSA-x432-mmvf-jvqf, L-01); it returns when SAML ships with IdP
+// signature verification. TestEveryMintSitePassesAGrantConstant also covers
+// mint sites that do not exist yet.
 func TestMintSites_EmitGty(t *testing.T) {
 	t.Run("password login", func(t *testing.T) {
 		svc, cleanup := newServiceForTest(t)
@@ -396,8 +396,7 @@ func TestGrantSets_AreDisjoint(t *testing.T) {
 	}
 }
 
-// TestEveryMintSitePassesAGrantConstant is a source-level guard, and it is the
-// test that actually covers the SAML mint site.
+// TestEveryMintSitePassesAGrantConstant is a source-level guard.
 //
 // Issue #130's gate is "every mint path emits gty", which no set of
 // behavioural tests can prove — they can only cover the paths someone
@@ -490,10 +489,13 @@ func TestEveryMintSitePassesAGrantConstant(t *testing.T) {
 	}
 
 	// The mint sites named in issue #130's surface inventory: the shared
-	// chokepoint, IssueServiceToken, and the SAML handler. A count that drops
-	// means a mint path was removed or reshaped, and this test stopped covering
-	// it — which would otherwise look identical to "all clear".
-	const wantMintSites = 3
+	// chokepoint and IssueServiceToken. The SAML handler's Sign call was
+	// removed with the dormant unsigned-assertion path (GHSA-x432-mmvf-jvqf,
+	// L-01) — it returns to three when SAML ships with signature verification.
+	// A count that drops means a mint path was removed or reshaped, and this
+	// test stopped covering it — which would otherwise look identical to
+	// "all clear".
+	const wantMintSites = 2
 	if mintSites < wantMintSites {
 		t.Errorf("found %d Sign() call sites, want at least %d — the scan is no longer finding the mint sites", mintSites, wantMintSites)
 	}
