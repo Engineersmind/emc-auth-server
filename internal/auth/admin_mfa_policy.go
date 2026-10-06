@@ -556,11 +556,55 @@ func (s *AuthService) AdminMethodEnrollable(ctx context.Context, userID, tenantI
 	return nil
 }
 
+// AcquireAdminFactorRemovalLock serialises the check-then-remove sequence an
+// administrator's factor removal is built from. Without it two concurrent
+// requests — one per factor — can both observe "the other factor still exists"
+// and both proceed, leaving the administrator with zero factors, which is the
+// exact state AdminFactorRemovalAllowed exists to prevent.
+//
+// Session-scoped (pg_advisory_lock, not the xact variant) because the removal
+// itself runs in a DIFFERENT service and transaction than the check — only a
+// lock pinned to a held connection can span both. Callers must invoke the
+// returned release exactly once; it unlocks on a fresh context so a cancelled
+// request cannot strand the lock until connection teardown.
+func (s *AuthService) AcquireAdminFactorRemovalLock(ctx context.Context, userID, tenantID int64) (func(), error) {
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire admin factor lock connection: %w", err)
+	}
+	a, b := adminFactorRemovalLockKey(userID, tenantID)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, $2)`, a, b); err != nil {
+		conn.Release()
+		return nil, fmt.Errorf("acquire admin factor lock: %w", err)
+	}
+	return func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1, $2)`, a, b); err != nil {
+			s.logger.Warn().Err(err).Msg("admin factor lock: advisory unlock failed")
+		}
+		conn.Release()
+	}, nil
+}
+
+// adminFactorRemovalLockKey derives the advisory-lock pair. It shares the
+// two-int32 space with the session-cap lock (sessionCapLockKey), so the second
+// key is salted to keep the namespaces apart — a collision would only
+// serialise two unrelated operations, but silently.
+func adminFactorRemovalLockKey(userID, tenantID int64) (int32, int32) {
+	a, b := sessionCapLockKey(userID, tenantID)
+	return a, b ^ 0x4d4641 // "MFA"
+}
+
 // AdminFactorRemovalAllowed refuses turning off an administrator's last second
 // factor that satisfies their policy. Only factors the policy accepts count as
 // remaining: keeping one it no longer accepts does not keep the administrator
 // able to sign in. An authenticator app can still be REPLACED (set up again on
 // a new phone with a current code) whatever else the account holds.
+//
+// This is only the CHECK half — a caller that removes a factor after it passes
+// must hold AcquireAdminFactorRemovalLock across check and removal, or the
+// guard races itself.
 func (s *AuthService) AdminFactorRemovalAllowed(ctx context.Context, userID, tenantID int64, perms []string, method string) error {
 	if s.adminMFA == nil {
 		return nil

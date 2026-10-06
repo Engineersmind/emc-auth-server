@@ -2073,6 +2073,15 @@ func (h *AuthHandler) EmailMFADisable(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required to disable email MFA"})
 	}
 
+	// Check and removal must be serialised per user: two concurrent requests,
+	// one per factor, could each pass the guard on the other's existence.
+	release, err := h.svc.AcquireAdminFactorRemovalLock(c.Request().Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("email MFA disable: factor lock failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to disable email MFA"})
+	}
+	defer release()
+
 	if err := h.svc.AdminFactorRemovalAllowed(c.Request().Context(), userID, tenantID, claims.Permissions, auth.MFAMethodEmail); err != nil {
 		return adminMFAPolicyError(c, h, claims.UserID, err)
 	}
@@ -2215,6 +2224,15 @@ func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	// Check and removal must be serialised per user: two concurrent requests,
+	// one per factor, could each pass the guard on the other's existence.
+	release, err := h.svc.AcquireAdminFactorRemovalLock(c.Request().Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Msg("TOTP disable: factor lock failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to disable 2FA"})
+	}
+	defer release()
+
 	if err := h.svc.AdminFactorRemovalAllowed(c.Request().Context(), userID, tenantID, claims.Permissions, auth.MFAMethodTOTP); err != nil {
 		return adminMFAPolicyError(c, h, claims.UserID, err)
 	}

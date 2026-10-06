@@ -16,15 +16,23 @@ const (
 	// application: the tenant's owners, who administer every application, and
 	// the co-owners granted that one.
 	scopeApplication scope = iota + 1
-	// scopeTenant reaches every administrator of the tenant, owners and
-	// co-owners alike.
-	scopeTenant
+	// scopeTenantOwners reaches the tenant's owners only. Tenant
+	// deactivation uses it: co-owners never received that notice before the
+	// notify rewrite, and the review of that rewrite asked for the owner-only
+	// scoping to be restored rather than re-decided.
+	scopeTenantOwners
 )
 
 // notable is one catalogued action: how the email phrases it, and who hears.
 type notable struct {
 	phrase string
 	scope  scope
+	// oversight adds the platform tier (PLATFORM_NOTIFY_EMAIL, or every
+	// super_admin when unset) to the audience. Restored for the two actions
+	// the tier always saw before the notify rewrite dropped it: a secret
+	// rotation and a tenant deactivation are exactly what platform oversight
+	// exists to hear about.
+	oversight bool
 }
 
 // notableActions lists the actions that raise an email.
@@ -44,8 +52,8 @@ type notable struct {
 // The actor is not special-cased. They are an administrator of the scope, so
 // they receive the same email, which is how a stolen session is discovered.
 var notableActions = map[string]notable{
-	audit.ActionAdminApplicationSecretRotated: {phrase: "rotated a client secret", scope: scopeApplication},
-	audit.ActionAdminTenantDeactivated:        {phrase: "deactivated the tenant", scope: scopeTenant},
+	audit.ActionAdminApplicationSecretRotated: {phrase: "rotated a client secret", scope: scopeApplication, oversight: true},
+	audit.ActionAdminTenantDeactivated:        {phrase: "deactivated the tenant", scope: scopeTenantOwners, oversight: true},
 }
 
 // Notifications are sent only for actions that SUCCEEDED.
@@ -55,6 +63,26 @@ var notableActions = map[string]notable{
 // is how a channel gets filtered to junk — losing the successful-action notices
 // that share it. Refusals are still audited (audit.ActionAdminAccessDenied) and
 // queryable in Monitoring; only the email is withheld.
+
+// subjectLabels phrase an access change in the SECOND person, for the notice
+// sent to the person it was made to.
+//
+// These actions are not in notableActions — the tier of observers was
+// deliberately narrowed — but the person whose access changed still needs the
+// mail: they are not in any observer audience, and without this they would
+// learn of it only by being refused something they could do yesterday.
+var subjectLabels = map[string]string{
+	audit.ActionAdminTenantAdminInvited:   "You were given administrator access",
+	audit.ActionAdminTenantAdminGrantsSet: "The applications you administer were changed",
+	audit.ActionAdminTenantAdminRemoved:   "Your administrator access was withdrawn",
+}
+
+// subjectLabel returns the second-person phrasing for an action that changes
+// somebody's own access, and whether this is such an action.
+func subjectLabel(action string) (string, bool) {
+	phrase, ok := subjectLabels[action]
+	return phrase, ok
+}
 
 // lookup returns the catalogue entry for an action, and whether it is notable
 // at all.

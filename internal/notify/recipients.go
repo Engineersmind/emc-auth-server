@@ -26,11 +26,12 @@ type audience struct {
 	actorRole string
 }
 
-// resolveAudience decides who hears about an event: every usable administrator
-// of the scope the catalogue names for the action.
+// resolveAudience decides who hears about an event: the usable administrators
+// of the scope the catalogue names for the action, plus the platform tier when
+// the entry carries oversight.
 //
-//	scopeApplication → the tenant's owners + the co-owners granted appID
-//	scopeTenant      → every owner and co-owner of the tenant
+//	scopeApplication  → the tenant's owners + the co-owners granted appID
+//	scopeTenantOwners → the tenant's owners only
 //
 // The actor is included when they are one of those administrators. That is the
 // point for these actions: a copy of a secret rotation you did not make is how
@@ -45,13 +46,6 @@ func (s *EmailSink) resolveAudience(ctx context.Context, tenantID int64, appID, 
 	if !ok || tenantID == 0 {
 		return out, nil
 	}
-	var appScope *int64
-	if entry.scope == scopeApplication {
-		if appID == nil {
-			return out, nil
-		}
-		appScope = appID
-	}
 
 	role, err := s.describeActor(ctx, tenantID, actorUserID, actorEmail)
 	if err != nil {
@@ -59,16 +53,35 @@ func (s *EmailSink) resolveAudience(ctx context.Context, tenantID int64, appID, 
 	}
 	out.actorRole = role
 
-	to, err := s.administrators(ctx, tenantID, appScope)
+	var to []string
+	switch entry.scope {
+	case scopeApplication:
+		if appID == nil {
+			return out, nil
+		}
+		to, err = s.administrators(ctx, tenantID, appID)
+	default: // scopeTenantOwners
+		to, err = s.tenantOwners(ctx, tenantID)
+	}
 	if err != nil {
 		return out, err
 	}
+
+	if entry.oversight {
+		var oversight []string
+		oversight, err = s.platformRecipients(ctx)
+		if err != nil {
+			return out, err
+		}
+		to = append(to, oversight...)
+	}
+
 	seen := make(map[string]struct{}, len(to))
 	for _, addr := range to {
-		key := strings.ToLower(addr)
 		if addr == "" {
 			continue
 		}
+		key := strings.ToLower(addr)
 		if _, dup := seen[key]; dup {
 			continue
 		}
@@ -200,6 +213,136 @@ func (s *EmailSink) administrators(ctx context.Context, tenantID int64, appID *i
 		out = append(out, email)
 	}
 	return out, rows.Err()
+}
+
+// tenantOwners returns the addresses of owners who can actually act — the same
+// "usable" predicate administrators applies. scopeTenantOwners uses it for
+// tenant deactivation, which owner-tier oversight has always owned; co-owners
+// were never in that audience and the rewrite adding them was reverted.
+func (s *EmailSink) tenantOwners(ctx context.Context, tenantID int64) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.email
+		FROM tenant_admins ta
+		JOIN users u ON u.id = ta.user_id
+		WHERE ta.tenant_id = $1
+		  AND ta.admin_role = $2
+		  AND ta.deleted_at IS NULL
+		  AND ta.activated_at IS NOT NULL
+		  AND u.deleted_at IS NULL
+		  AND u.is_active
+		  AND u.blocked_at IS NULL
+		  AND u.email_verified
+		ORDER BY u.email
+	`, tenantID, roleOwner)
+	if err != nil {
+		return nil, fmt.Errorf("resolve tenant owners: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var email string
+		if err := rows.Scan(&email); err != nil {
+			return nil, fmt.Errorf("scan owner email: %w", err)
+		}
+		out = append(out, email)
+	}
+	return out, rows.Err()
+}
+
+// platformRecipients returns the platform tier.
+//
+// A configured address wins outright: a deployment that names one wants its
+// oversight mail in a shared mailbox or a ticket queue, and fanning out to every
+// super_admin as well would duplicate it. Without one, fall back to the
+// super_admin users so the feature works with no configuration at all.
+//
+// Deliberately NOT filtered on email_verified, unlike the owner lookup.
+// Verification is a self-service concept: a super_admin is provisioned by
+// whoever deployed the system, and the seeded one has email_verified = false to
+// this day. Requiring it meant the platform tier resolved to nobody and every
+// owner's action went unreported — with no error, because "no recipients" is a
+// legitimate outcome for a platform admin's own actions.
+func (s *EmailSink) platformRecipients(ctx context.Context) ([]string, error) {
+	if len(s.platformEmails) > 0 {
+		return s.platformEmails, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.email
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE r.name = 'super_admin'
+		  AND r.is_system = true
+		  AND r.application_id IS NULL
+		  AND r.deleted_at IS NULL
+		  AND u.deleted_at IS NULL
+		  AND u.is_active
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("resolve platform recipients: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var email string
+		if err := rows.Scan(&email); err != nil {
+			return nil, fmt.Errorf("scan platform email: %w", err)
+		}
+		out = append(out, email)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		// Say so loudly. Silence here is indistinguishable from "nothing worth
+		// reporting", and it means every owner action in the system is going
+		// unreported — which is precisely the state this feature exists to end.
+		s.logger.Warn().Msg("notify: no platform recipients — owner activity is going unreported; set PLATFORM_NOTIFY_EMAIL")
+	}
+	return out, nil
+}
+
+// accessChangeSubject resolves who an access change was made TO, and which
+// applications they administer afterwards.
+//
+// The handlers log these with resource_type "tenant_admin" and the
+// tenant_admins row id, which is the only link back to the person — the audit
+// event carries the ACTOR, never the subject.
+//
+// Soft-deleted rows are included deliberately: a withdrawal deletes the row, and
+// telling somebody their access was removed is the single most important message
+// in this whole feature. Excluding them would silently drop exactly that one.
+func (s *EmailSink) accessChangeSubject(ctx context.Context, tenantID int64, resourceType, resourceID string) (email string, apps string, activated bool) {
+	if resourceType != "tenant_admin" || resourceID == "" {
+		return "", "", false
+	}
+	adminID, err := strconv.ParseInt(resourceID, 10, 64)
+	if err != nil {
+		return "", "", false
+	}
+
+	// activated_at is selected so a grant the recipient has not accepted can be
+	// skipped by the caller. Not filtered in SQL: a withdrawal must still notify
+	// (see the comment above about soft-deleted rows), and a row can be both
+	// deleted and never activated.
+	err = s.pool.QueryRow(ctx, `
+		SELECT u.email,
+		       COALESCE((
+		           SELECT string_agg(oc.name, ', ' ORDER BY oc.name)
+		           FROM tenant_admin_app_scopes sc
+		           JOIN oauth_clients oc ON oc.id = sc.application_id
+		           WHERE sc.admin_id = ta.id
+		       ), ''),
+		       ta.activated_at IS NOT NULL
+		FROM tenant_admins ta
+		JOIN users u ON u.id = ta.user_id
+		WHERE ta.id = $1 AND ta.tenant_id = $2
+	`, adminID, tenantID).Scan(&email, &apps, &activated)
+	if err != nil {
+		return "", "", false
+	}
+	return email, apps, activated
 }
 
 // tenantName resolves the display name for the email body. Falls back to the

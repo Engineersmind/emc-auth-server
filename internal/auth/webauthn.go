@@ -1522,12 +1522,17 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 		perms = []string{}
 	}
 
-	// Mandatory administrator MFA: a passwordless passkey satisfies it only
-	// when the authenticator verified the user (possession + biometric/PIN) and
-	// the administrator's policy accepts passkeys. Refused before minting, for
-	// the same reason as the application-scoped refusal above.
-	if err := s.requireAdminPasskeyMFA(ctx, id, perms); err != nil {
-		return nil, id, err
+	// Mandatory administrator MFA governs the CONSOLE sign-in only, so it runs
+	// only on the cookie-session entry point. An ordinary application's passkey
+	// login takes LoginWebAuthn, and gating it would force user verification on
+	// every third-party sign-in by anyone who happens to administer a tenant —
+	// a behaviour change to a flow this policy was never meant to reach.
+	// Refused before minting, for the same reason as the application-scoped
+	// refusal above.
+	if refuseApplicationScoped {
+		if err := s.requireAdminPasskeyMFA(ctx, id, perms); err != nil {
+			return nil, id, err
+		}
 	}
 
 	amr := []string{AMRWebAuthn}

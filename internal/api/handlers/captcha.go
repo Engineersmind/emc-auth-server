@@ -71,7 +71,7 @@ type CaptchaChallengeRequest struct {
 // IssueChallenge handles POST /api/v1/captcha/challenge.
 //
 // @Summary      Get a CAPTCHA challenge
-// @Description  Issues a single-use image challenge. OMIT client_id for the first-party flows (login, session, login_otp, tenant-level register); SEND it for the application-authenticated flows (apps/login, apps/register, forgot_password). The challenge is bound to whichever you chose, so a mismatch is refused however correct the answer is. The image is returned inline as a PNG data URI. Answer it by sending `captcha_id` and `captcha_answer` on the protected request. Returns 404 when the application has no captcha policy enabled.
+// @Description  Issues a single-use image challenge. OMIT client_id for the first-party endpoints (/auth/login, /auth/session, /auth/login/otp, tenant-level /auth/register); SEND it for the application-authenticated endpoints (/auth/apps/login, /auth/apps/register, /auth/forgot-password). The challenge is bound to whichever you chose, so a mismatch is refused however correct the answer is. The image is returned inline as a PNG data URI. Answer it by sending `captcha_id` and `captcha_answer` on the protected request. Returns 404 when the application has no captcha policy enabled.
 // @Tags         AUTH
 // @Accept       json
 // @Produce      json
@@ -97,7 +97,7 @@ func (h *CaptchaHandler) IssueChallenge(c echo.Context) error {
 		// not server state — and a client that typo'd a purpose would otherwise
 		// see an empty 404 and conclude captchas are off.
 		return c.JSON(http.StatusBadRequest, map[string]string{
-			"error": "purpose must be one of login, session, login_otp, register, forgot_password",
+			"error": "purpose must be one of login, login_otp, register, forgot_password",
 		})
 	}
 

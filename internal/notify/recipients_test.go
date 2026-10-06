@@ -181,20 +181,45 @@ func TestResolveAudience_ActorIsIncludedAsAnAdministrator(t *testing.T) {
 	}
 }
 
-// A deactivated tenant reaches every administrator of it, whichever
-// applications they were granted.
-func TestResolveAudience_TenantDeactivationReachesEveryAdministrator(t *testing.T) {
+// A deactivated tenant reaches its owners — and ONLY them among the tenant's
+// administrators. Co-owners were never in this audience; a deactivation is a
+// billing-and-ownership event, not a day-to-day administration one.
+func TestResolveAudience_TenantDeactivationReachesOwnersOnly(t *testing.T) {
 	f := newNotifyFixture(t)
 
 	aud, err := f.sink.resolveAudience(f.ctx, f.tenantID, nil, nil, "superadmin@platform.test", audit.ActionAdminTenantDeactivated)
 	if err != nil {
 		t.Fatalf("resolveAudience: %v", err)
 	}
-	if want := []string{f.owner, f.coOwner, f.otherCoOwn}; !equal(aud.to, want) {
-		t.Errorf("recipients = %v, want %v", sorted(aud.to), sorted(want))
+	if want := []string{f.owner}; !equal(aud.to, want) {
+		t.Errorf("recipients = %v, want owners only %v", sorted(aud.to), sorted(want))
 	}
 	if aud.actorRole != "platform administrator" {
 		t.Errorf("actorRole = %q, want platform administrator", aud.actorRole)
+	}
+}
+
+// Both catalogued actions carry the platform oversight tier: a configured
+// oversight address hears about a secret rotation alongside the application's
+// own administrators, and the tenant tier is undisturbed.
+func TestResolveAudience_OversightReachesThePlatformTier(t *testing.T) {
+	f := newNotifyFixture(t)
+	f.sink.platformEmails = []string{"soc@platform.test"}
+
+	aud, err := f.sink.resolveAudience(f.ctx, f.tenantID, &f.appID, nil, f.owner, audit.ActionAdminApplicationSecretRotated)
+	if err != nil {
+		t.Fatalf("resolveAudience: %v", err)
+	}
+	if want := []string{f.owner, f.coOwner, "soc@platform.test"}; !equal(aud.to, want) {
+		t.Errorf("recipients = %v, want %v", sorted(aud.to), sorted(want))
+	}
+
+	aud, err = f.sink.resolveAudience(f.ctx, f.tenantID, nil, nil, f.owner, audit.ActionAdminTenantDeactivated)
+	if err != nil {
+		t.Fatalf("resolveAudience: %v", err)
+	}
+	if want := []string{f.owner, "soc@platform.test"}; !equal(aud.to, want) {
+		t.Errorf("deactivation recipients = %v, want owners + platform %v", sorted(aud.to), sorted(want))
 	}
 }
 

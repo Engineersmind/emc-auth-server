@@ -5565,7 +5565,7 @@ const docTemplate = `{
         },
         "/api/v1/captcha/challenge": {
             "post": {
-                "description": "Issues a single-use image challenge. OMIT client_id for the first-party flows (login, session, login_otp, tenant-level register); SEND it for the application-authenticated flows (apps/login, apps/register, forgot_password). The challenge is bound to whichever you chose, so a mismatch is refused however correct the answer is. The image is returned inline as a PNG data URI. Answer it by sending ` + "`" + `captcha_id` + "`" + ` and ` + "`" + `captcha_answer` + "`" + ` on the protected request. Returns 404 when the application has no captcha policy enabled.",
+                "description": "Issues a single-use image challenge. OMIT client_id for the first-party endpoints (/auth/login, /auth/session, /auth/login/otp, tenant-level /auth/register); SEND it for the application-authenticated endpoints (/auth/apps/login, /auth/apps/register, /auth/forgot-password). The challenge is bound to whichever you chose, so a mismatch is refused however correct the answer is. The image is returned inline as a PNG data URI. Answer it by sending ` + "`" + `captcha_id` + "`" + ` and ` + "`" + `captcha_answer` + "`" + ` on the protected request. Returns 404 when the application has no captcha policy enabled.",
                 "consumes": [
                     "application/json"
                 ],
