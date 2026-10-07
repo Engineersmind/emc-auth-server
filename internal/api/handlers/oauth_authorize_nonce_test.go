@@ -98,7 +98,8 @@ func newNonceFixture(t *testing.T) *nonceFixture {
 	// on a nil logger. Standing them up would add dependencies these assertions
 	// do not touch.
 	h := NewOAuthAuthorizeHandler(
-		auth.NewAuthorizationServer(pool, logger), f.sessions, nil, nil, logger, false)
+		auth.NewAuthorizationServer(pool, logger), f.sessions, nil, nil, logger,
+		false, true)
 
 	f.echo = echo.New()
 	f.echo.GET("/oauth/authorize", h.Authorize)
