@@ -13,6 +13,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// defaultSeedPassword is the local-development fallback only. It is never
+// used when ENV is production, staging, or any other deployed value — see the
+// credential step below, which fails closed rather than create a super-admin
+// with a publicly-known password (GHSA-hv5j-m2r7-r4cr).
 const defaultSeedPassword = "ChangeMe123!"
 
 // generateTenantSecret returns 32 bytes of crypto/rand as hex — the same strength
@@ -30,15 +34,20 @@ func generateTenantSecret() (string, error) {
 // All inserts use ON CONFLICT DO NOTHING for idempotency — safe to run multiple times.
 // BIGINT IDENTITY PKs are auto-generated; we INSERT without explicit id, then SELECT
 // to retrieve the generated value for use in subsequent inserts.
-// The admin password is read from SEED_ADMIN_PASSWORD env var; falls back to "ChangeMe123!"
-// with a prominent warning log.
+// The admin password is read from SEED_ADMIN_PASSWORD env var. In development/test
+// an unset value falls back to a local-only default with a warning log; in any
+// deployed environment a missing value is only tolerated when the credential
+// already exists (upgrade boot) — a fresh super-admin is never seeded with the
+// default.
 // CORS origins are seeded from SEED_CORS_ORIGINS (comma-separated, e.g.
 // "https://auth.senie.ai,https://app.senie.ai,http://localhost:3000").
 func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) error {
 	seedPassword := os.Getenv("SEED_ADMIN_PASSWORD")
-	if seedPassword == "" {
+	env := os.Getenv("ENV")
+	deployed := env != "development" && env != "test" && env != ""
+	if seedPassword == "" && !deployed {
 		seedPassword = defaultSeedPassword
-		logger.Warn().Msg("SEED_ADMIN_PASSWORD not set — using default password. Override this in production!")
+		logger.Warn().Msg("SEED_ADMIN_PASSWORD not set — using local-dev default password")
 	}
 
 	var corsOrigins []string
@@ -147,19 +156,40 @@ func RunSeed(ctx context.Context, pool *pgxpool.Pool, logger zerolog.Logger) err
 	// other credential so the seeded account is never the odd one out — a literal
 	// cost here would silently diverge the moment the parameters move, and the
 	// super-admin is the last account that should be weaker than the rest.
-	hash, err := password.NewHasher(password.DefaultParams()).Hash(ctx, seedPassword)
-	if err != nil {
-		return fmt.Errorf("hash seed password: %w", err)
+	//
+	// A deployed environment without SEED_ADMIN_PASSWORD reaches here with an
+	// empty seedPassword. That is acceptable exactly once: when the credential
+	// row already exists (upgrade boot), the INSERT would be an ON CONFLICT
+	// no-op anyway, so there is nothing to seed. A fresh deployment must set
+	// the variable rather than silently create a super-admin with the
+	// compiled-in default (GHSA-hv5j-m2r7-r4cr).
+	if seedPassword == "" {
+		var hasCredential bool
+		if err := pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM user_credentials WHERE user_id = $1)`,
+			userID,
+		).Scan(&hasCredential); err != nil {
+			return fmt.Errorf("seed credentials check: %w", err)
+		}
+		if !hasCredential {
+			return fmt.Errorf("seed: SEED_ADMIN_PASSWORD is required when ENV=%q — refusing to create the super-admin with the compiled-in default password", env)
+		}
+		logger.Info().Msg("seed credentials already present — SEED_ADMIN_PASSWORD unchanged")
+	} else {
+		hash, err := password.NewHasher(password.DefaultParams()).Hash(ctx, seedPassword)
+		if err != nil {
+			return fmt.Errorf("hash seed password: %w", err)
+		}
+		_, err = pool.Exec(ctx, `
+			INSERT INTO user_credentials (user_id, tenant_id, password_hash)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (user_id) DO NOTHING
+		`, userID, tenantID, string(hash))
+		if err != nil {
+			return fmt.Errorf("seed credentials: %w", err)
+		}
+		logger.Info().Msg("seed credentials ensured")
 	}
-	_, err = pool.Exec(ctx, `
-		INSERT INTO user_credentials (user_id, tenant_id, password_hash)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (user_id) DO NOTHING
-	`, userID, tenantID, string(hash))
-	if err != nil {
-		return fmt.Errorf("seed credentials: %w", err)
-	}
-	logger.Info().Msg("seed credentials ensured")
 
 	// 5. Seed base permissions for the emc tenant (tenant:manage + admin:access).
 	_, err = pool.Exec(ctx, `

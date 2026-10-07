@@ -83,7 +83,7 @@ jobs:
         image: postgres:16-alpine
         env:
           POSTGRES_USER: emc_auth
-          POSTGRES_PASSWORD: password
+          POSTGRES_PASSWORD: ci_local_only
           POSTGRES_DB: emc_auth_test
         ports: ["5432:5432"]
         options: >-
@@ -102,7 +102,7 @@ jobs:
           --health-retries 10
 
     env:
-      DATABASE_URL: postgres://emc_auth:password@localhost:5432/emc_auth_test?sslmode=disable
+      DATABASE_URL: postgres://emc_auth:ci_local_only@localhost:5432/emc_auth_test?sslmode=disable
       REDIS_URL: redis://localhost:6379/0
       JWT_ISSUER: https://auth.emc.local
       APP_BASE_URL: http://localhost:8080
@@ -250,12 +250,14 @@ jobs:
         run: |
           # [CI-06] Fixed: docker-compose.yml (was "docker compose.yml" with space)
           # --wait blocks until postgres + redis health checks pass (no fixed sleep needed)
-          docker compose -f docker-compose.yml up -d --wait postgres redis
+          # POSTGRES_PASSWORD matches the smoke-test DSN below (GHSA-hv5j-m2r7-r4cr
+          # made the compose password env-driven instead of a committed literal).
+          POSTGRES_PASSWORD=ci_local_only docker compose -f docker-compose.yml up -d --wait postgres redis
           # [CI-11] PORT=8080 required — server defaults to 9090; curl must match
           # Host port 5433: docker-compose.yml maps postgres 5433->5432 (dodges
           # native-PostgreSQL conflicts on dev machines); smoke test must match.
           docker run --rm --network host \
-            -e DATABASE_URL=postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable \
+            -e DATABASE_URL=postgres://emc_auth:ci_local_only@localhost:5433/emc_auth?sslmode=disable \
             -e REDIS_URL=redis://localhost:6379/0 \
             -e JWT_ISSUER=https://auth.emc.local \
             -e APP_BASE_URL=http://localhost:8080 \

@@ -15,6 +15,7 @@ server*.log
 # Certs
 certs/*.key
 certs/*.pem
+infra/tls/
 
 # Build
 dist/
