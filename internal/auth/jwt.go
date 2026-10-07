@@ -394,6 +394,12 @@ type JWTService struct {
 	// emc_auth_legacy_audience_verifications_total sitting at zero for longer
 	// than a refresh token's lifetime — not elapsed time, and not a clean deploy.
 	requireAudience bool
+	// secretBox encrypts/decrypts tenants.jwt_secret at rest (GHSA-4x5m-3gph-938r).
+	// The signing-key box is reused: a leaked tenant HS256 secret is signing
+	// authority, the same asset class as signing_keys.private_key_enc.
+	// When nil the service reads the plaintext column only — the pre-#94
+	// behaviour, kept so tests and embedders without a box still work.
+	secretBox *SecretBox
 }
 
 // NewJWTService creates a JWTService backed by the given pool.
@@ -619,20 +625,159 @@ func (s *JWTService) signClaims(ctx context.Context, tenantID int64, claims jwt.
 	return signed, nil
 }
 
+// WithSecretBox wires the AES-256-GCM box used to encrypt tenants.jwt_secret
+// at rest (GHSA-4x5m-3gph-938r). Reuses the signing-key box: the legacy
+// symmetric secret is signing authority, the same asset class as
+// signing_keys.private_key_enc. When unset, tenantSecret reads the plaintext
+// column — the behaviour before this column existed.
+func (s *JWTService) WithSecretBox(box *SecretBox) *JWTService {
+	s.secretBox = box
+	return s
+}
+
 // tenantSecret fetches the jwt_secret for the given tenant from the DB.
+//
+// Reads jwt_secret_enc first when a SecretBox is wired; the plaintext
+// jwt_secret column is only a fallback for rows the startup backfill has not
+// reached yet — a window measured in seconds at boot, not a steady state.
 func (s *JWTService) tenantSecret(ctx context.Context, tenantID int64) (string, error) {
-	var secret string
+	var secret, secretEnc string
 	err := s.pool.QueryRow(ctx,
-		`SELECT jwt_secret FROM tenants WHERE id = $1 AND is_active = true`,
+		`SELECT COALESCE(jwt_secret, ''), COALESCE(jwt_secret_enc, '')
+		 FROM tenants WHERE id = $1 AND is_active = true`,
 		tenantID,
-	).Scan(&secret)
+	).Scan(&secret, &secretEnc)
 	if err != nil {
 		return "", fmt.Errorf("fetch tenant jwt_secret: %w", err)
+	}
+	if secretEnc != "" && s.secretBox != nil {
+		dec, err := s.secretBox.Decrypt(secretEnc)
+		if err != nil {
+			return "", fmt.Errorf("decrypt tenant jwt_secret: %w", err)
+		}
+		return dec, nil
 	}
 	if secret == "" {
 		return "", errors.New("tenant jwt_secret is empty")
 	}
 	return secret, nil
+}
+
+// EncryptAllTenantSecrets encrypts every plaintext tenants.jwt_secret into
+// jwt_secret_enc and blanks the plaintext column. Runs at startup, right after
+// the signing-key backfill — same "backfill so rows that predate the column
+// work immediately" contract. No-ops when no box is wired, and when the box is
+// built on the development all-zero key: encrypting under it would make the
+// rows undecryptable the moment a real JWT_SIGNING_KEY_ENCRYPTION_KEY is set,
+// so dev secrets stay plaintext until then (the read path tolerates both).
+func (s *JWTService) EncryptAllTenantSecrets(ctx context.Context) (int, error) {
+	if s.secretBox == nil || s.secretBox.UsesInsecureZeroKey() {
+		return 0, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, jwt_secret FROM tenants
+		 WHERE COALESCE(jwt_secret, '') <> ''
+		   AND COALESCE(jwt_secret_enc, '') = ''`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("list plaintext jwt_secret rows: %w", err)
+	}
+	defer rows.Close()
+
+	type pending struct {
+		id     int64
+		secret string
+	}
+	var todo []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.secret); err != nil {
+			return 0, fmt.Errorf("scan tenant secret row: %w", err)
+		}
+		todo = append(todo, p)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate tenant secret rows: %w", err)
+	}
+
+	migrated := 0
+	for _, p := range todo {
+		enc, err := s.secretBox.Encrypt(p.secret)
+		if err != nil {
+			return migrated, fmt.Errorf("encrypt jwt_secret for tenant %d: %w", p.id, err)
+		}
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE tenants SET jwt_secret_enc = $1, jwt_secret = '' WHERE id = $2`,
+			enc, p.id,
+		); err != nil {
+			return migrated, fmt.Errorf("store encrypted jwt_secret for tenant %d: %w", p.id, err)
+		}
+		migrated++
+	}
+	return migrated, nil
+}
+
+// ReencryptTenantSecrets re-seals every tenants.jwt_secret_enc row under the
+// CURRENT JWT_SIGNING_KEY_ENCRYPTION_KEY while a previous key is configured.
+//
+// tenants.jwt_secret_enc has no natural rewrite path — unlike an OAuth client
+// secret, nothing rewrites it on the tenant's next write — so without this
+// sweep an old-key ciphertext would become undecryptable the day the previous
+// key is retired (GHSA-4x5m-3gph-938r review). Run at startup right after
+// EncryptAllTenantSecrets whenever the box carries a previous key: Decrypt
+// falls back to it transparently, and Encrypt always seals under the primary.
+// One boot is then enough to retire the previous key — leave
+// JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS set for one restart, then remove it.
+//
+// Idempotent and a no-op when no rotation is configured.
+func (s *JWTService) ReencryptTenantSecrets(ctx context.Context) (int, error) {
+	if s.secretBox == nil || !s.secretBox.HasPreviousKey() {
+		return 0, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, jwt_secret_enc FROM tenants
+		 WHERE COALESCE(jwt_secret_enc, '') <> ''`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("list encrypted jwt_secret rows: %w", err)
+	}
+	defer rows.Close()
+
+	type pending struct {
+		id  int64
+		enc string
+	}
+	var todo []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.enc); err != nil {
+			return 0, fmt.Errorf("scan tenant enc row: %w", err)
+		}
+		todo = append(todo, p)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate tenant enc rows: %w", err)
+	}
+
+	reencrypted := 0
+	for _, p := range todo {
+		plain, err := s.secretBox.Decrypt(p.enc)
+		if err != nil {
+			return reencrypted, fmt.Errorf("decrypt jwt_secret_enc for tenant %d: %w", p.id, err)
+		}
+		enc, err := s.secretBox.Encrypt(plain)
+		if err != nil {
+			return reencrypted, fmt.Errorf("re-encrypt jwt_secret for tenant %d: %w", p.id, err)
+		}
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE tenants SET jwt_secret_enc = $1 WHERE id = $2`,
+			enc, p.id,
+		); err != nil {
+			return reencrypted, fmt.Errorf("store re-encrypted jwt_secret for tenant %d: %w", p.id, err)
+		}
+		reencrypted++
+	}
+	return reencrypted, nil
 }
 
 // AccessTokenTTL is the lifetime of an access token (AUTH-06).

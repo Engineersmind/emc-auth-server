@@ -16,17 +16,21 @@ every token minted a second earlier.
 
 ## What is already in the codebase
 
-The code for this phase **is written and tested** — it is switched off, not missing.
+The code for this phase **is written and tested** — the strict posture is now
+the default, and the permissive window is an explicit opt-in
+(GHSA-4x5m-3gph-938r).
 
 | Piece | Where | State |
 |---|---|---|
-| `JWT_ALLOW_LEGACY_HS256` env var | `internal/config/config.go` | defaults to `true` |
+| `JWT_ALLOW_LEGACY_HS256` env var | `internal/config/config.go` | defaults to `false` — strict; set `true` only for a migration window |
+| Deploy-path pin | `infra/docker-compose.prod.yml` | pins `JWT_ALLOW_LEGACY_HS256: ${JWT_ALLOW_LEGACY_HS256:-true}` so an upgrade does not flag-day live tokens — delete the pin to complete the cutover |
 | Both algorithm pins narrow to RS256 | `internal/auth/jwt.go` — `WithValidMethods` **and** the keyfunc's HMAC branch | active when the flag is `false` |
-| Startup warning on cutover | `internal/api/routes.go` | active |
+| Startup warning while the window is open | `internal/api/routes.go` | active — logs `JWT_ALLOW_LEGACY_HS256=true — HS256 tokens are still ACCEPTED` until the flag is off |
 | Rejection counter | `emc_auth_legacy_hs256_verifications_total{reason="rejected"}` | active |
 | Test coverage | `TestJWTService_Phase4Cutover` | passing |
 
-So step 2 below is an **env var change and a restart**, not a code change.
+So step 2 below is an **env var change and a restart**, not a code change —
+and for the shipped compose deployment it means removing the migration pin.
 
 ---
 
@@ -93,14 +97,21 @@ appears in that list. If it does not, **stop** — cutover would reject everythi
 
 ### Step 2 — reject HS256
 
+Since GHSA-4x5m-3gph-938r the flag **defaults to false** — deployments that
+never set it are already strict. If the shipped `docker-compose.prod.yml`
+migration pin (`JWT_ALLOW_LEGACY_HS256: ${JWT_ALLOW_LEGACY_HS256:-true}`) is in
+place, the cutover is:
+
 ```bash
+# remove the pin from the compose environment block, or set explicitly:
 JWT_ALLOW_LEGACY_HS256=false
 ```
 
-Restart. Confirm at startup:
+Restart. Confirm at startup that the migration-window warning is **gone**:
 
 ```
-WARN  JWT_ALLOW_LEGACY_HS256=false — HS256 tokens are REJECTED (issue #95 Phase 4 cutover)
+# this line must NOT appear:
+WARN  JWT_ALLOW_LEGACY_HS256=true — HS256 tokens are still ACCEPTED (issue #95 Phase 4 migration window)
 ```
 
 **Blast radius, honestly:** any access token minted before RS256 went live now fails.
