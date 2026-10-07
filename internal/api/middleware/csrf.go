@@ -2,7 +2,6 @@ package middleware
 
 import (
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/labstack/echo/v4"
@@ -15,18 +14,21 @@ import (
 // The attacker cannot read the response (CORS blocks that), but rotation still
 // occurs — revoking the victim's in-flight token.
 //
-// Protection: reject requests whose Origin header is present and whose host
-// does not match the trusted domain at a label boundary.  Same-origin and
-// Bearer-only clients (no Origin header) pass through unchanged.
+// Protection: the Origin must exactly match the trusted-origins list
+// (GLOBAL_CORS_ORIGINS via CookieConfig.TrustedOrigins). GHSA-jv2c-x735-vff7
+// (L-04) removed the two looser behaviours: blanket trust of every subdomain
+// of the cookie domain — any attacker-controlled subdomain could CSRF — and
+// allowing requests with no Origin at all. Browsers always send Origin on
+// POSTs; a missing Origin on a cookie-authenticated write is a curl client or
+// an attack, and cookie sessions are browser-facing by definition.
 //
 // Security properties:
 //
-//   - Label-boundary check: "evil-engineersmind.com" does NOT match trusted
-//     domain "engineersmind.com" because HasSuffix(".engineersmind.com") fails.
+//   - Exact origin match: "evil-engineersmind.com" and unlisted subdomains are
+//     rejected — only origins in GLOBAL_CORS_ORIGINS pass.
 //
-//   - Fail-closed on missing domain: if COOKIE_DOMAIN is not set in production
-//     (cfg.Secure=true, cfg.Domain=""), all cross-origin requests are rejected
-//     rather than silently accepted.
+//   - Fail-closed on misconfiguration: secure cookies with an empty trusted
+//     list rejects every request rather than silently accepting them.
 //
 // Apply only to state-mutating session endpoints:
 //   - POST /auth/session (login)
@@ -126,51 +128,48 @@ func hasAuthCookie(c echo.Context) bool {
 // was written, and the caller would go on to invoke the handler anyway. Any
 // future rejection site must return (…, true).
 //
-// A missing Origin passes. This is a policy choice, not an inference about the
-// caller: same-origin form submits omit Origin, as do some browsers in privacy
-// modes and many non-browser clients, so rejecting on absence would break
-// legitimate traffic. It is safe against the threat this guards — a cross-site
-// page cannot suppress the Origin header on a real browser fetch or form post.
-// The consequence is that a non-browser client is not covered by this check;
-// such callers hold no ambient cookie credential to forge, and are bounded by
-// the token rate limiter instead.
+// GHSA-jv2c-x735-vff7 (L-04) tightened both directions of this check:
+//
+//   - A missing Origin is now rejected. Browsers send Origin on every mutating
+//     request (fetch AND form posts), so absence on a cookie-authenticated
+//     write means a non-browser client or a stripped-header attack — the
+//     endpoints this guards exist for browser sessions.
+//   - Subdomain suffix-matching is gone in favour of an exact allowlist
+//     (cfg.TrustedOrigins, fed by GLOBAL_CORS_ORIGINS). Trusting every
+//     subdomain of the cookie domain let any attacker-controlled or
+//     abandoned subdomain CSRF the session endpoints.
 func checkTrustedOrigin(c echo.Context, cfg CookieConfig) (rejection error, blocked bool) {
 	origin := c.Request().Header.Get("Origin")
 	if origin == "" {
-		return nil, false
+		return csrfRejected(c), true
 	}
 
-	// cfg.Domain is e.g. ".engineersmind.com"; strip the leading dot to get
-	// the bare hostname used for comparison.
-	trusted := strings.TrimPrefix(cfg.Domain, ".")
-
-	// Fail-closed: if ENV=production but COOKIE_DOMAIN is not configured,
-	// reject all cross-origin requests rather than accepting every origin.
-	if trusted == "" {
+	// Deliberately GLOBAL_CORS_ORIGINS only — per-tenant cors_origins rows are
+	// NOT consulted here. CORS is a read-protection (which origins may read
+	// responses); CSRF is a write-protection (which origins may drive the
+	// browser's ambient credential). The session cookies this guards are set
+	// by the portal, which lives at the global origin — tenant SPAs carry
+	// Bearer tokens, whose security does not depend on this list at all.
+	// Widening the allowlist to every tenant's cors_origins would let any
+	// tenant-controlled origin CSRF the admin session: a cross-tenant
+	// privilege escalation.
+	if len(cfg.TrustedOrigins) == 0 {
 		return c.JSON(http.StatusForbidden, map[string]string{
-			"error": "CSRF check misconfigured: COOKIE_DOMAIN must be set in production",
+			"error": "CSRF check misconfigured: GLOBAL_CORS_ORIGINS must be set in production",
 			"code":  "csrf_misconfigured",
 		}), true
 	}
 
-	// Parse the Origin header to extract the hostname.
-	// Malformed or opaque origins (e.g. "null") are treated as untrusted.
-	u, parseErr := url.Parse(origin)
-	if parseErr != nil || u.Host == "" {
-		return csrfRejected(c), true
+	// Exact match on the full origin (scheme + host + port). Opaque origins
+	// like "null" and every subdomain not explicitly listed are rejected.
+	// Trailing slashes are stripped in config parsing (getEnvList); strip here
+	// too so a stray configured slash cannot silently break legitimate calls.
+	for _, trusted := range cfg.TrustedOrigins {
+		if origin == strings.TrimSuffix(trusted, "/") {
+			return nil, false
+		}
 	}
-
-	// u.Hostname() strips any port suffix so "app.engineersmind.com:443"
-	// is treated the same as "app.engineersmind.com".
-	host := u.Hostname()
-
-	// Label-boundary match: exact equality OR subdomain with a "." separator.
-	// This prevents "evil-engineersmind.com" from matching "engineersmind.com".
-	if host != trusted && !strings.HasSuffix(host, "."+trusted) {
-		return csrfRejected(c), true
-	}
-
-	return nil, false
+	return csrfRejected(c), true
 }
 
 func csrfRejected(c echo.Context) error {
