@@ -234,8 +234,15 @@ C
 # ── 07 user_invitation ────────────────────────────────────────────────────────
 {
   eyebrow "You are invited" "muted"
-  h1 "{{if .InviterName}}{{.InviterName}} invited you{{else}}You have been invited{{end}}"
-  p "{{if .InviterName}}{{.InviterName}} has invited you{{else}}You have been invited{{end}} to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}{{if .Name}}, {{.Name}}{{end}}. Accept the invitation to set your password and activate your account."
+  # Every invitation reads the same — owner, co-owner or user — and none names
+  # the inviter. "<someone> invited you" from a noreply address is the shape of
+  # a phishing lure, and spam filters score it as one.
+  # An administrator invitation says what the recipient is being made — "as the
+  # owner of <tenant>" / "as a co-owner of <tenant>". The recipient's name is
+  # left out: a seeded owner's is a placeholder ("Owner <slug>"), which read as
+  # a garbled name when appended to this sentence.
+  h1 "You have been invited"
+  p "You have been invited to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}{{if .AdminRole}} as {{if eq .AdminRole \"owner\"}}the owner{{else}}a co-owner{{end}}{{if .TenantName}} of {{.TenantName}}{{end}}{{end}}. Accept the invitation to set your password and activate your account."
   # 4320 minutes reads absurdly; no FuncMap exists to divide, so the thresholds
   # are matched to InvitationTTL (72h). Change both together.
   callout "&#9888;&nbsp; $(ttl "This invitation expires in")" "warn"
@@ -244,8 +251,8 @@ C
   rule
   note "If you were not expecting this invitation, you can ignore it &mdash; no account will be created until you accept."
 } | emit "07_user_invitation.html" \
-  "{{if .InviterName}}{{.InviterName}} invited you to {{end}}{{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}" \
-  "{{if .InviterName}}{{.InviterName}} has invited you{{else}}You have been invited{{end}} to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}."
+  "You&rsquo;re invited to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}" \
+  "You have been invited to join {{if .AppName}}{{.AppName}}{{else}}{{.ProductName}}{{end}}."
 
 # ── 08 change_email (2 variants) ──────────────────────────────────────────────
 {

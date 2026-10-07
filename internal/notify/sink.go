@@ -144,11 +144,16 @@ func (s *EmailSink) Emit(events []audit.Event) {
 	}
 
 	// Filter before copying: most batches are logins and token refreshes, and
-	// there is no reason to copy events nobody will be told about.
+	// there is no reason to copy events nobody will be told about. An action
+	// qualifies on either catalogue: notable (observer mail) or subjectLabel
+	// (the access-change notice mailed to the person the change was made TO,
+	// whose actions were deliberately left out of notableActions).
 	var keep []audit.Event
 	for _, e := range events {
-		if _, ok := label(e.Action); !ok {
-			continue
+		if _, ok := lookup(e.Action); !ok {
+			if _, subj := subjectLabel(e.Action); !subj {
+				continue
+			}
 		}
 		// Status is the raw value the caller set; the writer's "" → success
 		// normalisation happens on the copy bound for the database. An attempt
@@ -270,11 +275,25 @@ func (s *EmailSink) deliver(n *notice) {
 	defer cancel()
 
 	if n.ev.TenantID == nil {
-		return // a cross-tenant event has no owner tier to notify
+		return // a cross-tenant event has no administrators to notify
 	}
 	tenantID := *n.ev.TenantID
+	actorRole, _ := s.describeActor(ctx, tenantID, n.ev.UserID, n.ev.ActorEmail)
 
-	aud, err := s.resolveAudience(ctx, tenantID, n.ev.UserID, n.ev.ActorEmail, n.ev.Action)
+	// The person the change was made TO, when it was an access change. They are
+	// not in the scope audience — that reports to administrators — and without
+	// this they would learn of it only by being refused something they could do
+	// yesterday. Runs before the observer path so an action carrying no
+	// observer audience (subject-only catalogued) still sends it.
+	s.notifySubject(ctx, n, tenantID, actorRole, s.tenantName(ctx, tenantID))
+
+	entry, notable := lookup(n.ev.Action)
+	if !notable {
+		return
+	}
+
+	appID := eventApplication(n.ev.ApplicationID, n.ev.ResourceType, n.ev.ResourceID)
+	aud, err := s.resolveAudience(ctx, tenantID, appID, n.ev.UserID, n.ev.ActorEmail, n.ev.Action)
 	if err != nil {
 		metrics.AuditEnrichmentErrors.WithLabelValues("notify_recipients").Inc()
 		s.logger.Error().Err(err).Str("action", n.ev.Action).Msg("notify: could not resolve recipients")
@@ -283,25 +302,20 @@ func (s *EmailSink) deliver(n *notice) {
 	if len(aud.to) == 0 {
 		return
 	}
+	// resolveAudience already described the actor; keep the two consistent.
+	aud.actorRole = actorRole
 
-	phrase, _ := label(n.ev.Action)
-	appName := s.applicationName(ctx, n.ev.ApplicationID, n.ev.ResourceType, n.ev.ResourceID)
 	msg := mailer.AdminActivityEmail{
 		ActorEmail:   n.ev.ActorEmail,
 		ActorRole:    aud.actorRole,
-		ActionLabel:  phrase,
+		ActionLabel:  entry.phrase,
 		TenantName:   s.tenantName(ctx, tenantID),
-		ResourceName: appName,
+		ResourceName: s.applicationName(ctx, appID),
 		OccurredAt:   n.ev.CreatedAt().UTC().Format("2 Jan 2006, 15:04 MST"),
 		IPAddress:    n.ev.IPAddress,
 		Link:         s.monitoringLink(tenantID),
 		Count:        n.count,
 	}
-
-	// The person the change was made TO, when it was an access change. They are
-	// not in the tier-up audience — that reports upward — and without this they
-	// would learn of it only by being refused something they could do yesterday.
-	s.notifySubject(ctx, n, tenantID, aud.actorRole, msg.TenantName)
 
 	for _, addr := range aud.to {
 		if !s.allow(addr) {

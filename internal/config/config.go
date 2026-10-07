@@ -75,9 +75,9 @@ type Config struct {
 	// deployment where the console is not on localhost must set it explicitly.
 	DashboardBaseURL string
 
-	// PlatformNotifyEmails receive the admin-activity notifications raised when a
-	// tenant OWNER takes a privileged action — the platform tier's oversight
-	// mail. Comma-separated; set via PLATFORM_NOTIFY_EMAIL.
+	// PlatformNotifyEmails receive the admin-activity notifications raised for
+	// the platform tier's oversight mail — secret rotations and tenant
+	// deactivations. Comma-separated; set via PLATFORM_NOTIFY_EMAIL.
 	//
 	// When empty the notifier falls back to every active super_admin user, so
 	// the feature works unconfigured. Naming an address is preferable in a real
