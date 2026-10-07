@@ -50,8 +50,10 @@ type RoutesConfig struct {
 	JWTIssuer string
 	// Env is "development" or "production" — controls HTTPS enforcement behaviour.
 	Env string
-	// MetricsToken optionally gates GET /metrics behind a bearer token. Empty
-	// leaves it open, relying on the reverse proxy / network policy as before.
+	// MetricsToken gates GET /metrics behind a bearer token. In
+	// production/staging the endpoint is not registered at all when this is
+	// empty (GHSA-4r4c-348x-w452); in development/test it is served open for
+	// local scraping. See middleware.MetricsRouteEnabled.
 	MetricsToken string
 	// PasswordHashMaxConcurrent caps simultaneous Argon2id derivations, bounding
 	// worst-case hashing memory. 0 means NumCPU (floored at 2). See
@@ -322,8 +324,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// GHSA-4r4c-348x-w452 (L-02): in production/staging the endpoint is not
 	// registered at all unless METRICS_TOKEN is set — defence in depth cannot
 	// depend on an empty-string bypass. Development/test keeps the open
-	// endpoint so local scraping keeps working without a token.
-	if deps.Config.MetricsToken != "" || (deps.Config.Env != "production" && deps.Config.Env != "staging") {
+	// endpoint so local scraping keeps working without a token. The decision
+	// is extracted into mw.MetricsRouteEnabled so a unit test can pin it
+	// without standing up RegisterRoutes' full dependency set.
+	if mw.MetricsRouteEnabled(deps.Config.Env, deps.Config.MetricsToken) {
 		e.GET("/metrics", echo.WrapHandler(promhttp.Handler()), mw.MetricsAuth(deps.Config.MetricsToken))
 	} else {
 		deps.Logger.Warn().Msg("METRICS_TOKEN unset — /metrics endpoint DISABLED in production/staging; set METRICS_TOKEN to expose it behind bearer auth")

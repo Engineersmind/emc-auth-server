@@ -20,6 +20,9 @@ certs/*.pem
 dist/
 build/
 
+# Generated at deploy time by deploy.sh (contains METRICS_TOKEN)
+infra/prometheus/prometheus.generated.yml
+
 # IDE
 .vscode/settings.json
 .idea/

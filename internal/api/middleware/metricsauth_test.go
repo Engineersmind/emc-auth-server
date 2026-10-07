@@ -49,3 +49,30 @@ func TestMetricsAuth_EmptyTokenPasses(t *testing.T) {
 		t.Errorf("empty token (dev-only branch): status = %d, want 200", rec.Code)
 	}
 }
+
+// The registration decision itself — the conditional RegisterRoutes evaluates
+// to call e.GET("/metrics", ...) or not — pinned without standing up the
+// router's full dependency set (GHSA-4r4c-348x-w452 review).
+func TestMetricsRouteEnabled(t *testing.T) {
+	cases := []struct {
+		name, env, token string
+		want             bool
+	}{
+		{"prod + token registers", "production", "tok", true},
+		{"staging + token registers", "staging", "tok", true},
+		{"prod + no token: endpoint absent, not open", "production", "", false},
+		{"staging + no token: endpoint absent, not open", "staging", "", false},
+		{"dev + no token stays open", "development", "", true},
+		{"test + no token stays open", "test", "", true},
+		{"dev + token registers", "development", "tok", true},
+		{"unrecognised env fails closed", "prodution", "", false},
+		{"empty env fails closed", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MetricsRouteEnabled(tc.env, tc.token); got != tc.want {
+				t.Errorf("MetricsRouteEnabled(%q, %q) = %v, want %v", tc.env, tc.token, got, tc.want)
+			}
+		})
+	}
+}

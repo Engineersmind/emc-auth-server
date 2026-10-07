@@ -48,3 +48,18 @@ func MetricsAuth(token string) echo.MiddlewareFunc {
 		}
 	}
 }
+
+// MetricsRouteEnabled is the registration decision for GET /metrics
+// (GHSA-4r4c-348x-w452, L-02): the endpoint is served open only in
+// development/test; every other environment — production, staging, or a
+// mistyped ENV — requires a bearer token to register it at all, matching the
+// same env contract as NewSecretBox and Config.Validate. Exported so the
+// RegisterRoutes decision is unit-testable without standing up the router's
+// full dependency set — and so a caller can never accidentally re-inline a
+// weaker variant of the check.
+func MetricsRouteEnabled(env, token string) bool {
+	if env == "development" || env == "test" {
+		return true
+	}
+	return token != ""
+}
