@@ -142,6 +142,9 @@ type RoutesConfig struct {
 	// that carries a real one is always held to its route's policy. See
 	// config.Config.RequireAudience and middleware/audience.go.
 	RequireAudience bool
+	// OAuthRequireState rejects /oauth/authorize requests that omit `state`
+	// (GHSA-6fcw-g2xw-v42w). See config.Config.OAuthRequireState.
+	OAuthRequireState bool
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -360,11 +363,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	jwtSvc.WithTenantIssuers(issuerResolver).
 		WithLegacyIssuer(deps.Config.JWTAllowLegacyIssuer).
 		WithRequireAudience(deps.Config.RequireAudience)
-	if !deps.Config.JWTAllowLegacyIssuer {
-		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_ISSUER=false — tokens carrying the old global JWT_ISSUER are REJECTED (issue #7 cutover). Any token minted before per-tenant issuers went live will fail.")
+	if deps.Config.JWTAllowLegacyIssuer {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_ISSUER=true — tokens carrying the old global JWT_ISSUER are still ACCEPTED (issue #7 migration window). Set to false once emc_auth_legacy_issuer_verifications_total has been flat at zero.")
 	}
-	if deps.Config.RequireAudience {
-		deps.Logger.Warn().Msg("REQUIRE_AUDIENCE=true — the audience is MANDATORY server-wide (issue #132 cutover). Tokens carrying no gty claim and tokens resolving to no audience are REJECTED across every tenant on this server. Rollback is REQUIRE_AUDIENCE=false, config only, no deploy.")
+	if !deps.Config.RequireAudience {
+		deps.Logger.Warn().Msg("REQUIRE_AUDIENCE=false — the audience backstop is DISABLED server-wide (issue #132 rollout window). Tokens carrying no gty claim or resolving to no audience are still accepted. Set to true once every client that matters enforces its own flag.")
 	}
 	deps.Logger.Info().
 		Str("issuer_base_url", issuerResolver.BaseURL()).
@@ -765,7 +768,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authHandler.WithCaptcha(captchaSvc)
 	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
 	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
-		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure)
+		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure,
+		deps.Config.OAuthRequireState)
 	oauthTokenHandler := handlers.NewOAuthTokenHandler(
 		authzSvc, authSvc, jwtSvc, appSvc, auditLog, deps.Logger)
 

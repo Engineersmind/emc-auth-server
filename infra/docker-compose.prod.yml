@@ -37,6 +37,27 @@ services:
       SMTP_FROM: ${SMTP_FROM:-noreply@emc.local}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # ── GHSA-6fcw-g2xw-v42w (L-05) migration window ──────────────────
+      # The code defaults are the SECURE ones (legacy issuer rejected,
+      # audience required, state required). The pins below preserve the
+      # pre-advisory behaviour for existing deployments so this release is
+      # NOT a flag-day cutover — outstanding 30-day refresh tokens keep
+      # verifying and first-party clients get a window to add `state`.
+      #
+      # Migration window: ONE refresh-token lifetime (30 days) after this
+      # deploy. Flip each pin to the secure value — or delete the line and
+      # let the code default take over — once:
+      #   • JWT_ALLOW_LEGACY_ISSUER → false when
+      #     emc_auth_legacy_issuer_verifications_total has been flat at zero
+      #     (longest-lived affected token: the 1 h agent token)
+      #   • REQUIRE_AUDIENCE → true when every first-party client enforces
+      #     on its own oauth_clients.require_audience flag (issue #132)
+      #   • OAUTH_REQUIRE_STATE → true when every first-party client sends
+      #     `state` on /oauth/authorize (watch the
+      #     "authorize: request omitted state" warning going silent)
+      JWT_ALLOW_LEGACY_ISSUER: ${JWT_ALLOW_LEGACY_ISSUER:-true}
+      REQUIRE_AUDIENCE: ${REQUIRE_AUDIENCE:-false}
+      OAUTH_REQUIRE_STATE: ${OAUTH_REQUIRE_STATE:-false}
     depends_on:
       redis:
         condition: service_healthy

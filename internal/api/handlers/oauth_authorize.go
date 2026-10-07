@@ -124,10 +124,17 @@ type OAuthAuthorizeHandler struct {
 	audit     *audit.Logger
 	logger    zerolog.Logger
 	secure    bool
+	// requireState rejects authorize requests that omit `state`
+	// (OAUTH_REQUIRE_STATE). The flag exists for the migration window only —
+	// a client that omits state has no CSRF binding on its callback
+	// (GHSA-6fcw-g2xw-v42w).
+	requireState bool
 }
 
 // NewOAuthAuthorizeHandler builds the handler. secure controls the Secure flag
-// on the SSO cookie and must be true in production.
+// on the SSO cookie and must be true in production. requireState controls the
+// missing-state rejection — a constructor argument rather than a setter so the
+// secure value cannot be silently left at its permissive zero value.
 func NewOAuthAuthorizeHandler(
 	authz *auth.AuthorizationServer,
 	sessions *auth.AuthzSessionStore,
@@ -135,11 +142,13 @@ func NewOAuthAuthorizeHandler(
 	auditLog *audit.Logger,
 	logger zerolog.Logger,
 	secure bool,
+	requireState bool,
 ) *OAuthAuthorizeHandler {
 	return &OAuthAuthorizeHandler{
 		authz: authz, sessions: sessions, authSvc: authSvc,
 		audiences: authSvc.Audiences(),
 		audit:     auditLog, logger: logger, secure: secure,
+		requireState: requireState,
 	}
 }
 
@@ -153,7 +162,7 @@ func NewOAuthAuthorizeHandler(
 // @Param        redirect_uri           query  string  false  "Must exactly match a registered redirect_uri. Optional only when exactly one is registered."
 // @Param        response_type          query  string  true   "Must be 'code'"
 // @Param        scope                  query  string  false  "Space-delimited. Unregistered scopes are dropped, not rejected."
-// @Param        state                  query  string  false  "Opaque value echoed back on the redirect"
+// @Param        state                  query  string  true   "Opaque value echoed back on the redirect — required unless OAUTH_REQUIRE_STATE=false"
 // @Param        nonce                  query  string  false  "OIDC nonce, echoed into the ID token"
 // @Param        code_challenge         query  string  true   "base64url(SHA256(code_verifier))"
 // @Param        code_challenge_method  query  string  true   "Must be 'S256'"
@@ -208,12 +217,18 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	// the response to its own request.
 	state := q.Get("state")
 	if state == "" {
-		// Spec-permitted (RFC 6749 §4.1.1 marks state RECOMMENDED, not required),
-		// so this is a warning and not a rejection — refusing would break
-		// conformant clients. But a client that omits state has no way to bind the
-		// callback to the request it started, which is the CSRF defence for the
-		// redirect leg, so the omission is worth a log line an integrator can be
-		// pointed at.
+		// RFC 6749 §4.1.1 marks state RECOMMENDED, not required — but a client
+		// that omits it has no way to bind the callback to the request it
+		// started, which is the CSRF defence for the redirect leg. Only
+		// first-party clients reach this point (third-party is refused above),
+		// and the operator controls those, so GHSA-6fcw-g2xw-v42w makes the
+		// omission an invalid_request rejection by default. The warning path
+		// remains for the OAUTH_REQUIRE_STATE=false migration window.
+		if h.requireState {
+			countAuthorize(authzOutcomeInvalidRequest)
+			return h.redirectError(c, redirectURI, state, errInvalidRequest,
+				"state parameter is required")
+		}
 		h.logger.Warn().Str("client_id", client.ClientID).
 			Msg("authorize: request omitted state — no CSRF binding on the callback")
 	}
