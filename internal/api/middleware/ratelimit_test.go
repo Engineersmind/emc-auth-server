@@ -418,3 +418,89 @@ func TestPasskeyBeginPerIPRate_ExceedsLoginRate(t *testing.T) {
 			"materially higher allowance", middleware.PasskeyBeginPerIPRate, loginRate)
 	}
 }
+
+// resetRequest runs a POST carrying a forgot/reset-password-shaped body through
+// the middleware. email may be empty (reset-password sends only a token).
+func resetRequest(t *testing.T, mw echo.MiddlewareFunc, remoteAddr, email, basicAuth string) int {
+	t.Helper()
+	e := echo.New()
+	body := `{}`
+	if email != "" {
+		body = `{"email":"` + email + `"}`
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/forgot-password", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if basicAuth != "" {
+		req.Header.Set(echo.HeaderAuthorization, basicAuth)
+	}
+	req.RemoteAddr = remoteAddr + ":12345"
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	handler := mw(func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+	_ = handler(c)
+	return rec.Code
+}
+
+// TestPasswordResetRateLimiter_BlocksByIP: the per-IP bucket is what bounds
+// online reset-token guessing — per-token keying can never work because each
+// guess is a different token and gets a fresh bucket.
+func TestPasswordResetRateLimiter_BlocksByIP(t *testing.T) {
+	middleware.ResetStoresForTest()
+	mw := middleware.PasswordResetRateLimiter(middleware.DefaultRateLimitConfig()) // PerIPRate: 5
+
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+	for i := 0; i < 5; i++ {
+		if got := resetRequest(t, mw, ip, "", ""); got != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i+1, got)
+		}
+	}
+	if got := resetRequest(t, mw, ip, "", ""); got != http.StatusTooManyRequests {
+		t.Fatalf("6th request: expected 429, got %d", got)
+	}
+}
+
+// TestPasswordResetRateLimiter_BlocksByEmail: inbox flooding of one victim must
+// be bounded even when the attacker rotates IPs and client credentials.
+func TestPasswordResetRateLimiter_BlocksByEmail(t *testing.T) {
+	middleware.ResetStoresForTest()
+	mw := middleware.PasswordResetRateLimiter(middleware.RateLimitConfig{
+		PerIPRate:     1000,
+		PerTenantRate: 3,
+	})
+
+	email := fmt.Sprintf("victim-%d@example.com", time.Now().UnixNano())
+	for i := 0; i < 3; i++ {
+		ip := fmt.Sprintf("198.51.100.%d", 60+i)
+		if got := resetRequest(t, mw, ip, email, ""); got != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i+1, got)
+		}
+	}
+	if got := resetRequest(t, mw, "198.51.100.64", email, ""); got != http.StatusTooManyRequests {
+		t.Fatalf("4th request for the same email from a new IP: expected 429, got %d", got)
+	}
+}
+
+// TestPasswordResetRateLimiter_BlocksByClient: forgot-password authenticates
+// the calling application with Basic credentials — per-client volume must be
+// bounded independently of IP.
+func TestPasswordResetRateLimiter_BlocksByClient(t *testing.T) {
+	middleware.ResetStoresForTest()
+	mw := middleware.PasswordResetRateLimiter(middleware.RateLimitConfig{
+		PerIPRate:     1000,
+		PerTenantRate: 2,
+	})
+
+	client := "Basic " + base64.StdEncoding.EncodeToString(
+		[]byte(fmt.Sprintf("client-%d:secret", time.Now().UnixNano())))
+	for i := 0; i < 2; i++ {
+		ip := fmt.Sprintf("203.0.113.%d", 80+i)
+		if got := resetRequest(t, mw, ip, "", client); got != http.StatusOK {
+			t.Fatalf("request %d: expected 200, got %d", i+1, got)
+		}
+	}
+	if got := resetRequest(t, mw, "203.0.113.83", "", client); got != http.StatusTooManyRequests {
+		t.Fatalf("3rd request for the same client: expected 429, got %d", got)
+	}
+}

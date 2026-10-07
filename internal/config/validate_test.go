@@ -151,6 +151,21 @@ func TestValidate(t *testing.T) {
 			cfg:     Config{Env: "production", DatabaseURL: goodDSN, CookieDomain: ".engineersmind.com", GlobalCORSOrigins: []string{"https://admin.engineersmind.com"}, TOTPEncryptionKey: realTOTPKey, TrustedProxies: []string{"172.18.0.0/16/"}},
 			wantErr: true,
 		},
+		{
+			// The CSRF allowlist reads this list, so empty is not "no CORS" -
+			// it is every cookie write 403ing at runtime, including login.
+			name:    "production without any global CORS origin",
+			cfg:     Config{Env: "production", DatabaseURL: goodDSN, CookieDomain: ".engineersmind.com"},
+			wantErr: true,
+		},
+		{
+			// Same check in staging: an empty allowlist is not "no CORS" -
+			// the CSRF guard fails closed on it and every cookie-authenticated
+			// write 403s at runtime.
+			name:    "staging without any global CORS origin",
+			cfg:     Config{Env: "staging", DatabaseURL: goodDSN, CookieDomain: ".engineersmind.com"},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -175,5 +190,36 @@ func TestLoad_TrustedProxiesKeepsTheTrailingSlash(t *testing.T) {
 	}
 	if _, err := cfg.TrustedProxyNets(); err == nil {
 		t.Error("TrustedProxyNets accepted the double-slashed range")
+	}
+}
+
+// TestLoad_EnvDefaultsToProduction locks in GHSA-vgf9-64q8-gj87 (M-03): an
+// unset ENV must resolve to the strict posture, not development. A deploy that
+// forgets ENV then trips Validate()'s COOKIE_DOMAIN requirement instead of
+// silently shipping lax cookies, no CSRF check, and no HTTPS redirect.
+func TestLoad_EnvDefaultsToProduction(t *testing.T) {
+	t.Setenv("ENV", "")
+	cfg := Load()
+	if cfg.Env != "production" {
+		t.Errorf("unset ENV: Env = %q, want %q", cfg.Env, "production")
+	}
+}
+
+// The reviewer asked for the end-to-end shape, not just the Load half: an
+// unset ENV must produce a config that Validate() rejects — the whole point is
+// that a deployment which forgets ENV fails closed rather than silently
+// taking development defaults.
+func TestLoadValidate_UnsetEnvFailsClosed(t *testing.T) {
+	t.Setenv("ENV", "")
+	cfg := Load()
+	if err := cfg.Validate(); err == nil {
+		t.Error("Load()+Validate() with ENV unset: expected refusal (production posture, missing COOKIE_DOMAIN et al), got nil")
+	}
+
+	// And the contract's other half: an explicit development env still loads
+	// and validates, so local runs are untouched.
+	t.Setenv("ENV", "development")
+	if err := Load().Validate(); err != nil {
+		t.Errorf("Load()+Validate() with ENV=development: %v, want nil", err)
 	}
 }

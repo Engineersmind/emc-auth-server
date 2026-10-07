@@ -157,10 +157,11 @@ type Config struct {
 	// JWTAllowLegacyIssuer keeps tokens carrying the old global JWT_ISSUER
 	// verifiable during the migration to per-tenant issuers (issue #7).
 	//
-	// Same shape and same discipline as JWTAllowLegacyHS256: defaults to true so
-	// the switch does not invalidate tokens minted seconds earlier, and is flipped
-	// to false only once emc_auth_legacy_issuer_verifications_total has been flat
-	// at zero. The longest-lived affected token is the 1 h agent token.
+	// GHSA-6fcw-g2xw-v42w (L-05): defaults to false — the legacy issuer is
+	// rejected unless an operator explicitly sets JWT_ALLOW_LEGACY_ISSUER=true
+	// for a migration window. Flip it back to false once
+	// emc_auth_legacy_issuer_verifications_total has been flat at zero. The
+	// longest-lived affected token is the 1 h agent token.
 	JWTAllowLegacyIssuer bool
 
 	// CookieDomain sets the Domain attribute on auth cookies.
@@ -333,8 +334,23 @@ type Config struct {
 	// fallback code is a separate, later release, once this flag has stayed on
 	// without incident for longer than a refresh token's lifetime.
 	//
-	// Set via REQUIRE_AUDIENCE. Defaults to false.
+	// Set via REQUIRE_AUDIENCE. GHSA-6fcw-g2xw-v42w (L-05): defaults to true —
+	// the backstop is on unless an operator explicitly sets it false to stage
+	// the per-client rollout. Set it back to true as soon as the clients that
+	// matter enforce on their own flag.
 	RequireAudience bool
+
+	// OAuthRequireState rejects /oauth/authorize requests that omit the `state`
+	// parameter — the advisory's third component (GHSA-6fcw-g2xw-v42w). RFC
+	// 6749 §4.1.1 marks state RECOMMENDED, but a client that omits it has no
+	// CSRF binding on its callback, and only first-party clients use the flow
+	// here (third-party is refused at the consent gate), so the operator
+	// controls every affected integrator.
+	//
+	// Set via OAUTH_REQUIRE_STATE. Defaults to true — only the exact string
+	// "false" keeps the permissive RFC-default behaviour, for the migration
+	// window while first-party clients add the parameter.
+	OAuthRequireState bool
 
 	// AuditSIEMWebhookSecret, when set, signs every outbound SIEM payload with
 	// HMAC-SHA256 in the X-EMC-Audit-Signature header so the receiver can
@@ -351,10 +367,18 @@ func Load() *Config {
 		// GHSA-hv5j-m2r7-r4cr (L-06): no committed DSN default — the old fallback
 		// embedded credentials and sslmode=disable. DATABASE_URL must be set
 		// explicitly; Validate() refuses to boot without it.
-		DatabaseURL:                            getEnv("DATABASE_URL", ""),
-		RedisURL:                               getEnv("REDIS_URL", "redis://localhost:6379/0"),
-		LogLevel:                               getEnv("LOG_LEVEL", "info"),
-		Env:                                    getEnv("ENV", "development"),
+		DatabaseURL: getEnv("DATABASE_URL", ""),
+		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379/0"),
+		LogLevel:    getEnv("LOG_LEVEL", "info"),
+		// GHSA-vgf9-64q8-gj87 (M-03): unset ENV must mean the STRICT posture, not
+		// development. With "development" as the default a deploy that forgets
+		// ENV ships SameSite=Lax insecure cookies, no CSRF check, and no HTTPS
+		// redirect — silently. Defaulting to production makes the omission loud:
+		// Validate() refuses to boot without COOKIE_DOMAIN, so the operator is
+		// forced to choose rather than inheriting the lax path. Local dev is
+		// unaffected — .env.example and docker-compose set ENV=development
+		// explicitly.
+		Env: getEnv("ENV", "production"),
 		MetricsToken:                           getEnv("METRICS_TOKEN", ""),
 		JWTIssuer:                              getEnv("JWT_ISSUER", "https://auth.emc.local"),
 		EmailProvider:                          getEnv("EMAIL_PROVIDER", ""),
@@ -378,15 +402,20 @@ func Load() *Config {
 		// exact string "false" disables legacy verification, so a typo cannot
 		// accidentally reject every live token.
 		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
-		// Same fail-towards-compatibility rule as JWT_ALLOW_LEGACY_HS256 above.
-		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "true") != "false",
-		// The same fail-towards-COMPATIBILITY rule as the two legacy flags
-		// above, with the polarity mirrored: those default true and only the
-		// exact string "false" tightens them, whereas this defaults false and
-		// only the exact string "true" tightens it. Either way a typo leaves
-		// every live token working rather than refusing all of them, which is
-		// the only direction a misread env var may fail in.
-		RequireAudience: getEnv("REQUIRE_AUDIENCE", "false") == "true",
+		// GHSA-6fcw-g2xw-v42w (L-05): the legacy issuer is now opt-IN, not
+		// opt-out — only the exact string "true" re-accepts old global
+		// JWT_ISSUER tokens during a migration window. An unset or mistyped
+		// variable rejects them rather than silently widening verification.
+		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "false") == "true",
+		// GHSA-6fcw-g2xw-v42w (L-05): audience enforcement defaults ON
+		// server-wide; only the exact string "false" opens the per-client
+		// rollout window. An unset or mistyped variable enforces rather than
+		// silently accepting audience-less tokens.
+		RequireAudience: getEnv("REQUIRE_AUDIENCE", "true") != "false",
+		// GHSA-6fcw-g2xw-v42w (L-05): same polarity as RequireAudience — the
+		// rejection defaults ON; only the exact string "false" keeps the
+		// permissive RFC-6749 behaviour during the migration window.
+		OAuthRequireState: getEnv("OAUTH_REQUIRE_STATE", "true") != "false",
 		// Defaults to APP_BASE_URL: in the single-binary deployment the auth server
 		// and the origin used for email links are the same host, so requiring both
 		// to be set would be a config trap with one obviously correct answer.
@@ -472,6 +501,12 @@ func (c *Config) Validate() error {
 	}
 	if _, err := c.TrustedProxyNets(); err != nil {
 		return err
+	}
+	// The CSRF check (GHSA-jv2c-x735-vff7) allowlists cookie-authenticated
+	// writes against this list, so an empty list is no longer "no CORS" — it
+	// is every login and portal write 403ing at runtime. Fail at boot instead.
+	if len(c.GlobalCORSOrigins) == 0 {
+		return errors.New("GLOBAL_CORS_ORIGINS must list at least the portal origin when ENV=production or staging: it is now the CSRF trusted-origin allowlist, and empty fails every cookie-authenticated write at runtime")
 	}
 	return nil
 }

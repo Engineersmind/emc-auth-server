@@ -364,6 +364,7 @@ func main() {
 			UntrustedIPCIDRs:                       cfg.UntrustedIPCIDRs,
 			AudienceScheme:                         cfg.AudienceScheme,
 			RequireAudience:                        cfg.RequireAudience,
+			OAuthRequireState:                      cfg.OAuthRequireState,
 			CaptchaEnabled:                         cfg.CaptchaEnabled,
 			CaptchaHMACKey:                         cfg.CaptchaHMACKey,
 			CaptchaTTLSeconds:                      cfg.CaptchaTTLSeconds,
