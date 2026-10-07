@@ -22,7 +22,7 @@ This runbook covers first-time production deployment, environment configuration,
 | TOTP_ENCRYPTION_KEY | Yes | — | 64-char hex AES-256 key for TOTP secret encryption. Generate: `openssl rand -hex 32` |
 | TRUSTED_PROXIES | Yes (production/staging) | — | Comma-separated CIDRs of **this server's own** reverse proxies; `X-Forwarded-For` is believed only from them. The server refuses to start without it outside development. See [Client IP and trusted proxies](#client-ip-and-trusted-proxies) |
 | PORT | No | `8080` | HTTP listen port |
-| ENV | No | `development` | Set to `production` to enable HTTPS redirect and production mailer |
+| ENV | Yes | `production` | GHSA-vgf9-64q8-gj87: an **unset** ENV defaults to the production posture (fails closed on missing COOKIE_DOMAIN/TOTP_ENCRYPTION_KEY/TRUSTED_PROXIES); set `development` explicitly for local runs. Unrecognised values refuse to boot |
 | LOG_LEVEL | No | `info` | Zerolog level: `debug` / `info` / `warn` / `error` |
 | SMTP_HOST | No | — | SMTP server hostname (required in production for password-reset emails) |
 | SMTP_PORT | No | `587` | SMTP server port (587 for STARTTLS, 465 for SSL) |
