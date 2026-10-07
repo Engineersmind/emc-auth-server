@@ -395,7 +395,9 @@ server {
         proxy_set_header   Connection       "";
         proxy_set_header   Host             \$host;
         proxy_set_header   X-Real-IP        \$remote_addr;
-        proxy_set_header   X-Forwarded-For  \$proxy_add_x_forwarded_for;
+        # Overwrite, never append: nginx is the first hop, so anything the
+        # client sent in this header is forged (GHSA-3rxg-g9v9-4gh8).
+        proxy_set_header   X-Forwarded-For  \$remote_addr;
         proxy_set_header   X-Forwarded-Proto \$scheme;
         proxy_read_timeout  120s;
         proxy_send_timeout  120s;
@@ -577,6 +579,10 @@ create_secret() {
 
   warn "Action required: update SMTP_PASSWORD and SEED_ADMIN_PASSWORD in the AWS console"
   warn "  Console: https://${AWS_REGION}.console.aws.amazon.com/secretsmanager/secret?name=${SECRET_NAME}&region=${AWS_REGION}"
+  # Not generated: the subnet does not exist until Docker creates the network,
+  # and the server refuses to boot in production without it.
+  warn "Action required: add TRUSTED_PROXIES = the app's Docker network subnet, e.g. 172.18.0.0/16"
+  warn "  Find it: docker network inspect <network> --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

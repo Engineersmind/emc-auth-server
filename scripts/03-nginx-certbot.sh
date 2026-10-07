@@ -58,7 +58,9 @@ server {
         proxy_set_header    Connection        "";
         proxy_set_header    Host              \$host;
         proxy_set_header    X-Real-IP         \$remote_addr;
-        proxy_set_header    X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        # Overwrite, never append: nginx is the first hop, so anything the
+        # client sent in this header is forged (GHSA-3rxg-g9v9-4gh8).
+        proxy_set_header    X-Forwarded-For   \$remote_addr;
         proxy_set_header    X-Forwarded-Proto \$scheme;
         proxy_read_timeout  120s;
         proxy_send_timeout  120s;
