@@ -413,8 +413,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithHasher(passwordHasher).
 		WithAudiences(audienceSvc)
 
-	// TOTP service — requires encryption key; logs warning in dev if missing.
-	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Logger)
+	// TOTP service — requires a real encryption key in production/staging; in
+	// development it warns and falls back to the zero key.
+	totpSvc, totpErr := auth.NewTOTPService(deps.Pool, deps.Config.TOTPEncryptionKey, deps.Config.Env, deps.Logger)
 	if totpErr != nil {
 		deps.Logger.Fatal().Err(totpErr).Msg("TOTP service init failed — check TOTP_ENCRYPTION_KEY")
 	}
@@ -490,6 +491,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		deps.Logger.Fatal().Err(waErr).Msg("passkey service init failed — check WEBAUTHN_RP_ID / WEBAUTHN_ORIGINS")
 	}
 	authSvc.WithWebAuthn(webauthnSvc)
+
+	// Mandatory administrator MFA (migration 00094). One resolver shared by the
+	// login path and the admin write path that invalidates it, so a policy change
+	// applies at the next sign-in rather than when a cache happens to expire.
+	adminMFAPolicySvc := auth.NewAdminMFAPolicyService(deps.Pool, deps.Logger)
+	authSvc.WithAdminMFAPolicy(adminMFAPolicySvc)
 
 	// Invitations, self-service email change, account lockout, and breached-
 	// password warnings — the remaining transactional email flows. Each reuses
@@ -574,7 +581,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		// user logout share one implementation — including the revoked-session
 		// denylist, without which an admin revoke would report success while the
 		// session's access token kept working for up to another 15 minutes.
-		WithAuthService(authSvc)
+		WithAuthService(authSvc).
+		WithAdminMFAPolicy(adminMFAPolicySvc)
 
 	// Background drain for queued bulk user imports.
 	//
@@ -878,6 +886,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/session/refresh", authHandler.SessionRefresh, sessionCSRF)
 	authGroup.POST("/session/logout", authHandler.SessionLogout, sessionCSRF)
 
+	// Completing an MFA-gated console sign-in (migration 00094). Cookie-only —
+	// the tokens land in HttpOnly cookies and never in a body — and refused for
+	// application-scoped challenges. The TOTP QR and the emailed enrollment code
+	// are fetched from /login/mfa/enroll and /login/mfa/email, which return no
+	// tokens. Not captcha-gated: OTPRateLimiter plus the per-challenge attempt
+	// cap bound guessing, and MFA is itself the stronger control.
+	authGroup.POST("/session/mfa/verify", authHandler.SessionMFAVerify, mw.OTPRateLimiter(rlCfg), sessionCSRF)
+	authGroup.POST("/session/mfa/enroll/activate", authHandler.SessionMFAEnrollActivate, mw.OTPRateLimiter(rlCfg), sessionCSRF)
+
 	// Client credentials token endpoint — machine-to-machine auth (no user).
 	// TokenRateLimiter keys per client_id (not email) so each M2M client gets
 	// an isolated bucket instead of all sharing one email-less fallback bucket;
@@ -1021,6 +1038,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/change-email", authHandler.ChangeEmail, jwtRenew, appRateLimit, mw.TokenRateLimiter(rlCfg))
 
 	// TOTP management — protected (03-01)
+	// The caller's MFA state across every method, including whether it is
+	// mandatory for them (administrators) — what the settings page renders.
+	authGroup.GET("/me/mfa", authHandler.MyMFA, jwtRenew, appRateLimit)
+
 	otpGroup := authGroup.Group("/otp", jwtRenew, appRateLimit)
 	otpGroup.POST("/enroll", authHandler.TOTPEnroll)
 	otpGroup.POST("/activate", authHandler.TOTPActivate)
@@ -1233,6 +1254,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// like the session policy above: these thresholds govern whether USERS can sign
 	// in, so the permission that gates blocking and unblocking a user is the one
 	// that should gate the policy deciding it automatically.
+	// Administrator MFA policy — which methods satisfy the mandatory requirement.
+	// Tenant-level guards, so co-owners (application-scoped) are refused; they
+	// read their own allowed methods from /auth/me/mfa instead.
+	adminGroup.GET("/tenants/:tid/admin-mfa-policy", adminHandler.GetAdminMFAPolicy, tidUsersRead)
+	adminGroup.PUT("/tenants/:tid/admin-mfa-policy", adminHandler.UpdateAdminMFAPolicy, tidUsersWrite)
+	adminGroup.DELETE("/tenants/:tid/admin-mfa-policy", adminHandler.DeleteAdminMFAPolicy, tidUsersWrite)
 	adminGroup.GET("/tenants/:tid/lockout-policy", adminHandler.GetLockoutPolicy, tidUsersRead)
 	adminGroup.PUT("/tenants/:tid/lockout-policy", adminHandler.UpdateLockoutPolicy, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/lockout-policy", adminHandler.DeleteLockoutPolicy, tidUsersWrite)
@@ -1418,6 +1445,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.POST("/tenants/:tid/admins", adminHandler.InviteTenantAdmin, tidUsersWrite, mw.TokenRateLimiter(rlCfg))
 	adminGroup.PUT("/tenants/:tid/admins/:adminID/applications", adminHandler.SetTenantAdminGrants, tidUsersWrite)
 	adminGroup.DELETE("/tenants/:tid/admins/:adminID", adminHandler.RemoveTenantAdmin, tidUsersWrite)
+	// Recovery for an administrator who lost their factor. Owners and platform
+	// administrators only (tenant-level guard); never one's own.
+	adminGroup.DELETE("/tenants/:tid/admins/:adminID/mfa", adminHandler.ResetAdministratorMFA, tidUsersWrite)
 
 	// Tenant stats + activity feed (EMC-004 tenant overview page).
 	adminGroup.GET("/tenants/:tid/stats", adminHandler.TenantGetStats, tidStatsRead)
@@ -1606,6 +1636,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	//
 	// No DELETE: the platform row terminates resolution for every scope, so it
 	// must always exist. Disable it with enabled=false.
+	adminGroup.GET("/platform/admin-mfa-policy", adminHandler.GetPlatformAdminMFAPolicy, platformOnly)
+	adminGroup.PUT("/platform/admin-mfa-policy", adminHandler.UpdatePlatformAdminMFAPolicy, platformOnly)
 	adminGroup.GET("/platform/captcha-policy", adminHandler.GetPlatformCaptchaPolicy, platformOnly)
 	adminGroup.PUT("/platform/captcha-policy", adminHandler.UpdatePlatformCaptchaPolicy, platformOnly)
 

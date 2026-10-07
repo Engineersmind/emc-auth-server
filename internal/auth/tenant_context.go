@@ -453,16 +453,35 @@ func (s *AuthService) AllTenantsForPlatformAdmin(ctx context.Context, limit, off
 // amr is deliberately NOT re-stated here. The user authenticated at login and
 // that is what the session row already records; a tenant change is not an
 // authentication event and must not claim to be one.
+//
+// humanSession is true when the caller signed in as a person (any grant in
+// HumanGrants). Such a session may only be carried into another tenant if it
+// was established with MFA: administrator MFA is mandatory, and a switch is
+// how a session reaches a tenant it did not sign in to. API-key and machine
+// callers have no session or factor to check and are exempt.
 func (s *AuthService) SwitchTenantContextForClaims(
 	ctx context.Context,
 	userID, currentTenantID, targetTenantID int64,
 	platformAdmin bool,
 	sessionID string,
+	humanSession bool,
 ) (*AuthResult, error) {
 	sess := sessionContext{}
 	if sessionID != "" {
 		if sid, err := strconv.ParseInt(sessionID, 10, 64); err == nil {
 			sess.sessionID = &sid
+		}
+	}
+	if s.adminMFA != nil && humanSession {
+		if sess.sessionID == nil {
+			return nil, ErrMFAStepUpRequired
+		}
+		ok, err := s.sessionHasMFA(ctx, *sess.sessionID, userID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, ErrMFAStepUpRequired
 		}
 	}
 	return s.SwitchTenantContext(ctx, userID, currentTenantID, targetTenantID, platformAdmin, sess)

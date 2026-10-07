@@ -60,7 +60,7 @@ Reviewer should verify correctness, security assumptions, and operational readin
 ### 3.1 TOTP Service (AES-256-GCM encrypted secrets)
 - **Files:** `internal/auth/totp.go`
 - **Review:**
-  - `TOTP_ENCRYPTION_KEY` — 32-byte AES key, hex-encoded. Dev zero-key fallback logs a warning; **must** be set in production.
+  - `TOTP_ENCRYPTION_KEY` — 32-byte AES key, hex-encoded. Dev zero-key fallback logs a warning; in production/staging a missing or all-zero key refuses to boot (`Config.Validate` and `NewTOTPService`, GHSA-92p3-fj5f-8gx7).
   - AES-256-GCM encryption: nonce prepended to ciphertext, base64-encoded at rest. Confirm nonce is unique per encryption call (`rand.Read`).
   - Key rotation: no mechanism exists. Adding key rotation is a future requirement.
   - Backup codes: 8 × 8-char from unambiguous charset, SHA-256 hashed, single-use. Verify the consume logic is atomic (race condition: two concurrent uses of the same backup code).

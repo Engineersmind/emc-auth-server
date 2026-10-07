@@ -459,7 +459,7 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		s.logger.Info().Str("email", email).Int64("tenant_id", in.TenantID).
 			Str("role", in.Role).
 			Msg("admin: grant widened for an already-active administrator; no invitation needed")
-	} else if err := s.invSvc.InviteRequired(ctx, in.TenantID, nil, userID, email, in.InviterName, nil); err != nil {
+	} else if err := s.invSvc.InviteAdmin(ctx, in.TenantID, userID, email, in.InviterName, nil, in.Role); err != nil {
 		// s.invSvc is non-nil: checked before the transaction opened.
 		res.InviteError = err.Error()
 		s.logger.Error().Err(err).Str("email", email).Int64("tenant_id", in.TenantID).

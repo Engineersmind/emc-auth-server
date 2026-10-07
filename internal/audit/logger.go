@@ -257,6 +257,11 @@ const (
 	ActionAdminMFAPolicyUpdated = "admin.mfa_policy_updated"
 	ActionAdminUserMFAReset     = "admin.user_mfa_reset"
 
+	// Admin — mandatory administrator MFA policy (migration 00094): which
+	// methods satisfy the requirement, per tenant and for the platform.
+	ActionAdminAdminMFAPolicySet   = "admin.admin_mfa_policy_set"
+	ActionAdminAdminMFAPolicyReset = "admin.admin_mfa_policy_reset"
+
 	// Admin — white-label email sender management (issue #63 follow-on)
 	ActionAdminEmailSenderUpdated = "admin.email_sender_updated"
 	ActionAdminEmailSenderDeleted = "admin.email_sender_deleted"

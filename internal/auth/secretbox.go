@@ -36,16 +36,27 @@ type SecretBox struct {
 // missing in an environment where an insecure fallback is not acceptable.
 var ErrEncryptionKeyRequired = errors.New("encryption key is required in production — set the env var to a 64-character hex string (openssl rand -hex 32)")
 
+// ErrZeroEncryptionKey is returned when an encryption key is the all-zero
+// development key in an environment that must not use it. The key protects the
+// JWT signing key and OAuth client secrets — a publicly known key under it
+// means anyone who reads the database can mint tokens and unwrap secrets.
+var ErrZeroEncryptionKey = errors.New("encryption key is the all-zero development key, which is publicly known — generate a real one (openssl rand -hex 32)")
+
 // NewSecretBox builds a SecretBox from a 64-character hex key (32 bytes).
 //
-// env controls the missing-key behaviour: in "production" (and "staging") a
-// missing key is a hard error; in development it falls back to an insecure
-// zero key with a loud warning so local setups keep working. keyName is only
-// used in log/error messages (e.g. "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY").
+// env controls the missing-key and zero-key behaviour, with the same contract
+// as NewTOTPService and Config.Validate: only the two named non-deployed
+// environments, "development" and "test", may fall back to or use the insecure
+// zero key — with a loud warning so local setups keep working. Any other value
+// — "production", "staging", a misspelling such as "prodution", or an empty
+// ENV — fails closed, so a typo in ENV cannot quietly encrypt secrets under a
+// publicly known key. keyName is only used in log/error messages (e.g.
+// "OAUTH_CLIENT_SECRET_ENCRYPTION_KEY").
 func NewSecretBox(keyHex, env, keyName string, logger zerolog.Logger) (*SecretBox, error) {
+	deployed := env != "development" && env != "test"
 	if keyHex == "" {
-		if env == "production" || env == "staging" {
-			return nil, fmt.Errorf("%s: %w", keyName, ErrEncryptionKeyRequired)
+		if deployed {
+			return nil, fmt.Errorf("%s (ENV=%q): %w", keyName, env, ErrEncryptionKeyRequired)
 		}
 		logger.Warn().Str("key", keyName).Msg("encryption key not set — using insecure zero key (dev only)")
 		keyHex = strings.Repeat("0", 64)
@@ -53,6 +64,9 @@ func NewSecretBox(keyHex, env, keyName string, logger zerolog.Logger) (*SecretBo
 	key, err := hex.DecodeString(keyHex)
 	if err != nil || len(key) != 32 {
 		return nil, fmt.Errorf("%s must be a 64-character hex string (32 bytes)", keyName)
+	}
+	if deployed && isZeroKey(key) {
+		return nil, fmt.Errorf("%s (ENV=%q): %w", keyName, env, ErrZeroEncryptionKey)
 	}
 	return &SecretBox{key: key}, nil
 }

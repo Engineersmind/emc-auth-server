@@ -33,12 +33,6 @@ type CaptchaFlow string
 const (
 	// CaptchaFlowLogin covers POST /auth/login and POST /auth/apps/login.
 	CaptchaFlowLogin CaptchaFlow = "login"
-	// CaptchaFlowSession covers POST /auth/session — the admin console's own
-	// sign-in. It is a separate flow from login because it is a separate
-	// endpoint: the console posts here so credentials land in HttpOnly cookies
-	// rather than in a response body, and gating only "login" would leave the
-	// door holding the super-admin accounts open.
-	CaptchaFlowSession CaptchaFlow = "session"
 	// CaptchaFlowLoginOTP covers POST /auth/login/otp, where a brute-forcer
 	// moves once the password step is gated.
 	CaptchaFlowLoginOTP CaptchaFlow = "login_otp"
@@ -54,7 +48,6 @@ const (
 // exist.
 var ValidCaptchaFlows = []CaptchaFlow{
 	CaptchaFlowLogin,
-	CaptchaFlowSession,
 	CaptchaFlowLoginOTP,
 	CaptchaFlowRegister,
 	CaptchaFlowForgotPassword,
@@ -162,7 +155,7 @@ var DefaultCaptchaPolicy = CaptchaPolicy{
 	Enabled:                 false,
 	Provider:                CaptchaProviderInternal,
 	Mode:                    CaptchaModeAdaptive,
-	ProtectedFlows:          []string{"login", "session", "login_otp", "register", "forgot_password"},
+	ProtectedFlows:          []string{"login", "login_otp", "register", "forgot_password"},
 	TriggerAfterFailures:    2,
 	FailureWindow:           15 * time.Minute,
 	FailureWindowSeconds:    900,
