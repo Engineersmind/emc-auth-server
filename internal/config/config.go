@@ -339,6 +339,18 @@ type Config struct {
 	// matter enforce on their own flag.
 	RequireAudience bool
 
+	// OAuthRequireState rejects /oauth/authorize requests that omit the `state`
+	// parameter — the advisory's third component (GHSA-6fcw-g2xw-v42w). RFC
+	// 6749 §4.1.1 marks state RECOMMENDED, but a client that omits it has no
+	// CSRF binding on its callback, and only first-party clients use the flow
+	// here (third-party is refused at the consent gate), so the operator
+	// controls every affected integrator.
+	//
+	// Set via OAUTH_REQUIRE_STATE. Defaults to true — only the exact string
+	// "false" keeps the permissive RFC-default behaviour, for the migration
+	// window while first-party clients add the parameter.
+	OAuthRequireState bool
+
 	// AuditSIEMWebhookSecret, when set, signs every outbound SIEM payload with
 	// HMAC-SHA256 in the X-EMC-Audit-Signature header so the receiver can
 	// authenticate the stream. Empty leaves payloads unsigned. Set via
@@ -388,6 +400,10 @@ func Load() *Config {
 		// rollout window. An unset or mistyped variable enforces rather than
 		// silently accepting audience-less tokens.
 		RequireAudience: getEnv("REQUIRE_AUDIENCE", "true") != "false",
+		// GHSA-6fcw-g2xw-v42w (L-05): same polarity as RequireAudience — the
+		// rejection defaults ON; only the exact string "false" keeps the
+		// permissive RFC-6749 behaviour during the migration window.
+		OAuthRequireState: getEnv("OAUTH_REQUIRE_STATE", "true") != "false",
 		// Defaults to APP_BASE_URL: in the single-binary deployment the auth server
 		// and the origin used for email links are the same host, so requiring both
 		// to be set would be a config trap with one obviously correct answer.

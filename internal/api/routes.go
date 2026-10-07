@@ -142,6 +142,9 @@ type RoutesConfig struct {
 	// that carries a real one is always held to its route's policy. See
 	// config.Config.RequireAudience and middleware/audience.go.
 	RequireAudience bool
+	// OAuthRequireState rejects /oauth/authorize requests that omit `state`
+	// (GHSA-6fcw-g2xw-v42w). See config.Config.OAuthRequireState.
+	OAuthRequireState bool
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -758,7 +761,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authHandler.WithCaptcha(captchaSvc)
 	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
 	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
-		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure)
+		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure,
+		deps.Config.OAuthRequireState)
 	oauthTokenHandler := handlers.NewOAuthTokenHandler(
 		authzSvc, authSvc, jwtSvc, appSvc, auditLog, deps.Logger)
 
