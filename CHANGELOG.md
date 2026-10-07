@@ -10,6 +10,32 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Security
+- **Committed credentials removed and production DSNs require TLS**
+  ([GHSA-hv5j-m2r7-r4cr](https://github.com/Engineersmind/emc-auth-server/security/advisories/GHSA-hv5j-m2r7-r4cr)).
+  - `DATABASE_URL` has no committed fallback and is required in every environment.
+    In `production`/`staging`, `Config.Validate` parses the DSN (URL **and**
+    keyword/value form) and accepts only `sslmode=require`, `verify-ca`, or
+    `verify-full`; `disable`, `allow`, `prefer`, and a missing `sslmode` all
+    refuse to boot.
+  - `deploy.sh --create-secret` now generates `sslmode=require` and **random**
+    `SEED_ADMIN_PASSWORD` / `GRAFANA_PASSWORD` values instead of the shipped
+    `ChangeMe123!` / `changeme` constants. A new `setup_db_tls` step issues a
+    self-signed cert for the bundled postgres, which now runs with `ssl=on`
+    (certs under `infra/tls/postgres/`, git-ignored).
+  - `infra/docker-compose.prod.yml` drops every `changeme` fallback:
+    `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, and `GRAFANA_PASSWORD` must be set
+    or compose refuses to start. On an **existing** `postgres_data` volume the
+    stored password still wins — rotate it with
+    `ALTER USER emc_auth WITH PASSWORD '…';` inside the container, or recreate
+    the volume on a fresh deploy.
+  - `internal/store/seed.go` no longer seeds a super-admin with the compiled-in
+    password in deployed environments: an unset `SEED_ADMIN_PASSWORD` is only
+    tolerated when the credential row already exists (upgrade boot); a fresh
+    deployment without it fails to boot.
+  - Local-development defaults (`local-dev-only` Postgres password) remain for
+    `docker-compose.yml` and test containers only, and are labelled as such in
+    `.env.example` and the integration docs.
+
 - **`TOTP_ENCRYPTION_KEY` now fails closed in production and staging**
   ([GHSA-92p3-fj5f-8gx7](https://github.com/Engineersmind/emc-auth-server/security/advisories/GHSA-92p3-fj5f-8gx7)).
   Previously, a missing key made the TOTP service log one warning and fall back to the

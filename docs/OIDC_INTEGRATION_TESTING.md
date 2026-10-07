@@ -43,7 +43,7 @@ deferred #8). Non-default ports, own database, own Redis DB index:
 
 ```bash
 docker run -d --name emc-oidc-pg \
-  -e POSTGRES_USER=emc_auth -e POSTGRES_PASSWORD=password -e POSTGRES_DB=emc_auth_oidc \
+  -e POSTGRES_USER=emc_auth -e POSTGRES_PASSWORD=local-dev-only -e POSTGRES_DB=emc_auth_oidc \
   -p 55433:5432 postgres:16-alpine
 docker run -d --name emc-oidc-redis -p 56380:6379 redis:7-alpine
 

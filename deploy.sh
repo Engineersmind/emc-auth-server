@@ -180,7 +180,7 @@ _setup_app_user() {
 #   "POSTGRES_USER":       "emc_auth",
 #   "POSTGRES_PASSWORD":   "...",
 #   "POSTGRES_DB":         "emc_auth",
-#   "DATABASE_URL":        "postgres://emc_auth:PASS@postgres:5432/emc_auth?sslmode=disable",
+#   "DATABASE_URL":        "postgres://emc_auth:PASS@postgres:5432/emc_auth?sslmode=require",
 #   "REDIS_PASSWORD":      "...",
 #   "REDIS_URL":           "redis://:PASS@redis:6379",
 #   "JWT_SECRET":          "...",
@@ -333,6 +333,30 @@ YAML
   info "Grafana provisioning stubs created."
 }
 
+# Self-signed TLS for the bundled postgres. ENV=production refuses
+# DATABASE_URL sslmode=disable (GHSA-hv5j-m2r7-r4cr), so the in-network
+# hop between app and postgres containers is encrypted too. "require"
+# (not verify-full) matches a self-signed cert on a private bridge.
+setup_db_tls() {
+  local tls_dir="${APP_SRC}/infra/tls/postgres"
+  if [[ -f "${tls_dir}/server.key" && -f "${tls_dir}/server.crt" ]]; then
+    info "Postgres TLS certs already present — skipping."
+    return
+  fi
+  info "Generating self-signed TLS certificate for bundled postgres..."
+  mkdir -p "${tls_dir}"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+    -keyout "${tls_dir}/server.key" \
+    -out    "${tls_dir}/server.crt" \
+    -subj "/CN=postgres" -addext "subjectAltName=DNS:postgres"
+  # postgres refuses a key that isn't 0600 and owned by the db user;
+  # postgres:16-alpine runs as uid 70.
+  chown 70:70 "${tls_dir}/server.key" "${tls_dir}/server.crt"
+  chmod 600 "${tls_dir}/server.key"
+  chmod 644 "${tls_dir}/server.crt"
+  info "Postgres TLS certs written to ${tls_dir}."
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. DOCKER COMPOSE — build and start
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,6 +366,7 @@ deploy_compose() {
   write_compose_override
   write_prometheus_config
   write_grafana_stubs
+  setup_db_tls
 
   info "Building image and starting services..."
   compose_cmd up -d --build --remove-orphans
@@ -523,11 +548,13 @@ create_secret() {
   command -v jq  &>/dev/null || { error "jq not installed. Run --setup first."; exit 1; }
 
   # Generate strong random credentials
-  local pg_pass redis_pass jwt_secret totp_key
+  local pg_pass redis_pass jwt_secret totp_key seed_admin grafana_pass
   pg_pass=$(openssl rand -base64 32 | tr -d /=+)
   redis_pass=$(openssl rand -base64 32 | tr -d /=+)
   jwt_secret=$(openssl rand -base64 48 | tr -d /=+)
   totp_key=$(openssl rand -hex 32)
+  seed_admin=$(openssl rand -base64 24 | tr -d /=+)
+  grafana_pass=$(openssl rand -base64 24 | tr -d /=+)
 
   local secret_value
   secret_value=$(jq -n \
@@ -535,25 +562,34 @@ create_secret() {
     --arg rp   "${redis_pass}" \
     --arg jwt  "${jwt_secret}" \
     --arg totp "${totp_key}" \
+    --arg seed "${seed_admin}" \
+    --arg graf "${grafana_pass}" \
     '{
       POSTGRES_USER:       "emc_auth",
       POSTGRES_PASSWORD:   $pgp,
       POSTGRES_DB:         "emc_auth",
-      DATABASE_URL:        ("postgres://emc_auth:" + $pgp + "@postgres:5432/emc_auth?sslmode=disable"),
+      # sslmode=require: the bundled postgres runs TLS (deploy.sh generates a
+      # self-signed cert — see setup_db_tls). "require" encrypts without CA
+      # verification, which fits a private bridge network; use verify-full
+      # with a CA-signed cert if the database is ever reachable off-box.
+      # sslmode=disable would now fail Config.Validate() under ENV=production
+      # (GHSA-hv5j-m2r7-r4cr).
+      DATABASE_URL:        ("postgres://emc_auth:" + $pgp + "@postgres:5432/emc_auth?sslmode=require"),
       REDIS_PASSWORD:      $rp,
       REDIS_URL:           ("redis://:" + $rp + "@redis:6379"),
       JWT_SECRET:          $jwt,
       JWT_ACCESS_TTL:      "3600",
       JWT_REFRESH_TTL:     "2592000",
       TOTP_ENCRYPTION_KEY: $totp,
-      SEED_ADMIN_PASSWORD: "ChangeMe123!",
+      # Randomly generated — read from Secrets Manager, rotate after first login.
+      SEED_ADMIN_PASSWORD: $seed,
       SMTP_HOST:           "smtp.sendgrid.net",
       SMTP_PORT:           "587",
       SMTP_USER:           "apikey",
       SMTP_PASSWORD:       "REPLACE_WITH_SENDGRID_KEY",
       EMAIL_FROM:          "noreply@engineersmind.com",
       LOG_LEVEL:           "info",
-      GRAFANA_PASSWORD:    "changeme"
+      GRAFANA_PASSWORD:    $graf
     }')
 
   # Check if secret already exists
@@ -577,7 +613,9 @@ create_secret() {
     info "Secret '${SECRET_NAME}' created in ${AWS_REGION}."
   fi
 
-  warn "Action required: update SMTP_PASSWORD and SEED_ADMIN_PASSWORD in the AWS console"
+  warn "Action required: update SMTP_PASSWORD in the AWS console (placeholder is not usable)"
+  warn "  SEED_ADMIN_PASSWORD and GRAFANA_PASSWORD were generated randomly — read them"
+  warn "  from Secrets Manager and rotate after first login."
   warn "  Console: https://${AWS_REGION}.console.aws.amazon.com/secretsmanager/secret?name=${SECRET_NAME}&region=${AWS_REGION}"
   # Not generated: the subnet does not exist until Docker creates the network,
   # and the server refuses to boot in production without it.

@@ -81,3 +81,31 @@ func TestSeed_AdminUserExists(t *testing.T) {
 		t.Error("seed user ID should be non-zero")
 	}
 }
+
+// GHSA-hv5j-m2r7-r4cr: a deployed environment must never seed a super-admin
+// with the compiled-in default password.
+func TestRunSeed_DeployedEnvRequiresSeedAdminPassword(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	testhelper.CleanupTables(t, pool)
+	t.Setenv("ENV", "production")
+	t.Setenv("SEED_ADMIN_PASSWORD", "")
+
+	ctx := context.Background()
+	logger := testhelper.TestLogger()
+
+	if err := store.RunSeed(ctx, pool, logger); err == nil {
+		t.Fatal("RunSeed() without SEED_ADMIN_PASSWORD under ENV=production: expected error, got nil")
+	}
+
+	// With a real password the seed completes; a later boot without the
+	// variable is the upgrade path — the credential row exists, so it must
+	// not fail.
+	t.Setenv("SEED_ADMIN_PASSWORD", "str0ng-first-boot-password")
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed() with SEED_ADMIN_PASSWORD error = %v", err)
+	}
+	t.Setenv("SEED_ADMIN_PASSWORD", "")
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("upgrade-boot RunSeed() without SEED_ADMIN_PASSWORD error = %v", err)
+	}
+}
