@@ -399,14 +399,17 @@ func Load() *Config {
 		CaptchaTTLSeconds:               mustAtoi(getEnv("CAPTCHA_TTL_SECONDS", "120")),
 		GeoIPDatabasePath:               getEnv("GEOIP_DATABASE_PATH", ""),
 		UntrustedIPCIDRs:                getEnvList("UNTRUSTED_IP_CIDRS", ""),
-		TrustedProxies:                  getEnvList("TRUSTED_PROXIES", ""),
-		BreachDetectionEnabled:          getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
-		AuditCaptureResponseBody:        getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
-		AuditRetentionDays:              mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
-		PasswordHashMaxConcurrent:       mustAtoi(getEnv("PASSWORD_HASH_MAX_CONCURRENT", "0")),
-		AuditSIEMWebhookURL:             getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
-		AuditSIEMWebhookSecret:          getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
-		AudienceScheme:                  getEnv("AUDIENCE_SCHEME", "api://"),
+		// CIDR notation, not origins: getEnvList strips a trailing "/" for
+		// URLs, which would silently repair a typo like "172.18.0.0/16/" into a
+		// valid range instead of letting validation refuse it.
+		TrustedProxies:            getEnvRawList("TRUSTED_PROXIES", ""),
+		BreachDetectionEnabled:    getEnv("BREACH_DETECTION_ENABLED", "false") == "true",
+		AuditCaptureResponseBody:  getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
+		AuditRetentionDays:        mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
+		PasswordHashMaxConcurrent: mustAtoi(getEnv("PASSWORD_HASH_MAX_CONCURRENT", "0")),
+		AuditSIEMWebhookURL:       getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
+		AuditSIEMWebhookSecret:    getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		AudienceScheme:            getEnv("AUDIENCE_SCHEME", "api://"),
 	}
 }
 
@@ -438,9 +441,14 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// TrustedProxyNets parses TrustedProxies. A /0 range is refused: trusting every
-// peer would let any client write its own IP again, which is the bug this
-// setting exists to close.
+// TrustedProxyNets parses TrustedProxies. Overbroad ranges are refused: a
+// trusted proxy is the deployment's OWN reverse proxy, which lives at a known
+// host or in a known subnet — never in half the internet. The floor is /16 for
+// IPv4 and /64 for IPv6, matching DEPLOYMENT.md ("broad ranges like 10.0.0.0/8
+// are dangerous"; a Docker network subnet like 172.18.0.0/16 is the intended
+// upper bound). A mask looser than that — /1, /8, or the catch-all /0 — lets
+// every peer inside it write its own X-Forwarded-For, which is the spoofing
+// hole this setting exists to close.
 func (c *Config) TrustedProxyNets() ([]*net.IPNet, error) {
 	nets := make([]*net.IPNet, 0, len(c.TrustedProxies))
 	for _, s := range c.TrustedProxies {
@@ -448,8 +456,13 @@ func (c *Config) TrustedProxyNets() ([]*net.IPNet, error) {
 		if err != nil {
 			return nil, fmt.Errorf("TRUSTED_PROXIES: %q is not a CIDR range (e.g. 172.18.0.0/16): %w", s, err)
 		}
-		if ones, _ := n.Mask.Size(); ones == 0 {
-			return nil, fmt.Errorf("TRUSTED_PROXIES: %q trusts every address", s)
+		ones, bits := n.Mask.Size()
+		minOnes := 16
+		if bits == 128 {
+			minOnes = 64
+		}
+		if ones < minOnes {
+			return nil, fmt.Errorf("TRUSTED_PROXIES: %q is too broad — a trusted proxy must be a /%d range or narrower", s, minOnes)
 		}
 		nets = append(nets, n)
 	}
@@ -476,11 +489,24 @@ func getEnv(key, fallback string) string {
 // getEnvList parses a comma-separated env var into a trimmed, non-empty slice.
 // Trailing slashes are stripped since browser Origin headers never include a path.
 func getEnvList(key, fallback string) []string {
-	raw := getEnv(key, fallback)
+	return splitEnvList(getEnv(key, fallback), true)
+}
+
+// getEnvRawList is getEnvList without the trailing-slash strip, for values that
+// are not origin-style URLs — CIDR ranges in particular, where a stray "/" is a
+// typo the validator should see, not something to silently repair.
+func getEnvRawList(key, fallback string) []string {
+	return splitEnvList(getEnv(key, fallback), false)
+}
+
+func splitEnvList(raw string, stripTrailingSlash bool) []string {
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		p = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(p), "/"))
+		p = strings.TrimSpace(p)
+		if stripTrailingSlash {
+			p = strings.TrimSuffix(p, "/")
+		}
 		if p != "" {
 			out = append(out, p)
 		}

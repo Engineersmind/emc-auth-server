@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -243,7 +244,14 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 			// X-Forwarded-For is believed only from TRUSTED_PROXIES hops.
 			ip := c.RealIP()
 			if ip == "" {
-				ip = c.Request().RemoteAddr
+				// RemoteAddr is "host:port" — the port differs per connection,
+				// so keying on the raw string would give every request its own
+				// bucket and silently disable the limit.
+				if host, _, err := net.SplitHostPort(c.Request().RemoteAddr); err == nil {
+					ip = host
+				} else {
+					ip = c.Request().RemoteAddr
+				}
 			}
 
 			// Per-IP rate check. Key is prefixed per surface ("login-ip:") so the
