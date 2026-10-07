@@ -449,7 +449,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		Logger:         deps.Logger,
 	})
 	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
-		WithHasher(passwordHasher)
+		WithHasher(passwordHasher).
+		// Reset links open the console's reset-password page, not the API —
+		// the page POSTs the token in the body so it never lands in URL logs
+		// (GHSA-2267-r48x-9fh2).
+		WithDashboardURL(deps.Config.DashboardBaseURL)
 
 	// White-label email senders (issue #63 follow-on) — transactional emails
 	// resolve their sender application → tenant → global. Providers: SMTP or SendGrid.
@@ -848,8 +852,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.GET("/my-tenants", authHandler.MyTenants,
 		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
 		identityAudience)
-	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
-	authGroup.POST("/reset-password", authHandler.ResetPassword)
+	// PasswordResetRateLimiter covers the pair's distinct abuse vectors:
+	// per-IP for token guessing, per-client for application volume, per-email
+	// for inbox flooding on forgot-password (GHSA-2267-r48x-9fh2).
+	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.PasswordResetRateLimiter(rlCfg), appClientRateLimit)
+	// reset-password consumes a bearer credential — without a limiter it is an
+	// online brute-force oracle on reset tokens. Per-IP is the only meaningful
+	// key here: the presented value IS the guess, so a per-token bucket can
+	// never fill.
+	authGroup.POST("/reset-password", authHandler.ResetPassword, mw.PasswordResetRateLimiter(rlCfg), appClientRateLimit)
 
 	// Email verification — link is clicked (GET) from the email; resend is
 	// rate-limited and enumeration-safe (tenant via X-Tenant-Slug).

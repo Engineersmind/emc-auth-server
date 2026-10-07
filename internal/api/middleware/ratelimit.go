@@ -368,6 +368,76 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	}
 }
 
+// PasswordResetRateLimiter rate-limits the forgot/reset-password pair
+// (GHSA-2267-r48x-9fh2).
+//
+// Three buckets, each guarding a different abuse vector:
+//
+//   - reset_ip:{ip} bounds token-guessing volume at /reset-password. The
+//     endpoint's only meaningful key is the caller IP — keying on the
+//     *presented* token would give every guess a fresh bucket, i.e. no limit
+//     at all. The token itself is 32 bytes of CSPRNG output (~256-bit),
+//     hashed at rest, single-use, 15-minute TTL; at 5 guesses/minute per IP
+//     the brute-force window is not measurable.
+//   - reset_client:{client_id} bounds /forgot-password per calling
+//     application (its Basic credentials), same keying as TokenRateLimiter.
+//   - reset_email:{email} bounds per-victim inbox flooding: without it, an
+//     attacker rotating IPs AND client credentials could mail one victim
+//     unboundedly. The address is peeked from the body without consuming it
+//     (same technique as loginEmailFromBody); reset-password carries no email
+//     so that bucket simply doesn't apply there.
+func PasswordResetRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			if !allowVia(c.Request().Context(), ipStore, "reset_ip", "reset-ip:"+ip, cfg.PerIPRate) {
+				metrics.RateLimitHits.WithLabelValues("reset_ip").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many password reset requests from your IP address",
+					"retry_after": "60",
+				})
+			}
+
+			if clientID := tokenClientID(c); clientID != "" {
+				if len(clientID) > maxRateLimitEmailLen {
+					clientID = clientID[:maxRateLimitEmailLen]
+				}
+				if !allowVia(c.Request().Context(), tenantStore, "reset_client", "reset-client:"+clientID, cfg.PerTenantRate) {
+					metrics.RateLimitHits.WithLabelValues("reset_client").Inc()
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSON(http.StatusTooManyRequests, map[string]string{
+						"error":       "too many password reset requests for this client",
+						"retry_after": "60",
+					})
+				}
+			}
+
+			if email := loginEmailFromBody(c); email != "" {
+				if len(email) > maxRateLimitEmailLen {
+					email = email[:maxRateLimitEmailLen]
+				}
+				if !allowVia(c.Request().Context(), tenantStore, "reset_email", "reset-email:"+email, cfg.PerTenantRate) {
+					metrics.RateLimitHits.WithLabelValues("reset_email").Inc()
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSON(http.StatusTooManyRequests, map[string]string{
+						"error":       "too many password reset requests for this email",
+						"retry_after": "60",
+					})
+				}
+			}
+
+			return next(c)
+		}
+	}
+}
+
 // OTPRateLimiter rate-limits the OTP-challenge completion endpoints
 // (/auth/login/otp, /auth/login/mfa/enroll, /auth/login/mfa/activate).
 // These carry no email and no client credentials — the only stable identifiers
