@@ -46,6 +46,13 @@ services:
       SMTP_FROM: ${SMTP_FROM:-noreply@emc.local}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # GHSA-4r4c-348x-w452 (L-02): forwarded explicitly like every other
+      # secret — without this line METRICS_TOKEN never reaches the container
+      # even when set in .env, and /metrics silently fails to register in
+      # production while the bundled Prometheus scrapes a 404.
+      # deploy.sh --create-secret generates the token and the matching
+      # prometheus.generated.yml (authorization.credentials) automatically.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       # ── GHSA-6fcw-g2xw-v42w (L-05) migration window ──────────────────
       # The code defaults are the SECURE ones (legacy issuer rejected,
       # audience required, state required). The pins below preserve the
