@@ -852,12 +852,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.GET("/my-tenants", authHandler.MyTenants,
 		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
 		identityAudience)
-	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
-	// GHSA-2267-r48x-9fh2 (L-03): reset-password consumes a bearer credential —
-	// without a limiter it is an online brute-force oracle on reset tokens.
-	// Same limiter as forgot-password: per-user keying once claims exist,
-	// per-IP before they do.
-	authGroup.POST("/reset-password", authHandler.ResetPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	// PasswordResetRateLimiter covers the pair's distinct abuse vectors:
+	// per-IP for token guessing, per-client for application volume, per-email
+	// for inbox flooding on forgot-password (GHSA-2267-r48x-9fh2).
+	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.PasswordResetRateLimiter(rlCfg), appClientRateLimit)
+	// reset-password consumes a bearer credential — without a limiter it is an
+	// online brute-force oracle on reset tokens. Per-IP is the only meaningful
+	// key here: the presented value IS the guess, so a per-token bucket can
+	// never fill.
+	authGroup.POST("/reset-password", authHandler.ResetPassword, mw.PasswordResetRateLimiter(rlCfg), appClientRateLimit)
 
 	// Email verification — link is clicked (GET) from the email; resend is
 	// rate-limited and enumeration-safe (tenant via X-Tenant-Slug).

@@ -3,6 +3,7 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -218,5 +219,67 @@ func TestResetPassword_ShortPassword(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("ResetPassword() expected error for short password, got nil")
+	}
+}
+
+// TestForgotPassword_ResetLinkTargetsDashboard pins GHSA-2267-r48x-9fh2's fix:
+// with DASHBOARD_BASE_URL configured the emailed link lands on the console's
+// /reset-password page (token out of API URLs and proxy logs), and without it
+// the link keeps the legacy API-path shape for console-less deployments.
+func TestForgotPassword_ResetLinkTargetsDashboard(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	testhelper.CleanupTables(t, pool)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc'`).Scan(&tenantID); err != nil {
+		t.Fatalf("tenant id: %v", err)
+	}
+
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local")
+	authSvc := auth.NewAuthService(pool, jwtSvc, logger)
+	email := uniqueEmail("reset-link")
+	if _, err := authSvc.Register(ctx, auth.RegisterInput{
+		Email: email, Password: "OldPassword123!", FirstName: "R", LastName: "L",
+	}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	mail := &captureMailer{}
+	svc := auth.NewResetService(pool, mail, "http://api.internal:8080", logger).
+		WithDashboardURL("https://console.acme.example")
+	if err := svc.ForgotPassword(ctx, tenantID, nil, email); err != nil {
+		t.Fatalf("ForgotPassword: %v", err)
+	}
+	if len(mail.resets) != 1 {
+		t.Fatalf("reset emails sent = %d, want 1", len(mail.resets))
+	}
+	link := mail.resets[0].ResetLink
+	if !strings.HasPrefix(link, "https://console.acme.example/reset-password?token=") {
+		t.Errorf("reset link = %q, want https://console.acme.example/reset-password?token=…", link)
+	}
+	if strings.Contains(link, "/api/v1/") {
+		t.Errorf("reset link %q still routes through the API path", link)
+	}
+	token := strings.TrimPrefix(link, "https://console.acme.example/reset-password?token=")
+	if len(token) != 64 {
+		t.Errorf("token length = %d, want 64 hex chars (32 random bytes)", len(token))
+	}
+
+	// No dashboard configured → the API-path fallback must stay intact.
+	mail2 := &captureMailer{}
+	svc2 := auth.NewResetService(pool, mail2, "http://api.internal:8080", logger)
+	if err := svc2.ForgotPassword(ctx, tenantID, nil, email); err != nil {
+		t.Fatalf("ForgotPassword (no dashboard): %v", err)
+	}
+	if len(mail2.resets) != 1 {
+		t.Fatalf("reset emails sent (no dashboard) = %d, want 1", len(mail2.resets))
+	}
+	if !strings.HasPrefix(mail2.resets[0].ResetLink, "http://api.internal:8080/api/v1/auth/reset-password?token=") {
+		t.Errorf("fallback link = %q, want API-path link", mail2.resets[0].ResetLink)
 	}
 }

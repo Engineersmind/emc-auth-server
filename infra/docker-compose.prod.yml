@@ -6,6 +6,9 @@
 ##   2. Set TOTP_ENCRYPTION_KEY to a 32-byte hex string (openssl rand -hex 32)
 ##   3. Set SEED_ADMIN_PASSWORD to a strong password
 ##   4. Set JWT_ISSUER to your public domain
+##   5. Set DASHBOARD_BASE_URL to the admin console origin — emailed reset and
+##      invitation links land on it. Unset, the container defaults to the Vite
+##      dev server (http://localhost:5173) and every emailed link is dead.
 
 version: "3.9"
 
@@ -22,6 +25,7 @@ services:
       REDIS_URL: ${REDIS_URL}
       JWT_ISSUER: ${JWT_ISSUER}
       APP_BASE_URL: ${APP_BASE_URL}
+      DASHBOARD_BASE_URL: ${DASHBOARD_BASE_URL}
       TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD}
       LOG_LEVEL: info
