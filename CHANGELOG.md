@@ -9,6 +9,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- **`TOTP_ENCRYPTION_KEY` now fails closed in production and staging**
+  ([GHSA-92p3-fj5f-8gx7](https://github.com/Engineersmind/emc-auth-server/security/advisories/GHSA-92p3-fj5f-8gx7)).
+  Previously, a missing key made the TOTP service log one warning and fall back to the
+  all-zero AES-256 key. Every TOTP seed, and every tenant's SMTP password and email-provider
+  API key (the email sender reuses the same key), was then encrypted under a key anyone
+  can read in this repository. The server now **refuses to boot** with `ENV=production` or
+  `staging` if the key is unset or all zeros: `Config.Validate` checks it, and
+  `NewTOTPService` takes `env` with the same contract as `NewSecretBox`. Only
+  `development` and `test` keep the zero-key fallback.
+  - **`ENV` must now be one of `development`, `test`, `staging`, `production`.** Any other
+    value (e.g. a misspelt `prodution`) refuses to boot instead of silently running with
+    development defaults — insecure cookies, no CSRF check, and the zero TOTP key.
+  - **Before upgrading:** confirm `TOTP_ENCRYPTION_KEY` is present in the deployment secret
+    (AWS Secrets Manager), or the new container will not start.
+  - **If a deployment ever ran without the key**, treat those TOTP seeds and email
+    credentials as disclosed: set a real key, have affected users re-enrol TOTP, and
+    re-enter each tenant's email-sender credentials.
+
 ### Deprecated
 - **`POST /api/v1/auth/token` is deprecated in favour of `POST /oauth/token`** (#132,
   CLAUDE.md deferred #21). **Nothing changes for any caller**: the endpoint serves the same

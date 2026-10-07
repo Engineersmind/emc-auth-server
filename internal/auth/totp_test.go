@@ -45,7 +45,7 @@ func newTOTPService(t *testing.T) (*auth.TOTPService, context.Context, *pgxpool.
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "development", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestTOTPService_VerifyAndActivate(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "development", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestTOTPService_Verify_InvalidCode(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "development", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestTOTPService_VerifyBackupCode_ConsumesCode(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "development", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestTOTPService_Disable(t *testing.T) {
 		t.Fatalf("fetch seed tenant id: %v", err)
 	}
 
-	svc, err := auth.NewTOTPService(pool, totpEnvKey(), logger)
+	svc, err := auth.NewTOTPService(pool, totpEnvKey(), "development", logger)
 	if err != nil {
 		t.Fatalf("NewTOTPService: %v", err)
 	}
