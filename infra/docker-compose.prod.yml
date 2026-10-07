@@ -33,6 +33,15 @@ services:
       SMTP_FROM: ${SMTP_FROM:-noreply@emc.local}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # ── GHSA-4x5m-3gph-938r (M-02) migration window ──────────────────
+      # The code default is now the SECURE one (HS256 verification off).
+      # This pin preserves the pre-advisory behaviour so an upgrade does
+      # not instantly reject live HS256 access/agent tokens — see
+      # docs/PHASE4_HS256_CUTOVER.md. Window: one agent-token lifetime
+      # (1 h; take a 2 h quiet margin) plus time to confirm
+      #   emc_auth_legacy_hs256_verifications_total is flat at zero.
+      # Then delete this line (or set false) to adopt the secure default.
+      JWT_ALLOW_LEGACY_HS256: ${JWT_ALLOW_LEGACY_HS256:-true}
     depends_on:
       redis:
         condition: service_healthy

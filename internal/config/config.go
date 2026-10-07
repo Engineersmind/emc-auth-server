@@ -118,9 +118,14 @@ type Config struct {
 
 	// JWTSigningKeyEncryptionKeyPrevious enables zero-downtime rotation of the
 	// key above: set the NEW key as JWT_SIGNING_KEY_ENCRYPTION_KEY and the old
-	// one here. Decryption falls back to it transparently. Note this rotates the
-	// ENCRYPTION key, not the signing keys themselves — signing-key rotation is
-	// a separate operation (see the admin rotate endpoint).
+	// one here. Decryption falls back to it transparently. While it is set, the
+	// startup sweep (JWTService.ReencryptTenantSecrets) re-seals every
+	// tenants.jwt_secret_enc row under the new key — those ciphertexts have no
+	// rewrite path of their own, so the sweep is what lets this variable be
+	// removed safely. Leave it set for ONE restart after rotating, then remove
+	// it. Note this rotates the ENCRYPTION key, not the signing keys themselves
+	// — signing-key rotation is a separate operation (see the admin rotate
+	// endpoint).
 	JWTSigningKeyEncryptionKeyPrevious string
 
 	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable during the

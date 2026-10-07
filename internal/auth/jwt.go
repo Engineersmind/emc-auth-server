@@ -717,6 +717,69 @@ func (s *JWTService) EncryptAllTenantSecrets(ctx context.Context) (int, error) {
 	return migrated, nil
 }
 
+// ReencryptTenantSecrets re-seals every tenants.jwt_secret_enc row under the
+// CURRENT JWT_SIGNING_KEY_ENCRYPTION_KEY while a previous key is configured.
+//
+// tenants.jwt_secret_enc has no natural rewrite path — unlike an OAuth client
+// secret, nothing rewrites it on the tenant's next write — so without this
+// sweep an old-key ciphertext would become undecryptable the day the previous
+// key is retired (GHSA-4x5m-3gph-938r review). Run at startup right after
+// EncryptAllTenantSecrets whenever the box carries a previous key: Decrypt
+// falls back to it transparently, and Encrypt always seals under the primary.
+// One boot is then enough to retire the previous key — leave
+// JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS set for one restart, then remove it.
+//
+// Idempotent and a no-op when no rotation is configured.
+func (s *JWTService) ReencryptTenantSecrets(ctx context.Context) (int, error) {
+	if s.secretBox == nil || !s.secretBox.HasPreviousKey() {
+		return 0, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, jwt_secret_enc FROM tenants
+		 WHERE COALESCE(jwt_secret_enc, '') <> ''`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("list encrypted jwt_secret rows: %w", err)
+	}
+	defer rows.Close()
+
+	type pending struct {
+		id  int64
+		enc string
+	}
+	var todo []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.enc); err != nil {
+			return 0, fmt.Errorf("scan tenant enc row: %w", err)
+		}
+		todo = append(todo, p)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate tenant enc rows: %w", err)
+	}
+
+	reencrypted := 0
+	for _, p := range todo {
+		plain, err := s.secretBox.Decrypt(p.enc)
+		if err != nil {
+			return reencrypted, fmt.Errorf("decrypt jwt_secret_enc for tenant %d: %w", p.id, err)
+		}
+		enc, err := s.secretBox.Encrypt(plain)
+		if err != nil {
+			return reencrypted, fmt.Errorf("re-encrypt jwt_secret for tenant %d: %w", p.id, err)
+		}
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE tenants SET jwt_secret_enc = $1 WHERE id = $2`,
+			enc, p.id,
+		); err != nil {
+			return reencrypted, fmt.Errorf("store re-encrypted jwt_secret for tenant %d: %w", p.id, err)
+		}
+		reencrypted++
+	}
+	return reencrypted, nil
+}
+
 // AccessTokenTTL is the lifetime of an access token (AUTH-06).
 // 15 minutes matches the API contract; transparent middleware renewal keeps
 // browser sessions alive without client-side retry logic.

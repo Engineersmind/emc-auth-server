@@ -83,6 +83,15 @@ func (b *SecretBox) UsesInsecureZeroKey() bool {
 	return b != nil && b.zeroKey
 }
 
+// HasPreviousKey reports whether a rotation is in progress — a previous key was
+// configured via WithPreviousKey and Decrypt accepts ciphertext under either
+// key. Readers use this to decide whether a re-encryption sweep is needed:
+// ciphertext written under the old key must be re-sealed under the new one
+// before the previous key is retired (GHSA-4x5m-3gph-938r review).
+func (b *SecretBox) HasPreviousKey() bool {
+	return b != nil && b.prevKey != nil
+}
+
 // WithPreviousKey accepts the previous 64-character hex key for decryption
 // fallback during key rotation. An empty key is a no-op.
 func (b *SecretBox) WithPreviousKey(keyHex, keyName string) error {
