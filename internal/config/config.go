@@ -19,10 +19,10 @@ type Config struct {
 	Env         string
 	JWTIssuer   string
 
-	// MetricsToken optionally gates GET /metrics behind a bearer token, set via
-	// METRICS_TOKEN. Empty (the default) leaves the endpoint open, preserving
-	// the original contract: bind it to localhost and restrict it at the
-	// reverse proxy.
+	// MetricsToken gates GET /metrics behind a bearer token, set via
+	// METRICS_TOKEN. In production/staging the endpoint is NOT REGISTERED at
+	// all when this is empty (GHSA-4r4c-348x-w452); in development/test it is
+	// served open for local scraping.
 	//
 	// This exists because that network-level control is the ONLY thing standing
 	// between the Prometheus registry and the public internet, and it is easy to
