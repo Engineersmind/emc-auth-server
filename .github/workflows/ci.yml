@@ -38,8 +38,9 @@ name: CI
 #   Fix:   Updated echo v4.12.0 → v4.15.2 (drops jwt v3 indirect dependency)
 #
 # [CI-10] govulncheck GO-2026-5039, GO-2026-5037 — stdlib net/textproto + x509
-#   Cause: Go 1.25.10 has unpatched stdlib vulns; fixed version (1.25.11) not yet released
-#   Fix:   Warn-only mode for govulncheck; block only on NEW non-stdlib findings
+#   Cause: Go <1.25.11 had unpatched stdlib vulns while the fixed release was pending
+#   Fix:   go directive bumped to 1.25.13 (GHSA-xw24-669x-wjhr); govulncheck is a
+#          hard gate again — the warn-only carve-out ended when 1.25.11 shipped
 #
 # [CI-11] Docker smoke test health check — server starts on PORT 9090 by default
 #   Cause: docker run missing -e PORT=8080; curl targeted 8080, server was on 9090
@@ -203,36 +204,15 @@ jobs:
           cache: true
 
       # [CI-09] golang-jwt v3 vulnerability eliminated by upgrading echo v4.12→v4.15.2
-      # [CI-10] stdlib net/textproto + x509 vulns fixed in go1.25.11 (not yet released);
-      #         warn-only mode until patch is available — blocks on NEW findings only
+      # [CI-10] stdlib net/textproto + x509 vulns are fixed since go1.25.11 —
+      #         the warn-only carve-out ended; every finding now blocks the build.
+      #         go.mod's `go 1.25.13` directive is itself the floor: with
+      #         GOTOOLCHAIN=auto the toolchain under scan cannot silently be an
+      #         older patch release.
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          # Run in JSON mode; fail only on non-stdlib vulnerabilities that can be patched
-          govulncheck -json ./... > /tmp/vuln.json 2>&1 || true
-          # Surface stdlib-only issues as warnings; fail on module-level vulnerabilities
-          python3 -c "
-          import json, sys
-          data = open('/tmp/vuln.json').read()
-          # Count findings that are NOT Go stdlib
-          vulns = []
-          for line in data.splitlines():
-              try:
-                  obj = json.loads(line)
-                  if obj.get('finding') and obj['finding'].get('osv'):
-                      osv = obj['finding']['osv']
-                      # Flag non-stdlib (module) vulnerabilities
-                      if 'stdlib' not in osv.lower() and 'go' not in obj['finding'].get('trace', [{}])[0].get('module', 'stdlib').lower():
-                          vulns.append(osv)
-              except: pass
-          if vulns:
-              print('::error::' + str(len(vulns)) + ' patchable module vulnerability(s) found: ' + ', '.join(set(vulns)))
-              sys.exit(1)
-          else:
-              print('::notice::govulncheck passed (stdlib-only findings are warn-only)')
-          " || (cat /tmp/vuln.json | grep -A3 '"osv"' | head -60 && exit 1)
-          # Also print a human-readable summary for the CI log
-          govulncheck ./... 2>&1 || echo "::warning::govulncheck warnings above — stdlib vulns pending Go patch release"
+          govulncheck ./...
 
   # ─── Docker Build Smoke Test ─────────────────────────────────────────────────
   docker:
