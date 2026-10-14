@@ -504,3 +504,123 @@ func TestPasswordResetRateLimiter_BlocksByClient(t *testing.T) {
 		t.Fatalf("3rd request for the same client: expected 429, got %d", got)
 	}
 }
+
+// registerRequest is tokenRequest aimed at POST /apps/register.
+func registerRequest(t *testing.T, mw echo.MiddlewareFunc, remoteAddr, clientID string) (int, string) {
+	t.Helper()
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/apps/register", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(clientID+":secret")))
+	req.RemoteAddr = remoteAddr + ":12345"
+	rec := httptest.NewRecorder()
+	c := e.NewContext(req, rec)
+	handler := mw(func(c echo.Context) error {
+		return c.JSON(http.StatusCreated, map[string]string{"status": "ok"})
+	})
+	_ = handler(c)
+	return rec.Code, rec.Header().Get("Retry-After")
+}
+
+// Issue #794: a server-to-server caller registers every user from one IP with one
+// client_id. Fifteen registrations in a minute must all pass under the default
+// config, where the shared token limiter would have rejected the sixth.
+func TestAppRegisterRateLimiter_DefaultsAllowServerToServerBurst(t *testing.T) {
+	middleware.ResetStoresForTest()
+	cfg := middleware.DefaultRateLimitConfig()
+	reg := middleware.AppRegisterRateLimiter(cfg)
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+
+	for i := 1; i <= 15; i++ {
+		if code, _ := registerRequest(t, reg, ip, "insureddesk"); code != http.StatusCreated {
+			t.Fatalf("registration %d = %d, want 201", i, code)
+		}
+	}
+
+	// The limiter it replaces would not have: pin the regression.
+	middleware.ResetStoresForTest()
+	tok := middleware.TokenRateLimiter(cfg)
+	blocked := false
+	for i := 1; i <= 15; i++ {
+		if code := tokenRequest(t, tok, ip, "insureddesk", ""); code == http.StatusTooManyRequests {
+			blocked = true
+			break
+		}
+	}
+	if !blocked {
+		t.Fatal("TokenRateLimiter no longer throttles at the AUTH-07 default; the regression pin is stale")
+	}
+}
+
+func TestAppRegisterRateLimiter_HonoursConfiguredPerIPRate(t *testing.T) {
+	middleware.ResetStoresForTest()
+	reg := middleware.AppRegisterRateLimiter(middleware.RateLimitConfig{
+		AppRegisterPerIPRate: 3, AppRegisterPerClientRate: 1000,
+	})
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+
+	for i := 1; i <= 3; i++ {
+		if code, _ := registerRequest(t, reg, ip, "insureddesk"); code != http.StatusCreated {
+			t.Fatalf("request %d = %d, want 201", i, code)
+		}
+	}
+	code, retryAfter := registerRequest(t, reg, ip, "insureddesk")
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("request 4 = %d, want 429", code)
+	}
+	if retryAfter != "60" {
+		t.Errorf("Retry-After = %q, want 60", retryAfter)
+	}
+}
+
+func TestAppRegisterRateLimiter_HonoursConfiguredPerClientRateAndIsolatesClients(t *testing.T) {
+	middleware.ResetStoresForTest()
+	reg := middleware.AppRegisterRateLimiter(middleware.RateLimitConfig{
+		AppRegisterPerIPRate: 1000, AppRegisterPerClientRate: 2,
+	})
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+
+	for i := 1; i <= 2; i++ {
+		if code, _ := registerRequest(t, reg, ip, "client_A"); code != http.StatusCreated {
+			t.Fatalf("client A request %d = %d, want 201", i, code)
+		}
+	}
+	if code, _ := registerRequest(t, reg, ip, "client_A"); code != http.StatusTooManyRequests {
+		t.Errorf("client A request 3 = %d, want 429", code)
+	}
+	if code, _ := registerRequest(t, reg, ip, "client_B"); code != http.StatusCreated {
+		t.Errorf("client B after A throttled = %d, want 201", code)
+	}
+}
+
+// A zero (unset) config must mean "the default", never "unlimited".
+func TestAppRegisterRateLimiter_ZeroConfigFallsBackToDefault(t *testing.T) {
+	middleware.ResetStoresForTest()
+	reg := middleware.AppRegisterRateLimiter(middleware.RateLimitConfig{})
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+
+	for i := 1; i <= middleware.DefaultAppRegisterPerIPRate; i++ {
+		if code, _ := registerRequest(t, reg, ip, "insureddesk"); code != http.StatusCreated {
+			t.Fatalf("request %d = %d, want 201", i, code)
+		}
+	}
+	if code, _ := registerRequest(t, reg, ip, "insureddesk"); code != http.StatusTooManyRequests {
+		t.Errorf("request %d = %d, want 429", middleware.DefaultAppRegisterPerIPRate+1, code)
+	}
+}
+
+// Register and token traffic keep separate buckets, in both directions.
+func TestAppRegisterRateLimiter_DoesNotShareBucketsWithTokenLimiter(t *testing.T) {
+	middleware.ResetStoresForTest()
+	cfg := middleware.DefaultRateLimitConfig()
+	tok := middleware.TokenRateLimiter(cfg)
+	reg := middleware.AppRegisterRateLimiter(cfg)
+	ip := fmt.Sprintf("192.0.2.%d", (time.Now().UnixNano()%200)+10)
+
+	for i := 0; i < cfg.PerIPRate+1; i++ {
+		tokenRequest(t, tok, ip, "insureddesk", "")
+	}
+	if code, _ := registerRequest(t, reg, ip, "insureddesk"); code != http.StatusCreated {
+		t.Errorf("register after token bucket exhausted = %d, want 201", code)
+	}
+}

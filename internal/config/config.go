@@ -294,6 +294,12 @@ type Config struct {
 	// PASSWORD_HASH_MAX_CONCURRENT.
 	PasswordHashMaxConcurrent int
 
+	// AppRegisterPerIPRate and AppRegisterPerClientRate size the POST
+	// /apps/register rate limiter, per minute (issue #794). 0 means the built-in
+	// default (60). Env: RATE_LIMIT_APP_REGISTER_PER_IP / _PER_CLIENT.
+	AppRegisterPerIPRate     int
+	AppRegisterPerClientRate int
+
 	// AuditSIEMWebhookURL, when set, streams every persisted audit event as a
 	// JSON POST to this URL (Datadog/Splunk/S3-proxy/generic webhook). Empty
 	// disables streaming. Must be https and resolve to a public IP — private,
@@ -440,6 +446,8 @@ func Load() *Config {
 		AuditCaptureResponseBody:  getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
 		AuditRetentionDays:        mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
 		PasswordHashMaxConcurrent: mustAtoi(getEnv("PASSWORD_HASH_MAX_CONCURRENT", "0")),
+		AppRegisterPerIPRate:      mustAtoi(getEnv("RATE_LIMIT_APP_REGISTER_PER_IP", "0")),
+		AppRegisterPerClientRate:  mustAtoi(getEnv("RATE_LIMIT_APP_REGISTER_PER_CLIENT", "0")),
 		AuditSIEMWebhookURL:       getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
 		AuditSIEMWebhookSecret:    getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
 		AudienceScheme:            getEnv("AUDIENCE_SCHEME", "api://"),
