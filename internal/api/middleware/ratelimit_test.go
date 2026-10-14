@@ -523,8 +523,15 @@ func registerRequest(t *testing.T, mw echo.MiddlewareFunc, remoteAddr, clientID 
 }
 
 // Issue #794: a server-to-server caller registers every user from one IP with one
-// client_id. Fifteen registrations in a minute must all pass under the default
-// config, where the shared token limiter would have rejected the sixth.
+// client_id. This covers the register limiter ALONE: fifteen registrations in a
+// minute pass under its default config, where the shared token limiter would have
+// rejected the sixth.
+//
+// It does not cover AppClientRateLimiter, which runs next on the real route. For
+// an application with no app_rate_limits row that limiter falls back to
+// auth.DefaultRequestsPerMinute/DefaultBurst (60/min, burst 10), so a 15-request
+// burst is only absorbed end to end when the application has a row sized for it
+// (the InsuredDesk row is 101 rpm, burst 30).
 func TestAppRegisterRateLimiter_DefaultsAllowServerToServerBurst(t *testing.T) {
 	middleware.ResetStoresForTest()
 	cfg := middleware.DefaultRateLimitConfig()
