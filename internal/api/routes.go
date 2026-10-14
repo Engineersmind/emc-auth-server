@@ -46,6 +46,10 @@ type Deps struct {
 
 // RoutesConfig holds configuration values needed at route-wiring time.
 type RoutesConfig struct {
+	// AppRegisterPerIPRate and AppRegisterPerClientRate size the POST
+	// /apps/register limiter (issue #794). Zero keeps the middleware defaults.
+	AppRegisterPerIPRate     int
+	AppRegisterPerClientRate int
 	// JWTIssuer is placed in the "iss" claim (e.g. "https://auth.emc.local").
 	JWTIssuer string
 	// Env is "development" or "production" — controls HTTPS enforcement behaviour.
@@ -799,6 +803,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 
 	// Rate limiter config (AUTH-07: 5/min/IP, 10/min/tenant).
 	rlCfg := mw.DefaultRateLimitConfig()
+	// /apps/register has its own server-to-server sizing (issue #794). Zero keeps
+	// the default.
+	if deps.Config.AppRegisterPerIPRate > 0 {
+		rlCfg.AppRegisterPerIPRate = deps.Config.AppRegisterPerIPRate
+	}
+	if deps.Config.AppRegisterPerClientRate > 0 {
+		rlCfg.AppRegisterPerClientRate = deps.Config.AppRegisterPerClientRate
+	}
 
 	// /api/v1 route group.
 	//
@@ -936,7 +948,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// Authorization: Basic, and gets its own isolated end-user base, distinct
 	// from /register and /login above (which are tenant-level, first-party
 	// only). Rate-limited per client_id — same reasoning as /token.
-	authGroup.POST("/apps/register", authHandler.AppRegister, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	authGroup.POST("/apps/register", authHandler.AppRegister, mw.AppRegisterRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/apps/login", authHandler.AppLogin, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
 	// Attach roles to one of the application's own users after registration

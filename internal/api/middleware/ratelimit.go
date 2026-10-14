@@ -30,7 +30,20 @@ type RateLimitConfig struct {
 	// no longer takes a tenant slug, this is keyed on the submitted email instead.
 	// Default: 10 (AUTH-07).
 	PerTenantRate int
+	// AppRegisterPerIPRate and AppRegisterPerClientRate bound POST /apps/register
+	// only. A server-to-server caller (a product backend registering its users)
+	// reaches this route from one egress IP with one client_id, so the shared
+	// AUTH-07 5/10 per minute would cap that whole product at ~5 signups a minute.
+	// Defaults: 60 each. Zero falls back to the default, never to unlimited.
+	AppRegisterPerIPRate     int
+	AppRegisterPerClientRate int
 }
+
+// Defaults for the /apps/register limiter (issue #794).
+const (
+	DefaultAppRegisterPerIPRate     = 60
+	DefaultAppRegisterPerClientRate = 60
+)
 
 // maxRateLimitEmailLen caps how much of a submitted "email" is used as part of
 // a rate-limiter map key. RFC 5321 caps real addresses at 254 bytes; without
@@ -41,8 +54,10 @@ const maxRateLimitEmailLen = 254
 // DefaultRateLimitConfig returns AUTH-07 compliant defaults.
 func DefaultRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
-		PerIPRate:     5,
-		PerTenantRate: 10,
+		PerIPRate:                5,
+		PerTenantRate:            10,
+		AppRegisterPerIPRate:     DefaultAppRegisterPerIPRate,
+		AppRegisterPerClientRate: DefaultAppRegisterPerClientRate,
 	}
 }
 
@@ -358,6 +373,67 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 					c.Response().Header().Set("Retry-After", "60")
 					return c.JSON(http.StatusTooManyRequests, map[string]string{
 						"error":       "too many token requests for this client",
+						"retry_after": "60",
+					})
+				}
+			}
+
+			return next(c)
+		}
+	}
+}
+
+// AppRegisterRateLimiter rate-limits POST /apps/register (issue #794).
+//
+// It replaces TokenRateLimiter on that one route. TokenRateLimiter applies the
+// AUTH-07 login budget (5/min per IP, 10/min per client_id), which is right for
+// credential-guessing surfaces but wrong here: /apps/register is called by the
+// product backend, so every signup shares one IP and one client_id, and the
+// whole product was capped at ~5 registrations a minute regardless of the
+// app_rate_limits row configured for it.
+//
+// Same two dimensions, sized for server-to-server use and configurable
+// (AppRegisterPerIPRate / AppRegisterPerClientRate). The per-application limit
+// from app_rate_limits is still enforced afterwards by AppClientRateLimiter.
+// Own key prefixes and labels: register traffic must not spend the token or
+// login budget for the same IP or client, nor the reverse.
+func AppRegisterRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
+	startCleanup()
+
+	perIP := cfg.AppRegisterPerIPRate
+	if perIP <= 0 {
+		perIP = DefaultAppRegisterPerIPRate
+	}
+	perClient := cfg.AppRegisterPerClientRate
+	if perClient <= 0 {
+		perClient = DefaultAppRegisterPerClientRate
+	}
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			ip := c.RealIP()
+			if ip == "" {
+				ip = c.Request().RemoteAddr
+			}
+
+			if !allowVia(c.Request().Context(), ipStore, "app_register_ip", "app-register-ip:"+ip, perIP) {
+				metrics.RateLimitHits.WithLabelValues("app_register_ip").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many registration requests from your IP address",
+					"retry_after": "60",
+				})
+			}
+
+			if clientID := tokenClientID(c); clientID != "" {
+				if len(clientID) > maxRateLimitEmailLen {
+					clientID = clientID[:maxRateLimitEmailLen]
+				}
+				if !allowVia(c.Request().Context(), tenantStore, "app_register_client", "app-register-client:"+clientID, perClient) {
+					metrics.RateLimitHits.WithLabelValues("app_register_client").Inc()
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSON(http.StatusTooManyRequests, map[string]string{
+						"error":       "too many registration requests for this client",
 						"retry_after": "60",
 					})
 				}

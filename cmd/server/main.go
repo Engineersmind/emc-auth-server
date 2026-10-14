@@ -334,6 +334,8 @@ func main() {
 			Env:                                    cfg.Env,
 			MetricsToken:                           cfg.MetricsToken,
 			PasswordHashMaxConcurrent:              cfg.PasswordHashMaxConcurrent,
+			AppRegisterPerIPRate:                   cfg.AppRegisterPerIPRate,
+			AppRegisterPerClientRate:               cfg.AppRegisterPerClientRate,
 			AppBaseURL:                             cfg.AppBaseURL,
 			DashboardBaseURL:                       cfg.DashboardBaseURL,
 			TOTPEncryptionKey:                      cfg.TOTPEncryptionKey,
