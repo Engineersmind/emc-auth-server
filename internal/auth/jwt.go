@@ -262,8 +262,6 @@ const (
 	GrantSocial = "social"
 	// GrantPasskey is WebAuthn passkey assertion (#112).
 	GrantPasskey = "passkey"
-	// GrantSAML is SAML 2.0 JIT login.
-	GrantSAML = "saml"
 	// GrantTenantSwitch is a token re-minted for a second tenant the caller
 	// already proved they belong to. No credential is presented, so it is named
 	// separately from the grant that authenticated the original session.
@@ -296,7 +294,6 @@ var (
 		GrantMagicLink,
 		GrantSocial,
 		GrantPasskey,
-		GrantSAML,
 		GrantTenantSwitch,
 	}
 
