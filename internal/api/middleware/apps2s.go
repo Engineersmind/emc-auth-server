@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -596,13 +597,18 @@ func (s *AppS2S) resolve(surface string, mode resolveMode, creds func(echo.Conte
 				caller.Verified = outcome == verifyOK
 				caller.Failed = outcome == verifyWrongSecret
 
+				// Record a wrong secret for the NEXT request's admission check,
+				// but never refuse THIS one because of it. A refusal decided
+				// after the check depends on the check's outcome: on a route
+				// whose handler hides that outcome (forgot-password answers 200
+				// to a bad client) a 429 here would say "wrong" while a right
+				// secret got through. Admission is decided only before the
+				// check, in guardVerification, where the outcome is unknown.
 				if caller.Failed && !mode.failedFallsBack {
 					ipKey, clientKey := badCredentialKeys(caller.ConnIP, clientID)
-					// Spend both; the next request sees the result above.
-					ipOK := allowVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate)
-					clientOK := caller.ServerIP || allowVia(ctx, appIPStore, "app_bad_credentials_client", clientKey, s.cfg.BadCredentialsPerClientRate)
-					if !ipOK || !clientOK {
-						return rejectIP(c, "app_bad_credentials_ip", s.cfg.UnverifiedPerIPRate)
+					allowVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate)
+					if !caller.ServerIP {
+						allowVia(ctx, appIPStore, "app_bad_credentials_client", clientKey, s.cfg.BadCredentialsPerClientRate)
 					}
 				}
 			}
@@ -768,17 +774,27 @@ func (s *AppS2S) guardVerification(c echo.Context, mode resolveMode, caller *App
 	}
 
 	if trusted {
+		// One admission decision for every credentialed request from this
+		// address, made BEFORE the cache is consulted. If a cached secret
+		// skipped it, someone sharing the backend's egress (PaaS shared
+		// egress, carrier NAT) could exhaust the wrong-secret budget and then
+		// tell a right guess (cache hit, admitted) from a wrong one (429).
+		//
+		// The cost is deliberate and the same as before this change: five
+		// wrong secrets a minute from a shared address hold up every
+		// credentialed request from it for the rest of that minute, as the
+		// legacy 5/min per-IP limit already did for any five requests.
+		if !mode.failedFallsBack {
+			ipKey, _ := badCredentialKeys(caller.ConnIP, clientID)
+			if exhaustedVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate) {
+				return "app_bad_credentials_ip", s.cfg.UnverifiedPerIPRate, true, nil
+			}
+		}
 		if cached {
 			return "", 0, false, nil
 		}
 		if !spend("app_verify_attempts_trusted_ip", "app-verify-trusted-ip:"+caller.ConnIP, verifyAttemptsTrustedPerIP) {
 			return "app_verify_attempts_trusted_ip", verifyAttemptsTrustedPerIP, true, spent
-		}
-		if !mode.failedFallsBack {
-			ipKey, _ := badCredentialKeys(caller.ConnIP, clientID)
-			if exhaustedVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate) {
-				return "app_bad_credentials_ip", s.cfg.UnverifiedPerIPRate, true, spent
-			}
 		}
 		return "", 0, false, spent
 	}
@@ -906,9 +922,17 @@ func SubjectEmail(c echo.Context, _ *AppCaller) (string, bool) {
 	return strings.ToLower(strings.TrimSpace(peekBodyString(c, "email"))), true
 }
 
-// SubjectUserID keys on the "user_id" field of the JSON body.
+// SubjectUserID keys on the "user_id" field of the JSON body, canonicalised the
+// way the roles handler reads it (strconv.ParseInt): "12", "012" and "+12" are
+// one user, so they must be one bucket, or varying the spelling would bypass
+// the limit.
 func SubjectUserID(c echo.Context, _ *AppCaller) (string, bool) {
-	return strings.TrimSpace(peekBodyString(c, "user_id")), true
+	raw := peekBodyString(c, "user_id")
+	if id, err := strconv.ParseInt(raw, 10, 64); err == nil {
+		return strconv.FormatInt(id, 10), true
+	}
+	// Not a number: the handler refuses it, so any stable key will do.
+	return strings.TrimSpace(raw), true
 }
 
 // SubjectEndUserIP keys on the end user's forwarded address, for routes whose
@@ -943,15 +967,24 @@ func SubjectGuessBudget(c echo.Context, caller *AppCaller) (string, bool) {
 	return "", false
 }
 
-// SubjectBearerUser keys on the user in the Bearer token, read WITHOUT verifying
+// SubjectBearerUser keys on the user in the access token, read WITHOUT verifying
 // it. That is enough for bucketing: a forged token only earns its author a
 // bucket of their own, and the JWT middleware after this still rejects it.
+//
+// The token is found exactly where JWTRenew finds it — bearerToken (any case of
+// "Bearer", or a raw JWT), then the access-token cookie — so every form the
+// route accepts is bucketed per user rather than in one shared bucket.
 func SubjectBearerUser(c echo.Context, _ *AppCaller) (string, bool) {
-	h := c.Request().Header.Get(echo.HeaderAuthorization)
-	if !strings.HasPrefix(h, "Bearer ") {
+	token, found := bearerToken(c)
+	if !found {
+		if cookie, err := c.Cookie(AccessTokenCookie); err == nil && cookie.Value != "" {
+			token, found = cookie.Value, true
+		}
+	}
+	if !found {
 		return "", true
 	}
-	parts := strings.Split(strings.TrimSpace(h[len("Bearer "):]), ".")
+	parts := strings.Split(token, ".")
 	if len(parts) != 3 || len(parts[1]) > 8<<10 {
 		return "", true
 	}
@@ -979,6 +1012,13 @@ func SubjectBearerUser(c echo.Context, _ *AppCaller) (string, bool) {
 
 // peekBodyString reads one top-level string field from a JSON body and restores
 // the body so the handler's Bind still sees all of it.
+//
+// It decodes the way the handlers do — echo's Bind is a json.Decoder into a
+// struct — so both see the SAME value. A map lookup would not: struct decoding
+// matches field names case-insensitively and lets the last duplicate win, so
+// {"email":"decoy","Email":"victim"} would bucket the decoy while the handler
+// acted on the victim. Decoding into a one-field struct tagged with the same
+// name gives identical matching, duplicate and trailing-data behaviour.
 func peekBodyString(c echo.Context, field string) string {
 	req := c.Request()
 	if req.Body == nil {
@@ -990,14 +1030,15 @@ func peekBodyString(c echo.Context, field string) string {
 	if err != nil || len(data) == 0 {
 		return ""
 	}
-	var payload map[string]json.RawMessage
-	if json.Unmarshal(data, &payload) != nil {
+	holder := reflect.New(reflect.StructOf([]reflect.StructField{{
+		Name: "V",
+		Type: reflect.TypeOf(""),
+		Tag:  reflect.StructTag(`json:"` + field + `"`),
+	}}))
+	if json.NewDecoder(bytes.NewReader(data)).Decode(holder.Interface()) != nil {
 		return ""
 	}
-	var v string
-	if json.Unmarshal(payload[field], &v) != nil {
-		return ""
-	}
+	v := holder.Elem().Field(0).String()
 	if len(v) > maxRateLimitEmailLen {
 		v = v[:maxRateLimitEmailLen]
 	}

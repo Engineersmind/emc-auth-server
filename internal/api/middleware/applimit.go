@@ -104,10 +104,27 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 			if clientID == "" {
 				return next(c)
 			}
-			if caller, ok := CallerFrom(c); ok && caller.ClientID == clientID && caller.HasCredentials {
-				if caller.Verified {
+			// Behind a resolver, only a VERIFIED secret may spend the
+			// application's quota. Everything else is classified from what the
+			// resolver proved, never from the header's mere presence:
+			//
+			//   - A wrong secret is not charged here at all. It was admitted by
+			//     the outcome-blind budgets before the check; refusing it here,
+			//     after the check, would make the response depend on whether the
+			//     secret was right (forgot-password otherwise answers 200 to a
+			//     bad client), and those budgets already bound its volume.
+			//   - No secret, an empty secret ("Basic client_id:"), or a check
+			//     that could not run spends the separate unverified bucket.
+			//     Counting it against the real quota would let anyone who knows
+			//     the public client_id drain the product's quota without ever
+			//     authenticating.
+			if caller, ok := CallerFrom(c); ok {
+				switch {
+				case caller.Verified && caller.ClientID == clientID:
 					rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
 					return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
+				case caller.Failed:
+					return next(c)
 				}
 				tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
 				if !ok {

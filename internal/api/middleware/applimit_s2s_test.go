@@ -56,15 +56,25 @@ func TestAppClientRateLimiter_QuotaBehindResolve(t *testing.T) {
 	s := middleware.NewAppS2S(middleware.AppS2SConfig{}, trust, appSvc, logger)
 	chain := []echo.MiddlewareFunc{s.Resolve(middleware.SurfaceApp), middleware.AppClientRateLimiter(limitSvc, rdb, logger)}
 
-	// A stranger with the right client_id and wrong secrets, from many IPs so
-	// the per-IP limits do not stop them first, exhausts only the unverified
-	// bucket.
+	// A stranger who knows the public client_id but never authenticates —
+	// wrong secrets, and empty-secret "Basic client_id:" requests (Copilot
+	// review) — from many IPs so the per-IP limits do not stop them first.
+	// Wrong secrets are not charged to any quota (the admission budgets bound
+	// them, and a post-check refusal would reveal the outcome); empty-secret
+	// requests spend only the separate unverified bucket.
 	for i := 0; i < 4; i++ {
 		runS2S(t, chain, s2sReq{remote: fmt.Sprintf("198.51.100.%d", 10+i), clientID: app.ClientID, secret: "wrong"})
 	}
-	res := runS2S(t, chain, s2sReq{remote: "198.51.100.50", clientID: app.ClientID, secret: "wrong"})
+	for i := 0; i < 3; i++ {
+		runS2S(t, chain, s2sReq{remote: fmt.Sprintf("198.51.100.%d", 30+i), clientID: app.ClientID, secret: ""})
+	}
+	res := runS2S(t, chain, s2sReq{remote: "198.51.100.50", clientID: app.ClientID, secret: ""})
 	if res.code != http.StatusTooManyRequests {
-		t.Fatalf("unverified requests past the quota: got %d, want 429", res.code)
+		t.Fatalf("empty-secret requests past the unverified quota: got %d, want 429", res.code)
+	}
+	res = runS2S(t, chain, s2sReq{remote: "198.51.100.51", clientID: app.ClientID, secret: "wrong"})
+	if res.code == http.StatusTooManyRequests && res.body["limiter"] == "app" {
+		t.Fatal("a wrong secret must never be refused by the application quota after its check")
 	}
 
 	// The product itself still has its full quota.
