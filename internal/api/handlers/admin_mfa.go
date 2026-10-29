@@ -56,7 +56,7 @@ func (h *AuthHandler) sessionMFAFailure(c echo.Context, session *auth.OTPSession
 		Action:       audit.ActionAuthMFAChallengeFailed,
 		AuthMethod:   method,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"phase": phase, "flow": "session"},
 	}
@@ -99,7 +99,7 @@ func (h *AuthHandler) auditSessionMFALogin(c echo.Context, session *auth.OTPSess
 		Action:       audit.ActionAuthLogin,
 		AuthMethod:   method,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     meta,
 	})
@@ -144,7 +144,7 @@ func (h *AuthHandler) SessionMFAVerify(c echo.Context) error {
 		Action:       audit.ActionAuthLogin,
 		AuthMethod:   audit.AuthMethodMFA,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"flow": "session", "transaction_id": transactionID(req.OTPSessionToken)},
 	})
@@ -186,7 +186,7 @@ func (h *AuthHandler) SessionMFAEnrollActivate(c echo.Context) error {
 		Action:       audit.ActionAuthMFAActivated,
 		AuthMethod:   audit.AuthMethodMFA,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"flow": "session", "phase": "enrollment"},
 	})

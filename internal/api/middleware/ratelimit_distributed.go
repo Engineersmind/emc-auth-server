@@ -167,6 +167,46 @@ func allowVia(ctx context.Context, store *limiterStore, label, key string, r int
 	return store.getOrCreate(key, r).Allow()
 }
 
+// exhaustedVia reports, WITHOUT spending a token, whether key's bucket (r per
+// minute, burst r — the same shape allowVia uses) has nothing left.
+//
+// For checks that must refuse before doing work whose outcome the refusal would
+// otherwise reveal (see the bad-credential budgets in apps2s.go). A cost-0 GCRA
+// call computes the remaining allowance and writes back the unchanged state.
+// On a Redis error it answers from the in-process bucket, as allowVia would
+// have spent from it.
+func exhaustedVia(ctx context.Context, store *limiterStore, label, key string, r int) bool {
+	if d := distributed(); d != nil {
+		res, err := d.limiter.AllowN(ctx, key, redis_rate.Limit{Rate: r, Burst: r, Period: time.Minute}, 0)
+		if err == nil {
+			return res.Remaining < 1
+		}
+		metrics.RateLimitFailOpen.WithLabelValues(label, "redis_error").Inc()
+		d.logger.Warn().Err(err).Str("limiter", label).
+			Msg("rate limiting: Redis error — falling back to the in-process bucket")
+	}
+	return store.exhausted(key)
+}
+
+// refundVia gives back one token spent by allowVia on key.
+//
+// For budgets that are spent BEFORE an outcome is known, so the spend holds
+// under concurrency, and returned once the outcome shows the request was not
+// what the budget exists to bound (a correct client secret). A GCRA refund is
+// a negative-cost call: it moves the bucket's theoretical arrival time back by
+// one emission interval, and cannot fill the bucket past its burst because
+// the script clamps that time to "now" first.
+func refundVia(ctx context.Context, store *limiterStore, label, key string, r int) {
+	if d := distributed(); d != nil {
+		_, err := d.limiter.AllowN(ctx, key, redis_rate.Limit{Rate: r, Burst: r, Period: time.Minute}, -1)
+		if err == nil {
+			return
+		}
+		metrics.RateLimitFailOpen.WithLabelValues(label, "redis_error").Inc()
+	}
+	store.refund(key)
+}
+
 // allowViaEvery is allowVia for interval-based buckets.
 func allowViaEvery(ctx context.Context, store *limiterStore, label, key string, interval time.Duration, burst int) bool {
 	if allowed, decided := allowSharedEvery(ctx, label, key, interval, burst); decided {

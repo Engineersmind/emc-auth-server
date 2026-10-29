@@ -27,12 +27,15 @@ import (
 type AdminHandler struct {
 	svc         *admin.Service
 	appLimitSvc *auth.AppRateLimitService
-	appSvc      *auth.ApplicationService
-	totpSvc     *auth.TOTPService
-	senderSvc   *auth.EmailSenderService
-	tmplSvc     *auth.EmailTemplateService
-	mailer      mailer.Mailer
-	corsSvc     *mw.TenantCORSService
+	// trustSvc backs the server-trust routes (server IPs, forwarded IP). nil
+	// makes them answer 503.
+	trustSvc  *auth.AppTrustService
+	appSvc    *auth.ApplicationService
+	totpSvc   *auth.TOTPService
+	senderSvc *auth.EmailSenderService
+	tmplSvc   *auth.EmailTemplateService
+	mailer    mailer.Mailer
+	corsSvc   *mw.TenantCORSService
 	// webauthnSvc backs the passkey policy and admin credential handlers. nil
 	// when WEBAUTHN_RP_ID is unset, which makes those routes answer 501 rather
 	// than panicking — the same shape as the other optional services here.
@@ -2471,7 +2474,7 @@ func (h *AdminHandler) auditAdminTenantMeta(c echo.Context, claims *auth.Claims,
 		Action:        action,
 		ResourceType:  resourceType,
 		ResourceID:    resourceID,
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 		Metadata:      meta,
 	})
@@ -2501,7 +2504,7 @@ func (h *AdminHandler) auditPrivilegeRefused(c echo.Context, claims *auth.Claims
 		ResourceType: resourceType,
 		ResourceID:   resourceID,
 		Status:       audit.StatusFailure,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"attempted": attempted},
 	})

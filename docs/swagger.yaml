@@ -1259,6 +1259,35 @@ definitions:
           type: string
         type: array
     type: object
+  auth.AppServerIP:
+    properties:
+      cidr:
+        type: string
+      created_at:
+        type: string
+      description:
+        type: string
+    type: object
+  auth.AppServerIPInput:
+    properties:
+      cidr:
+        type: string
+      description:
+        type: string
+    type: object
+  auth.AppServerTrust:
+    properties:
+      application_id:
+        type: integer
+      server_ips:
+        items:
+          $ref: '#/definitions/auth.AppServerIP'
+        type: array
+      tenant_id:
+        type: integer
+      trust_forwarded_ip:
+        type: boolean
+    type: object
   auth.AppsPage:
     properties:
       data:
@@ -2522,6 +2551,22 @@ definitions:
           who saved a customisation while its Status toggle was off receives the
           default and concludes the save failed. The template screen turns this into
           an explanation rather than a mystery.
+        type: boolean
+    type: object
+  handlers.ServerTrustRequest:
+    properties:
+      server_ips:
+        description: |-
+          ServerIPs replaces the application's registered egress addresses. Each
+          entry is an address or CIDR range (IPv4 /24 or narrower, IPv6 /48 or
+          narrower), at most 50.
+        items:
+          $ref: '#/definitions/auth.AppServerIPInput'
+        type: array
+      trust_forwarded_ip:
+        description: |-
+          TrustForwardedIP lets the application report its end user's address in
+          X-EMC-Forwarded-For.
         type: boolean
     type: object
   handlers.SessionLoginRequest:
@@ -4245,6 +4290,80 @@ paths:
       summary: Mark a role as the application's default
       tags:
       - admin-rbac
+  /api/v1/applications/{appID}/server-trust:
+    get:
+      description: Returns the application's registered server IPs and whether it
+        may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppServerTrust'
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get an application's server-to-server settings
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: Registers the application backend's egress IPs (requests from them
+        skip the per-IP flood guard; the application quota and per-user limits still
+        apply) and turns forwarding of the end user's IP on or off. A forwarded IP
+        is believed only when the client secret verifies and the request comes from
+        one of the registered server IPs, so forwarding needs at least one. Omitted
+        fields are left unchanged. Changes apply on this instance immediately and
+        on others within 30 seconds. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Settings to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ServerTrustRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppServerTrust'
+        "400":
+          description: Invalid address or range
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an application's server-to-server settings
+      tags:
+      - admin-rate-limits
   /api/v1/applications/{appID}/users/{uid}/mfa:
     delete:
       description: Removes the user's TOTP enrollment (support path for lost phone
@@ -4737,6 +4856,11 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.AppLoginRequest'
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -4759,6 +4883,13 @@ paths:
         "428":
           description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
             and retry; do NOT treat as bad credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -4786,6 +4917,11 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.MagicLinkRequest'
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -4813,6 +4949,13 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       summary: Request a magic sign-in link
       tags:
       - AUTH
@@ -4836,6 +4979,11 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.MagicLinkVerifyRequest'
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -4851,6 +4999,13 @@ paths:
             type: object
         "403":
           description: MFA enrollment required
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -4876,6 +5031,11 @@ paths:
         name: X-Client-Authorization
         required: true
         type: string
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -4885,6 +5045,13 @@ paths:
             $ref: '#/definitions/auth.MeResult'
         "401":
           description: token_invalid — generic for every rejection reason
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -4915,6 +5082,11 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.AppRegisterRequest'
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -4947,6 +5119,13 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
+          schema:
+            additionalProperties:
+              type: string
+            type: object
       summary: Register an end user via application credentials
       tags:
       - AUTH
@@ -4974,6 +5153,11 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.AssignAppUserRolesRequest'
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -4995,6 +5179,13 @@ paths:
             type: object
         "404":
           description: User not found in this application
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -5096,6 +5287,11 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.ForgotPasswordRequest'
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -5114,6 +5310,13 @@ paths:
         "428":
           description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
             and retry; do NOT treat as bad credentials
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -5208,6 +5411,18 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.MFAActivateRequest'
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -5251,6 +5466,18 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.MFAEmailPendingRequest'
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -5302,6 +5529,18 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.MFAEnrollRequest'
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -5317,6 +5556,12 @@ paths:
             type: object
         "401":
           description: Invalid or expired enrollment token
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited; wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -5338,6 +5583,18 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.LoginOTPRequest'
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -5387,6 +5644,18 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.LoginOTPResendRequest'
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -5659,6 +5928,18 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.OAuthExchangeRequest'
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -5674,6 +5955,12 @@ paths:
             type: object
         "401":
           description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited; wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -6017,6 +6304,19 @@ paths:
       description: Returns PublicKeyCredentialRequestOptions with an empty allowCredentials,
         usable with either the default mediation (a "sign in with a passkey" button)
         or mediation:"conditional" (autofill).
+      parameters:
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -6026,6 +6326,12 @@ paths:
             $ref: '#/definitions/handlers.webauthnBeginResponse'
         "403":
           description: passkeys or passwordless sign-in disabled, or origin not allowed
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited; wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -6043,6 +6349,18 @@ paths:
         name: ceremony_token
         required: true
         type: string
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -6058,6 +6376,12 @@ paths:
             type: object
         "403":
           description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited; wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -6306,11 +6630,29 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.ResendVerificationRequest'
+      - description: 'Basic base64(client_id:client_secret). Optional for a backend
+          acting for its users: with it the call is limited per end user and by the
+          application quota instead of per IP. Without it, the per-IP limit applies
+          as before'
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only with valid Basic credentials, when the
+          application trusts forwarded IPs; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
         "200":
           description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited; wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -6331,6 +6673,17 @@ paths:
         required: true
         schema:
           $ref: '#/definitions/handlers.ResetPasswordRequest'
+      - description: Basic base64(client_id:client_secret). Optional; send it when
+          your backend calls this for a user, or the call is limited as an anonymous
+          browser (5/min per IP)
+        in: header
+        name: Authorization
+        type: string
+      - description: End user's IP. Used only when the application trusts forwarded
+          IPs and the client secret is valid; see /docs/reference/rate-limits
+        in: header
+        name: X-EMC-Forwarded-For
+        type: string
       produces:
       - application/json
       responses:
@@ -6342,6 +6695,13 @@ paths:
             type: object
         "400":
           description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user, app
+            or ip); wait Retry-After seconds
           schema:
             additionalProperties:
               type: string
@@ -8798,6 +9158,88 @@ paths:
       summary: Set an application's rate limit
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/server-trust:
+    get:
+      description: Returns the application's registered server IPs and whether it
+        may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppServerTrust'
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get an application's server-to-server settings
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: Registers the application backend's egress IPs (requests from them
+        skip the per-IP flood guard; the application quota and per-user limits still
+        apply) and turns forwarding of the end user's IP on or off. A forwarded IP
+        is believed only when the client secret verifies and the request comes from
+        one of the registered server IPs, so forwarding needs at least one. Omitted
+        fields are left unchanged. Changes apply on this instance immediately and
+        on others within 30 seconds. Requires apps:write.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      - description: Settings to change
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ServerTrustRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AppServerTrust'
+        "400":
+          description: Invalid address or range
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an application's server-to-server settings
+      tags:
+      - admin-rate-limits
   /api/v1/tenants/{tid}/audiences:
     get:
       description: Returns every audience registered in the tenant, with its owning
@@ -9976,9 +10418,10 @@ paths:
         in: query
         name: scope
         type: string
-      - description: Opaque value echoed back on the redirect
+      - description: Opaque value echoed back on the redirect — required unless OAUTH_REQUIRE_STATE=false
         in: query
         name: state
+        required: true
         type: string
       - description: OIDC nonce, echoed into the ID token
         in: query

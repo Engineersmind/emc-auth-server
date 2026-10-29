@@ -764,7 +764,7 @@ func (h *OAuthAuthorizeHandler) auditEvent(c echo.Context, action string, req *a
 		ResourceType:  "oauth_client",
 		ResourceID:    req.ClientID,
 		Status:        audit.StatusSuccess,
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 		Metadata:      map[string]any{"scopes": req.Scopes},
 	}

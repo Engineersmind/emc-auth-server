@@ -83,7 +83,18 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, log
 // by TokenRateLimiter, which runs ahead of this middleware.
 //
 // Requests with no Basic client_id, or a client_id that maps to no live
-// application, are passed through (the per-IP TokenRateLimiter still applies).
+// application, are passed through (the per-IP limits still apply).
+//
+// Behind AppS2S.Resolve (every application end-user route) it uses what Resolve
+// learned instead of looking the client up again:
+//
+//   - Verified credentials spend the application's quota, which is the limit an
+//     administrator sizes for the product's whole user base.
+//   - Credentials that did NOT verify spend a separate bucket
+//     ("appauth-unverified:") of the same size. The client_id is public, so
+//     without this anyone who knew it could exhaust the product's quota with
+//     bogus requests and lock out every real user — the same cross-surface DoS
+//     the "appauth:"/"app:" split prevents, one level down.
 func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
 	limiter := redis_rate.NewLimiter(redisCli)
 
@@ -92,6 +103,17 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 			clientID := tokenClientID(c)
 			if clientID == "" {
 				return next(c)
+			}
+			if caller, ok := CallerFrom(c); ok && caller.ClientID == clientID && caller.HasCredentials {
+				if caller.Verified {
+					rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
+					return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
+				}
+				tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
+				if !ok {
+					return next(c)
+				}
+				return enforceAppLimit(c, next, limiter, logger, "appauth-unverified:", tenantID, appID, rpm, burst)
 			}
 			tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
 			if !ok {
@@ -112,8 +134,11 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 	// limiter ("app:") and the pre-auth client_id limiter ("appauth:") stay
 	// distinguishable in metrics, exactly as they are in Redis.
 	limiterLabel := "app"
-	if keyPrefix == "appauth:" {
+	switch keyPrefix {
+	case "appauth:":
 		limiterLabel = "app_client"
+	case "appauth-unverified:":
+		limiterLabel = "app_client_unverified"
 	}
 
 	rateKey := keyPrefix + strconv.FormatInt(tenantID, 10) + ":" + strconv.FormatInt(appID, 10)
@@ -140,7 +165,10 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 		retryAfter := int(res.RetryAfter.Seconds())
 		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		return c.JSON(http.StatusTooManyRequests, map[string]string{
-			"error":       "rate limit exceeded for application " + strconv.FormatInt(appID, 10),
+			"error": "rate limit exceeded for application " + strconv.FormatInt(appID, 10),
+			// limiter tells an integrator which limit fired: "app" means the
+			// whole product is over its quota, unlike "user" or "ip".
+			"limiter":     "app",
 			"retry_after": strconv.Itoa(retryAfter) + "s",
 		})
 	}
@@ -153,6 +181,31 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 // string fields; anything larger is not a challenge request and does not get to
 // make the limiter allocate for it.
 const captchaBodyLimit = 8 << 10 // 8 KiB
+
+// AppCallerRateLimiter charges the application quota of the application that
+// AppS2S's resolver identified — the one whose secret verified, or, for a
+// client_id presented without a secret from that application's registered
+// server IP, that application. Anything else passes through.
+//
+// For routes where the request may name an application in more than one place
+// (a Basic header and a body client_id). Keying on what Resolve PROVED, rather
+// than on whichever client_id a header or body carries, is what stops one
+// tenant's valid credentials from spending another application's quota.
+// Mount behind BackendsOnly, after a resolver.
+func AppCallerRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
+	limiter := redis_rate.NewLimiter(redisCli)
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			caller, ok := CallerFrom(c)
+			if !ok || caller.AppID <= 0 || caller.TenantID <= 0 || !TrustedBackend(c) {
+				return next(c)
+			}
+			rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
+			return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
+		}
+	}
+}
 
 // AppClientBodyRateLimiter is AppClientRateLimiter for routes that carry
 // client_id in the JSON BODY rather than in an Authorization: Basic header.
