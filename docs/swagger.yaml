@@ -1279,6 +1279,11 @@ definitions:
     properties:
       application_id:
         type: integer
+      per_ip_limit:
+        description: |-
+          PerIPLimit is the per-IP limit, per minute, that requests from the server
+          IPs skip. Set by the admin API from configuration; 0 when unknown.
+        type: integer
       server_ips:
         items:
           $ref: '#/definitions/auth.AppServerIP'
@@ -1803,6 +1808,33 @@ definitions:
       user_id:
         type: integer
     type: object
+  auth.ServerIPSuggestion:
+    properties:
+      ip:
+        type: string
+      last_seen:
+        type: string
+      registered:
+        description: Registered is true when the address is already covered by the
+          allowlist.
+        type: boolean
+      users:
+        description: |-
+          Users is how many different users of the application signed in, registered
+          or were otherwise acted on from this address in the window.
+        type: integer
+    type: object
+  auth.ServerIPSuggestions:
+    properties:
+      min_users:
+        type: integer
+      suggestions:
+        items:
+          $ref: '#/definitions/auth.ServerIPSuggestion'
+        type: array
+      window_days:
+        type: integer
+    type: object
   auth.StoredCredential:
     properties:
       aaguid:
@@ -1986,6 +2018,17 @@ definitions:
     required:
     - email
     - password
+    type: object
+  handlers.AppUserLimits:
+    properties:
+      application_id:
+        type: integer
+      limits:
+        items:
+          $ref: '#/definitions/handlers.UserLimitView'
+        type: array
+      tenant_id:
+        type: integer
     type: object
   handlers.AssignAppUserRolesRequest:
     properties:
@@ -2926,6 +2969,43 @@ definitions:
           UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,
           which is what the rest of this API returns for timestamps.
         type: integer
+    type: object
+  handlers.UserLimitView:
+    properties:
+      default:
+        description: Default is the server-wide value, per minute.
+        type: integer
+      effective:
+        description: Effective is what the limiter enforces for this application.
+        type: integer
+      endpoints:
+        description: Endpoints are the routes the limit applies to.
+        items:
+          type: string
+        type: array
+      key:
+        description: Key names the limit in the API and in app_user_rate_limits.limits.
+        type: string
+      keyed_by:
+        description: 'KeyedBy says what one bucket is: whose requests share the allowance.'
+        type: string
+      max:
+        description: Max is the highest override accepted, per minute.
+        type: integer
+      name:
+        description: Name is the human label shown in the admin console.
+        type: string
+      override:
+        description: Override is the application's own value, or null when it uses
+          the default.
+        type: integer
+    type: object
+  handlers.UserLimitsRequest:
+    properties:
+      overrides:
+        additionalProperties:
+          type: integer
+        type: object
     type: object
   handlers.renamePasskeyRequest:
     properties:
@@ -4362,6 +4442,111 @@ paths:
       security:
       - BearerAuth: []
       summary: Set an application's server-to-server settings
+      tags:
+      - admin-rate-limits
+  /api/v1/applications/{appID}/server-trust/suggestions:
+    get:
+      description: Lists the addresses that served several different users of the
+        application recently (from the audit log, administrator actions excluded)
+        — likely the application backend's outbound addresses — and whether each is
+        already registered. Suggestions only; nothing is registered until the server
+        IPs are saved. Requires apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.ServerIPSuggestions'
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Suggest an application's server addresses
+      tags:
+      - admin-rate-limits
+  /api/v1/applications/{appID}/user-limits:
+    get:
+      description: Lists every per-user limit on the application end-user routes (sign
+        in, password reset, magic link, OTP, ...) with the server default, the application's
+        override if any, the effective value, and the highest override accepted. Requires
+        apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.AppUserLimits'
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get an application's per-user rate limits
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: 'Replaces the application''s per-user limit overrides. Each value
+        is requests per minute, between 1 and that limit''s max; a limit left out
+        returns to the server default, and {"overrides": {}} clears them all. Changes
+        apply on this instance immediately and on others within 30 seconds. Requires
+        apps:write.'
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Overrides
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UserLimitsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.AppUserLimits'
+        "400":
+          description: Unknown limit or value out of range
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an application's per-user rate limits
       tags:
       - admin-rate-limits
   /api/v1/applications/{appID}/users/{uid}/mfa:
@@ -9238,6 +9423,123 @@ paths:
       security:
       - BearerAuth: []
       summary: Set an application's server-to-server settings
+      tags:
+      - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/server-trust/suggestions:
+    get:
+      description: Lists the addresses that served several different users of the
+        application recently (from the audit log, administrator actions excluded)
+        — likely the application backend's outbound addresses — and whether each is
+        already registered. Suggestions only; nothing is registered until the server
+        IPs are saved. Requires apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.ServerIPSuggestions'
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Suggest an application's server addresses
+      tags:
+      - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/user-limits:
+    get:
+      description: Lists every per-user limit on the application end-user routes (sign
+        in, password reset, magic link, OTP, ...) with the server default, the application's
+        override if any, the effective value, and the highest override accepted. Requires
+        apps:read.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.AppUserLimits'
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Get an application's per-user rate limits
+      tags:
+      - admin-rate-limits
+    put:
+      consumes:
+      - application/json
+      description: 'Replaces the application''s per-user limit overrides. Each value
+        is requests per minute, between 1 and that limit''s max; a limit left out
+        returns to the server default, and {"overrides": {}} clears them all. Changes
+        apply on this instance immediately and on others within 30 seconds. Requires
+        apps:write.'
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Tenant ID (super_admin cross-tenant mirror)
+        in: path
+        name: tid
+        type: string
+      - description: Overrides
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UserLimitsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.AppUserLimits'
+        "400":
+          description: Unknown limit or value out of range
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Set an application's per-user rate limits
       tags:
       - admin-rate-limits
   /api/v1/tenants/{tid}/audiences:

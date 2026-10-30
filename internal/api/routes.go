@@ -656,6 +656,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	trustSvc := auth.NewAppTrustService(deps.Pool, deps.Logger)
 	stopTrustRefresh := trustSvc.Start(context.Background())
 
+	// Per-application overrides of the per-user limits, read on the request
+	// path from a snapshot refreshed like the trust settings above.
+	userLimitSvc := auth.NewAppUserLimitService(deps.Pool, deps.Logger)
+	stopUserLimitRefresh := userLimitSvc.Start(context.Background())
+
 	// Per-tenant CORS service — DB-backed, Redis-cached, 60s TTL. Slug-less
 	// requests (e.g. /auth/login) fall back to the global allow-list instead.
 	corsSvc := mw.NewTenantCORSService(deps.Pool, deps.Redis, deps.Logger).
@@ -826,8 +831,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// server IPs and the forwarded end-user IP.
 	s2s := mw.NewAppS2S(deps.Config.AppRateLimits, trustSvc, appSvc, deps.Logger).
 		WithAppLimits(appLimitSvc).
+		WithUserLimitOverrides(userLimitSvc).
 		WithRedis(deps.Redis)
 	userLimits := s2s.UserLimits()
+	adminHandler.WithUserLimits(userLimitSvc, userLimits.ByKey(), s2s.PerIPRate())
 
 	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
 	e.Use(mw.TenantCORS(corsSvc))
@@ -1864,6 +1871,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/applications/:appID/server-trust", adminHandler.SetServerTrust, appsWrite)
 	adminGroup.GET("/tenants/:tid/applications/:appID/server-trust", adminHandler.GetServerTrust, appAppsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/server-trust", adminHandler.SetServerTrust, appAppsWrite)
+	adminGroup.GET("/applications/:appID/server-trust/suggestions", adminHandler.SuggestServerIPs, appsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/server-trust/suggestions", adminHandler.SuggestServerIPs, appAppsRead)
+
+	// Per-user limit overrides (login per email, reset per user IP, ...), within
+	// the ceilings in auth.UserLimitDefs. Same guards as the two above.
+	adminGroup.GET("/applications/:appID/user-limits", adminHandler.GetUserLimits, appsRead)
+	adminGroup.PUT("/applications/:appID/user-limits", adminHandler.SetUserLimits, appsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/user-limits", adminHandler.GetUserLimits, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/user-limits", adminHandler.SetUserLimits, appAppsWrite)
 
 	// JWT signing-key management (issue #95) — tenant:manage, because rotating a
 	// signing key is a tenant-wide security operation, not an application-level one.
@@ -2053,5 +2069,6 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	return func() {
 		stopImportWorker()
 		stopTrustRefresh()
+		stopUserLimitRefresh()
 	}
 }

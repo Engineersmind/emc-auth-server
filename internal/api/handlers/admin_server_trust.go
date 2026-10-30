@@ -65,7 +65,46 @@ func (h *AdminHandler) GetServerTrust(c echo.Context) error {
 		h.logger.Error().Err(err).Msg("admin: get server trust failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to get server trust"})
 	}
+	trust.PerIPLimit = h.perIPLimit
 	return c.JSON(http.StatusOK, trust)
+}
+
+// SuggestServerIPs handles GET /api/v1/applications/:appID/server-trust/suggestions
+// and its tenant-scoped mirror.
+//
+// @Summary      Suggest an application's server addresses
+// @Description  Lists the addresses that served several different users of the application recently (from the audit log, administrator actions excluded) — likely the application backend's outbound addresses — and whether each is already registered. Suggestions only; nothing is registered until the server IPs are saved. Requires apps:read.
+// @Tags         admin-rate-limits
+// @Produce      json
+// @Security     BearerAuth
+// @Param        appID  path      string  true   "Application ID"
+// @Param        tid    path      string  false  "Tenant ID (super_admin cross-tenant mirror)"
+// @Success      200    {object}  auth.ServerIPSuggestions
+// @Failure      404    {object}  map[string]string  "Application not found"
+// @Router       /api/v1/applications/{appID}/server-trust/suggestions [get]
+// @Router       /api/v1/tenants/{tid}/applications/{appID}/server-trust/suggestions [get]
+func (h *AdminHandler) SuggestServerIPs(c echo.Context) error {
+	if h.trustSvc == nil {
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "server trust is not configured"})
+	}
+	tenantID, _, err := h.tenantFromClaimsOrPath(c)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, APIError{Error: "forbidden", Message: err.Error()})
+	}
+	appID, ok := h.applicationOwnedByTenant(c, tenantID)
+	if !ok {
+		return nil
+	}
+
+	out, err := h.trustSvc.SuggestServerIPs(c.Request().Context(), tenantID, appID)
+	if err != nil {
+		if errors.Is(err, auth.ErrAppNotFound) {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "application not found"})
+		}
+		h.logger.Error().Err(err).Msg("admin: suggest server ips failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to suggest server addresses"})
+	}
+	return c.JSON(http.StatusOK, out)
 }
 
 // SetServerTrust handles PUT /api/v1/applications/:appID/server-trust and its
@@ -131,5 +170,6 @@ func (h *AdminHandler) SetServerTrust(c echo.Context) error {
 			"trust_forwarded_ip": trust.TrustForwardedIP,
 			"server_ips":         cidrs,
 		})
+	trust.PerIPLimit = h.perIPLimit
 	return c.JSON(http.StatusOK, trust)
 }

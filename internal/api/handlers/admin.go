@@ -29,13 +29,19 @@ type AdminHandler struct {
 	appLimitSvc *auth.AppRateLimitService
 	// trustSvc backs the server-trust routes (server IPs, forwarded IP). nil
 	// makes them answer 503.
-	trustSvc  *auth.AppTrustService
-	appSvc    *auth.ApplicationService
-	totpSvc   *auth.TOTPService
-	senderSvc *auth.EmailSenderService
-	tmplSvc   *auth.EmailTemplateService
-	mailer    mailer.Mailer
-	corsSvc   *mw.TenantCORSService
+	trustSvc *auth.AppTrustService
+	// userLimitSvc backs the per-user limit routes; userLimitDefaults are the
+	// server-wide values an override replaces. nil makes the routes answer 503.
+	userLimitSvc      *auth.AppUserLimitService
+	userLimitDefaults map[string]int
+	// perIPLimit is reported with the server-trust settings.
+	perIPLimit int
+	appSvc     *auth.ApplicationService
+	totpSvc    *auth.TOTPService
+	senderSvc  *auth.EmailSenderService
+	tmplSvc    *auth.EmailTemplateService
+	mailer     mailer.Mailer
+	corsSvc    *mw.TenantCORSService
 	// webauthnSvc backs the passkey policy and admin credential handlers. nil
 	// when WEBAUTHN_RP_ID is unset, which makes those routes answer 501 rather
 	// than panicking — the same shape as the other optional services here.

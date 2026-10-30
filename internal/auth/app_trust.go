@@ -82,10 +82,13 @@ type AppServerIPInput struct {
 // AppServerTrust is an application's server-to-server settings, as the admin API
 // reads and writes them.
 type AppServerTrust struct {
-	ApplicationID    int64         `json:"application_id"`
-	TenantID         int64         `json:"tenant_id"`
-	TrustForwardedIP bool          `json:"trust_forwarded_ip"`
-	ServerIPs        []AppServerIP `json:"server_ips"`
+	ApplicationID    int64 `json:"application_id"`
+	TenantID         int64 `json:"tenant_id"`
+	TrustForwardedIP bool  `json:"trust_forwarded_ip"`
+	// PerIPLimit is the per-IP limit, per minute, that requests from the server
+	// IPs skip. Set by the admin API from configuration; 0 when unknown.
+	PerIPLimit int           `json:"per_ip_limit,omitempty"`
+	ServerIPs  []AppServerIP `json:"server_ips"`
 }
 
 // ServerTrust is the request-path view of one application's settings.
@@ -322,6 +325,101 @@ func (s *AppTrustService) SetServerTrust(
 		s.logger.Warn().Err(err).Msg("app trust: reload after update failed — change applies at the next refresh")
 	}
 	return s.GetServerTrust(ctx, tenantID, applicationID)
+}
+
+// Server address suggestions.
+//
+// An integrator rarely knows their backend's outbound address offhand. The
+// audit log already records the address each of this application's requests
+// came from — the same c.RealIP() the allowlist is matched against — so the
+// addresses that served several different users are listed as likely servers.
+// A person's own address serves one user; a server serves many. A shared office
+// network can look the same, which is why these are suggestions an
+// administrator confirms, never added automatically.
+const (
+	ServerIPSuggestionWindowDays = 7
+	ServerIPSuggestionMinUsers   = 3
+	maxServerIPSuggestions       = 5
+)
+
+// ServerIPSuggestion is one address this application's users were seen from.
+type ServerIPSuggestion struct {
+	IP string `json:"ip"`
+	// Users is how many different users of the application signed in, registered
+	// or were otherwise acted on from this address in the window.
+	Users    int       `json:"users"`
+	LastSeen time.Time `json:"last_seen"`
+	// Registered is true when the address is already covered by the allowlist.
+	Registered bool `json:"registered"`
+}
+
+// ServerIPSuggestions is the response of the suggestions route. The criteria are
+// returned with the list so the console can state them rather than repeat them.
+type ServerIPSuggestions struct {
+	WindowDays  int                  `json:"window_days"`
+	MinUsers    int                  `json:"min_users"`
+	Suggestions []ServerIPSuggestion `json:"suggestions"`
+}
+
+// SuggestServerIPs lists the addresses that served at least
+// ServerIPSuggestionMinUsers different users of the application in the last
+// ServerIPSuggestionWindowDays days, most users first. Administrator actions are
+// excluded: an admin's address is not the application's backend. When the
+// application forwards its users' IPs those are what the log holds, and they
+// rarely reach the threshold — the suggestions matter before forwarding is set
+// up, which is exactly when the server address is being registered.
+// ErrAppNotFound when the application does not exist in the tenant.
+func (s *AppTrustService) SuggestServerIPs(ctx context.Context, tenantID, applicationID int64) (*ServerIPSuggestions, error) {
+	trust, err := s.GetServerTrust(ctx, tenantID, applicationID)
+	if err != nil {
+		return nil, err
+	}
+	var prefixes []netip.Prefix
+	for _, ip := range trust.ServerIPs {
+		if p, err := netip.ParsePrefix(ip.CIDR); err == nil {
+			prefixes = append(prefixes, p.Masked())
+		}
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT host(ip_address), COUNT(DISTINCT user_id)::int, MAX(created_at)
+		FROM audit_logs
+		WHERE application_id = $1 AND tenant_id = $2
+		  AND created_at > NOW() - make_interval(days => $3)
+		  AND ip_address IS NOT NULL AND user_id IS NOT NULL
+		  AND action NOT LIKE 'admin.%'
+		GROUP BY ip_address
+		HAVING COUNT(DISTINCT user_id) >= $4
+		ORDER BY 2 DESC, 3 DESC
+		LIMIT $5
+	`, applicationID, tenantID, ServerIPSuggestionWindowDays, ServerIPSuggestionMinUsers, maxServerIPSuggestions)
+	if err != nil {
+		return nil, fmt.Errorf("suggest server ips: %w", err)
+	}
+	defer rows.Close()
+
+	out := &ServerIPSuggestions{
+		WindowDays:  ServerIPSuggestionWindowDays,
+		MinUsers:    ServerIPSuggestionMinUsers,
+		Suggestions: []ServerIPSuggestion{},
+	}
+	for rows.Next() {
+		var sg ServerIPSuggestion
+		if err := rows.Scan(&sg.IP, &sg.Users, &sg.LastSeen); err != nil {
+			return nil, fmt.Errorf("scan server ip suggestion: %w", err)
+		}
+		if addr, err := netip.ParseAddr(sg.IP); err == nil {
+			addr = addr.Unmap()
+			for _, p := range prefixes {
+				if p.Contains(addr) {
+					sg.Registered = true
+					break
+				}
+			}
+		}
+		out.Suggestions = append(out.Suggestions, sg)
+	}
+	return out, rows.Err()
 }
 
 // NormalizeServerIPs validates and canonicalises an allowlist: bare addresses

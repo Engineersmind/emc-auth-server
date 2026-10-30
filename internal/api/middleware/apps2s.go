@@ -231,6 +231,7 @@ type AppS2S struct {
 	trust     ServerTrustLookup
 	clients   ClientAuthenticator
 	limits    AppLimitLookup
+	overrides UserLimitOverrides
 	verified  *verifiedClientCache
 	knownGood *knownGoodAddrs
 	logger    zerolog.Logger
@@ -255,6 +256,74 @@ type AppLimitLookup interface {
 func (s *AppS2S) WithAppLimits(l AppLimitLookup) *AppS2S {
 	s.limits = l
 	return s
+}
+
+// UserLimitOverrides returns an application's override of one per-user limit
+// (auth.AppUserLimitService). Must not touch the database: it runs on every
+// limited request.
+type UserLimitOverrides interface {
+	UserLimitOverride(applicationID int64, key string) (perMinute int, ok bool)
+}
+
+// WithUserLimitOverrides lets administrators size the per-user limits per
+// application. Without it every application uses the configured defaults.
+func (s *AppS2S) WithUserLimitOverrides(o UserLimitOverrides) *AppS2S {
+	s.overrides = o
+	return s
+}
+
+// userLimitKeys maps each per-user limiter label used in routes.go to its
+// auth.UserLimitDefs key, so an override reaches the limiter it names. The
+// per-application half of GuessLimit (label+"_app") is deliberately absent:
+// it bounds a backend that does not forward IPs, not one user.
+var userLimitKeys = map[string]string{
+	"app_register_user":            auth.UserLimitRegister,
+	"app_login_user":               auth.UserLimitLogin,
+	"app_magic_link_user":          auth.UserLimitMagicLink,
+	"app_magic_link_verify_user":   auth.UserLimitMagicLinkVerify,
+	"app_forgot_password_user":     auth.UserLimitForgotPassword,
+	"app_reset_password_user":      auth.UserLimitResetPassword,
+	"app_roles_user":               auth.UserLimitRoles,
+	"app_me_user":                  auth.UserLimitMe,
+	"app_mfa_challenge_user":       auth.UserLimitMFAChallenge,
+	"app_oauth_exchange_user":      auth.UserLimitOAuthExchange,
+	"app_passkey_login_user":       auth.UserLimitPasskeyLogin,
+	"app_resend_verification_user": auth.UserLimitResendVerification,
+}
+
+// ByKey returns the limits keyed like auth.UserLimitDefs, for the admin API to
+// show the defaults an override replaces.
+func (u AppUserLimits) ByKey() map[string]int {
+	return map[string]int{
+		auth.UserLimitRegister:           u.Register,
+		auth.UserLimitLogin:              u.Login,
+		auth.UserLimitMagicLink:          u.MagicLink,
+		auth.UserLimitMagicLinkVerify:    u.MagicLinkVerify,
+		auth.UserLimitForgotPassword:     u.ForgotPassword,
+		auth.UserLimitResetPassword:      u.ResetPassword,
+		auth.UserLimitRoles:              u.Roles,
+		auth.UserLimitMe:                 u.Me,
+		auth.UserLimitMFAChallenge:       u.MFAChallenge,
+		auth.UserLimitOAuthExchange:      u.OAuthExchange,
+		auth.UserLimitPasskeyLogin:       u.PasskeyLogin,
+		auth.UserLimitResendVerification: u.ResendVerification,
+	}
+}
+
+// userRate is the per-minute rate for label on this caller's application: its
+// override when one is set, otherwise def.
+func (s *AppS2S) userRate(label string, caller *AppCaller, def int) (rate int, overridden bool) {
+	if s.overrides == nil || caller.AppID <= 0 {
+		return def, false
+	}
+	key, ok := userLimitKeys[label]
+	if !ok {
+		return def, false
+	}
+	if v, ok := s.overrides.UserLimitOverride(caller.AppID, key); ok && v > 0 {
+		return v, true
+	}
+	return def, false
 }
 
 // appRPM is the caller's application quota, or 0 when unknown.
@@ -360,6 +429,10 @@ func NewAppS2S(cfg AppS2SConfig, trust ServerTrustLookup, clients ClientAuthenti
 
 // UserLimits returns the effective per-user limits after defaults.
 func (s *AppS2S) UserLimits() AppUserLimits { return s.cfg.Users }
+
+// PerIPRate is the per-IP flood guard that registered server addresses skip,
+// per minute, for the admin API to report the configured value.
+func (s *AppS2S) PerIPRate() int { return s.cfg.PerIPRate }
 
 // Surfaces name the groups of routes that share one strict per-IP bucket for
 // anonymous and unverified callers. They are the two groups the limiters this
@@ -946,12 +1019,19 @@ func (s *AppS2S) subjectLimit(label string, perMinute int, subject SubjectFunc, 
 			}
 			sum := sha256.Sum256([]byte(client + "\x00" + sub))
 			key := label + ":" + client + ":" + hex.EncodeToString(sum[:16])
+			rate, overridden := s.userRate(label, caller, perMinute)
+			if overridden {
+				// An in-process bucket keeps the rate it was created with, so an
+				// overridden rate gets its own bucket; a change takes effect at
+				// once in both modes.
+				key += ":r" + strconv.Itoa(rate)
+			}
 
-			if !allowVia(c.Request().Context(), appUserStore, label, key, perMinute) {
+			if !allowVia(c.Request().Context(), appUserStore, label, key, rate) {
 				metrics.RateLimitHits.WithLabelValues(label).Inc()
 				h := c.Response().Header()
 				h.Set("Retry-After", "60")
-				h.Set("X-RateLimit-Limit", strconv.Itoa(perMinute))
+				h.Set("X-RateLimit-Limit", strconv.Itoa(rate))
 				h.Set("X-RateLimit-Remaining", "0")
 				msg := "too many requests for this user — try again later"
 				if limiterName == "app" {

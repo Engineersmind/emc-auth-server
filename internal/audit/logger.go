@@ -103,6 +103,8 @@ const (
 
 	// Admin — application server-to-server trust (server IPs, forwarded IP)
 	ActionAdminAppServerTrustUpdated = "admin.app_server_trust_updated"
+	// Admin — application per-user rate limit overrides
+	ActionAdminAppUserLimitsUpdated = "admin.app_user_limits_updated"
 
 	// Admin — tenant CORS configuration
 	ActionAdminCORSUpdated = "admin.cors_origins_updated"

@@ -83,6 +83,7 @@ type s2sResult struct {
 	caller    *middleware.AppCaller
 	endUserIP string
 	ctxIP     string
+	header    http.Header
 }
 
 func runS2S(t *testing.T, chain []echo.MiddlewareFunc, r s2sReq) s2sResult {
@@ -125,6 +126,7 @@ func runS2S(t *testing.T, chain []echo.MiddlewareFunc, r s2sReq) s2sResult {
 	}
 	_ = h(c)
 	res.code = rec.Code
+	res.header = rec.Header()
 	_ = json.Unmarshal(rec.Body.Bytes(), &res.body)
 	return res
 }

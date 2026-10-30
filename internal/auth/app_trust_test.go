@@ -206,3 +206,94 @@ func TestAppTrustService_SetGetLookup(t *testing.T) {
 		t.Fatal("a suspended application must leave the snapshot")
 	}
 }
+
+// Server address suggestions come from the audit log: addresses that served
+// several different users of the application, administrator actions excluded,
+// flagged when already registered.
+func TestAppTrustService_SuggestServerIPs(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+	ctx := context.Background()
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	app, err := auth.NewApplicationService(pool, logger).CreateApplication(ctx, tenantID,
+		fmt.Sprintf("s2s-suggest-%d", time.Now().UnixNano()), "web", nil)
+	if err != nil {
+		t.Fatalf("CreateApplication: %v", err)
+	}
+	appID, _ := strconv.ParseInt(app.ID, 10, 64)
+
+	stamp := time.Now().UnixNano()
+	var userIDs []int64
+	for i := 0; i < 4; i++ {
+		var id int64
+		if err := pool.QueryRow(ctx, `INSERT INTO users (tenant_id, application_id, email) VALUES ($1, $2, $3) RETURNING id`,
+			tenantID, appID, fmt.Sprintf("suggest-%d-%d@example.test", stamp, i)).Scan(&id); err != nil {
+			t.Fatalf("insert user: %v", err)
+		}
+		userIDs = append(userIDs, id)
+	}
+	t.Cleanup(func() {
+		bg := context.Background()
+		_, _ = pool.Exec(bg, `DELETE FROM audit_logs WHERE application_id = $1`, appID)
+		_, _ = pool.Exec(bg, `DELETE FROM users WHERE application_id = $1`, appID)
+		_, _ = pool.Exec(bg, `DELETE FROM oauth_clients WHERE id = $1`, appID)
+	})
+	event := func(action, ip string, userID int64, age time.Duration) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO audit_logs (tenant_id, application_id, user_id, action, ip_address, created_at)
+			VALUES ($1, $2, $3, $4, $5::inet, NOW() - $6::interval)
+		`, tenantID, appID, userID, action, ip, fmt.Sprintf("%d seconds", int(age.Seconds()))); err != nil {
+			t.Fatalf("insert audit event: %v", err)
+		}
+	}
+
+	// The backend: 4 users, 2 events each.
+	for _, u := range userIDs {
+		event("auth.login", "203.0.113.10", u, time.Hour)
+		event("auth.login", "203.0.113.10", u, 2*time.Hour)
+	}
+	// A person at home: one user only.
+	event("auth.login", "198.51.100.7", userIDs[0], time.Hour)
+	// An administrator's office: many "users", but admin actions.
+	for _, u := range userIDs {
+		event("admin.app_updated", "192.0.2.50", u, time.Hour)
+	}
+	// An old server, outside the window.
+	for _, u := range userIDs {
+		event("auth.login", "203.0.113.99", u, 10*24*time.Hour)
+	}
+
+	svc := auth.NewAppTrustService(pool, logger)
+	got, err := svc.SuggestServerIPs(ctx, tenantID, appID)
+	if err != nil {
+		t.Fatalf("SuggestServerIPs: %v", err)
+	}
+	if got.WindowDays != auth.ServerIPSuggestionWindowDays || got.MinUsers != auth.ServerIPSuggestionMinUsers {
+		t.Fatalf("criteria: %+v", got)
+	}
+	if len(got.Suggestions) != 1 || got.Suggestions[0].IP != "203.0.113.10" || got.Suggestions[0].Users != 4 || got.Suggestions[0].Registered {
+		t.Fatalf("suggestions: %+v, want only 203.0.113.10 with 4 users, not registered", got.Suggestions)
+	}
+
+	// Registering a range that covers it flags it.
+	ips := []auth.AppServerIPInput{{CIDR: "203.0.113.0/28"}}
+	if _, err := svc.SetServerTrust(ctx, tenantID, appID, nil, &ips); err != nil {
+		t.Fatalf("SetServerTrust: %v", err)
+	}
+	got, err = svc.SuggestServerIPs(ctx, tenantID, appID)
+	if err != nil || len(got.Suggestions) != 1 || !got.Suggestions[0].Registered {
+		t.Fatalf("after registering: %+v, %v", got, err)
+	}
+
+	// Another tenant learns nothing.
+	if _, err := svc.SuggestServerIPs(ctx, tenantID+100000, appID); !errors.Is(err, auth.ErrAppNotFound) {
+		t.Fatalf("cross-tenant: want ErrAppNotFound, got %v", err)
+	}
+}
