@@ -234,15 +234,27 @@ func TestLiveIntegrationRateLimits(t *testing.T) {
 		return send(http.MethodPost, "/api/v1/auth/resend-verification", "203.0.113.24", basic(big, big.ClientSecret),
 			fmt.Sprintf(`{"email":%q}`, email(big.ID, i)))
 	})
-	run("change-email: 2 signed-in users x 5, one backend IP", 0, 10, func(i int) int {
+	changeEmail := func(i int, ip string, withClient bool) int {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/change-email",
 			strings.NewReader(fmt.Sprintf(`{"new_email":"moved-%d-%d@example.test"}`, i, time.Now().UnixNano())))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set(echo.HeaderAuthorization, "Bearer "+accessTokens[i%2])
-		req.RemoteAddr = "203.0.113.25:40000"
+		if withClient {
+			req.Header.Set("X-Client-Authorization", basic(big, big.ClientSecret))
+		}
+		req.RemoteAddr = ip + ":40000"
 		rec := httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
 		return rec.Code
+	}
+	// Without application credentials change-email keeps master's 5/min per IP
+	// (code review: one address holding many accounts must not multiply the
+	// mail it sends), so 5 of 10 limited is exactly today's behaviour.
+	run("change-email: 2 signed-in users x 5, one IP, no client credentials (= master)", 5, 10, func(i int) int {
+		return changeEmail(i, "203.0.113.25", false)
+	})
+	run("change-email: 2 signed-in users x 5, one backend IP, X-Client-Authorization", 0, 10, func(i int) int {
+		return changeEmail(i, "203.0.113.28", true)
 	})
 	run("OIDC client: 150 /oauth/token calls (old fixed cap 120)", 0, 150, func(int) int {
 		req := httptest.NewRequest(http.MethodPost, "/oauth/token", strings.NewReader("grant_type=refresh_token&refresh_token=not-a-token"))

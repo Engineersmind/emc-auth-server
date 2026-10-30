@@ -1658,10 +1658,20 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "new_password is required"})
 	}
 
-	err := h.resetSvc.ResetPassword(c.Request().Context(), auth.ResetPasswordInput{
+	in := auth.ResetPasswordInput{
 		RawToken:    req.Token,
 		NewPassword: req.NewPassword,
-	})
+	}
+	// An application's backend may only redeem its own users' tokens. Its
+	// limits on this route are per application (higher than the per-IP limit a
+	// browser gets), so without this scope a tenant holding valid credentials
+	// could spend them guessing OTHER tenants' tokens. Callers that are not a
+	// proven backend stay unscoped, exactly as before.
+	if caller, ok := mw.CallerFrom(c); ok && caller.AppID > 0 && mw.TrustedBackend(c) {
+		appID := caller.AppID
+		in.ScopeTenantID, in.ScopeApplicationID = caller.TenantID, &appID
+	}
+	err := h.resetSvc.ResetPassword(c.Request().Context(), in)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidResetToken) {
 			return fail(c, http.StatusBadRequest, "reset_link_invalid")

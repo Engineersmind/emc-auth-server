@@ -447,8 +447,13 @@ func (s *AppS2S) ResolveOptional(surface string) echo.MiddlewareFunc {
 // different application.
 func (s *AppS2S) ResolveOptionalBodyClient(surface string) echo.MiddlewareFunc {
 	return s.resolve(surface, resolveMode{optional: true}, func(c echo.Context) (string, string, bool) {
+		// Header credentials count only when the body names the SAME
+		// application. An absent or unreadable body client_id is a mismatch,
+		// not a pass: whatever the limiter could not read, the handler still
+		// might, and it would then act for an application these credentials
+		// do not belong to.
 		bodyID := clientIDFromBody(c)
-		if id, secret, ok := headerCredentials(c); ok && (bodyID == "" || bodyID == id) {
+		if id, secret, ok := headerCredentials(c); ok && bodyID != "" && bodyID == id {
 			return id, secret, true
 		}
 		return bodyID, "", false
@@ -874,6 +879,49 @@ type SubjectFunc func(c echo.Context, caller *AppCaller) (subject string, apply 
 //
 // Keys are hashed, so email addresses never appear in Redis.
 func (s *AppS2S) UserLimit(label string, perMinute int, subject SubjectFunc) echo.MiddlewareFunc {
+	return s.subjectLimit(label, perMinute, subject, "user")
+}
+
+// unforwardedGuessPerApp is the per-application budget GuessLimit gives a
+// proven backend that does not forward its users' addresses: the rate the
+// legacy OAuth token limiter allowed one client.
+const unforwardedGuessPerApp = OAuthTokenPerClientRate
+
+// GuessLimit bounds a route that redeems a one-time token or code
+// (/reset-password, magic-link verify, /auth/oauth/exchange), where the limit
+// is what bounds guessing. A per-token key would be useless: every guess is a
+// new token.
+//
+//   - Backend forwarding its users' IPs: perUser per end-user IP.
+//   - Proven backend NOT forwarding: one bucket for the whole application at
+//     unforwardedGuessPerApp. Without it such a backend — which skips the
+//     per-IP limits — would be bounded by nothing but its quota. Sized per
+//     application rather than at the per-user rate, or every user of a
+//     product that does not forward IPs would share one user's allowance.
+//     Safe at that size because a backend can only redeem its own
+//     application's tokens: login codes are bound to the client_id, magic
+//     links to the application, and reset tokens are scoped to the caller's
+//     tenant and application.
+//   - Anyone else: nothing here; the per-IP limits in the resolver and the
+//     legacy limiter apply exactly as before.
+func (s *AppS2S) GuessLimit(label string, perUser int) echo.MiddlewareFunc {
+	perUserIP := s.subjectLimit(label, perUser, SubjectEndUserIP, "user")
+	perApp := s.subjectLimit(label+"_app", unforwardedGuessPerApp, subjectUnforwardedBackend, "app")
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return perUserIP(perApp(next))
+	}
+}
+
+// subjectUnforwardedBackend is one subject per application, for a proven
+// backend whose users' addresses are not forwarded.
+func subjectUnforwardedBackend(c echo.Context, caller *AppCaller) (string, bool) {
+	if caller.Forwarded || !TrustedBackend(c) {
+		return "", false
+	}
+	return "unforwarded", true
+}
+
+func (s *AppS2S) subjectLimit(label string, perMinute int, subject SubjectFunc, limiterName string) echo.MiddlewareFunc {
 	if perMinute <= 0 {
 		perMinute = DefaultAppUserLimits().Login
 	}
@@ -905,9 +953,13 @@ func (s *AppS2S) UserLimit(label string, perMinute int, subject SubjectFunc) ech
 				h.Set("Retry-After", "60")
 				h.Set("X-RateLimit-Limit", strconv.Itoa(perMinute))
 				h.Set("X-RateLimit-Remaining", "0")
+				msg := "too many requests for this user — try again later"
+				if limiterName == "app" {
+					msg = "too many requests for this application — try again later"
+				}
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
-					"error":       "too many requests for this user — try again later",
-					"limiter":     "user",
+					"error":       msg,
+					"limiter":     limiterName,
 					"retry_after": "60",
 				})
 			}
@@ -947,24 +999,24 @@ func SubjectEndUserIP(_ echo.Context, caller *AppCaller) (string, bool) {
 	return "ip:" + caller.EndUserIP, true
 }
 
-// SubjectGuessBudget is SubjectEndUserIP for routes that redeem a one-time
-// token (/reset-password, magic-link verify), where the limit is what bounds
-// guessing.
+// SubjectEmailAndUserIP is SubjectEmail for sign-in, where the per-user limit
+// is also a lockout an attacker can trigger.
 //
-// A verified backend that does not forward its users' addresses is otherwise
-// bounded only by its quota there — far above the 5/min per IP those routes
-// had. It gets one bucket for the whole application instead, at the same
-// per-user rate: never below what one backend IP had before, and no longer a
-// way to guess tokens faster just by holding valid credentials. Forwarding the
-// user's IP restores a bucket per user.
-func SubjectGuessBudget(c echo.Context, caller *AppCaller) (string, bool) {
-	if sub, ok := SubjectEndUserIP(c, caller); ok {
-		return sub, true
+// Keyed on the email alone, anyone could keep a user locked out by submitting
+// five wrong passwords a minute through the product's own sign-in form: the
+// backend forwards them all into the victim's bucket. When the backend vouches
+// for the user's address (Forwarded), the bucket is email + that address, as
+// Auth0's brute-force protection keys it: an attacker exhausts only their own
+// pair and the real user signs in from theirs. Guessing one account across
+// many addresses is still bounded by the account lockout and the captcha.
+// Without a forwarded address there is nothing to tell the two apart, so the
+// email alone is the key.
+func SubjectEmailAndUserIP(c echo.Context, caller *AppCaller) (string, bool) {
+	email, _ := SubjectEmail(c, caller)
+	if caller.Forwarded {
+		return email + "|ip:" + caller.EndUserIP, true
 	}
-	if caller.Verified {
-		return "unforwarded", true
-	}
-	return "", false
+	return email, true
 }
 
 // SubjectBearerUser keys on the user in the access token, read WITHOUT verifying
@@ -1020,29 +1072,61 @@ func SubjectBearerUser(c echo.Context, _ *AppCaller) (string, bool) {
 // acted on the victim. Decoding into a one-field struct tagged with the same
 // name gives identical matching, duplicate and trailing-data behaviour.
 func peekBodyString(c echo.Context, field string) string {
-	req := c.Request()
-	if req.Body == nil {
-		return ""
-	}
-	data, err := io.ReadAll(io.LimitReader(req.Body, 1<<16))
-	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(data))
-	if err != nil || len(data) == 0 {
-		return ""
-	}
-	holder := reflect.New(reflect.StructOf([]reflect.StructField{{
-		Name: "V",
-		Type: reflect.TypeOf(""),
-		Tag:  reflect.StructTag(`json:"` + field + `"`),
-	}}))
-	if json.NewDecoder(bytes.NewReader(data)).Decode(holder.Interface()) != nil {
-		return ""
-	}
-	v := holder.Elem().Field(0).String()
+	v := peekBodyField(c, field, 1<<16)
 	if len(v) > maxRateLimitEmailLen {
 		v = v[:maxRateLimitEmailLen]
 	}
 	return v
+}
+
+// peekBodyField is the one body reader every limiter in this package uses.
+//
+// One reader, because two that disagree are a bypass: a json.Unmarshal-based
+// one failed on trailing data that the handler's json.Decoder ignores, so a
+// body like `{"client_id":"A"} junk` read as "no client_id" to the limiter and
+// as client A to the handler.
+//
+// It reads at most limit bytes to decode, but puts back the WHOLE body —
+// the decoded prefix followed by whatever was not read — so a larger body is
+// never silently truncated for the handler.
+func peekBodyField(c echo.Context, field string, limit int64) string {
+	req := c.Request()
+	if req.Body == nil {
+		return ""
+	}
+	orig := req.Body
+	prefix, err := io.ReadAll(io.LimitReader(orig, limit))
+	req.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(prefix), orig), orig}
+	if err != nil || len(prefix) == 0 {
+		return ""
+	}
+	holder := reflect.New(bodyFieldType(field))
+	if json.NewDecoder(bytes.NewReader(prefix)).Decode(holder.Interface()) != nil {
+		return ""
+	}
+	return holder.Elem().Field(0).String()
+}
+
+// bodyFieldTypes caches the one-field struct types peekBodyField decodes into,
+// keyed by JSON field name; there are only a handful of field names.
+var bodyFieldTypes sync.Map
+
+func bodyFieldType(field string) reflect.Type {
+	if v, ok := bodyFieldTypes.Load(field); ok {
+		if t, ok := v.(reflect.Type); ok {
+			return t
+		}
+	}
+	t := reflect.StructOf([]reflect.StructField{{
+		Name: "V",
+		Type: reflect.TypeOf(""),
+		Tag:  reflect.StructTag(`json:"` + field + `"`),
+	}})
+	bodyFieldTypes.Store(field, t) // racing stores write equivalent types
+	return t
 }
 
 // basicCredentials parses "Basic base64(id:secret)".

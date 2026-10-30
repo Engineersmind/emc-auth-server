@@ -1,9 +1,6 @@
 package middleware
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -274,24 +271,8 @@ func AppClientBodyRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.C
 // JSON, or no client_id field. Every one of those means "no per-client bucket
 // applies", never "reject".
 func clientIDFromBody(c echo.Context) string {
-	req := c.Request()
-	if req.Body == nil {
-		return ""
-	}
-	raw, err := io.ReadAll(io.LimitReader(req.Body, captchaBodyLimit))
-	// Restore unconditionally, including on a read error: the handler must get
-	// whatever was readable rather than an already-consumed body.
-	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(raw))
-	if err != nil || len(raw) == 0 {
-		return ""
-	}
-
-	var probe struct {
-		ClientID string `json:"client_id"`
-	}
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return ""
-	}
-	return probe.ClientID
+	// The shared reader (peekBodyField): decodes exactly as the handlers'
+	// Bind does, so the limiter and the handler can never see different
+	// client_ids, and the full body is put back.
+	return peekBodyField(c, "client_id", captchaBodyLimit)
 }

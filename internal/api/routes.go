@@ -934,10 +934,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// guess, so a per-token bucket could never fill: the meaningful key is who
 	// is guessing. A browser calling directly carries no credentials and gets
 	// the AUTH-07 5/min per IP in Resolve; a backend calling for its users is
-	// limited per forwarded end-user IP.
+	// limited per forwarded end-user IP, or per application when it does not
+	// forward (GuessLimit). A backend's reset only redeems its own
+	// application's tokens.
 	authGroup.POST("/reset-password", authHandler.ResetPassword,
 		s2s.Resolve(mw.SurfaceReset), appClientRateLimit,
-		s2s.UserLimit("app_reset_password_user", userLimits.ResetPassword, mw.SubjectGuessBudget))
+		s2s.GuessLimit("app_reset_password_user", userLimits.ResetPassword))
 
 	// Email verification — link is clicked (GET) from the email; resend is
 	// rate-limited and enumeration-safe (tenant via X-Tenant-Slug).
@@ -1005,7 +1007,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		s2s.UserLimit("app_register_user", userLimits.Register, mw.SubjectEmail))
 	authGroup.POST("/apps/login", authHandler.AppLogin,
 		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
-		s2s.UserLimit("app_login_user", userLimits.Login, mw.SubjectEmail))
+		s2s.UserLimit("app_login_user", userLimits.Login, mw.SubjectEmailAndUserIP))
 
 	// Attach roles to one of the application's own users after registration
 	// (#146). Sits beside /apps/register and /apps/login because it shares their
@@ -1034,7 +1036,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		s2s.UserLimit("app_magic_link_user", userLimits.MagicLink, mw.SubjectEmail))
 	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify,
 		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
-		s2s.UserLimit("app_magic_link_verify_user", userLimits.MagicLinkVerify, mw.SubjectGuessBudget))
+		s2s.GuessLimit("app_magic_link_verify_user", userLimits.MagicLinkVerify))
 
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates
@@ -1143,11 +1145,18 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// Self-service email change — authenticated: the user must prove who they are
 	// to start it, and prove control of the new inbox to finish it (the GET
 	// confirm route above). Rate-limited so the confirmation mail cannot be used
-	// to spam an arbitrary address. Per signed-in user rather than per IP: a
-	// backend calling it for its users shares one IP, and one person never had
-	// more than 5/min either way.
+	// to spam an arbitrary address.
+	//
+	// Everyone keeps TokenRateLimiter's 5/min per IP — keyed per user alone, one
+	// address holding many accounts could send that many times the mail. A
+	// backend acting for its users opts in with its application credentials in
+	// X-Client-Authorization (Authorization carries the user's token): once
+	// verified it skips the per-IP limit, which its users all share, and is
+	// limited per signed-in user instead.
 	authGroup.POST("/change-email", authHandler.ChangeEmail, jwtRenew, appRateLimit,
-		mw.SignedInUserRateLimiter("change_email_user", rlCfg.PerIPRate))
+		s2s.ResolveOptional(mw.SurfaceAccount),
+		mw.BackendsOnly(mw.SignedInUserRateLimiter("change_email_user", rlCfg.PerIPRate)),
+		mw.TokenRateLimiter(rlCfg))
 
 	// TOTP management — protected (03-01)
 	// The caller's MFA state across every method, including whether it is
@@ -1991,11 +2000,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// social sign-in of a product at 5/min. A trusted backend — Basic
 	// credentials that verify, or the body client_id from that application's
 	// registered server IP — skips the per-IP bucket and is limited per
-	// forwarded end-user IP and by its quota. Everyone else: unchanged.
+	// forwarded end-user IP (or per application when it does not forward) and
+	// by its quota; login codes are bound to the client_id. Everyone else:
+	// unchanged.
 	authGroup.POST("/oauth/exchange", oauthHandler.Exchange,
 		s2s.ResolveOptionalBodyClient(mw.SurfaceOAuth),
 		mw.BackendsOnly(appCallerRateLimit),
-		mw.BackendsOnly(s2s.UserLimit("app_oauth_exchange_user", userLimits.OAuthExchange, mw.SubjectEndUserIP)),
+		mw.BackendsOnly(s2s.GuessLimit("app_oauth_exchange_user", userLimits.OAuthExchange)),
 		mw.OAuthRateLimiter(rlCfg))
 
 	// Identity provider (social login) admin config — apps:read / apps:write.

@@ -132,16 +132,24 @@ func TestReview5_AnonymousResendHasNoPerEmailBucket(t *testing.T) {
 // budget for the whole application on token-redeeming routes.
 func TestReview6_GuessBudgetWithoutForwarding(t *testing.T) {
 	s, _ := newS2S(middleware.AppS2SConfig{}, trustWith([]string{backendIP + "/32"}, true))
-	limit := s.UserLimits().ResetPassword
+	perUser := s.UserLimits().ResetPassword
+	limit := middleware.OAuthTokenPerClientRate // one budget for the application
 	chain := []echo.MiddlewareFunc{
 		s.Resolve(middleware.SurfaceReset),
-		s.UserLimit("app_reset_password_user", limit, middleware.SubjectGuessBudget),
+		s.GuessLimit("app_reset_password_user", perUser),
 	}
+	// Sized for the application, not one user: many users' resets fit.
 	for i := 0; i < limit; i++ {
-		runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, body: `{"token":"t"}`})
+		if res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, body: `{"token":"t"}`}); res.code != http.StatusOK {
+			t.Fatalf("unforwarded reset %d of %d: got %d, want 200", i+1, limit, res.code)
+		}
 	}
-	if res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, body: `{"token":"t"}`}); res.code != http.StatusTooManyRequests {
+	res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, body: `{"token":"t"}`})
+	if res.code != http.StatusTooManyRequests {
 		t.Fatalf("unforwarded guess %d: got %d, want 429", limit+1, res.code)
+	}
+	if res.body["limiter"] != "app" {
+		t.Fatalf("429 must name the application limiter, got %v", res.body)
 	}
 	// Forwarding restores a budget per user.
 	if res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, forwarded: "49.36.1.7", body: `{"token":"t"}`}); res.code != http.StatusOK {

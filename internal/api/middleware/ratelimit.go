@@ -3,7 +3,6 @@ package middleware
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net"
@@ -612,41 +611,15 @@ const ClientAuthHeader = "X-Client-Authorization"
 // basicClientID extracts the client_id from a "Basic base64(id:secret)" header
 // value, or "" if the value is absent, not Basic, or malformed.
 func basicClientID(header string) string {
-	if !strings.HasPrefix(header, "Basic ") {
-		return ""
-	}
-	decoded, err := base64.StdEncoding.DecodeString(header[len("Basic "):])
-	if err != nil {
-		return ""
-	}
-	if id, _, found := strings.Cut(string(decoded), ":"); found && id != "" {
-		return id
-	}
-	return ""
+	id, _, _ := basicCredentials(header)
+	return id
 }
 
 // loginEmailFromBody peeks the "email" field out of a login request body
 // without consuming it, so the handler can still bind the full body afterward.
 // Returns "" if the body is missing, unreadable, or not valid JSON.
 func loginEmailFromBody(c echo.Context) string {
-	req := c.Request()
-	if req.Body == nil {
-		return ""
-	}
-	data, err := io.ReadAll(io.LimitReader(req.Body, 1<<16)) // cap: login bodies are tiny
-	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(data))
-	if err != nil {
-		return ""
-	}
-
-	var payload struct {
-		Email string `json:"email"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSpace(payload.Email))
+	return strings.ToLower(strings.TrimSpace(peekBodyField(c, "email", 1<<16)))
 }
 
 // jwksStore holds the per-IP buckets for the public JWKS endpoint, kept separate
