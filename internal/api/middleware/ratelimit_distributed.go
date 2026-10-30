@@ -47,7 +47,9 @@ import (
 // only", which is what makes the fallback path free of nil checks at call sites.
 type distributedLimiter struct {
 	limiter *redis_rate.Limiter
-	logger  zerolog.Logger
+	// rdb runs refundScript; redis_rate has no refund of its own.
+	rdb    *redisv9.Client
+	logger zerolog.Logger
 }
 
 var (
@@ -79,6 +81,7 @@ func ConfigureDistributedRateLimiting(client *redisv9.Client, logger zerolog.Log
 
 	sharedLimiter = &distributedLimiter{
 		limiter: redis_rate.NewLimiter(client),
+		rdb:     client,
 		logger:  logger,
 	}
 	logger.Info().Msg("rate limiting: Redis-backed, shared across instances")
@@ -166,6 +169,78 @@ func allowVia(ctx context.Context, store *limiterStore, label, key string, r int
 	}
 	return store.getOrCreate(key, r).Allow()
 }
+
+// exhaustedVia reports, WITHOUT spending a token, whether key's bucket (r per
+// minute, burst r — the same shape allowVia uses) has nothing left.
+//
+// For checks that must refuse before doing work whose outcome the refusal would
+// otherwise reveal (see the bad-credential budgets in apps2s.go). A cost-0 GCRA
+// call computes the remaining allowance and writes back the unchanged state.
+// On a Redis error it answers from the in-process bucket, as allowVia would
+// have spent from it.
+func exhaustedVia(ctx context.Context, store *limiterStore, label, key string, r int) bool {
+	if d := distributed(); d != nil {
+		res, err := d.limiter.AllowN(ctx, key, redis_rate.Limit{Rate: r, Burst: r, Period: time.Minute}, 0)
+		if err == nil {
+			return res.Remaining < 1
+		}
+		metrics.RateLimitFailOpen.WithLabelValues(label, "redis_error").Inc()
+		d.logger.Warn().Err(err).Str("limiter", label).
+			Msg("rate limiting: Redis error — falling back to the in-process bucket")
+	}
+	return store.exhausted(key)
+}
+
+// refundVia gives back one token spent by allowVia on key.
+//
+// For budgets that are spent BEFORE an outcome is known, so the spend holds
+// under concurrency, and returned once the outcome shows the request was not
+// what the budget exists to bound (a correct client secret).
+//
+// Not redis_rate's AllowN(-1): its script only writes the new state when the
+// theoretical arrival time stays in the future, so refunding the only token
+// outstanding — the common case, one request in flight — was silently
+// dropped, and Redis mode and in-process mode disagreed. refundScript does the
+// GCRA arithmetic itself, atomically, and deletes the key when the refund
+// leaves the bucket full (redis_rate reads a missing key as a full bucket).
+func refundVia(ctx context.Context, store *limiterStore, label, key string, r int) {
+	if d := distributed(); d != nil {
+		emission := time.Minute.Seconds() / float64(r)
+		if err := refundScript.Run(ctx, d.rdb, []string{redisRatePrefix + key}, emission).Err(); err == nil {
+			return
+		}
+		metrics.RateLimitFailOpen.WithLabelValues(label, "redis_error").Inc()
+	}
+	store.refund(key)
+}
+
+// redisRatePrefix is redis_rate's own key prefix (its unexported
+// redisPrefix), so refundScript edits the same key allowVia spent from.
+const redisRatePrefix = "rate:"
+
+// refundScript moves a redis_rate GCRA bucket's theoretical arrival time
+// (TAT) back by one emission interval. Same clock and epoch as redis_rate's
+// script (Redis TIME, relative to 2017-01-01), so the stored value means the
+// same thing to both.
+var refundScript = redisv9.NewScript(`
+redis.replicate_commands()
+local key = KEYS[1]
+local emission_interval = tonumber(ARGV[1])
+local tat = redis.call("GET", key)
+if not tat then
+  return 0
+end
+local jan_1_2017 = 1483228800
+local now = redis.call("TIME")
+now = (now[1] - jan_1_2017) + (now[2] / 1000000)
+local new_tat = tonumber(tat) - emission_interval
+if new_tat <= now then
+  redis.call("DEL", key)
+else
+  redis.call("SET", key, new_tat, "EX", math.ceil(new_tat - now))
+end
+return 1
+`)
 
 // allowViaEvery is allowVia for interval-based buckets.
 func allowViaEvery(ctx context.Context, store *limiterStore, label, key string, interval time.Duration, burst int) bool {

@@ -126,7 +126,7 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 		AuthMethod:   audit.SocialAuthMethod(st.Provider),
 		ResourceType: "user",
 		ResourceID:   strconv.FormatInt(result.UserID, 10),
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 	if result.Outcome == "linked" {
@@ -137,7 +137,7 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 			Action:       audit.SocialLinkedAction(st.Provider),
 			ResourceType: "user",
 			ResourceID:   strconv.FormatInt(result.UserID, 10),
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 		})
 	}
@@ -160,7 +160,7 @@ func (h *OAuthHandler) auditLoginFailed(c echo.Context, st *auth.OAuthState, rea
 		AuthMethod:   audit.SocialAuthMethod(provider),
 		ResourceType: "user",
 		ResourceID:   reason,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"reason": reason, "error_code": reason, "provider": c.Param("provider")},
 	}
@@ -189,6 +189,9 @@ type OAuthExchangeRequest struct {
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited; wait Retry-After seconds"
 // @Router       /api/v1/auth/oauth/exchange [post]
 func (h *OAuthHandler) Exchange(c echo.Context) error {
 	var req OAuthExchangeRequest
@@ -364,7 +367,7 @@ func (h *OAuthHandler) UnlinkUserIdentity(c echo.Context) error {
 		Action:       audit.ActionAdminUserIdentityUnlinked,
 		ResourceType: "user",
 		ResourceID:   userResourceID(c) + ":" + provider,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 	return c.NoContent(http.StatusNoContent)
@@ -421,7 +424,7 @@ func (h *OAuthHandler) UpsertProviderConfig(c echo.Context) error {
 		Action:        audit.ActionAdminIdPConfigUpdated,
 		ResourceType:  "application",
 		ResourceID:    c.Param("appID") + ":" + detail.Provider,
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 	return c.JSON(http.StatusOK, detail)
@@ -482,7 +485,7 @@ func (h *OAuthHandler) TestProviderConfig(c echo.Context) error {
 			Action:        audit.ActionAdminIdPConfigTested,
 			ResourceType:  "application",
 			ResourceID:    c.Param("appID") + ":" + provider,
-			IPAddress:     c.RealIP(),
+			IPAddress:     clientIP(c),
 			UserAgent:     c.Request().UserAgent(),
 			Status:        status,
 			HTTPStatus:    httpStatus,
@@ -544,7 +547,7 @@ func (h *OAuthHandler) DeleteProviderConfig(c echo.Context) error {
 		Action:        audit.ActionAdminIdPConfigDeleted,
 		ResourceType:  "application",
 		ResourceID:    c.Param("appID") + ":" + provider,
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 	return c.NoContent(http.StatusNoContent)

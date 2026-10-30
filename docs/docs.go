@@ -2009,6 +2009,111 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/server-trust": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's registered server IPs and whether it may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Registers the application backend's egress IPs (requests from them skip the per-IP flood guard; the application quota and per-user limits still apply) and turns forwarding of the end user's IP on or off. A forwarded IP is believed only when the client secret verifies and the request comes from one of the registered server IPs, so forwarding needs at least one. Omitted fields are left unchanged. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Settings to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ServerTrustRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid address or range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/users/{uid}/mfa": {
             "delete": {
                 "security": [
@@ -2755,6 +2860,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AppLoginRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2784,6 +2895,15 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2823,6 +2943,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MagicLinkRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2855,6 +2981,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "Magic link not enabled for this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2894,6 +3029,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MagicLinkVerifyRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2914,6 +3055,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "MFA enrollment required",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2953,6 +3103,12 @@ const docTemplate = `{
                         "name": "X-Client-Authorization",
                         "in": "header",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2964,6 +3120,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "token_invalid — generic for every rejection reason",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3003,6 +3168,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AppRegisterRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3047,6 +3218,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -3080,6 +3260,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AssignAppUserRolesRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3109,6 +3295,15 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "User not found in this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3258,6 +3453,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ForgotPasswordRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3281,6 +3482,15 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3412,6 +3622,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAActivateRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3473,6 +3695,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAEmailPendingRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3546,6 +3780,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAEnrollRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3566,6 +3812,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Invalid or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3598,6 +3853,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.LoginOTPRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3668,6 +3935,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.LoginOTPResendRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4079,6 +4358,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.OAuthExchangeRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4099,6 +4390,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4613,6 +4913,20 @@ const docTemplate = `{
                     "Passkeys"
                 ],
                 "summary": "Begin passwordless passkey sign-in",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -4622,6 +4936,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "passkeys or passwordless sign-in disabled, or origin not allowed",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4649,6 +4972,18 @@ const docTemplate = `{
                         "name": "ceremony_token",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4669,6 +5004,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5028,11 +5372,32 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ResendVerificationRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
                     "200": {
                         "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5065,6 +5430,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ResetPasswordRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional; send it when your backend calls this for a user, or the call is limited as an anonymous browser (5/min per IP)",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -5079,6 +5456,15 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -8754,6 +9140,123 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/server-trust": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's registered server IPs and whether it may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Registers the application backend's egress IPs (requests from them skip the per-IP flood guard; the application quota and per-user limits still apply) and turns forwarding of the end user's IP on or off. A forwarded IP is believed only when the client secret verifies and the request comes from one of the registered server IPs, so forwarding needs at least one. Omitted fields are left unchanged. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Settings to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ServerTrustRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid address or range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/audiences": {
             "get": {
                 "security": [
@@ -10320,9 +10823,10 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Opaque value echoed back on the redirect",
+                        "description": "Opaque value echoed back on the redirect — required unless OAUTH_REQUIRE_STATE=false",
                         "name": "state",
-                        "in": "query"
+                        "in": "query",
+                        "required": true
                     },
                     {
                         "type": "string",
@@ -12367,6 +12871,51 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AppServerIP": {
+            "type": "object",
+            "properties": {
+                "cidr": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.AppServerIPInput": {
+            "type": "object",
+            "properties": {
+                "cidr": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.AppServerTrust": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "integer"
+                },
+                "server_ips": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.AppServerIP"
+                    }
+                },
+                "tenant_id": {
+                    "type": "integer"
+                },
+                "trust_forwarded_ip": {
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.AppsPage": {
             "type": "object",
             "properties": {
@@ -13874,6 +14423,22 @@ const docTemplate = `{
                 },
                 "used_custom_template": {
                     "description": "UsedCustomTemplate distinguishes \"your saved template was sent\" from \"the\nbuilt-in default was sent instead\".\n\nThe second happens for a reason that is invisible from the send itself: a\nstored template with is_active = false is skipped by Resolve, so an admin\nwho saved a customisation while its Status toggle was off receives the\ndefault and concludes the save failed. The template screen turns this into\nan explanation rather than a mystery.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "handlers.ServerTrustRequest": {
+            "type": "object",
+            "properties": {
+                "server_ips": {
+                    "description": "ServerIPs replaces the application's registered egress addresses. Each\nentry is an address or CIDR range (IPv4 /24 or narrower, IPv6 /48 or\nnarrower), at most 50.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.AppServerIPInput"
+                    }
+                },
+                "trust_forwarded_ip": {
+                    "description": "TrustForwardedIP lets the application report its end user's address in\nX-EMC-Forwarded-For.",
                     "type": "boolean"
                 }
             }

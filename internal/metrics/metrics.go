@@ -117,7 +117,16 @@ var (
 	// per-surface abuse is distinguishable: login_ip, login_account, token_ip,
 	// token_client, otp_ip, otp_session, oauth_ip, oauth_client, authorize,
 	// oauth_token, revoke, jwks_ip, userinfo, audit_maint,
-	// signing_key_rotation, app, app_client.
+	// signing_key_rotation, passkey_begin, app, app_client,
+	// app_client_unverified.
+	//
+	// Application end-user routes (apps2s.go) add: app_ip (flood guard),
+	// app_unverified_ip (credentials that did not verify), and one per-user
+	// label per route — app_register_user, app_login_user, app_magic_link_user,
+	// app_magic_link_verify_user, app_forgot_password_user,
+	// app_reset_password_user, app_roles_user, app_me_user. A spike in a *_user
+	// label is credential stuffing against individual accounts; a sustained
+	// app_client count means an application's quota is too small.
 	//
 	// Every limiter must increment this on rejection. A limiter that blocks
 	// silently is indistinguishable from one that never fires, which makes it
@@ -131,6 +140,27 @@ var (
 			Help:      "Total number of requests rejected by rate limiters.",
 		},
 		[]string{"limiter"},
+	)
+
+	// ForwardedIPIgnored counts X-EMC-Forwarded-For headers that were present
+	// but not believed.
+	//
+	// Labels: reason — client_not_verified, not_trusted (the application has
+	// not turned forwarding on), not_from_server_ip (it registered server IPs
+	// and the request came from elsewhere), invalid (not an address).
+	//
+	// A steady not_trusted count is a backend sending the header before an
+	// administrator enabled it, so its users' captcha and audit still see the
+	// backend's address. client_not_verified or not_from_server_ip from an
+	// application that does have forwarding on is worth a look: someone is
+	// sending user addresses without the means to vouch for them.
+	ForwardedIPIgnored = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "forwarded_ip_ignored_total",
+			Help:      "End-user IP headers that were present but not trusted.",
+		},
+		[]string{"reason"},
 	)
 
 	// ---------------------------------------------------------------------

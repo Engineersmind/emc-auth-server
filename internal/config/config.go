@@ -294,6 +294,12 @@ type Config struct {
 	// PASSWORD_HASH_MAX_CONCURRENT.
 	PasswordHashMaxConcurrent int
 
+	// AppRateLimits sizes the limits on the application end-user routes
+	// (/auth/apps/*, forgot/reset-password, /auth/token) that product backends
+	// call for every one of their users. 0 means the built-in default, never
+	// unlimited. Env: RATE_LIMIT_APP_*.
+	AppRateLimits AppRateLimitConfig
+
 	// AuditSIEMWebhookURL, when set, streams every persisted audit event as a
 	// JSON POST to this URL (Datadog/Splunk/S3-proxy/generic webhook). Empty
 	// disables streaming. Must be https and resolve to a public IP — private,
@@ -378,7 +384,7 @@ func Load() *Config {
 		// forced to choose rather than inheriting the lax path. Local dev is
 		// unaffected — .env.example and docker-compose set ENV=development
 		// explicitly.
-		Env: getEnv("ENV", "production"),
+		Env:                                    getEnv("ENV", "production"),
 		MetricsToken:                           getEnv("METRICS_TOKEN", ""),
 		JWTIssuer:                              getEnv("JWT_ISSUER", "https://auth.emc.local"),
 		EmailProvider:                          getEnv("EMAIL_PROVIDER", ""),
@@ -440,9 +446,26 @@ func Load() *Config {
 		AuditCaptureResponseBody:  getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
 		AuditRetentionDays:        mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
 		PasswordHashMaxConcurrent: mustAtoi(getEnv("PASSWORD_HASH_MAX_CONCURRENT", "0")),
-		AuditSIEMWebhookURL:       getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
-		AuditSIEMWebhookSecret:    getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
-		AudienceScheme:            getEnv("AUDIENCE_SCHEME", "api://"),
+		AppRateLimits: AppRateLimitConfig{
+			PerIP:                   mustAtoi(getEnv("RATE_LIMIT_APP_PER_IP", "0")),
+			UnverifiedPerIP:         mustAtoi(getEnv("RATE_LIMIT_APP_UNVERIFIED_PER_IP", "0")),
+			BadCredentialsPerClient: mustAtoi(getEnv("RATE_LIMIT_APP_BAD_CREDENTIALS_PER_CLIENT", "0")),
+			UserRegister:            mustAtoi(getEnv("RATE_LIMIT_APP_USER_REGISTER", "0")),
+			UserLogin:               mustAtoi(getEnv("RATE_LIMIT_APP_USER_LOGIN", "0")),
+			UserMagicLink:           mustAtoi(getEnv("RATE_LIMIT_APP_USER_MAGIC_LINK", "0")),
+			UserMagicLinkVerify:     mustAtoi(getEnv("RATE_LIMIT_APP_USER_MAGIC_LINK_VERIFY", "0")),
+			UserForgotPassword:      mustAtoi(getEnv("RATE_LIMIT_APP_USER_FORGOT_PASSWORD", "0")),
+			UserResetPassword:       mustAtoi(getEnv("RATE_LIMIT_APP_USER_RESET_PASSWORD", "0")),
+			UserRoles:               mustAtoi(getEnv("RATE_LIMIT_APP_USER_ROLES", "0")),
+			UserMe:                  mustAtoi(getEnv("RATE_LIMIT_APP_USER_ME", "0")),
+			UserMFAChallenge:        mustAtoi(getEnv("RATE_LIMIT_APP_USER_MFA_CHALLENGE", "0")),
+			UserOAuthExchange:       mustAtoi(getEnv("RATE_LIMIT_APP_USER_OAUTH_EXCHANGE", "0")),
+			UserPasskeyLogin:        mustAtoi(getEnv("RATE_LIMIT_APP_USER_PASSKEY_LOGIN", "0")),
+			UserResendVerification:  mustAtoi(getEnv("RATE_LIMIT_APP_USER_RESEND_VERIFICATION", "0")),
+		},
+		AuditSIEMWebhookURL:    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
+		AuditSIEMWebhookSecret: getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		AudienceScheme:         getEnv("AUDIENCE_SCHEME", "api://"),
 	}
 }
 
@@ -467,6 +490,9 @@ func (c *Config) Validate() error {
 	// later at pool-connect with a less obvious error.
 	if c.DatabaseURL == "" {
 		return errors.New("DATABASE_URL must be set: there is no default DSN (committed defaults previously embedded credentials and sslmode=disable)")
+	}
+	if err := c.AppRateLimits.validate(); err != nil {
+		return err
 	}
 	switch c.Env {
 	case "development", "test":
@@ -507,6 +533,59 @@ func (c *Config) Validate() error {
 	// is every login and portal write 403ing at runtime. Fail at boot instead.
 	if len(c.GlobalCORSOrigins) == 0 {
 		return errors.New("GLOBAL_CORS_ORIGINS must list at least the portal origin when ENV=production or staging: it is now the CSRF trusted-origin allowlist, and empty fails every cookie-authenticated write at runtime")
+	}
+	return nil
+}
+
+// AppRateLimitConfig sizes the limits on application end-user routes, per
+// minute. Every field is optional: 0 means the default in
+// middleware.AppS2SConfig.
+type AppRateLimitConfig struct {
+	// PerIP is the per-IP flood guard for callers not on an application's
+	// registered server IPs (default 600). RATE_LIMIT_APP_PER_IP.
+	PerIP int
+	// UnverifiedPerIP applies to callers whose client credentials did not
+	// verify (default 5, AUTH-07). RATE_LIMIT_APP_UNVERIFIED_PER_IP.
+	UnverifiedPerIP int
+	// BadCredentialsPerClient bounds wrong client secrets for one client_id
+	// across every IP (default 10). RATE_LIMIT_APP_BAD_CREDENTIALS_PER_CLIENT.
+	BadCredentialsPerClient int
+	// Per end user, per application. RATE_LIMIT_APP_USER_<ROUTE>.
+	UserRegister           int
+	UserLogin              int
+	UserMagicLink          int
+	UserMagicLinkVerify    int
+	UserForgotPassword     int
+	UserResetPassword      int
+	UserRoles              int
+	UserMe                 int
+	UserMFAChallenge       int
+	UserOAuthExchange      int
+	UserPasskeyLogin       int
+	UserResendVerification int
+}
+
+func (a AppRateLimitConfig) validate() error {
+	for name, v := range map[string]int{
+		"RATE_LIMIT_APP_PER_IP":                     a.PerIP,
+		"RATE_LIMIT_APP_UNVERIFIED_PER_IP":          a.UnverifiedPerIP,
+		"RATE_LIMIT_APP_BAD_CREDENTIALS_PER_CLIENT": a.BadCredentialsPerClient,
+		"RATE_LIMIT_APP_USER_REGISTER":              a.UserRegister,
+		"RATE_LIMIT_APP_USER_LOGIN":                 a.UserLogin,
+		"RATE_LIMIT_APP_USER_MAGIC_LINK":            a.UserMagicLink,
+		"RATE_LIMIT_APP_USER_MAGIC_LINK_VERIFY":     a.UserMagicLinkVerify,
+		"RATE_LIMIT_APP_USER_FORGOT_PASSWORD":       a.UserForgotPassword,
+		"RATE_LIMIT_APP_USER_RESET_PASSWORD":        a.UserResetPassword,
+		"RATE_LIMIT_APP_USER_ROLES":                 a.UserRoles,
+		"RATE_LIMIT_APP_USER_ME":                    a.UserMe,
+		"RATE_LIMIT_APP_USER_MFA_CHALLENGE":         a.UserMFAChallenge,
+		"RATE_LIMIT_APP_USER_OAUTH_EXCHANGE":        a.UserOAuthExchange,
+		"RATE_LIMIT_APP_USER_PASSKEY_LOGIN":         a.UserPasskeyLogin,
+		"RATE_LIMIT_APP_USER_RESEND_VERIFICATION":   a.UserResendVerification,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s must be 0 (default) or a positive number of requests per minute, got %d", name, v)
+		}
 	}
 	return nil
 }

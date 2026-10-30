@@ -54,6 +54,8 @@ type AssignAppUserRolesRequest struct {
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string  "Invalid application credentials"
 // @Failure      404   {object}  map[string]string  "User not found in this application"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/apps/users/roles [post]
 func (h *AuthHandler) AssignAppUserRoles(c echo.Context) error {
 	var req AssignAppUserRolesRequest
@@ -108,7 +110,7 @@ func (h *AuthHandler) AssignAppUserRoles(c echo.Context) error {
 		AuthMethod:   audit.AuthMethodClientCredentials,
 		ResourceType: "user",
 		ResourceID:   strconv.FormatInt(result.UserID, 10),
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata: map[string]any{
 			"client_id": clientID,
@@ -135,7 +137,7 @@ func (h *AuthHandler) AssignAppUserRoles(c echo.Context) error {
 func (h *AuthHandler) appUserRolesError(c echo.Context, clientID string, err error) error {
 	switch {
 	case errors.Is(err, auth.ErrInvalidClient):
-		h.logger.Warn().Str("client_id", clientID).Str("ip", c.RealIP()).
+		h.logger.Warn().Str("client_id", clientID).Str("ip", clientIP(c)).
 			Msg("app role assignment: invalid client credentials")
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid client credentials"})
 

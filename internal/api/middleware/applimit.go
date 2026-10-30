@@ -1,9 +1,6 @@
 package middleware
 
 import (
-	"bytes"
-	"encoding/json"
-	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -83,7 +80,18 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, log
 // by TokenRateLimiter, which runs ahead of this middleware.
 //
 // Requests with no Basic client_id, or a client_id that maps to no live
-// application, are passed through (the per-IP TokenRateLimiter still applies).
+// application, are passed through (the per-IP limits still apply).
+//
+// Behind AppS2S.Resolve (every application end-user route) it uses what Resolve
+// learned instead of looking the client up again:
+//
+//   - Verified credentials spend the application's quota, which is the limit an
+//     administrator sizes for the product's whole user base.
+//   - Credentials that did NOT verify spend a separate bucket
+//     ("appauth-unverified:") of the same size. The client_id is public, so
+//     without this anyone who knew it could exhaust the product's quota with
+//     bogus requests and lock out every real user — the same cross-surface DoS
+//     the "appauth:"/"app:" split prevents, one level down.
 func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
 	limiter := redis_rate.NewLimiter(redisCli)
 
@@ -92,6 +100,34 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 			clientID := tokenClientID(c)
 			if clientID == "" {
 				return next(c)
+			}
+			// Behind a resolver, only a VERIFIED secret may spend the
+			// application's quota. Everything else is classified from what the
+			// resolver proved, never from the header's mere presence:
+			//
+			//   - A wrong secret is not charged here at all. It was admitted by
+			//     the outcome-blind budgets before the check; refusing it here,
+			//     after the check, would make the response depend on whether the
+			//     secret was right (forgot-password otherwise answers 200 to a
+			//     bad client), and those budgets already bound its volume.
+			//   - No secret, an empty secret ("Basic client_id:"), or a check
+			//     that could not run spends the separate unverified bucket.
+			//     Counting it against the real quota would let anyone who knows
+			//     the public client_id drain the product's quota without ever
+			//     authenticating.
+			if caller, ok := CallerFrom(c); ok {
+				switch {
+				case caller.Verified && caller.ClientID == clientID:
+					rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
+					return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
+				case caller.Failed:
+					return next(c)
+				}
+				tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
+				if !ok {
+					return next(c)
+				}
+				return enforceAppLimit(c, next, limiter, logger, "appauth-unverified:", tenantID, appID, rpm, burst)
 			}
 			tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
 			if !ok {
@@ -112,8 +148,11 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 	// limiter ("app:") and the pre-auth client_id limiter ("appauth:") stay
 	// distinguishable in metrics, exactly as they are in Redis.
 	limiterLabel := "app"
-	if keyPrefix == "appauth:" {
+	switch keyPrefix {
+	case "appauth:":
 		limiterLabel = "app_client"
+	case "appauth-unverified:":
+		limiterLabel = "app_client_unverified"
 	}
 
 	rateKey := keyPrefix + strconv.FormatInt(tenantID, 10) + ":" + strconv.FormatInt(appID, 10)
@@ -140,7 +179,10 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 		retryAfter := int(res.RetryAfter.Seconds())
 		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		return c.JSON(http.StatusTooManyRequests, map[string]string{
-			"error":       "rate limit exceeded for application " + strconv.FormatInt(appID, 10),
+			"error": "rate limit exceeded for application " + strconv.FormatInt(appID, 10),
+			// limiter tells an integrator which limit fired: "app" means the
+			// whole product is over its quota, unlike "user" or "ip".
+			"limiter":     "app",
 			"retry_after": strconv.Itoa(retryAfter) + "s",
 		})
 	}
@@ -153,6 +195,31 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 // string fields; anything larger is not a challenge request and does not get to
 // make the limiter allocate for it.
 const captchaBodyLimit = 8 << 10 // 8 KiB
+
+// AppCallerRateLimiter charges the application quota of the application that
+// AppS2S's resolver identified — the one whose secret verified, or, for a
+// client_id presented without a secret from that application's registered
+// server IP, that application. Anything else passes through.
+//
+// For routes where the request may name an application in more than one place
+// (a Basic header and a body client_id). Keying on what Resolve PROVED, rather
+// than on whichever client_id a header or body carries, is what stops one
+// tenant's valid credentials from spending another application's quota.
+// Mount behind BackendsOnly, after a resolver.
+func AppCallerRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
+	limiter := redis_rate.NewLimiter(redisCli)
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			caller, ok := CallerFrom(c)
+			if !ok || caller.AppID <= 0 || caller.TenantID <= 0 || !TrustedBackend(c) {
+				return next(c)
+			}
+			rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
+			return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
+		}
+	}
+}
 
 // AppClientBodyRateLimiter is AppClientRateLimiter for routes that carry
 // client_id in the JSON BODY rather than in an Authorization: Basic header.
@@ -204,24 +271,8 @@ func AppClientBodyRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.C
 // JSON, or no client_id field. Every one of those means "no per-client bucket
 // applies", never "reject".
 func clientIDFromBody(c echo.Context) string {
-	req := c.Request()
-	if req.Body == nil {
-		return ""
-	}
-	raw, err := io.ReadAll(io.LimitReader(req.Body, captchaBodyLimit))
-	// Restore unconditionally, including on a read error: the handler must get
-	// whatever was readable rather than an already-consumed body.
-	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(raw))
-	if err != nil || len(raw) == 0 {
-		return ""
-	}
-
-	var probe struct {
-		ClientID string `json:"client_id"`
-	}
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return ""
-	}
-	return probe.ClientID
+	// The shared reader (peekBodyField): decodes exactly as the handlers'
+	// Bind does, so the limiter and the handler can never see different
+	// client_ids, and the full body is put back.
+	return peekBodyField(c, "client_id", captchaBodyLimit)
 }
