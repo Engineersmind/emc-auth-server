@@ -139,6 +139,13 @@ type AuthzRequest struct {
 	// was already checked — letting anyone who reaches the MFA page name a
 	// different account.
 	Email string `json:"email,omitempty"`
+
+	// Organization is the organisation the client asked for with the
+	// `organization` parameter (public id or slug), or the one the user picked
+	// on the organisation page. A request, not authority: it is checked against
+	// the signed-in user's live memberships before a code is issued, and the
+	// resolved organisation travels on the code itself.
+	Organization string `json:"organization,omitempty"`
 }
 
 // AuthzSession is a completed hosted login.

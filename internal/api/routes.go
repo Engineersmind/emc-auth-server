@@ -133,6 +133,11 @@ type RoutesConfig struct {
 	// answering 404 captcha_disabled, which is byte-identical to the behaviour
 	// before this feature existed.
 	CaptchaEnabled bool
+	// OrganizationsEnabled is the deployment-level switch for Organizations.
+	// False makes every application behave as organizations_mode 'off' and the
+	// organisation routes answer 404 — byte-identical to the behaviour before
+	// the feature existed. See config.Config.OrganizationsEnabled.
+	OrganizationsEnabled bool
 	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
 	// Required when CaptchaEnabled is true.
 	CaptchaHMACKey string
@@ -524,6 +529,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithHasher(passwordHasher).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
+	// Organizations (migrations 00100–00104): per-organisation membership and
+	// roles inside an application. Two switches — ORGANIZATIONS_ENABLED here and
+	// each application's organizations_mode — and with either off, every token
+	// and every login behaves exactly as before. Invitation mail reuses the same
+	// sender and template resolvers as every other flow, so it is branded and
+	// customisable per application.
+	orgSvc := auth.NewOrganizationService(deps.Pool, deps.Redis, deps.Config.OrganizationsEnabled, deps.Logger).
+		WithHasher(passwordHasher).
+		WithNotifier(auth.NewEmailNotifier(m, deps.Logger).WithSenders(senderSvc).WithTemplates(tmplSvc))
+	authSvc.WithOrganizations(orgSvc)
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
@@ -593,6 +608,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithInvitations(invSvc).
 		WithEmailChange(emailChangeSvc).
 		WithAccountBlocking(blockSvc)
+
+	// One handler serves organisation management to both the admin console and
+	// an application's own backend; only the scope resolver differs per mount.
+	orgHandler := handlers.NewOrganizationHandler(orgSvc, authSvc, appSvc, jwtSvc, auditLog, cookieCfg, deps.Logger)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger).
@@ -960,6 +979,42 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/apps/login/magic", authHandler.AppMagicLink, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
+	// Organizations — end-user flows. Each answers 404 while
+	// ORGANIZATIONS_ENABLED is false. They carry no client secret (a browser
+	// or mobile client calls them), so they sit behind the per-IP token limiter
+	// like the other unauthenticated credential exchanges.
+	//
+	// The static invitation paths are registered alongside /:org below; Echo
+	// prefers a static segment over a parameter, so they never collide.
+	authGroup.POST("/apps/login/organization", orgHandler.SelectOrganization, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/switch-organization", orgHandler.SwitchOrganization, mw.TokenRateLimiter(rlCfg))
+	authGroup.GET("/apps/organizations/invitations/preview", orgHandler.PreviewInvitation, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/organizations/invitations/accept", orgHandler.AcceptInvitation, mw.TokenRateLimiter(rlCfg))
+
+	// Organizations — management by an application's own backend, with its
+	// client credentials in Authorization: Basic, exactly like
+	// /apps/users/roles. The scope is the authenticated application, so a
+	// leaked secret reaches only that application's organisations.
+	appOrgScope := orgHandler.AppScope
+	appOrgs := authGroup.Group("/apps/organizations", mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	appOrgs.POST("", orgHandler.CreateOrganization(appOrgScope))
+	appOrgs.GET("", orgHandler.ListOrganizations(appOrgScope))
+	appOrgs.GET("/:org", orgHandler.GetOrganization(appOrgScope))
+	appOrgs.PATCH("/:org", orgHandler.UpdateOrganization(appOrgScope))
+	appOrgs.DELETE("/:org", orgHandler.DeleteOrganization(appOrgScope))
+	appOrgs.GET("/:org/members", orgHandler.ListMembers(appOrgScope))
+	appOrgs.PUT("/:org/members/:uid", orgHandler.AddMember(appOrgScope))
+	appOrgs.GET("/:org/members/:uid", orgHandler.GetMember(appOrgScope))
+	appOrgs.PATCH("/:org/members/:uid", orgHandler.UpdateMember(appOrgScope))
+	appOrgs.DELETE("/:org/members/:uid", orgHandler.RemoveMember(appOrgScope))
+	appOrgs.POST("/:org/members/:uid/roles", orgHandler.AssignMemberRoles(appOrgScope))
+	appOrgs.DELETE("/:org/members/:uid/roles/:role", orgHandler.RemoveMemberRole(appOrgScope))
+	appOrgs.POST("/:org/invitations", orgHandler.CreateInvitation(appOrgScope))
+	appOrgs.GET("/:org/invitations", orgHandler.ListInvitations(appOrgScope))
+	appOrgs.DELETE("/:org/invitations/:inv", orgHandler.RevokeInvitation(appOrgScope))
+	authGroup.GET("/apps/users/:uid/organizations", orgHandler.ListUserOrganizations(appOrgScope),
+		mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates
 	// the refresh token (distributed lock + fresh user DB load) and writes new
@@ -1022,6 +1077,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.GET("/apps/me", authHandler.AppMe,
 		mw.TokenRateLimiter(rlCfg), appClientRateLimit, mw.NormalizeAppScopeUnauthorized, jwtRenew)
 	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
+	// The organisations the signed-in user can switch to (Organizations).
+	authGroup.GET("/apps/me/organizations", orgHandler.MyOrganizations, jwtRenew, appRateLimit)
 
 	// Self-service session management — "these are your signed-in devices; sign the
 	// ones you do not recognise out". Every mainstream IdP offers this, and SOC 2
@@ -1359,6 +1416,31 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, appRolesWrite)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, appRolesWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/roles/:id", adminHandler.DeleteRole, appRolesWrite)
+
+	// Organizations (admin console). The mode is an application setting
+	// (apps:*); organisations and their members are user administration
+	// (users:*), the same permission that already governs the application's
+	// users and their roles.
+	adminGroup.GET("/tenants/:tid/applications/:appID/organization-settings", orgHandler.GetSettings, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/organization-settings", orgHandler.UpdateSettings, appAppsWrite)
+	adminOrgScope := orgHandler.AdminScope
+	adminOrgs := "/tenants/:tid/applications/:appID/organizations"
+	adminGroup.POST(adminOrgs, orgHandler.CreateOrganization(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs, orgHandler.ListOrganizations(adminOrgScope), appUsersRead)
+	adminGroup.GET(adminOrgs+"/:org", orgHandler.GetOrganization(adminOrgScope), appUsersRead)
+	adminGroup.PATCH(adminOrgs+"/:org", orgHandler.UpdateOrganization(adminOrgScope), appUsersWrite)
+	adminGroup.DELETE(adminOrgs+"/:org", orgHandler.DeleteOrganization(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs+"/:org/members", orgHandler.ListMembers(adminOrgScope), appUsersRead)
+	adminGroup.PUT(adminOrgs+"/:org/members/:uid", orgHandler.AddMember(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs+"/:org/members/:uid", orgHandler.GetMember(adminOrgScope), appUsersRead)
+	adminGroup.PATCH(adminOrgs+"/:org/members/:uid", orgHandler.UpdateMember(adminOrgScope), appUsersWrite)
+	adminGroup.DELETE(adminOrgs+"/:org/members/:uid", orgHandler.RemoveMember(adminOrgScope), appUsersWrite)
+	adminGroup.POST(adminOrgs+"/:org/members/:uid/roles", orgHandler.AssignMemberRoles(adminOrgScope), appUsersWrite)
+	adminGroup.DELETE(adminOrgs+"/:org/members/:uid/roles/:role", orgHandler.RemoveMemberRole(adminOrgScope), appUsersWrite)
+	adminGroup.POST(adminOrgs+"/:org/invitations", orgHandler.CreateInvitation(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs+"/:org/invitations", orgHandler.ListInvitations(adminOrgScope), appUsersRead)
+	adminGroup.DELETE(adminOrgs+"/:org/invitations/:inv", orgHandler.RevokeInvitation(adminOrgScope), appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/organizations", orgHandler.ListUserOrganizations(adminOrgScope), appUsersRead)
 
 	// End-user application permissions under the canonical family.
 	adminGroup.POST("/tenants/:tid/applications/:appID/permissions", adminHandler.CreatePermission, appPermsWrite)
@@ -1859,6 +1941,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	e.GET(handlers.PathOAuthAuthorize, authorizeHandler.Authorize, authorizeLimit)
 	e.POST(handlers.PathOAuthAuthorize+"/login", authorizeHandler.LoginSubmit, authorizeLimit)
 	e.POST(handlers.PathOAuthAuthorize+"/mfa", authorizeHandler.MFASubmit, authorizeLimit)
+	// The organisation picker (Organizations). Rendered only for an application
+	// in organizations_mode "required" whose user belongs to several; same
+	// limiter as the login and MFA steps it follows.
+	e.POST(handlers.PathOAuthAuthorize+"/organization", authorizeHandler.OrganizationSubmit, authorizeLimit)
 
 	// Token endpoint — form-encoded (RFC 6749 §4.1.3), unlike the JSON
 	// POST /auth/token which keeps working as a documented-deprecated alias.
@@ -1867,6 +1953,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// Revocation (RFC 7009). Always 200, so the limiter is what stops it being
 	// used to probe token validity at volume.
 	e.POST(handlers.PathOAuthRevoke, oauthTokenHandler.Revoke, mw.RevokeRateLimiter())
+	// RFC 7662 introspection — the live check behind a locally verified JWT.
+	// Confidential clients only, for their own application's tokens. Shares
+	// the revocation limiter: both are client-authenticated token lookups.
+	e.POST(handlers.PathOAuthIntrospect, oauthTokenHandler.Introspect, mw.RevokeRateLimiter())
 
 	// Social login browser endpoints — public, top-level like SAML, but with
 	// the dedicated rate limiting SAML's routes lack (issue #64).

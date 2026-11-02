@@ -201,6 +201,12 @@ func (h *OAuthHandler) Exchange(c echo.Context) error {
 
 	tokens, err := h.svc.ExchangeLoginCode(c.Request().Context(), req.ClientID, req.LoginCode)
 	if err != nil {
+		// Social sign-in mints at this exchange, so an organisation outcome
+		// (choose one, or no access) surfaces here, after the provider
+		// already proved the identity.
+		if handled, resp := organizationSignInError(c, err); handled {
+			return resp
+		}
 		if errors.Is(err, auth.ErrInvalidLoginCode) {
 			return echo.NewHTTPError(http.StatusUnauthorized, "invalid or expired login code")
 		}

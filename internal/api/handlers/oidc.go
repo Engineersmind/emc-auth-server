@@ -75,6 +75,13 @@ type UserInfoResponse struct {
 	// UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,
 	// which is what the rest of this API returns for timestamps.
 	UpdatedAt int64 `json:"updated_at,omitempty"`
+
+	// OrgID and OrgName identify the organisation the presented token is signed
+	// in to (Organizations). Omitted for every token that is not, which is every
+	// token of an application in organizations_mode "off". Identity, not
+	// authorisation: roles and permissions stay in the access token.
+	OrgID   string `json:"org_id,omitempty"`
+	OrgName string `json:"org_name,omitempty"`
 }
 
 // UserInfo handles GET and POST /oauth/userinfo.
@@ -199,6 +206,7 @@ func (h *OIDCHandler) UserInfo(c echo.Context) error {
 			resp.Name = full
 		}
 	}
+	resp.OrgID, resp.OrgName = claims.OrgID, claims.OrgName
 
 	return c.JSON(http.StatusOK, resp)
 }

@@ -75,7 +75,10 @@ type AuthService struct {
 	// sign-in as it was; set, MFA is mandatory for every administrator (see
 	// admin_mfa_policy.go and migration 00094).
 	adminMFA *AdminMFAPolicyService
-	logger   zerolog.Logger
+	// orgSvc resolves organisation membership at mint time. Nil, or present but
+	// switched off, means every application behaves as organizations_mode 'off'.
+	orgSvc *OrganizationService
+	logger zerolog.Logger
 }
 
 // NewAuthService creates an AuthService.
@@ -292,7 +295,18 @@ type LoginInput struct {
 	// LoginInput is never itself bound from JSON; keep it that way. Setting
 	// this from a request body would let any caller name any application and
 	// authenticate against its isolated user base.
+	//
+	// It also DEFERS organisation resolution: the hosted authorize flow picks
+	// the organisation itself, after sign-in, and carries it on the
+	// authorization code. The session Login mints there is never handed out.
 	VerifiedApp *VerifiedApp
+
+	// Organization is the organisation (public id or slug) the session should be
+	// signed in to. Empty is the normal case. Ignored for an application in
+	// organizations_mode 'off'; otherwise checked against live membership after
+	// the password and any second factor succeed, and refused with
+	// ErrOrganizationAccessDenied if the user may not sign in to it.
+	Organization string
 }
 
 // VerifiedApp is an application identity the caller has already resolved from
@@ -384,6 +398,12 @@ type MeResult struct {
 	// Empty for callers who are not tenant administrators.
 	AdminScope string   `json:"admin_scope,omitempty"`
 	AdminApps  []string `json:"admin_apps,omitempty"`
+	// Organisation claims of the presented token, omitted when it is not
+	// signed in to an organisation. See Claims.OrgID.
+	OrgID          string   `json:"org_id,omitempty"`
+	OrgName        string   `json:"org_name,omitempty"`
+	OrgRoles       []string `json:"org_roles,omitempty"`
+	OrgPermissions []string `json:"org_permissions,omitempty"`
 }
 
 // resolveRegistrationTenant returns the tenant a first-party registration lands
@@ -748,6 +768,35 @@ type sessionContext struct {
 	// application and `permissions` is what every first-party consumer reads.
 	// Filtering everywhere would strip those claims from live flows.
 	filterPermsForClient bool
+
+	// org says which organisation a NEW session should be signed in to. The zero
+	// value — nothing requested — is the normal case, and for an application in
+	// organizations_mode 'off' (every application until an operator changes it)
+	// it is the only case: the mint then behaves exactly as it did before
+	// organisations existed. On rotation it is ignored; the session row is the
+	// authority. See resolveMintOrganization.
+	org orgSessionRequest
+}
+
+// orgSessionRequest is a caller's organisation intent for a new session.
+//
+// None of these fields is trusted as authority. Every one is re-checked against
+// live membership at mint time, so a forged or stale value can only make the
+// mint refuse, never widen it.
+type orgSessionRequest struct {
+	// requested is a public id or slug the client asked for.
+	requested string
+	// boundID is an organisation the server already resolved — from an
+	// authorization code, a completed selection or a switch.
+	boundID *int64
+	// personal asks explicitly for no organisation (a switch out of one).
+	// Refused in 'required' mode.
+	personal bool
+	// skip defers organisation resolution entirely. Set ONLY by the hosted
+	// /oauth/authorize login, which resolves the organisation itself before it
+	// issues a code; the session that Login mints there is never handed to
+	// anyone. Never derived from request input.
+	skip bool
 }
 
 // issueTokenPair signs a JWT access token and persists a matching refresh token.
@@ -828,6 +877,26 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	claims.Roles = roles
 	claims.ActiveRoles = sess.activeRoles
 
+	// Organisation — resolved here for the same reason as Roles and AdminScope:
+	// every path that mints a user token funnels through this function, so no
+	// sign-in method can skip the membership check and no refresh can carry an
+	// organisation the user has since lost. For an application in
+	// organizations_mode 'off' this returns nil and the token is unchanged.
+	//
+	// Unlike Roles above, a failure here does NOT degrade: the mint fails. A
+	// token missing its org_* claims would tell the relying party the session is
+	// organisation-less, which is a different authority, not a smaller one.
+	org, err := s.resolveMintOrganization(ctx, userID, tenantID, email, role, perms, sess, appID, scope)
+	if err != nil {
+		return nil, err
+	}
+	var orgRowID *int64
+	if org != nil {
+		orgRowID = &org.rowID
+		claims.OrgID, claims.OrgName = org.publicID, org.slug
+		claims.OrgRoles, claims.OrgPermissions = org.roles, org.permissions
+	}
+
 	// The audience — issue #131. Resolved BEFORE the transaction opens, because
 	// a denial is the caller's error and must not leave a half-written session
 	// behind, and because ErrInvalidTarget has to surface as invalid_target at
@@ -853,6 +922,9 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	// it now just asks for the filter and the resolution supplies the fact.
 	if sess.filterPermsForClient {
 		claims.Permissions = FilterPermissionsForClient(claims.Permissions, aud.FirstParty)
+		if claims.OrgPermissions != nil {
+			claims.OrgPermissions = FilterPermissionsForClient(claims.OrgPermissions, aud.FirstParty)
+		}
 	}
 
 	// Grant-level scope narrowing. A grant may permit fewer scopes than the
@@ -969,13 +1041,14 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO user_sessions
 			    (user_id, tenant_id, application_id, user_agent, device_hint, ip_address,
-			     auth_time, amr, is_persistent, idle_expires_at, absolute_expires_at)
+			     auth_time, amr, is_persistent, idle_expires_at, absolute_expires_at,
+			     organization_id)
 			VALUES ($1, $2, $3, $4, NULLIF($5, ''), NULLIF($6, '')::INET,
-			        $7, $8, $9, $10, $11)
+			        $7, $8, $9, $10, $11, $12)
 			RETURNING id
 		`, userID, tenantID, parseAppID(appID), device.UserAgent, DeviceHint(device.UserAgent),
 			device.IPAddress, authTime, amr, sess.persistent,
-			idleExpiresAt, absoluteExpiresAt).Scan(&sessionID); err != nil {
+			idleExpiresAt, absoluteExpiresAt, orgRowID).Scan(&sessionID); err != nil {
 			return nil, fmt.Errorf("create session: %w", err)
 		}
 		tokenExpiresAt = absoluteExpiresAt
@@ -1748,7 +1821,11 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		perms = []string{}
 	}
 
-	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent, activeRoles); err != nil {
+	// Organisation intent travels with the login through any MFA step and is
+	// checked only at the mint, after every factor has passed.
+	orgReq := orgSessionRequest{requested: strings.TrimSpace(in.Organization), skip: in.VerifiedApp != nil}
+
+	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent, activeRoles, orgReq); err != nil {
 		return nil, err
 	} else if gate != nil {
 		return gate, nil
@@ -1770,6 +1847,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 			amr:         []string{AMRPassword},
 			grant:       GrantPassword,
 			activeRoles: activeRoles,
+			org:         orgReq,
 		}, appID)
 	if err != nil {
 		return nil, err
@@ -1795,7 +1873,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // the finally-issued session honours it. Threaded through rather than re-read at the
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
-func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string) (*LoginResult, error) {
+func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
 	// Administrators first: for them MFA is mandatory, so this branch runs even
 	// on a deployment where the per-application gate below would return early.
 	// Only a tenant-level login (appRowID 0) can be an administrator's — an
@@ -1859,7 +1937,7 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	}
 
 	if len(methods) > 0 {
-		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles)
+		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, org)
 		if err != nil {
 			return nil, fmt.Errorf("create OTP session: %w", err)
 		}
@@ -1870,7 +1948,7 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// (re)enroll a permitted method before finishing login; otherwise the login
 	// proceeds (the app does not enforce MFA).
 	if appRowID != 0 && mode == MFAModeRequired {
-		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent, activeRoles)
+		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent, activeRoles, org)
 		if err != nil {
 			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
 		}
@@ -1949,6 +2027,7 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 		sessionContext{
 			persistent:  session.Persistent,
 			activeRoles: session.ActiveRoles,
+			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
 			amr:         []string{AMRPassword, AMROTP, AMRMFA},
 			// The grant is the one that began the flow. MFA is a second factor
 			// on a password login, not a grant of its own — amr already records
@@ -2083,6 +2162,7 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 		sessionContext{
 			persistent:  session.Persistent,
 			activeRoles: session.ActiveRoles,
+			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
 			amr:         []string{AMRPassword, AMROTP, AMRMFA},
 			grant:       GrantPassword,
 		}, session.AppID)
@@ -2095,8 +2175,8 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 // createOTPSession stores pre-auth user state in Redis and returns a challenge
 // token. When the user's active methods include email, a one-time code is
 // minted and sent to the account's inbox alongside the challenge.
-func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool, activeRoles []string) (*OTPChallenge, error) {
-	return s.createOTPSessionWith(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, true)
+func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool, activeRoles []string, org orgSessionRequest) (*OTPChallenge, error) {
+	return s.createOTPSessionWith(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, org, true)
 }
 
 // createOTPSessionWith is createOTPSession with control over the emailed code.
@@ -2104,17 +2184,19 @@ func (s *AuthService) createOTPSession(ctx context.Context, userID, tenantID int
 // when the user picks it (POST /auth/login/otp/resend). That is the
 // administrator shape, where email is a fallback beside a passkey or an
 // authenticator app and mailing a code on every sign-in would be noise.
-func (s *AuthService) createOTPSessionWith(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool, activeRoles []string, sendEmailNow bool) (*OTPChallenge, error) {
+func (s *AuthService) createOTPSessionWith(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, methods []string, persistent bool, activeRoles []string, org orgSessionRequest, sendEmailNow bool) (*OTPChallenge, error) {
 	sessionToken, err := s.storePreAuthSession(ctx, otpSessionKey, OTPSessionTTL, OTPSession{
-		UserID:      userID,
-		TenantID:    tenantID,
-		Email:       email,
-		RoleName:    roleName,
-		Perms:       perms,
-		ActiveRoles: activeRoles,
-		AppID:       appID,
-		Methods:     methods,
-		Persistent:  persistent,
+		UserID:           userID,
+		TenantID:         tenantID,
+		Email:            email,
+		RoleName:         roleName,
+		Perms:            perms,
+		ActiveRoles:      activeRoles,
+		AppID:            appID,
+		Methods:          methods,
+		Persistent:       persistent,
+		OrgRequest:       org.requested,
+		SkipOrganization: org.skip,
 	})
 	if err != nil {
 		return nil, err
@@ -2178,17 +2260,19 @@ func (s *AuthService) ResendLoginOTP(ctx context.Context, otpSessionToken string
 
 // createMFAEnrollmentSession stores pre-auth state for a forced enrollment and
 // returns the challenge handed back by Login instead of tokens.
-func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, allowedMethods []string, persistent bool, activeRoles []string) (*MFAEnrollmentChallenge, error) {
+func (s *AuthService) createMFAEnrollmentSession(ctx context.Context, userID, tenantID int64, email, roleName string, perms []string, appID string, allowedMethods []string, persistent bool, activeRoles []string, org orgSessionRequest) (*MFAEnrollmentChallenge, error) {
 	enrollmentToken, err := s.storePreAuthSession(ctx, mfaEnrollKey, MFAEnrollmentSessionTTL, OTPSession{
-		UserID:      userID,
-		TenantID:    tenantID,
-		Email:       email,
-		RoleName:    roleName,
-		Perms:       perms,
-		ActiveRoles: activeRoles,
-		AppID:       appID,
-		Methods:     allowedMethods,
-		Persistent:  persistent,
+		UserID:           userID,
+		TenantID:         tenantID,
+		Email:            email,
+		RoleName:         roleName,
+		Perms:            perms,
+		ActiveRoles:      activeRoles,
+		AppID:            appID,
+		Methods:          allowedMethods,
+		Persistent:       persistent,
+		OrgRequest:       org.requested,
+		SkipOrganization: org.skip,
 	})
 	if err != nil {
 		return nil, err
@@ -2302,15 +2386,19 @@ func mfaEnrollKey(token string) string {
 // Me returns profile information derived from JWT claims.
 func (s *AuthService) Me(claims *Claims) *MeResult {
 	return &MeResult{
-		UserID:      claims.UserID,
-		TenantID:    claims.TenantID,
-		Email:       claims.Email,
-		Role:        claims.Role,
-		Roles:       claims.Roles,
-		ActiveRoles: claims.ActiveRoles,
-		Permissions: claims.Permissions,
-		AdminScope:  claims.AdminScope,
-		AdminApps:   claims.AdminApps,
+		UserID:         claims.UserID,
+		TenantID:       claims.TenantID,
+		Email:          claims.Email,
+		Role:           claims.Role,
+		Roles:          claims.Roles,
+		ActiveRoles:    claims.ActiveRoles,
+		Permissions:    claims.Permissions,
+		AdminScope:     claims.AdminScope,
+		AdminApps:      claims.AdminApps,
+		OrgID:          claims.OrgID,
+		OrgName:        claims.OrgName,
+		OrgRoles:       claims.OrgRoles,
+		OrgPermissions: claims.OrgPermissions,
 	}
 }
 
@@ -2342,6 +2430,11 @@ type GraceResult struct {
 	// per-session revocation check. Omitting it left a ten-second window — the grace
 	// period — in which a single-session revoke was not enforced.
 	SessionID int64
+	// Organisation claims of the session, empty for none. See Claims.OrgID.
+	OrgID          string
+	OrgName        string
+	OrgRoles       []string
+	OrgPermissions []string
 }
 
 // Refresh rotates a refresh token pair (AUTH-03).
@@ -2517,14 +2610,25 @@ func (s *AuthService) checkGraceWindow(ctx context.Context, userID, tenantID, se
 		perms = []string{}
 	}
 
-	return &GraceResult{
+	// The organisation is re-validated here exactly as on a rotation: a
+	// membership removed since the sibling rotated ends the session.
+	org, err := s.sessionOrganization(ctx, userID, tenantID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	g := &GraceResult{
 		UserID:      userID,
 		TenantID:    tenantID,
 		Email:       email,
 		Role:        roleName,
 		Permissions: perms,
 		SessionID:   sessionID,
-	}, nil
+	}
+	if org != nil {
+		g.OrgID, g.OrgName, g.OrgRoles, g.OrgPermissions = org.publicID, org.slug, org.roles, org.permissions
+	}
+	return g, nil
 }
 
 // TokenOwner is the resolved identity behind a refresh token, used to attribute
@@ -2978,7 +3082,7 @@ type AuthorizedUser struct {
 // audience is the value the authorization code was issued against (issue
 // #131), carried on the code row so it survives the exchange. Empty means the
 // authorize request named no audience, and the client's own is used.
-func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenantID, userID, appRowID int64, grantedScopes []string, audience string) (*AuthorizedUser, error) {
+func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenantID, userID, appRowID int64, grantedScopes []string, audience string, organizationID *int64) (*AuthorizedUser, error) {
 	var (
 		email, firstName, lastName, roleName string
 		emailVerified                        bool
@@ -3008,7 +3112,7 @@ func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenan
 	}
 
 	appID := strconv.FormatInt(appRowID, 10)
-	tokens, err := s.issueScopedTokenPair(ctx, userID, tenantID, email, roleName, perms, appID, audience, grantedScopes)
+	tokens, err := s.issueScopedTokenPair(ctx, userID, tenantID, email, roleName, perms, appID, audience, grantedScopes, organizationID)
 	if err != nil {
 		return nil, err
 	}
@@ -3039,7 +3143,7 @@ func (s *AuthService) IssueTokensForAuthorizationCode(ctx context.Context, tenan
 //
 // strings.Join of an empty slice is "", so the no-scope case needs no branch:
 // the claim is omitempty and simply does not appear.
-func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, appID, audience string, scopes []string) (*AuthResult, error) {
+func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID int64, email, role string, perms []string, appID, audience string, scopes []string, organizationID *int64) (*AuthResult, error) {
 	// CLAUDE.md deferred #23, closed here.
 	//
 	// The access token minted on this path carries the OAuth `scope` claim AND
@@ -3066,6 +3170,10 @@ func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID
 		sessionContext{
 			amr: []string{AMRPassword}, grant: GrantAuthorizationCode, audience: audience,
 			filterPermsForClient: true,
+			// The organisation chosen at /oauth/authorize, carried on the code.
+			// Re-validated by the mint: a membership revoked between authorize
+			// and exchange makes the exchange fail rather than succeed.
+			org: orgSessionRequest{boundID: organizationID},
 		},
 		appID, strings.Join(scopes, " "))
 }
