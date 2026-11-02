@@ -235,8 +235,13 @@ func firstExhaustedVia(ctx context.Context, store *limiterStore, buckets ...buck
 		}
 		n, err := peekScript.Run(ctx, d.rdb, keys, rates...).Int()
 		if err == nil {
-			if n > 0 && n <= len(buckets) {
-				return buckets[n-1], true
+			// n is the script's 1-based answer, 0 for none. Matched by
+			// ranging rather than indexed, so an out-of-range reply can only
+			// ever mean "none exhausted".
+			for i, b := range buckets {
+				if i+1 == n {
+					return b, true
+				}
 			}
 			return bucketRef{}, false
 		}
