@@ -238,7 +238,15 @@ export async function createWorkspace(req, res) {
   if (mine.some((m) => m.roles.includes('org-admin')))
     return res.status(409).json({ error: 'already_has_workspace' })
 
-  const org = await ensureOrganization(toSlug(req.body.name), req.body.name)
+  let org
+  try {
+    org = await ensureOrganization(toSlug(req.body.name), req.body.name, claims.user_id)
+  } catch (e: any) {
+    // Someone else's organisation already has this slug — never join it.
+    if (e.code === 'organization_slug_taken')
+      return res.status(409).json({ error: 'workspace_name_taken' })
+    throw e
+  }
   await emc('PUT', `/organizations/${org.id}/members/${claims.user_id}`, { roles: ['org-admin'] })
   return res.status(201).json({ organization: org })
 }
@@ -703,7 +711,7 @@ Response `201`: organisation object.
 
 | Status | `error` | Meaning |
 |---|---|---|
-| 409 | `organization_slug_taken` | fetch it with 6.3 instead (idempotent create) |
+| 409 | `organization_slug_taken` | slug in use — ask for another name. Fetch it with 6.3 only to resume **your own** earlier create (see `ensureOrganization` in [§8](#8-enforcing-access-in-your-api)); never add a user to an organisation you did not create for them |
 | 409 | `limit_reached` | 10,000 organisations per application |
 
 ### 6.2 List organisations
@@ -1103,11 +1111,19 @@ export async function emc(method: string, path: string, body?: unknown) {
   return data
 }
 
-export async function ensureOrganization(slug: string, name: string) {
+// Idempotent create for retries ONLY. A taken slug is reused solely when this
+// same creator made it (e.g. the first POST timed out after succeeding);
+// anyone else's organisation is reported as taken, never handed back —
+// otherwise the caller would go on to make themselves its org-admin.
+export async function ensureOrganization(slug: string, name: string, creatorId: string) {
   try {
-    return await emc('POST', '/organizations', { slug, display_name: name })
+    return await emc('POST', '/organizations', {
+      slug, display_name: name, metadata: { created_by: creatorId },
+    })
   } catch (e: any) {
-    if (e.code === 'organization_slug_taken') return emc('GET', `/organizations/${slug}`)
+    if (e.code !== 'organization_slug_taken') throw e
+    const existing = await emc('GET', `/organizations/${slug}`)
+    if (existing.metadata?.created_by === creatorId) return existing
     throw e
   }
 }
@@ -1156,7 +1172,7 @@ Rules your backend owns:
 | `member_not_found` | 404 | management | user is not a member |
 | `invitation_not_found` | 404 | revoke | not pending |
 | `invalid_invitation` | 400 | preview, accept | invalid/expired, or wrong account |
-| `organization_slug_taken` | 409 | create | fetch the existing one |
+| `organization_slug_taken` | 409 | create | pick another slug; reuse only if you created it |
 | `account_exists` | 409 | accept | sign in and accept with the bearer token |
 | `email_already_registered` | 409 | register | invite the person instead |
 | `limit_reached` | 409 | create, add, roles | a limit was hit |
