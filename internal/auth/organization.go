@@ -539,9 +539,11 @@ func (s *OrganizationService) CreateOrganization(ctx context.Context, sc Organiz
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	// Serialise creation per application so the count-then-insert below cannot
-	// be raced past the cap by concurrent requests.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('organizations:app'), $1::INTEGER)`,
-		int32(sc.AppRowID)); err != nil {
+	// be raced past the cap by concurrent requests. The single-bigint lock form,
+	// keyed by hashing a fixed namespace with the application id as the seed, so
+	// the 64-bit id is never narrowed.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('organizations:create', $1))`,
+		sc.AppRowID); err != nil {
 		return nil, fmt.Errorf("lock organization count: %w", err)
 	}
 	var count int64

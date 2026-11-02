@@ -193,7 +193,8 @@ func (s *OrganizationService) invitationLink(ctx context.Context, sc Organizatio
 	if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" {
 		return "", ErrInvalidInvitationURL
 	}
-	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+	// https anywhere; plain http only on a loopback host (local development).
+	if u.Scheme != "https" && (u.Scheme != "http" || !isLoopbackHost(u.Hostname())) {
 		return "", ErrInvalidInvitationURL
 	}
 	var redirects []string
