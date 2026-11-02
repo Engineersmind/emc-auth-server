@@ -20,9 +20,10 @@ import (
 // Regression tests for the second human review of PR #174.
 
 // #1: on the optional routes, a verified backend is trusted only for subjects in
-// its own tenant (and application, when the subject belongs to one). Anything
-// else — another tenant, another application, a session that does not resolve —
-// gets exactly what a caller without credentials gets.
+// its own tenant (and application, when the subject belongs to one). Another
+// tenant's or application's subject gets exactly what a caller without
+// credentials gets. A session that does not resolve belongs to nobody and keeps
+// the backend trusted, or expired sessions would throttle a real backend.
 func TestReview174b_BackendTrustedOnlyForItsOwnSubjects(t *testing.T) {
 	s, _ := newS2S(middleware.AppS2SConfig{}, nil)
 	sessions := map[string][2]int64{
@@ -55,7 +56,7 @@ func TestReview174b_BackendTrustedOnlyForItsOwnSubjects(t *testing.T) {
 		runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret,
 			body: `{"otp_session_token":"` + token + `","code":"123456"}`})
 	}
-	for token, want := range map[string]bool{"own": true, "tenant-level": true, "other-tenant": false, "other-app": false, "expired": false} {
+	for token, want := range map[string]bool{"own": true, "tenant-level": true, "other-tenant": false, "other-app": false, "expired": true} {
 		if trusted[token] != want {
 			t.Errorf("session %q: trusted backend = %v, want %v", token, trusted[token], want)
 		}
@@ -107,11 +108,12 @@ func TestReview174b_EmailPaddingDoesNotBuyBuckets(t *testing.T) {
 		codes = append(codes, res.code)
 	}
 	for i, code := range codes {
-		if want := http.StatusOK; i >= 5 {
+		want := http.StatusOK
+		if i >= 5 {
 			want = http.StatusTooManyRequests
-			if code != want {
-				t.Fatalf("request %d for the same victim: got %d, want %d (codes %v)", i+1, code, want, codes)
-			}
+		}
+		if code != want {
+			t.Fatalf("request %d for the same victim: got %d, want %d (codes %v)", i+1, code, want, codes)
 		}
 	}
 }

@@ -582,7 +582,7 @@ func TrustedBackend(c echo.Context) bool {
 
 // SubjectScopeFunc reports the tenant and application the request's subject
 // belongs to; appID is 0 for a tenant-level subject. ok is false when the
-// subject cannot be resolved.
+// subject cannot be resolved (see ScopeToCaller for how that is treated).
 type SubjectScopeFunc func(c echo.Context) (tenantID, appID int64, ok bool)
 
 // ScopeToCaller trusts a backend only for its own users. Mount it right after
@@ -594,11 +594,17 @@ type SubjectScopeFunc func(c echo.Context) (tenantID, appID int64, ok bool)
 // any tenant's valid credentials lifted the route's per-IP limiter for subjects
 // in EVERY tenant: an administrator could raise their own application's quota
 // (it has no upper bound) and drive another tenant's flows at that rate from
-// one address (PR #174 review). A subject outside the caller's tenant, outside
-// its application (when the subject belongs to one), or that cannot be
-// resolved marks the caller OutOfScope, and the request gets exactly the
-// limits a caller without credentials gets. A tenant-level subject is in scope
-// for any application of that tenant.
+// one address (PR #174 review). A subject outside the caller's tenant, or
+// outside its application (when the subject belongs to one), marks the caller
+// OutOfScope, and the request gets exactly the limits a caller without
+// credentials gets. A tenant-level subject is in scope for any application of
+// that tenant.
+//
+// A subject that does not resolve (an expired or made-up session token) leaves
+// the caller trusted. It belongs to no tenant, so there is nobody to protect —
+// the handler refuses it — and demoting it would put a real backend back on
+// the shared per-IP limit whenever its users' sessions expire. Guessing session
+// tokens stays bounded by the per-session limits, which apply to everyone.
 func ScopeToCaller(scope SubjectScopeFunc) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
@@ -607,7 +613,7 @@ func ScopeToCaller(scope SubjectScopeFunc) echo.MiddlewareFunc {
 				return next(c)
 			}
 			tenantID, appID, known := scope(c)
-			if !known || tenantID != caller.TenantID || (appID != 0 && appID != caller.AppID) {
+			if known && (tenantID != caller.TenantID || (appID != 0 && appID != caller.AppID)) {
 				caller.OutOfScope = true
 			}
 			return next(c)
