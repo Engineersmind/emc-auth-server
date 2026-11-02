@@ -64,24 +64,34 @@ type limiterStore struct {
 	store sync.Map
 	// max caps how many keys the store holds; 0 means unbounded. Only stores
 	// keyed on something an outsider can mint freely at volume (one key per end
-	// user) set it. See getOrCreate for what happens at the cap.
+	// user) set it. See getOrCreateWith for what happens at the cap.
 	max int64
-	// label names the store in the fail-open metric when the cap is reached.
+	// partition and partitionMax cap how many of those keys one partition (for
+	// appUserStore, one limiter label + one application) may hold, so a single
+	// caller minting keys cannot fill the store for every other application.
+	partition    func(key string) string
+	partitionMax int64
+	// idleFull is how long a bucket in this store must sit unused before it is
+	// full again, so evicting it grants nothing waiting would not. Zero means
+	// the store has no such guarantee and is never swept early.
+	idleFull time.Duration
+	// label names the store in the overflow metric when a cap is reached.
 	label string
 	n     atomic.Int64
+	// parts counts keys per partition (string -> *atomic.Int64).
+	parts sync.Map
+	// overflow holds one shared bucket per partition for keys that arrive
+	// while the store or the partition is full (string -> *limiterEntry).
+	overflow  sync.Map
+	lastSweep atomic.Int64
 }
 
-// unlimitedLimiter is handed out by a store that is at its cap.
-var unlimitedLimiter = rate.NewLimiter(rate.Inf, 0)
+// overflowSweepEvery bounds how often a full store sweeps itself, so an
+// attacker holding it at the cap cannot make every request pay for a scan.
+const overflowSweepEvery = 5 * time.Second
 
 // getOrCreate returns the *rate.Limiter for the given key, creating it if absent.
 // r is requests per minute; burst is the token bucket burst size (= r for login).
-//
-// A bounded store that is full allows the request (an unlimited limiter for a
-// key it cannot add) and counts it on rate_limit_fail_open_total. Only the
-// in-process fallback can get there — with Redis configured these buckets live
-// in Redis — so this is the same fail-open choice the Redis path makes, and the
-// alternative, growing until the process is killed, takes every limit with it.
 func (s *limiterStore) getOrCreate(key string, r int) *rate.Limiter {
 	return s.getOrCreateWith(key, func() *rate.Limiter {
 		return rate.NewLimiter(rate.Every(time.Minute/time.Duration(r)), r)
@@ -97,15 +107,36 @@ func (s *limiterStore) getOrCreateEvery(key string, interval time.Duration, burs
 	})
 }
 
+// getOrCreateWith is where a bounded store enforces its caps. Only the
+// in-process fallback can reach them — with Redis configured these buckets live
+// in Redis.
+//
+// At a cap it first sweeps buckets idle long enough to be full again (idleFull),
+// which loses nothing. If the store is still full, the new key gets its
+// partition's shared overflow bucket: the limit FAILS CLOSED for new subjects in
+// that partition, rather than handing out an unlimited limiter that lifted the
+// per-user limits for every application at once (PR #174 review). With
+// partitions, a caller filling its own partition overflows only itself.
 func (s *limiterStore) getOrCreateWith(key string, newLimiter func() *rate.Limiter) *rate.Limiter {
 	if existing, ok := s.store.Load(key); ok {
 		e, _ := existing.(*limiterEntry)
 		e.lastSeen = time.Now()
 		return e.limiter
 	}
-	if s.max > 0 && s.n.Load() >= s.max {
-		metrics.RateLimitFailOpen.WithLabelValues(s.label, "local_store_full").Inc()
-		return unlimitedLimiter
+	part := s.partitionOf(key)
+	var partN *atomic.Int64
+	if s.partitionMax > 0 {
+		partN = s.partCounter(part)
+	}
+	full := func() bool {
+		return (s.max > 0 && s.n.Load() >= s.max) || (partN != nil && partN.Load() >= s.partitionMax)
+	}
+	if full() {
+		s.sweepIdle()
+		if full() {
+			metrics.RateLimitStoreOverflow.WithLabelValues(s.label).Inc()
+			return s.overflowLimiter(part, newLimiter)
+		}
 	}
 	entry, loaded := s.store.LoadOrStore(key, &limiterEntry{
 		limiter:  newLimiter(),
@@ -116,7 +147,51 @@ func (s *limiterStore) getOrCreateWith(key string, newLimiter func() *rate.Limit
 		e.lastSeen = time.Now()
 	} else {
 		s.n.Add(1)
+		if partN != nil {
+			partN.Add(1)
+		}
 	}
+	return e.limiter
+}
+
+func (s *limiterStore) partitionOf(key string) string {
+	if s.partition == nil {
+		return ""
+	}
+	return s.partition(key)
+}
+
+func (s *limiterStore) partCounter(part string) *atomic.Int64 {
+	if v, ok := s.parts.Load(part); ok {
+		n, _ := v.(*atomic.Int64)
+		return n
+	}
+	v, _ := s.parts.LoadOrStore(part, &atomic.Int64{})
+	n, _ := v.(*atomic.Int64)
+	return n
+}
+
+// sweepIdle evicts buckets that are already full again, at most once per
+// overflowSweepEvery.
+func (s *limiterStore) sweepIdle() {
+	if s.idleFull <= 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := s.lastSweep.Load()
+	if now-last >= int64(overflowSweepEvery) && s.lastSweep.CompareAndSwap(last, now) {
+		s.cleanup(s.idleFull)
+	}
+}
+
+func (s *limiterStore) overflowLimiter(part string, newLimiter func() *rate.Limiter) *rate.Limiter {
+	if v, ok := s.overflow.Load(part); ok {
+		e, _ := v.(*limiterEntry)
+		e.lastSeen = time.Now()
+		return e.limiter
+	}
+	v, _ := s.overflow.LoadOrStore(part, &limiterEntry{limiter: newLimiter(), lastSeen: time.Now()})
+	e, _ := v.(*limiterEntry)
 	return e.limiter
 }
 
@@ -129,7 +204,17 @@ func (s *limiterStore) cleanup(ttl time.Duration) {
 		if e.lastSeen.Before(cutoff) {
 			if _, deleted := s.store.LoadAndDelete(key); deleted {
 				s.n.Add(-1)
+				if s.partitionMax > 0 {
+					k, _ := key.(string)
+					s.partCounter(s.partitionOf(k)).Add(-1)
+				}
 			}
+		}
+		return true
+	})
+	s.overflow.Range(func(part, value any) bool {
+		if e, _ := value.(*limiterEntry); e.lastSeen.Before(cutoff) {
+			s.overflow.Delete(part)
 		}
 		return true
 	})
@@ -161,7 +246,10 @@ func (s *limiterStore) refund(key string) {
 // reset empties the store (tests only).
 func (s *limiterStore) reset() {
 	s.store.Range(func(k, _ any) bool { s.store.Delete(k); return true })
+	s.parts.Range(func(k, _ any) bool { s.parts.Delete(k); return true })
+	s.overflow.Range(func(k, _ any) bool { s.overflow.Delete(k); return true })
 	s.n.Store(0)
+	s.lastSweep.Store(0)
 }
 
 // global stores — package-level singletons, one per key space.
@@ -185,15 +273,37 @@ var (
 	appIPStore = &limiterStore{}
 	// appUserStore holds one bucket per end user per application. It is the one
 	// store whose key count tracks the size of every product's user base, so it
-	// is capped (see limiterStore.getOrCreate).
-	appUserStore = &limiterStore{max: appUserStoreMax, label: "app_user"}
-	cleanupOnce  sync.Once
+	// is capped, per application as well as in total (see
+	// limiterStore.getOrCreateWith).
+	appUserStore = &limiterStore{
+		max:          appUserStoreMax,
+		partition:    appUserPartition,
+		partitionMax: appUserPartitionMax,
+		// Every bucket here is r per minute with burst r (allowVia), so one
+		// idle for a minute is full again.
+		idleFull: time.Minute,
+		label:    "app_user",
+	}
+	cleanupOnce sync.Once
 )
 
 // appUserStoreMax bounds the in-process per-user buckets. At roughly 200 bytes a
 // bucket this is about 100 MB, reached only when Redis is unavailable and more
-// than this many distinct users act within the 10-minute eviction window.
+// than this many distinct users act within one minute.
 const appUserStoreMax = 500_000
+
+// appUserPartitionMax is the share of appUserStore one partition may hold, so
+// one application minting subjects (made-up emails through its own credentials
+// and a large self-set quota) overflows only its own partition.
+const appUserPartitionMax = 100_000
+
+// appUserPartition is the limiter label and the key's owner — the application
+// id (or "-") for UserLimit keys, "sub"/"ip" for SignedInUserRateLimiter keys.
+func appUserPartition(key string) string {
+	label, rest, _ := strings.Cut(key, ":")
+	owner, _, _ := strings.Cut(rest, ":")
+	return label + ":" + owner
+}
 
 // startCleanup starts a background goroutine that evicts stale limiter entries
 // every 5 minutes. Called once via sync.Once.

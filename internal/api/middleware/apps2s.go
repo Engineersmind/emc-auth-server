@@ -360,8 +360,12 @@ func (s *AppS2S) OAuthTokenLimit() echo.MiddlewareFunc {
 			// Its own key, not the legacy oauth_token:client:<id>: requests
 			// with a wrong secret for this client_id still spend the legacy
 			// bucket, and must not be able to empty the real client's.
+			// The rate is part of the key: an in-process bucket keeps the rate
+			// it was created with, so without it a quota change never reached
+			// a client busy enough never to idle out (PR #174 review).
 			rate := max(OAuthTokenPerClientRate, s.appRPM(c.Request().Context(), caller))
-			if !allowVia(c.Request().Context(), oauthTokenStore, "oauth_token", "oauth_token:verified:"+caller.ClientID, rate) {
+			key := "oauth_token:verified:" + caller.ClientID + ":r" + strconv.Itoa(rate)
+			if !allowVia(c.Request().Context(), oauthTokenStore, "oauth_token", key, rate) {
 				metrics.RateLimitHits.WithLabelValues("oauth_token").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
@@ -406,7 +410,8 @@ func (s *AppS2S) OAuthRevokeLimit() echo.MiddlewareFunc {
 				return viaLegacy(c)
 			}
 			rate := max(RevokePerIPRate, s.appRPM(c.Request().Context(), caller))
-			key := "revoke:verified:" + caller.ClientID + ":" + caller.ConnIP
+			// Rate in the key, as in OAuthTokenLimit.
+			key := "revoke:verified:" + caller.ClientID + ":" + caller.ConnIP + ":r" + strconv.Itoa(rate)
 			if !allowVia(c.Request().Context(), revokeStore, "revoke", key, rate) {
 				metrics.RateLimitHits.WithLabelValues("revoke").Inc()
 				c.Response().Header().Set("Retry-After", "60")
@@ -744,9 +749,7 @@ func (s *AppS2S) resolve(surface string, mode resolveMode, creds func(echo.Conte
 				// backend's traffic, from however many addresses, never uses
 				// them up. A refusal above also kept what it spent.
 				if !blocked && outcome != verifyWrongSecret {
-					for _, t := range spent {
-						refundVia(ctx, appIPStore, t.label, t.key, t.rate)
-					}
+					refundAllVia(ctx, appIPStore, spent)
 				}
 				if outcome == verifyOK && !caller.ServerIP {
 					s.knownGood.mark(ctx, clientID, caller.ConnIP)
@@ -960,11 +963,12 @@ func (s *AppS2S) guardVerification(c echo.Context, mode resolveMode, caller *App
 		switch {
 		case mode.failedFallsBack:
 		case caller.ServerIP:
-			if exhaustedVia(ctx, appIPStore, "app_bad_credentials_server_ip", serverIPBadSecretKey(caller.ConnIP, clientID, secret), s.cfg.UnverifiedPerIPRate) {
-				return "app_bad_credentials_server_ip", s.cfg.UnverifiedPerIPRate, true, nil
-			}
-			if exhaustedVia(ctx, appIPStore, "app_verify_attempts_trusted_ip", attemptsKey, verifyAttemptsTrustedPerIP) {
-				return "app_verify_attempts_trusted_ip", verifyAttemptsTrustedPerIP, true, nil
+			// Both peeks in one round trip.
+			if b, hit := firstExhaustedVia(ctx, appIPStore,
+				bucketRef{"app_bad_credentials_server_ip", serverIPBadSecretKey(caller.ConnIP, clientID, secret), s.cfg.UnverifiedPerIPRate},
+				bucketRef{"app_verify_attempts_trusted_ip", attemptsKey, verifyAttemptsTrustedPerIP},
+			); hit {
+				return b.label, b.rate, true, nil
 			}
 		default:
 			ipKey, _ := badCredentialKeys(caller.ConnIP, clientID)
@@ -991,11 +995,12 @@ func (s *AppS2S) guardVerification(c echo.Context, mode resolveMode, caller *App
 
 	ipKey, clientKey := badCredentialKeys(caller.ConnIP, clientID)
 	if !mode.failedFallsBack {
-		if exhaustedVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate) {
-			return "app_bad_credentials_ip", s.cfg.UnverifiedPerIPRate, true, nil
-		}
-		if exhaustedVia(ctx, appIPStore, "app_bad_credentials_client", clientKey, s.cfg.BadCredentialsPerClientRate) {
-			return "app_bad_credentials_client", s.cfg.BadCredentialsPerClientRate, true, nil
+		// Both peeks in one round trip.
+		if b, hit := firstExhaustedVia(ctx, appIPStore,
+			bucketRef{"app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate},
+			bucketRef{"app_bad_credentials_client", clientKey, s.cfg.BadCredentialsPerClientRate},
+		); hit {
+			return b.label, b.rate, true, nil
 		}
 	}
 

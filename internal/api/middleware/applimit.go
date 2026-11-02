@@ -115,9 +115,14 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 			//     Counting it against the real quota would let anyone who knows
 			//     the public client_id drain the product's quota without ever
 			//     authenticating.
+			//   - A proven backend — a verified secret, or this client_id with no
+			//     secret from one of the application's registered server IPs —
+			//     spends the real quota. The second case used to fall through to
+			//     the unverified bucket, which anyone sending "Basic <id>:" could
+			//     empty and get the real backend 429'd (PR #174 review).
 			if caller, ok := CallerFrom(c); ok {
 				switch {
-				case caller.Verified && caller.ClientID == clientID:
+				case TrustedBackend(c) && caller.ClientID == clientID && caller.AppID > 0:
 					rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
 					return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
 				case caller.Failed:

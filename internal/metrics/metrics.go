@@ -245,6 +245,23 @@ var (
 		[]string{"limiter", "reason"},
 	)
 
+	// RateLimitStoreOverflow counts requests that a full in-process limiter
+	// store put in a shared overflow bucket instead of a bucket of their own.
+	// That store fails CLOSED for new subjects, so a sustained non-zero rate
+	// means real users are being throttled together — reachable only without
+	// Redis, and only when one partition (a limiter + an application) holds
+	// more active subjects than its cap.
+	//
+	// Labels: store (which in-process store overflowed).
+	RateLimitStoreOverflow = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "rate_limit_store_overflow_total",
+			Help:      "Requests limited through a shared overflow bucket because an in-process limiter store was full.",
+		},
+		[]string{"store"},
+	)
+
 	// LegacyHS256Verifications counts tokens verified through the legacy
 	// symmetric HS256 path rather than by asymmetric key id (issue #95).
 	//

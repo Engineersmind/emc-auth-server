@@ -214,6 +214,90 @@ func refundVia(ctx context.Context, store *limiterStore, label, key string, r in
 	store.refund(key)
 }
 
+// bucketRef names one bucket of allowVia's shape (rate per minute, burst rate).
+type bucketRef struct {
+	label, key string
+	rate       int
+}
+
+// firstExhaustedVia is exhaustedVia for several buckets in ONE Redis round trip:
+// it reports the first bucket, in order, that has nothing left, without
+// spending. The resolver peeks two buckets on most credentialed requests, and
+// one call per peek was a sequential round trip each on the hot routes (PR #174
+// review). On a Redis error it answers from the in-process buckets, as
+// exhaustedVia does.
+func firstExhaustedVia(ctx context.Context, store *limiterStore, buckets ...bucketRef) (bucketRef, bool) {
+	if d := distributed(); d != nil && len(buckets) > 0 {
+		keys := make([]string, len(buckets))
+		rates := make([]any, len(buckets))
+		for i, b := range buckets {
+			keys[i], rates[i] = redisRatePrefix+b.key, b.rate
+		}
+		n, err := peekScript.Run(ctx, d.rdb, keys, rates...).Int()
+		if err == nil {
+			if n > 0 && n <= len(buckets) {
+				return buckets[n-1], true
+			}
+			return bucketRef{}, false
+		}
+		metrics.RateLimitFailOpen.WithLabelValues(buckets[0].label, "redis_error").Inc()
+		d.logger.Warn().Err(err).Str("limiter", buckets[0].label).
+			Msg("rate limiting: Redis error — falling back to the in-process bucket")
+	}
+	for _, b := range buckets {
+		if store.exhausted(b.key) {
+			return b, true
+		}
+	}
+	return bucketRef{}, false
+}
+
+// peekScript answers redis_rate's own question — is Remaining < 1 for a cost-0
+// call? — for each key in turn, with the same arithmetic, clock and epoch as
+// its allowN script (Period one minute, Burst equal to Rate, as allowVia
+// spends). Read only: unlike a cost-0 AllowN it writes nothing back. Returns the
+// 1-based index of the first exhausted key, or 0. A missing key is a full
+// bucket.
+var peekScript = redisv9.NewScript(`
+local jan_1_2017 = 1483228800
+local now = redis.call("TIME")
+now = (now[1] - jan_1_2017) + (now[2] / 1000000)
+for i, key in ipairs(KEYS) do
+  local tat = redis.call("GET", key)
+  if tat then
+    local rate = tonumber(ARGV[i])
+    local emission_interval = 60 / rate
+    local burst_offset = emission_interval * rate
+    tat = math.max(tonumber(tat), now)
+    local remaining = (now - (tat - burst_offset)) / emission_interval
+    if remaining < 1 then
+      return i
+    end
+  end
+end
+return 0
+`)
+
+// refundAllVia is refundVia for several spent tokens in one Redis pipeline.
+func refundAllVia(ctx context.Context, store *limiterStore, tokens []spentToken) {
+	if len(tokens) == 0 {
+		return
+	}
+	if d := distributed(); d != nil {
+		pipe := d.rdb.Pipeline()
+		for _, t := range tokens {
+			refundScript.Eval(ctx, pipe, []string{redisRatePrefix + t.key}, time.Minute.Seconds()/float64(t.rate))
+		}
+		if _, err := pipe.Exec(ctx); err == nil {
+			return
+		}
+		metrics.RateLimitFailOpen.WithLabelValues(tokens[0].label, "redis_error").Inc()
+	}
+	for _, t := range tokens {
+		store.refund(t.key)
+	}
+}
+
 // redisRatePrefix is redis_rate's own key prefix (its unexported
 // redisPrefix), so refundScript edits the same key allowVia spent from.
 const redisRatePrefix = "rate:"
