@@ -122,8 +122,21 @@ func (s *AuthService) resolveMintOrganization(ctx context.Context, userID, tenan
 		return s.resolveRotationOrganization(ctx, userID, tenantID, appRowID, *sess.sessionID)
 	}
 
-	if sess.org.skip || !s.orgSvc.Enabled() || appRowID == 0 {
-		if sess.org.requested != "" && !sess.org.skip {
+	if sess.org.skip {
+		return nil, nil
+	}
+	// A server-bound organisation (authorization code, completed selection) is
+	// an authorization the grant already carries. If organisations no longer
+	// apply it is refused, never quietly discarded: minting without it would
+	// turn an organisation grant into an organisation-less session. A merely
+	// requested organisation is still ignored below, so a client sending the
+	// parameter early cannot break sign-in.
+	if sess.org.boundID != nil && (!s.orgSvc.Enabled() || appRowID == 0) {
+		countOrganizationMint("denied")
+		return nil, ErrOrganizationAccessDenied
+	}
+	if !s.orgSvc.Enabled() || appRowID == 0 {
+		if sess.org.requested != "" {
 			countOrganizationParamIgnored()
 		}
 		return nil, nil
@@ -137,7 +150,8 @@ func (s *AuthService) resolveMintOrganization(ctx context.Context, userID, tenan
 			return nil, fmt.Errorf("%w: %v", ErrOrganizationUnavailable, err)
 		}
 		if mode == OrganizationsModeOff {
-			return nil, nil
+			countOrganizationMint("denied")
+			return nil, ErrOrganizationAccessDenied
 		}
 		orgRowID = sess.org.boundID
 	} else {
@@ -349,7 +363,55 @@ func (s *AuthService) CompleteOrganizationSelection(ctx context.Context, selecti
 	default:
 		return nil, ErrOrganizationSelectionInvalid
 	}
-	return s.issueTokenPairWithScope(ctx, st.UserID, st.TenantID, st.Email, st.Role, st.Perms, sess, st.AppID, st.Scope)
+
+	// The stored identity is up to OrganizationSelectionTTL old. Everything the
+	// session will carry is reloaded rather than trusted from it, so a user
+	// disabled, deleted, signed out everywhere or stripped of a role while the
+	// list was on screen cannot finish the sign-in with what they had before.
+	email, role, perms, err := s.reloadSelectionIdentity(ctx, &st, appRowID)
+	if err != nil {
+		return nil, err
+	}
+	return s.issueTokenPairWithScope(ctx, st.UserID, st.TenantID, email, role, perms, sess, st.AppID, st.Scope)
+}
+
+// reloadSelectionIdentity re-reads the account a selection token was issued
+// for: it must still be an active, undeleted user of the application, with no
+// account-wide revocation (operator block, revoke-all, credential change)
+// recorded at or after the authentication the selection resumes. Returns the
+// current email, primary role and permissions to mint with.
+//
+// Unlike SessionDenied this fails CLOSED on a Redis error: it gates the
+// creation of a new session, not a request on an existing one, and Redis has
+// just served the selection token itself.
+func (s *AuthService) reloadSelectionIdentity(ctx context.Context, st *orgSelectionState, appRowID int64) (email, role string, perms []string, err error) {
+	if err := s.pool.QueryRow(ctx, `
+		SELECT u.email, COALESCE(r.name, '')
+		FROM users u
+		LEFT JOIN roles r ON r.id = u.role_id AND r.deleted_at IS NULL
+		WHERE u.id = $1 AND u.tenant_id = $2 AND u.application_id = $3
+		  AND u.is_active = true AND u.deleted_at IS NULL
+	`, st.UserID, st.TenantID, appRowID).Scan(&email, &role); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", nil, ErrOrganizationSelectionInvalid
+		}
+		return "", "", nil, fmt.Errorf("%w: load user for selection: %v", ErrOrganizationUnavailable, err)
+	}
+
+	stamp, err := s.redisCli.Get(ctx, userDenyKey(st.UserID, st.TenantID)).Result()
+	switch {
+	case errors.Is(err, redis.Nil):
+	case err != nil:
+		return "", "", nil, fmt.Errorf("%w: check account revocation: %v", ErrOrganizationUnavailable, err)
+	case revokedBefore(stamp, st.AuthTime.Unix()):
+		return "", "", nil, ErrOrganizationSelectionInvalid
+	}
+
+	perms, err = s.permissionsForRefresh(ctx, st.UserID, st.TenantID, st.ActiveRoles)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("%w: load permissions for selection: %v", ErrOrganizationUnavailable, err)
+	}
+	return email, role, perms, nil
 }
 
 // SwitchOrganizationInput moves a signed-in user to another organisation.
@@ -365,9 +427,11 @@ type SwitchOrganizationInput struct {
 // SwitchOrganization creates a NEW session in another organisation from an
 // existing one, without asking for a password again.
 //
-// The new session inherits auth_time and amr from the old one, so its absolute
-// deadline is computed from the original sign-in: switching can never extend a
-// session or upgrade how strongly it was authenticated. The old session is left
+// The new session inherits auth_time and amr from the old one, and its
+// absolute deadline is clamped to the old session's stored one (absoluteCap) —
+// not merely recomputed from auth_time under today's policy, which a lengthened
+// policy would extend: switching can never extend a session or upgrade how
+// strongly it was authenticated. The old session is left
 // alone — a user may have two tabs in two organisations.
 func (s *AuthService) SwitchOrganization(ctx context.Context, in SwitchOrganizationInput) (*AuthResult, error) {
 	if !s.orgSvc.Enabled() {
@@ -385,14 +449,16 @@ func (s *AuthService) SwitchOrganization(ctx context.Context, in SwitchOrganizat
 	)
 	err := s.pool.QueryRow(ctx, `
 		SELECT s.user_id, s.tenant_id, s.application_id,
-		       s.is_persistent, s.auth_time, s.amr, rt.audience, rt.active_roles
+		       s.is_persistent, s.auth_time, s.amr, rt.audience, rt.active_roles,
+		       s.absolute_expires_at
 		FROM refresh_tokens rt
 		JOIN user_sessions s ON s.id = rt.session_id
 		WHERE rt.token_hash = $1
 		  AND `+LiveTokenWhere("rt.")+`
 		  AND `+LiveSessionWhere("s."),
 		HashToken(in.RefreshToken)).Scan(&userID, &tenantID, &appRowID,
-		&carried.persistent, &carried.authTime, &carried.amr, &pinnedAudience, &carried.activeRoles)
+		&carried.persistent, &carried.authTime, &carried.amr, &pinnedAudience, &carried.activeRoles,
+		&carried.absoluteCap)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken

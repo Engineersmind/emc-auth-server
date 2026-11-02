@@ -1347,6 +1347,39 @@ func (s *OrganizationService) loadMintOrganization(ctx context.Context, orgRowID
 	return m, nil
 }
 
+// lockMintMembership re-checks, inside the mint's own transaction and
+// immediately before its user_sessions INSERT, that the membership a new
+// session is about to be bound to is still live — and holds FOR SHARE on both
+// the membership and the organisation row until that transaction ends.
+//
+// loadMintOrganization alone is not enough: it runs before the transaction, so
+// RemoveMember could delete the membership and revoke every session it can see
+// in the gap, and the session inserted afterwards would escape the revocation.
+// The share lock closes that gap. RemoveMember's DELETE, SetMemberStatus's
+// UPDATE and the deactivate/delete UPDATEs on organizations all conflict with
+// it, so either they wait for this session to commit — and their
+// revoke-after-commit then finds it — or they commit first and this check
+// finds no row and the mint is refused.
+func lockMintMembership(ctx context.Context, tx pgx.Tx, orgRowID, userID, appRowID int64) error {
+	var ok int
+	err := tx.QueryRow(ctx, `
+		SELECT 1
+		FROM organizations o
+		JOIN organization_members mem ON mem.organization_id = o.id
+		WHERE o.id = $1 AND o.application_id = $3
+		  AND o.deleted_at IS NULL AND o.is_active = true
+		  AND mem.user_id = $2 AND mem.status = 'active'
+		FOR SHARE OF o, mem
+	`, orgRowID, userID, appRowID).Scan(&ok)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrOrganizationAccessDenied
+		}
+		return fmt.Errorf("%w: lock organization membership: %v", ErrOrganizationUnavailable, err)
+	}
+	return nil
+}
+
 // activeMembershipRefs lists the organisations a user may sign in to.
 func (s *OrganizationService) activeMembershipRefs(ctx context.Context, userID, appRowID int64) ([]OrganizationRef, error) {
 	rows, err := s.pool.Query(ctx, `

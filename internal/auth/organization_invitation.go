@@ -495,7 +495,8 @@ func (s *OrganizationService) AcceptInvitation(ctx context.Context, in AcceptOrg
 	// Validate the token BEFORE any password work. Argon2id is deliberately
 	// expensive; hashing first would let anyone spend server CPU by posting
 	// random tokens with a password. The row is re-read under lock below.
-	if _, err := loadPendingInvitation(ctx, s.pool, in.Token, false); err != nil {
+	pre, err := loadPendingInvitation(ctx, s.pool, in.Token, false)
+	if err != nil {
 		return nil, err
 	}
 
@@ -522,9 +523,21 @@ func (s *OrganizationService) AcceptInvitation(ctx context.Context, in AcceptOrg
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Lock order: organisation, THEN invitation — the order CreateInvitation and
+	// DeleteOrganization use. Taking the invitation first deadlocked against
+	// them. The organisation lock also enforces the member cap against
+	// concurrent additions, exactly as AddMember does. The invitation is then
+	// re-read under its own lock, which revalidates both: a deletion or revoke
+	// that committed while this waited makes it read as invalid.
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM organizations WHERE id = $1 FOR UPDATE`, pre.orgRowID); err != nil {
+		return nil, fmt.Errorf("lock organization: %w", err)
+	}
 	p, err := loadPendingInvitation(ctx, tx, in.Token, true)
 	if err != nil {
 		return nil, err
+	}
+	if p.orgRowID != pre.orgRowID {
+		return nil, ErrOrganizationInvitationInvalid
 	}
 	sc := OrganizationScope{TenantID: p.tenant, AppRowID: p.appRowID}
 
@@ -565,11 +578,6 @@ func (s *OrganizationService) AcceptInvitation(ctx context.Context, in AcceptOrg
 		created = true
 	}
 
-	// Lock the organisation row so the member cap is enforced against
-	// concurrent additions, exactly as AddMember does.
-	if _, err := tx.Exec(ctx, `SELECT 1 FROM organizations WHERE id = $1 FOR UPDATE`, p.orgRowID); err != nil {
-		return nil, fmt.Errorf("lock organization: %w", err)
-	}
 	if _, err := s.addMemberTx(ctx, tx, sc, p.orgRowID, userID, nil); err != nil {
 		return nil, err
 	}

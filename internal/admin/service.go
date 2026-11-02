@@ -1481,12 +1481,17 @@ func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) ([]int
 	// the scalar column would miss every user who holds the role
 	// non-primarily — since #146 phase 2 that is most of them — and leave their
 	// sessions un-revoked and their names out of the audit record.
+	// organization_member_roles is the third source (#175): a member granted the
+	// role only inside an organisation carries its permissions in org_permissions,
+	// and would otherwise keep presenting them until the token expired.
 	rows, err := tx.Query(ctx, `
 		SELECT u.id FROM users u
 		WHERE u.tenant_id = $2 AND u.deleted_at IS NULL
 		  AND (u.role_id = $1
 		       OR EXISTS (SELECT 1 FROM user_roles ur
-		                  WHERE ur.user_id = u.id AND ur.role_id = $1))
+		                  WHERE ur.user_id = u.id AND ur.role_id = $1)
+		       OR EXISTS (SELECT 1 FROM organization_member_roles omr
+		                  WHERE omr.user_id = u.id AND omr.role_id = $1))
 		ORDER BY u.id
 	`, roleID, tenantID)
 	if err != nil {
@@ -1531,6 +1536,13 @@ func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) ([]int
 		`DELETE FROM user_roles WHERE role_id = $1 AND tenant_id = $2`,
 		roleID, tenantID); err != nil {
 		return nil, fmt.Errorf("delete role: revoke grants: %w", err)
+	}
+	// The same for organisation grants (#175): their FK cascade does not fire on
+	// a soft delete either.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM organization_member_roles WHERE role_id = $1 AND tenant_id = $2`,
+		roleID, tenantID); err != nil {
+		return nil, fmt.Errorf("delete role: revoke organization grants: %w", err)
 	}
 
 	// Promote a surviving grant for anyone whose primary this was, so a user who

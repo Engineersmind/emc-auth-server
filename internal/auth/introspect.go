@@ -64,10 +64,18 @@ func (s *AuthService) Introspect(ctx context.Context, client IntrospectionClient
 	if token == "" {
 		return inactiveToken
 	}
-	if hint != "refresh_token" {
-		if r, ok := s.introspectAccessToken(ctx, client, token); ok {
+	// token_type_hint only orders the lookups. RFC 7662 §2.1: if the hinted
+	// type misses, the server MUST extend its search to the other types it
+	// supports, so a wrong hint can never make a live token read inactive.
+	if hint == "refresh_token" {
+		if r := s.introspectRefreshToken(ctx, client, token); r.Active {
 			return r
 		}
+		r, _ := s.introspectAccessToken(ctx, client, token)
+		return r
+	}
+	if r, ok := s.introspectAccessToken(ctx, client, token); ok {
+		return r
 	}
 	return s.introspectRefreshToken(ctx, client, token)
 }
@@ -101,11 +109,29 @@ func (s *AuthService) introspectAccessToken(ctx context.Context, client Introspe
 		if err != nil {
 			return inactiveToken, true
 		}
+		// The session is checked here as well as through SessionDenied above,
+		// because that denylist fails OPEN: with Redis down, or an entry lost, a
+		// revoked session's unexpired token would still read active. PostgreSQL
+		// is the durable record of the revocation; the denylist stays for the
+		// account-wide cases (revoke-all, block, role change) that leave the
+		// session row alone. A lookup failure answers inactive.
+		var sessionID *int64
+		if claims.SessionID != "" {
+			sid, err := strconv.ParseInt(claims.SessionID, 10, 64)
+			if err != nil {
+				return inactiveToken, true
+			}
+			sessionID = &sid
+		}
 		var live bool
 		if err := s.pool.QueryRow(ctx, `
 			SELECT EXISTS (SELECT 1 FROM users
 			               WHERE id = $1 AND tenant_id = $2 AND is_active = true AND deleted_at IS NULL)
-		`, uid, client.TenantID).Scan(&live); err != nil || !live {
+			   AND ($3::BIGINT IS NULL OR EXISTS (
+			            SELECT 1 FROM user_sessions s
+			            WHERE s.id = $3 AND s.user_id = $1 AND s.tenant_id = $2
+			              AND `+LiveSessionWhere("s.")+`))
+		`, uid, client.TenantID, sessionID).Scan(&live); err != nil || !live {
 			return inactiveToken, true
 		}
 		if claims.OrgID != "" && !s.orgSvc.memberActiveByPublicID(ctx, client.AppRowID, uid, claims.OrgID) {

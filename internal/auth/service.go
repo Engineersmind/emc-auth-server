@@ -776,6 +776,14 @@ type sessionContext struct {
 	// organisations existed. On rotation it is ignored; the session row is the
 	// authority. See resolveMintOrganization.
 	org orgSessionRequest
+
+	// absoluteCap is an upper bound on a NEW session's absolute deadline,
+	// carried from the session it was derived from (an organisation switch).
+	// Zero — every fresh sign-in — means none. Without it the new session's
+	// deadline is recomputed from authTime under the CURRENT policy, so a policy
+	// that lengthened the absolute lifetime since sign-in would let a switched
+	// session outlive the hard cap of the session it came from.
+	absoluteCap time.Time
 }
 
 // orgSessionRequest is a caller's organisation intent for a new session.
@@ -967,6 +975,9 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	// On rotation the absolute deadline is not recomputed at all — it is already on
 	// the session row and stays there. Only the idle clock is written.
 	_, absoluteExpiresAt := policy.Deadlines(authTime, sess.persistent)
+	if !sess.absoluteCap.IsZero() && absoluteExpiresAt.After(sess.absoluteCap) {
+		absoluteExpiresAt = sess.absoluteCap
+	}
 	idleExpiresAt := now.Add(policy.IdleTTLFor(sess.persistent))
 	if idleExpiresAt.After(absoluteExpiresAt) {
 		idleExpiresAt = absoluteExpiresAt
@@ -1036,6 +1047,15 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 		evicted, err = enforceSessionCap(ctx, tx, userID, tenantID, policy.MaxConcurrentSessions)
 		if err != nil {
 			return nil, err
+		}
+
+		// The membership was checked before this transaction opened; re-check it
+		// under a share lock so a concurrent RemoveMember either sees this session
+		// or makes this mint fail. See lockMintMembership.
+		if orgRowID != nil {
+			if err := lockMintMembership(ctx, tx, *orgRowID, userID, parseAppIDValue(appID)); err != nil {
+				return nil, s.countOrganizationFailure(err)
+			}
 		}
 
 		if err := tx.QueryRow(ctx, `
@@ -3173,7 +3193,13 @@ func (s *AuthService) issueScopedTokenPair(ctx context.Context, userID, tenantID
 			// The organisation chosen at /oauth/authorize, carried on the code.
 			// Re-validated by the mint: a membership revoked between authorize
 			// and exchange makes the exchange fail rather than succeed.
-			org: orgSessionRequest{boundID: organizationID},
+			//
+			// A nil organisation is an explicit "no organisation" binding, not a
+			// fresh login decision: without personal, an application moved from
+			// optional to required in between would auto-select the user's sole
+			// membership and issue tokens for an organisation the code never
+			// authorized. personal makes required mode refuse it instead.
+			org: orgSessionRequest{boundID: organizationID, personal: organizationID == nil},
 		},
 		appID, strings.Join(scopes, " "))
 }
