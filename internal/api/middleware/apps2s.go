@@ -23,6 +23,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/engineersmind/emc-auth-server/internal/metrics"
 	"github.com/engineersmind/emc-auth-server/internal/requestctx"
 )
@@ -92,6 +93,10 @@ type AppCaller struct {
 	// true, otherwise ConnIP.
 	EndUserIP string
 	Forwarded bool
+	// OutOfScope is set by ScopeToCaller when the request's subject (the user
+	// it acts on) is outside this caller's tenant or application. Such a
+	// request is not a trusted backend: the route's own per-IP limiter applies.
+	OutOfScope bool
 }
 
 // CallerFrom returns the caller Resolve stored on this request, if any.
@@ -449,7 +454,7 @@ const (
 	// the route's own limiter.
 	SurfaceMFA     = "mfa"     // /auth/login/otp, /otp/resend, /login/mfa/*
 	SurfaceOAuth   = "oauth"   // /auth/oauth/exchange, /oauth/token, /oauth/revoke
-	SurfacePasskey = "passkey" // /auth/passkey/login/*
+	SurfacePasskey = "passkey" // /auth/passkey/login/complete
 	SurfaceAccount = "account" // /auth/resend-verification
 )
 
@@ -569,10 +574,78 @@ func (s *AppS2S) ResolveOAuthClient(surface string, legacyExhausted func(echo.Co
 // exactly as before everywhere else.
 func TrustedBackend(c echo.Context) bool {
 	caller, ok := CallerFrom(c)
-	if !ok {
+	if !ok || caller.OutOfScope {
 		return false
 	}
 	return caller.Verified || (caller.ServerIP && !caller.HasCredentials)
+}
+
+// SubjectScopeFunc reports the tenant and application the request's subject
+// belongs to; appID is 0 for a tenant-level subject. ok is false when the
+// subject cannot be resolved.
+type SubjectScopeFunc func(c echo.Context) (tenantID, appID int64, ok bool)
+
+// ScopeToCaller trusts a backend only for its own users. Mount it right after
+// ResolveOptional, before anything that consults TrustedBackend.
+//
+// On the optional routes (MFA completion, change-email) the handler acts on
+// whatever subject the request names — a pending sign-in, a signed-in user —
+// without checking that it belongs to the calling application. Without this,
+// any tenant's valid credentials lifted the route's per-IP limiter for subjects
+// in EVERY tenant: an administrator could raise their own application's quota
+// (it has no upper bound) and drive another tenant's flows at that rate from
+// one address (PR #174 review). A subject outside the caller's tenant, outside
+// its application (when the subject belongs to one), or that cannot be
+// resolved marks the caller OutOfScope, and the request gets exactly the
+// limits a caller without credentials gets. A tenant-level subject is in scope
+// for any application of that tenant.
+func ScopeToCaller(scope SubjectScopeFunc) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			caller, ok := CallerFrom(c)
+			if !ok || !TrustedBackend(c) {
+				return next(c)
+			}
+			tenantID, appID, known := scope(c)
+			if !known || tenantID != caller.TenantID || (appID != 0 && appID != caller.AppID) {
+				caller.OutOfScope = true
+			}
+			return next(c)
+		}
+	}
+}
+
+// ScopeSignedInUser is the subject scope of a JWT-authenticated route: the
+// verified token's tenant and application. Mount after the JWT middleware.
+func ScopeSignedInUser(c echo.Context) (tenantID, appID int64, ok bool) {
+	claims, found := c.Get(userContextKey).(*auth.Claims)
+	if !found || claims == nil {
+		return 0, 0, false
+	}
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if claims.AppID != "" {
+		if appID, err = strconv.ParseInt(claims.AppID, 10, 64); err != nil {
+			return 0, 0, false
+		}
+	}
+	return tenantID, appID, true
+}
+
+// ScopeByBodyToken is the subject scope of a route whose subject is a token in
+// the JSON body field (otp_session_token, enrollment_token), resolved by
+// lookup. The field is read with the same decoder the handler binds with, so
+// both see the same token.
+func ScopeByBodyToken(field string, lookup func(ctx context.Context, token string) (tenantID, appID int64, ok bool)) SubjectScopeFunc {
+	return func(c echo.Context) (int64, int64, bool) {
+		token := peekBodyString(c, field)
+		if token == "" {
+			return 0, 0, false
+		}
+		return lookup(c.Request().Context(), token)
+	}
 }
 
 // BackendsOnly runs mw only for trusted backends and passes everyone else
@@ -646,7 +719,7 @@ func (s *AppS2S) resolve(surface string, mode resolveMode, creds func(echo.Conte
 				trusted := caller.ServerIP || s.knownGood.has(ctx, clientID, caller.ConnIP)
 				var outcome verifyOutcome
 				cachedTID, cachedAID, cached := s.verified.lookup(clientID, secret)
-				label, rate, blocked, spent := s.guardVerification(c, mode, caller, clientID, trusted, cached)
+				label, rate, blocked, spent := s.guardVerification(c, mode, caller, clientID, secret, trusted, cached)
 				switch {
 				case blocked && !mode.failedFallsBack:
 					return rejectIP(c, label, rate)
@@ -683,9 +756,12 @@ func (s *AppS2S) resolve(surface string, mode resolveMode, creds func(echo.Conte
 				// secret got through. Admission is decided only before the
 				// check, in guardVerification, where the outcome is unknown.
 				if caller.Failed && !mode.failedFallsBack {
-					ipKey, clientKey := badCredentialKeys(caller.ConnIP, clientID)
-					allowVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate)
-					if !caller.ServerIP {
+					if caller.ServerIP {
+						// Per secret, not per address: see serverIPBadSecretKey.
+						allowVia(ctx, appIPStore, "app_bad_credentials_server_ip", serverIPBadSecretKey(caller.ConnIP, clientID, secret), s.cfg.UnverifiedPerIPRate)
+					} else {
+						ipKey, clientKey := badCredentialKeys(caller.ConnIP, clientID)
+						allowVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate)
 						allowVia(ctx, appIPStore, "app_bad_credentials_client", clientKey, s.cfg.BadCredentialsPerClientRate)
 					}
 				}
@@ -841,7 +917,7 @@ const oauthVerifyAttemptsPerClient = OAuthTokenPerClientRate
 // concurrent requests — from one address or many — all pass before any of
 // them is recorded. The failure-bucket peeks below remain as a sequential
 // backstop; the spent budgets are what hold under concurrency.
-func (s *AppS2S) guardVerification(c echo.Context, mode resolveMode, caller *AppCaller, clientID string, trusted, cached bool) (label string, rate int, blocked bool, spent []spentToken) {
+func (s *AppS2S) guardVerification(c echo.Context, mode resolveMode, caller *AppCaller, clientID, secret string, trusted, cached bool) (label string, rate int, blocked bool, spent []spentToken) {
 	ctx := c.Request().Context()
 	spend := func(label, key string, rate int) bool {
 		if !allowVia(ctx, appIPStore, label, key, rate) {
@@ -862,7 +938,29 @@ func (s *AppS2S) guardVerification(c echo.Context, mode resolveMode, caller *App
 		// wrong secrets a minute from a shared address hold up every
 		// credentialed request from it for the rest of that minute, as the
 		// legacy 5/min per-IP limit already did for any five requests.
-		if !mode.failedFallsBack {
+		//
+		// A registered server IP is the exception: it is the application's
+		// own declared egress, and an IP-wide bucket there turned a secret
+		// rotation into an outage — one instance still holding the old secret
+		// filled it in five requests, and every instance on that address,
+		// new secret included, got 429 (PR #174 review). There wrong secrets
+		// are counted per secret instead, so a stale one blocks only itself.
+		// Without an address-wide check before the cache, though, exhausting
+		// the attempt budget below would leave a cached right secret admitted
+		// while wrong ones got 429 — an oracle — so that budget is peeked here
+		// too. A stale secret, stopped by its own bucket after five failures,
+		// spends at most five attempts a minute and never exhausts it.
+		attemptsKey := "app-verify-trusted-ip:" + caller.ConnIP
+		switch {
+		case mode.failedFallsBack:
+		case caller.ServerIP:
+			if exhaustedVia(ctx, appIPStore, "app_bad_credentials_server_ip", serverIPBadSecretKey(caller.ConnIP, clientID, secret), s.cfg.UnverifiedPerIPRate) {
+				return "app_bad_credentials_server_ip", s.cfg.UnverifiedPerIPRate, true, nil
+			}
+			if exhaustedVia(ctx, appIPStore, "app_verify_attempts_trusted_ip", attemptsKey, verifyAttemptsTrustedPerIP) {
+				return "app_verify_attempts_trusted_ip", verifyAttemptsTrustedPerIP, true, nil
+			}
+		default:
 			ipKey, _ := badCredentialKeys(caller.ConnIP, clientID)
 			if exhaustedVia(ctx, appIPStore, "app_bad_credentials_ip", ipKey, s.cfg.UnverifiedPerIPRate) {
 				return "app_bad_credentials_ip", s.cfg.UnverifiedPerIPRate, true, nil
@@ -871,7 +969,7 @@ func (s *AppS2S) guardVerification(c echo.Context, mode resolveMode, caller *App
 		if cached {
 			return "", 0, false, nil
 		}
-		if !spend("app_verify_attempts_trusted_ip", "app-verify-trusted-ip:"+caller.ConnIP, verifyAttemptsTrustedPerIP) {
+		if !spend("app_verify_attempts_trusted_ip", attemptsKey, verifyAttemptsTrustedPerIP) {
 			return "app_verify_attempts_trusted_ip", verifyAttemptsTrustedPerIP, true, spent
 		}
 		return "", 0, false, spent
@@ -926,6 +1024,16 @@ type spentToken struct {
 func badCredentialKeys(ip, clientID string) (ipKey, clientKey string) {
 	sum := sha256.Sum256([]byte(clientID))
 	return "app-badcred-ip:" + ip, "app-badcred-client:" + hex.EncodeToString(sum[:16])
+}
+
+// serverIPBadSecretKey is the wrong-secret bucket for one secret from one of the
+// application's registered server IPs. Keyed on the secret so that a stale
+// secret during a rotation fills only its own bucket; guessing many secrets is
+// bounded by the trusted attempt budget instead. Hashed, so no secret — even a
+// wrong or retired one — is ever stored.
+func serverIPBadSecretKey(ip, clientID, secret string) string {
+	sum := sha256.Sum256([]byte(clientID + "\x00" + secret))
+	return "app-badcred-server:" + ip + ":" + hex.EncodeToString(sum[:16])
 }
 
 // lookupTrust is nil-safe: with no trust source, no application has a server
@@ -1048,10 +1156,17 @@ func (s *AppS2S) subjectLimit(label string, perMinute int, subject SubjectFunc, 
 	}
 }
 
-// SubjectEmail keys on the "email" field of the JSON body, lower-cased and
-// trimmed so case and padding cannot buy a fresh bucket.
+// SubjectEmail keys on the "email" field of the JSON body, normalised exactly
+// as the handlers normalise it (emailaddr.Normalize) so case and padding cannot
+// buy a fresh bucket.
+//
+// Normalised from the FULL value, never a truncated one: cutting first and
+// trimming after let leading whitespace shift the cut, so "<spaces>victim@x.com"
+// keyed on "victim@x.co", "victim@x.c", ... — a fresh bucket per padding length
+// for one victim the handler mails every time. The bucket key is a hash, so its
+// size does not depend on the value's length.
 func SubjectEmail(c echo.Context, _ *AppCaller) (string, bool) {
-	return strings.ToLower(strings.TrimSpace(peekBodyString(c, "email"))), true
+	return emailaddr.Normalize(peekBodyString(c, "email")), true
 }
 
 // SubjectUserID keys on the "user_id" field of the JSON body, canonicalised the
@@ -1099,47 +1214,22 @@ func SubjectEmailAndUserIP(c echo.Context, caller *AppCaller) (string, bool) {
 	return email, true
 }
 
-// SubjectBearerUser keys on the user in the access token, read WITHOUT verifying
-// it. That is enough for bucketing: a forged token only earns its author a
-// bucket of their own, and the JWT middleware after this still rejects it.
+// SubjectSignedInUser keys on the user in the access token the JWT middleware
+// has already VERIFIED. Mount it after that middleware.
 //
-// The token is found exactly where JWTRenew finds it — bearerToken (any case of
-// "Bearer", or a raw JWT), then the access-token cookie — so every form the
-// route accepts is bucketed per user rather than in one shared bucket.
-func SubjectBearerUser(c echo.Context, _ *AppCaller) (string, bool) {
-	token, found := bearerToken(c)
-	if !found {
-		if cookie, err := c.Cookie(AccessTokenCookie); err == nil && cookie.Value != "" {
-			token, found = cookie.Value, true
-		}
-	}
-	if !found {
+// It used to read the token's claims unverified, ahead of the JWT middleware.
+// That let anyone bucket a request on any user: an unsigned token naming a
+// victim's tenant_id and (sequential, guessable) user_id spent the victim's
+// bucket before the JWT middleware rejected it, so ~30 forged requests a minute
+// kept the real user at 429. Keyed on verified claims, a forged token never
+// reaches this limiter. Unauthenticated volume is still bounded ahead of the
+// JWT middleware by the resolver's per-IP guard and the application quota.
+func SubjectSignedInUser(c echo.Context, _ *AppCaller) (string, bool) {
+	claims, ok := c.Get(userContextKey).(*auth.Claims)
+	if !ok || claims == nil || claims.UserID == "" {
 		return "", true
 	}
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 || len(parts[1]) > 8<<10 {
-		return "", true
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return "", true
-	}
-	var claims struct {
-		TenantID string `json:"tenant_id"`
-		UserID   string `json:"user_id"`
-		Sub      string `json:"sub"`
-	}
-	if json.Unmarshal(raw, &claims) != nil {
-		return "", true
-	}
-	user := claims.UserID
-	if user == "" {
-		user = claims.Sub
-	}
-	if user == "" {
-		return "", true
-	}
-	return claims.TenantID + ":" + user, true
+	return claims.TenantID + ":" + claims.UserID, true
 }
 
 // peekBodyString reads one top-level string field from a JSON body and restores
@@ -1151,12 +1241,12 @@ func SubjectBearerUser(c echo.Context, _ *AppCaller) (string, bool) {
 // {"email":"decoy","Email":"victim"} would bucket the decoy while the handler
 // acted on the victim. Decoding into a one-field struct tagged with the same
 // name gives identical matching, duplicate and trailing-data behaviour.
+//
+// The value is returned whole. Callers normalise it and subjectLimit hashes
+// the result, so nothing here needs a length cap — and a cap applied before
+// normalising is a bypass (see SubjectEmail).
 func peekBodyString(c echo.Context, field string) string {
-	v := peekBodyField(c, field, 1<<16)
-	if len(v) > maxRateLimitEmailLen {
-		v = v[:maxRateLimitEmailLen]
-	}
-	return v
+	return peekBodyField(c, field, 1<<16)
 }
 
 // peekBodyField is the one body reader every limiter in this package uses.

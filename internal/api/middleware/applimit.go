@@ -238,10 +238,15 @@ func AppCallerRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 // exactly the routes that need it, and the handler still binds the body itself.
 // The body is restored before next(c) so binding is unaffected.
 //
-// Same bucket namespace ("appauth:") as AppClientRateLimiter, deliberately —
-// both identify a caller by an unverified, public client_id before any secret is
-// checked, so they belong in the same pre-auth bucket and must stay out of the
-// JWT-authenticated "app:" one.
+// A body client_id carries no secret, so it never proves anything. Only a
+// caller AppS2S's resolver identified as the application's backend — that
+// client_id, from one of the application's registered server IPs — spends the
+// application's real quota ("appauth:"). Everyone else spends the separate
+// "appauth-unverified:" bucket. Since #173 the "appauth:" bucket is the main
+// limit on the product backend's VERIFIED traffic; charging it from a public
+// client_id let anyone send {"client_id":"<id>"} from a dozen addresses (or one
+// IPv6 /64), empty it, and get every real /apps/login, /apps/register and
+// forgot-password call answered 429 limiter=app (PR #174 review).
 //
 // Fails OPEN on an unreadable or unparseable body: the handler is the component
 // that owns rejecting a malformed request, and a limiter that 400s first would
@@ -255,11 +260,15 @@ func AppClientBodyRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.C
 			if clientID == "" {
 				return next(c)
 			}
+			if caller, ok := CallerFrom(c); ok && TrustedBackend(c) && caller.ClientID == clientID && caller.AppID > 0 {
+				rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
+				return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
+			}
 			tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
 			if !ok {
 				return next(c)
 			}
-			return enforceAppLimit(c, next, limiter, logger, "appauth:", tenantID, appID, rpm, burst)
+			return enforceAppLimit(c, next, limiter, logger, "appauth-unverified:", tenantID, appID, rpm, burst)
 		}
 	}
 }

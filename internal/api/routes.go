@@ -887,17 +887,28 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// bucket in OTPRateLimiter still bounds code guessing, the per-user limit
 	// keys on the forwarded end-user IP, and the application quota applies.
 	// Callers that send no credentials keep OTPRateLimiter exactly as before.
-	mfaChain := []echo.MiddlewareFunc{
-		s2s.ResolveOptional(mw.SurfaceMFA),
-		mw.BackendsOnly(appCallerRateLimit),
-		mw.BackendsOnly(s2s.UserLimit("app_mfa_challenge_user", userLimits.MFAChallenge, mw.SubjectEndUserIP)),
-		mw.OTPRateLimiter(rlCfg),
+	//
+	// ScopeToCaller: a backend is trusted only for its own users' pending
+	// sign-ins. A session from another tenant or application keeps
+	// OTPRateLimiter's per-IP limit (PR #174 review). Each chain reads the
+	// token field its handlers bind — a scope check reading one field while
+	// the handler acts on another would be a bypass.
+	mfaChain := func(scope mw.SubjectScopeFunc) []echo.MiddlewareFunc {
+		return []echo.MiddlewareFunc{
+			s2s.ResolveOptional(mw.SurfaceMFA),
+			mw.ScopeToCaller(scope),
+			mw.BackendsOnly(appCallerRateLimit),
+			mw.BackendsOnly(s2s.UserLimit("app_mfa_challenge_user", userLimits.MFAChallenge, mw.SubjectEndUserIP)),
+			mw.OTPRateLimiter(rlCfg),
+		}
 	}
-	authGroup.POST("/login/otp", authHandler.LoginOTP, mfaChain...)                    // complete MFA-gated login (TOTP, backup, or emailed code)
-	authGroup.POST("/login/otp/resend", authHandler.LoginOTPResend, mfaChain...)       // re-send the emailed login code (max 3/challenge)
-	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, mfaChain...)     // forced enrollment, TOTP path: get QR + backup codes
-	authGroup.POST("/login/mfa/email", authHandler.MFAEmailPending, mfaChain...)       // forced enrollment, email path: send code to inbox
-	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, mfaChain...) // forced enrollment: first code → tokens
+	otpChain := mfaChain(mw.ScopeByBodyToken("otp_session_token", authSvc.OTPSessionScope))
+	enrollChain := mfaChain(mw.ScopeByBodyToken("enrollment_token", authSvc.EnrollmentSessionScope))
+	authGroup.POST("/login/otp", authHandler.LoginOTP, otpChain...)                       // complete MFA-gated login (TOTP, backup, or emailed code)
+	authGroup.POST("/login/otp/resend", authHandler.LoginOTPResend, otpChain...)          // re-send the emailed login code (max 3/challenge)
+	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, enrollChain...)     // forced enrollment, TOTP path: get QR + backup codes
+	authGroup.POST("/login/mfa/email", authHandler.MFAEmailPending, enrollChain...)       // forced enrollment, email path: send code to inbox
+	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, enrollChain...) // forced enrollment: first code → tokens
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
 
@@ -1083,17 +1094,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	//
 	// Middleware order matters here, and Echo runs them left-to-right:
 	//
-	//	s2s.Resolve → appClientRateLimit → s2s.UserLimit → Normalize… → jwtRenew → AppMe
+	//	s2s.Resolve → appClientRateLimit → Normalize… → jwtRenew → s2s.UserLimit → AppMe
 	//
-	// Both limiters sit AHEAD of jwtRenew. Behind it, they would only ever run
-	// for callers who already hold a valid token, so anyone with an expired or
-	// forged one could drive the app lookups underneath at full speed — the
-	// unauthenticated traffic a limiter exists for would be the traffic it never
-	// saw. s2s.Resolve is first because its per-IP guard is charged before any
-	// database work: it fences the client verification and the app lookup
-	// behind it. This is the same chain every other /apps/* route uses. The
-	// per-user limit keys on the user named in the (not yet verified) token, so
-	// a backend serving many users from one IP is not throttled as one caller.
+	// The per-IP guard and the application quota sit AHEAD of jwtRenew. Behind
+	// it, they would only ever run for callers who already hold a valid token,
+	// so anyone with an expired or forged one could drive the app lookups
+	// underneath at full speed — the unauthenticated traffic a limiter exists
+	// for would be the traffic it never saw. s2s.Resolve is first because its
+	// per-IP guard is charged before any database work: it fences the client
+	// verification and the app lookup behind it.
+	//
+	// The per-user limit is the exception and sits BEHIND jwtRenew, keyed on
+	// the verified token's user, so a backend serving many users from one IP is
+	// not throttled as one caller. Ahead of jwtRenew it could only read the
+	// token unverified, and a forged token naming a victim spent the victim's
+	// bucket (PR #174 review). Inside NormalizeAppScopeUnauthorized is fine: it
+	// rewrites only 401s, so this limiter's 429 and Retry-After pass through.
 	//
 	// appClientRateLimit rather than appRateLimit: this endpoint bears client
 	// credentials, so it is keyed on client_id like every other /apps/* route.
@@ -1108,8 +1124,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// Retry-After signal a well-behaved client needs.
 	authGroup.GET("/apps/me", authHandler.AppMe,
 		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
-		s2s.UserLimit("app_me_user", userLimits.Me, mw.SubjectBearerUser),
-		mw.NormalizeAppScopeUnauthorized, jwtRenew)
+		mw.NormalizeAppScopeUnauthorized, jwtRenew,
+		s2s.UserLimit("app_me_user", userLimits.Me, mw.SubjectSignedInUser))
 	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
 
 	// Self-service session management — "these are your signed-in devices; sign the
@@ -1159,9 +1175,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// backend acting for its users opts in with its application credentials in
 	// X-Client-Authorization (Authorization carries the user's token): once
 	// verified it skips the per-IP limit, which its users all share, and is
-	// limited per signed-in user instead.
+	// limited per signed-in user instead — but only for a user of its own
+	// tenant (and application, for an application user). Another tenant's
+	// user keeps the per-IP limit (ScopeToCaller, PR #174 review).
 	authGroup.POST("/change-email", authHandler.ChangeEmail, jwtRenew, appRateLimit,
 		s2s.ResolveOptional(mw.SurfaceAccount),
+		mw.ScopeToCaller(mw.ScopeSignedInUser),
 		mw.BackendsOnly(mw.SignedInUserRateLimiter("change_email_user", rlCfg.PerIPRate)),
 		mw.TokenRateLimiter(rlCfg))
 
@@ -1227,12 +1246,18 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		// /login/complete verifies a signature and mints a session, so it keeps
 		// the tighter TokenRateLimiter.
 		//
-		// A backend relaying the ceremony for its users can send its Basic
+		// A backend relaying /login/complete for its users can send its Basic
 		// credentials (optional) to be limited per end user and by its quota
 		// rather than as one IP; others keep the limiters above unchanged.
+		//
+		// /login/begin keeps PasskeyBeginRateLimiter for every caller,
+		// credentials or not. It names no user and no application — the
+		// relying party comes from the Origin header — so there is nothing to
+		// check a backend's credentials against, and any tenant's credentials
+		// lifted the per-IP limit for every other tenant's origins (PR #174
+		// review). Its 300/min per IP was sized for page views and is what
+		// master gives every caller.
 		authGroup.POST("/passkey/login/begin", webauthnHandler.LoginBegin,
-			s2s.ResolveOptional(mw.SurfacePasskey),
-			mw.BackendsOnly(appCallerRateLimit),
 			mw.PasskeyBeginRateLimiter())
 		authGroup.POST("/passkey/login/complete", webauthnHandler.LoginComplete,
 			s2s.ResolveOptional(mw.SurfacePasskey),

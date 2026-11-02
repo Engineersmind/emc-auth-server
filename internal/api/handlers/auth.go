@@ -151,7 +151,13 @@ func (h *AuthHandler) ResendVerification(c echo.Context) error {
 	if req.Email == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email is required"})
 	}
-	if err := h.verifSvc.ResendVerification(c.Request().Context(), req.Email); err != nil {
+	// A trusted backend's lifted rate limit reaches only its own tenant's
+	// accounts; anyone else is unscoped, exactly as before.
+	var scopeTenantID int64
+	if caller, ok := mw.CallerFrom(c); ok && caller.TenantID > 0 && mw.TrustedBackend(c) {
+		scopeTenantID = caller.TenantID
+	}
+	if err := h.verifSvc.ResendVerificationInTenant(c.Request().Context(), req.Email, scopeTenantID); err != nil {
 		h.logger.Error().Err(err).Msg("auth: resend verification failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to process request"})
 	}

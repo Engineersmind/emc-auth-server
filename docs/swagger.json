@@ -5055,20 +5055,6 @@
                     "Passkeys"
                 ],
                 "summary": "Begin passwordless passkey sign-in",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
-                        "name": "Authorization",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
-                        "name": "X-EMC-Forwarded-For",
-                        "in": "header"
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -5086,7 +5072,7 @@
                         }
                     },
                     "429": {
-                        "description": "Rate limited; wait Retry-After seconds",
+                        "description": "Rate limited per IP; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {

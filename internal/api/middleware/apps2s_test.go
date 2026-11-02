@@ -382,11 +382,28 @@ func bearerFor(tenantID, userID string) string {
 	return enc.EncodeToString([]byte(`{"alg":"RS256"}`)) + "." + enc.EncodeToString(payload) + ".sig"
 }
 
+// verifiedClaimsFromBearer stands in for jwtRenew: it stores the bearer
+// token's claims as if verified. Only tests whose tokens are all genuine use it.
+func verifiedClaimsFromBearer(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		raw := strings.TrimPrefix(c.Request().Header.Get(echo.HeaderAuthorization), "Bearer ")
+		if parts := strings.Split(raw, "."); len(parts) == 3 {
+			payload, _ := base64.RawURLEncoding.DecodeString(parts[1])
+			var claims auth.Claims
+			if json.Unmarshal(payload, &claims) == nil {
+				c.Set("user", &claims)
+			}
+		}
+		return next(c)
+	}
+}
+
 func TestAppS2S_MeLimitsPerTokenUser(t *testing.T) {
 	s, _ := newS2S(middleware.AppS2SConfig{Users: middleware.AppUserLimits{Me: 2}}, nil)
 	chain := []echo.MiddlewareFunc{
 		s.Resolve(middleware.SurfaceApp),
-		s.UserLimit("app_me_user", s.UserLimits().Me, middleware.SubjectBearerUser),
+		verifiedClaimsFromBearer,
+		s.UserLimit("app_me_user", s.UserLimits().Me, middleware.SubjectSignedInUser),
 	}
 	me := func(user string) int {
 		return runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret,

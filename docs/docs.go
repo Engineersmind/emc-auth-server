@@ -2114,6 +2114,154 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/server-trust/suggestions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists the addresses that served several different users of the application recently (from the audit log, administrator actions excluded) — likely the application backend's outbound addresses — and whether each is already registered. Suggestions only; nothing is registered until the server IPs are saved. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Suggest an application's server addresses",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ServerIPSuggestions"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/user-limits": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists every per-user limit on the application end-user routes (sign in, password reset, magic link, OTP, ...) with the server default, the application's override if any, the effective value, and the highest override accepted. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's per-user limit overrides. Each value is requests per minute, between 1 and that limit's max; a limit left out returns to the server default, and {\"overrides\": {}} clears them all. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UserLimitsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown limit or value out of range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/users/{uid}/mfa": {
             "delete": {
                 "security": [
@@ -4913,20 +5061,6 @@ const docTemplate = `{
                     "Passkeys"
                 ],
                 "summary": "Begin passwordless passkey sign-in",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
-                        "name": "Authorization",
-                        "in": "header"
-                    },
-                    {
-                        "type": "string",
-                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
-                        "name": "X-EMC-Forwarded-For",
-                        "in": "header"
-                    }
-                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -4944,7 +5078,7 @@ const docTemplate = `{
                         }
                     },
                     "429": {
-                        "description": "Rate limited; wait Retry-After seconds",
+                        "description": "Rate limited per IP; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -9257,6 +9391,172 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/server-trust/suggestions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists the addresses that served several different users of the application recently (from the audit log, administrator actions excluded) — likely the application backend's outbound addresses — and whether each is already registered. Suggestions only; nothing is registered until the server IPs are saved. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Suggest an application's server addresses",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ServerIPSuggestions"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/user-limits": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists every per-user limit on the application end-user routes (sign in, password reset, magic link, OTP, ...) with the server default, the application's override if any, the effective value, and the highest override accepted. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's per-user limit overrides. Each value is requests per minute, between 1 and that limit's max; a limit left out returns to the server default, and {\"overrides\": {}} clears them all. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UserLimitsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown limit or value out of range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/audiences": {
             "get": {
                 "security": [
@@ -12902,6 +13202,10 @@ const docTemplate = `{
                 "application_id": {
                     "type": "integer"
                 },
+                "per_ip_limit": {
+                    "description": "PerIPLimit is the per-IP limit, per minute, that requests from the server\nIPs skip. Set by the admin API from configuration; 0 when unknown.",
+                    "type": "integer"
+                },
                 "server_ips": {
                     "type": "array",
                     "items": {
@@ -13559,6 +13863,42 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.ServerIPSuggestion": {
+            "type": "object",
+            "properties": {
+                "ip": {
+                    "type": "string"
+                },
+                "last_seen": {
+                    "type": "string"
+                },
+                "registered": {
+                    "description": "Registered is true when the address is already covered by the allowlist.",
+                    "type": "boolean"
+                },
+                "users": {
+                    "description": "Users is how many different users of the application signed in, registered\nor were otherwise acted on from this address in the window.",
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.ServerIPSuggestions": {
+            "type": "object",
+            "properties": {
+                "min_users": {
+                    "type": "integer"
+                },
+                "suggestions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.ServerIPSuggestion"
+                    }
+                },
+                "window_days": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.StoredCredential": {
             "type": "object",
             "properties": {
@@ -13754,6 +14094,23 @@ const docTemplate = `{
                 "password": {
                     "type": "string",
                     "minLength": 8
+                }
+            }
+        },
+        "handlers.AppUserLimits": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "integer"
+                },
+                "limits": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.UserLimitView"
+                    }
+                },
+                "tenant_id": {
+                    "type": "integer"
                 }
             }
         },
@@ -14899,6 +15256,57 @@ const docTemplate = `{
                 "updated_at": {
                     "description": "UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,\nwhich is what the rest of this API returns for timestamps.",
                     "type": "integer"
+                }
+            }
+        },
+        "handlers.UserLimitView": {
+            "type": "object",
+            "properties": {
+                "default": {
+                    "description": "Default is the server-wide value, per minute.",
+                    "type": "integer"
+                },
+                "effective": {
+                    "description": "Effective is what the limiter enforces for this application.",
+                    "type": "integer"
+                },
+                "endpoints": {
+                    "description": "Endpoints are the routes the limit applies to.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "key": {
+                    "description": "Key names the limit in the API and in app_user_rate_limits.limits.",
+                    "type": "string"
+                },
+                "keyed_by": {
+                    "description": "KeyedBy says what one bucket is: whose requests share the allowance.",
+                    "type": "string"
+                },
+                "max": {
+                    "description": "Max is the highest override accepted, per minute.",
+                    "type": "integer"
+                },
+                "name": {
+                    "description": "Name is the human label shown in the admin console.",
+                    "type": "string"
+                },
+                "override": {
+                    "description": "Override is the application's own value, or null when it uses the default.",
+                    "type": "integer"
+                }
+            }
+        },
+        "handlers.UserLimitsRequest": {
+            "type": "object",
+            "properties": {
+                "overrides": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
                 }
             }
         },

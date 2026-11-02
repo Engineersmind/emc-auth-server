@@ -4,8 +4,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 
@@ -102,44 +100,6 @@ func TestCopilot_UserIDSpellingsShareABucket(t *testing.T) {
 	}
 	if res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, body: `{"user_id":"0012","roles":["r"]}`}); res.code != http.StatusTooManyRequests {
 		t.Fatalf("fourth change to user 12 under another spelling: got %d, want 429", res.code)
-	}
-}
-
-// Copilot #7: every token form JWTRenew accepts is bucketed per user, not in
-// one shared bucket.
-func TestCopilot_TokenFormsAreBucketedPerUser(t *testing.T) {
-	s, _ := newS2S(middleware.AppS2SConfig{Users: middleware.AppUserLimits{Me: 1}}, nil)
-	chain := []echo.MiddlewareFunc{
-		s.Resolve(middleware.SurfaceApp),
-		s.UserLimit("app_me_user", s.UserLimits().Me, middleware.SubjectBearerUser),
-	}
-	send := func(set func(*http.Request)) int {
-		e := echo.New()
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/apps/me", strings.NewReader(""))
-		req.RemoteAddr = backendIP + ":1"
-		req.Header.Set(middleware.ClientAuthHeader, basicHeader(appClient, appSecret))
-		set(req)
-		rec := httptest.NewRecorder()
-		h := func(c echo.Context) error { return c.NoContent(http.StatusOK) }
-		for i := len(chain) - 1; i >= 0; i-- {
-			h = chain[i](h)
-		}
-		_ = h(e.NewContext(req, rec))
-		return rec.Code
-	}
-	forms := map[string]func(*http.Request){
-		"lower-case bearer": func(r *http.Request) { r.Header.Set("Authorization", "bearer "+bearerFor("7", "201")) },
-		"raw JWT":           func(r *http.Request) { r.Header.Set("Authorization", bearerFor("7", "202")) },
-		"access cookie": func(r *http.Request) {
-			r.AddCookie(&http.Cookie{Name: middleware.AccessTokenCookie, Value: bearerFor("7", "203")})
-		},
-	}
-	// One request each: with a limit of 1, a shared bucket would refuse the
-	// second and third.
-	for name, set := range forms {
-		if got := send(set); got != http.StatusOK {
-			t.Fatalf("%s: got %d, want 200 — each user must have their own bucket", name, got)
-		}
 	}
 }
 
