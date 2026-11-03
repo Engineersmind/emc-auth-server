@@ -2918,6 +2918,52 @@
                 }
             }
         },
+        "/api/v1/auth/apps/login/organization": {
+            "post": {
+                "description": "Completes a sign-in that answered 409 organization_selection_required. The selection_token is single-use and valid for 5 minutes; the organization must be one of those offered.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Choose an organization to finish signing in",
+                "parameters": [
+                    {
+                        "description": "Selection",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SelectOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "400": {
+                        "description": "organization_selection_invalid",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "organization_access_denied",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/apps/me": {
             "get": {
                 "security": [
@@ -2963,6 +3009,734 @@
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/me/organizations": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "The organizations the signed-in user can sign in to in this application, and which one the presented token is for.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "List my organizations",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MyOrganizationsResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Match slug or display name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationsPage"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates a customer organization inside the application. Allowed while the application's organizations_mode is still \"off\", so organizations can be prepared before sign-in depends on them. Application backends authenticate with Authorization: Basic (client credentials); the admin console with a bearer token. 404 when ORGANIZATIONS_ENABLED is false.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Create an organization",
+                "parameters": [
+                    {
+                        "description": "Organization",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Slug taken or limit reached",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/invitations/accept": {
+            "post": {
+                "description": "Two modes. With the invitee's own access token in Authorization: Bearer, the signed-in account joins the organization — it must be the invited email in the same application. Without one, a new verified account is created with the given password. Either way the membership and its roles are created atomically. Sign in with organization=\u003cid\u003e afterwards.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Accept an organization invitation",
+                "parameters": [
+                    {
+                        "description": "Acceptance",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AcceptOrganizationInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AcceptedOrganizationInvitation"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid or expired invitation, or weak password",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Account exists - sign in and accept with the access token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/invitations/preview": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Preview an organization invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Invitation token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationInvitationPreview"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id (org_…) or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Soft-deletes the organization: sign-in to it stops, every session in it is revoked and pending invitations are closed. Members and roles are kept for the audit trail.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Delete an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "Changes display_name, metadata or is_active. The slug is immutable. Setting is_active=false signs every member out of the organization.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Update an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Changes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/invitations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization invitations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Include accepted, revoked and expired",
+                        "name": "include_closed",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationInvitation"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates an invitation carrying the organization and roles. The raw token is returned once in the response and never stored. With send_email EMC delivers it; otherwise the application sends its own email using the token. A pending invitation for the same address is replaced.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Invite to an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Invitation",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.CreatedOrganizationInvitation"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/invitations/{inv}": {
+            "delete": {
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Revoke an organization invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Invitation id (inv_…)",
+                        "name": "inv",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization members",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Match email or name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMembersPage"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members/{uid}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Adds one of the application's users to the organization, optionally with organization roles. Idempotent: an existing member answers 200 and gains any additional roles; a new member answers 201.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Add an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AddOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Deletes the membership and its organization roles and revokes the member's sessions in this organization. The user's account is untouched.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "status \"suspended\" keeps the membership and roles but refuses sign-in to the organization and revokes the member's sessions in it. \"active\" restores it from the next sign-in.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Suspend or reactivate an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Status",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members/{uid}/roles": {
+            "post": {
+                "description": "Grants roles that apply only inside this organization. Roles are names of the application's own roles; unknown or system roles refuse the whole call. mode=add (default) keeps existing organization roles, mode=replace discards them. The member's access tokens are invalidated so the change applies at their next refresh.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Assign organization roles to a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationMemberRolesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members/{uid}/roles/{role}": {
+            "delete": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization role from a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Role name",
+                        "name": "role",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
                         }
                     }
                 }
@@ -3045,6 +3819,52 @@
                 }
             }
         },
+        "/api/v1/auth/apps/switch-organization": {
+            "post": {
+                "description": "Creates a new session in another organization from the current one, without asking for a password again. The new session keeps the original authentication time and methods, so it can never outlive the session it came from. The current session is left as it is. Set personal=true (and no organization) to leave organizations, when the application allows it.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Switch organization",
+                "parameters": [
+                    {
+                        "description": "Target",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SwitchOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "organization_access_denied",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/apps/users/roles": {
             "post": {
                 "description": "Attaches roles to one of the calling application's own users. Application credentials via Authorization: Basic header only. Roles are given by name and must already exist in this application; unknown, system, or other applications' roles are refused and nothing is written. mode=add (the default) keeps the roles the user already holds, mode=replace discards them. Every active session for the user is signed out so the change takes effect on their next request. SERVER-SIDE USE ONLY — the client secret must never be shipped in a browser or mobile client.",
@@ -3107,6 +3927,37 @@
                             "type": "object",
                             "additionalProperties": {
                                 "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/users/{uid}/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List a user's organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationMembership"
                             }
                         }
                     }
@@ -8590,6 +9441,718 @@
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/organization-settings": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an application's organization settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant id",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Application id",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationSettings"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "off (default): tokens are unchanged and organization parameters are ignored. optional: a session may be inside one organization or none. required: every end-user session is inside exactly one organization. Moving to \"required\" is refused (409) while active users belong to no organization unless force=true, and revokes organization-less sessions. Moving to \"off\" revokes organization sessions so users sign in again with a plain token.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Change an application's organization mode",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant id",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Application id",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Mode",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationSettingsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationSettings"
+                        }
+                    },
+                    "409": {
+                        "description": "Users without an organization",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Match slug or display name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationsPage"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates a customer organization inside the application. Allowed while the application's organizations_mode is still \"off\", so organizations can be prepared before sign-in depends on them. Application backends authenticate with Authorization: Basic (client credentials); the admin console with a bearer token. 404 when ORGANIZATIONS_ENABLED is false.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Create an organization",
+                "parameters": [
+                    {
+                        "description": "Organization",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Slug taken or limit reached",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id (org_…) or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Soft-deletes the organization: sign-in to it stops, every session in it is revoked and pending invitations are closed. Members and roles are kept for the audit trail.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Delete an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "Changes display_name, metadata or is_active. The slug is immutable. Setting is_active=false signs every member out of the organization.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Update an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Changes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/invitations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization invitations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Include accepted, revoked and expired",
+                        "name": "include_closed",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationInvitation"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates an invitation carrying the organization and roles. The raw token is returned once in the response and never stored. With send_email EMC delivers it; otherwise the application sends its own email using the token. A pending invitation for the same address is replaced.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Invite to an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Invitation",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.CreatedOrganizationInvitation"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/invitations/{inv}": {
+            "delete": {
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Revoke an organization invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Invitation id (inv_…)",
+                        "name": "inv",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization members",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Match email or name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMembersPage"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Adds one of the application's users to the organization, optionally with organization roles. Idempotent: an existing member answers 200 and gains any additional roles; a new member answers 201.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Add an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AddOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Deletes the membership and its organization roles and revokes the member's sessions in this organization. The user's account is untouched.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "status \"suspended\" keeps the membership and roles but refuses sign-in to the organization and revokes the member's sessions in it. \"active\" restores it from the next sign-in.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Suspend or reactivate an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Status",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}/roles": {
+            "post": {
+                "description": "Grants roles that apply only inside this organization. Roles are names of the application's own roles; unknown or system roles refuse the whole call. mode=add (default) keeps existing organization roles, mode=replace discards them. The member's access tokens are invalidated so the change applies at their next refresh.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Assign organization roles to a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationMemberRolesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}/roles/{role}": {
+            "delete": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization role from a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Role name",
+                        "name": "role",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/rate-limit": {
             "get": {
                 "security": [
@@ -8742,6 +10305,37 @@
                             "type": "object",
                             "additionalProperties": {
                                 "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List a user's organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationMembership"
                             }
                         }
                     }
@@ -10314,9 +11908,10 @@
                     },
                     {
                         "type": "string",
-                        "description": "Opaque value echoed back on the redirect",
+                        "description": "Opaque value echoed back on the redirect — required unless OAUTH_REQUIRE_STATE=false",
                         "name": "state",
-                        "in": "query"
+                        "in": "query",
+                        "required": true
                     },
                     {
                         "type": "string",
@@ -10345,6 +11940,50 @@
                     },
                     "400": {
                         "description": "HTML error page — client_id or redirect_uri invalid"
+                    }
+                }
+            }
+        },
+        "/oauth/introspect": {
+            "post": {
+                "description": "RFC 7662. Confidential clients only, authenticated with client_secret_basic or client_secret_post. Returns {\"active\": false} for any token that is invalid, expired, revoked, issued to another application, or whose user or organization membership is no longer active; otherwise the token's claims, including org_id and org_permissions for an organization session.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "Introspect a token",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The token",
+                        "name": "token",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "access_token or refresh_token",
+                        "name": "token_type_hint",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.IntrospectionResult"
+                        }
+                    },
+                    "401": {
+                        "description": "invalid_client",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
                     }
                 }
             }
@@ -12087,6 +13726,26 @@
                 }
             }
         },
+        "auth.AcceptedOrganizationInvitation": {
+            "type": "object",
+            "properties": {
+                "account_created": {
+                    "type": "boolean"
+                },
+                "organization": {
+                    "$ref": "#/definitions/auth.OrganizationRef"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.AgentAnalysis": {
             "type": "object",
             "properties": {
@@ -12501,6 +14160,47 @@
                 }
             }
         },
+        "auth.CreatedOrganizationInvitation": {
+            "type": "object",
+            "properties": {
+                "accepted_at": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "email_sent": {
+                    "type": "boolean"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "invitation_url": {
+                    "type": "string"
+                },
+                "organization_id": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.EffectiveBranding": {
             "type": "object",
             "properties": {
@@ -12655,6 +14355,87 @@
                 }
             }
         },
+        "auth.IntrospectionResult": {
+            "type": "object",
+            "properties": {
+                "active": {
+                    "type": "boolean"
+                },
+                "app_id": {
+                    "type": "string"
+                },
+                "aud": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "client_id": {
+                    "type": "string"
+                },
+                "exp": {
+                    "type": "integer"
+                },
+                "gty": {
+                    "description": "EMC extensions — the same names the access token carries.",
+                    "type": "string"
+                },
+                "iat": {
+                    "type": "integer"
+                },
+                "iss": {
+                    "type": "string"
+                },
+                "org_id": {
+                    "type": "string"
+                },
+                "org_name": {
+                    "type": "string"
+                },
+                "org_permissions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "org_roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "permissions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "scope": {
+                    "type": "string"
+                },
+                "sid": {
+                    "type": "string"
+                },
+                "sub": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                },
+                "token_type": {
+                    "type": "string"
+                },
+                "username": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.InvitationPreview": {
             "type": "object",
             "properties": {
@@ -12790,6 +14571,25 @@
                 "email": {
                     "type": "string"
                 },
+                "org_id": {
+                    "description": "Organisation claims of the presented token, omitted when it is not\nsigned in to an organisation. See Claims.OrgID.",
+                    "type": "string"
+                },
+                "org_name": {
+                    "type": "string"
+                },
+                "org_permissions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "org_roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "permissions": {
                     "type": "array",
                     "items": {
@@ -12811,6 +14611,224 @@
                 },
                 "user_id": {
                     "type": "string"
+                }
+            }
+        },
+        "auth.MemberRolesResult": {
+            "type": "object",
+            "properties": {
+                "assigned": {
+                    "description": "Assigned lists only roles this call added.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "removed": {
+                    "description": "Removed lists roles this call removed (replace mode or a single removal).",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "roles": {
+                    "description": "Roles is every organisation role the member holds after the call.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.Organization": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "display_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "member_count": {
+                    "type": "integer"
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "slug": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationInvitation": {
+            "type": "object",
+            "properties": {
+                "accepted_at": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "organization_id": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationInvitationPreview": {
+            "type": "object",
+            "properties": {
+                "account_exists": {
+                    "description": "AccountExists tells the client whether to ask the invitee to sign in or\nto choose a password. Shown only to the holder of the token, who already\nknows the address it was sent to.",
+                    "type": "boolean"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "organization": {
+                    "$ref": "#/definitions/auth.OrganizationRef"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "auth.OrganizationMember": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "first_name": {
+                    "type": "string"
+                },
+                "joined_at": {
+                    "type": "string"
+                },
+                "last_name": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationMembersPage": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.OrganizationMember"
+                    }
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.OrganizationMembership": {
+            "type": "object",
+            "properties": {
+                "joined_at": {
+                    "type": "string"
+                },
+                "organization": {
+                    "$ref": "#/definitions/auth.OrganizationRef"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationRef": {
+            "type": "object",
+            "properties": {
+                "display_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "slug": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationsPage": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.Organization"
+                    }
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
                 }
             }
         },
@@ -13126,6 +15144,35 @@
                 }
             }
         },
+        "handlers.AcceptOrganizationInvitationRequest": {
+            "type": "object",
+            "properties": {
+                "first_name": {
+                    "type": "string"
+                },
+                "last_name": {
+                    "type": "string"
+                },
+                "password": {
+                    "description": "Password, FirstName and LastName create the account when the invitee has\nnone. Ignored when the request carries the invitee's own access token.",
+                    "type": "string"
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.AddOrganizationMemberRequest": {
+            "type": "object",
+            "properties": {
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
         "handlers.AppLimitRequest": {
             "type": "object",
             "properties": {
@@ -13155,6 +15202,10 @@
                     "type": "string"
                 },
                 "email": {
+                    "type": "string"
+                },
+                "organization": {
+                    "description": "Organization is the organisation (id org_… or slug) to sign in to, for an\napplication with organisations enabled. Omitted — the normal case — keeps\ntoday's behaviour; for an application in organizations_mode \"off\" it is\nignored. Checked only after the password and any second factor succeed.",
                     "type": "string"
                 },
                 "password": {
@@ -13317,6 +15368,51 @@
                     "items": {
                         "type": "string"
                     }
+                }
+            }
+        },
+        "handlers.CreateOrganizationInvitationRequest": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "expires_in_hours": {
+                    "description": "ExpiresInHours defaults to 72; 1–720.",
+                    "type": "integer"
+                },
+                "invitation_url": {
+                    "description": "InvitationURL is the application's page that accepts invitations. Must be\non one of the application's registered redirect URI origins; the\ninvitation and organization query parameters are appended.",
+                    "type": "string"
+                },
+                "inviter_name": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "send_email": {
+                    "description": "SendEmail asks EMC to send the invitation using the application's branded\ntemplate. Requires invitation_url.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "handlers.CreateOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "display_name": {
+                    "type": "string"
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "slug": {
+                    "description": "Slug is the immutable handle: 1-63 lowercase letters, digits or hyphens.",
+                    "type": "string"
                 }
             }
         },
@@ -13575,6 +15671,21 @@
                 }
             }
         },
+        "handlers.MyOrganizationsResponse": {
+            "type": "object",
+            "properties": {
+                "current": {
+                    "description": "Current is the organisation this token is signed in to, empty for none.",
+                    "type": "string"
+                },
+                "organizations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.OrganizationMembership"
+                    }
+                }
+            }
+        },
         "handlers.MyTenantsResponse": {
             "type": "object",
             "properties": {
@@ -13639,6 +15750,10 @@
                         "type": "string"
                     }
                 },
+                "introspection_endpoint": {
+                    "description": "IntrospectionEndpoint is RFC 7662 / RFC 8414 introspection_endpoint.",
+                    "type": "string"
+                },
                 "issuer": {
                     "description": "Issuer must be byte-identical to the \"iss\" claim of every token this\ntenant issues. This is the one field a conformant client hard-fails on:\ngo-oidc, openid-client, MSAL and Spring Security all compare the string\nthey fetched discovery from against this value and refuse a mismatch.",
                     "type": "string"
@@ -13690,6 +15805,34 @@
                     }
                 },
                 "userinfo_endpoint": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.OrganizationMemberRolesRequest": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "description": "Mode is \"add\" (default) or \"replace\".",
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "handlers.OrganizationSettings": {
+            "type": "object",
+            "properties": {
+                "organizations_enabled": {
+                    "description": "Enabled reports the deployment switch, so the console can explain why\na mode has no effect.",
+                    "type": "boolean"
+                },
+                "organizations_mode": {
+                    "description": "Mode is \"off\", \"optional\" or \"required\".",
                     "type": "string"
                 }
             }
@@ -13821,6 +15964,18 @@
                     "type": "string"
                 },
                 "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SelectOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "organization": {
+                    "description": "Organization is the chosen id (org_…) or slug, from the 409 response.",
+                    "type": "string"
+                },
+                "selection_token": {
                     "type": "string"
                 }
             }
@@ -13988,6 +16143,23 @@
                 }
             }
         },
+        "handlers.SwitchOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "organization": {
+                    "description": "Organization is the target id (org_…) or slug.",
+                    "type": "string"
+                },
+                "personal": {
+                    "description": "Personal asks for a session with no organisation. Refused when the\napplication requires one.",
+                    "type": "boolean"
+                },
+                "refresh_token": {
+                    "description": "RefreshToken of the current session. Required, in the body.",
+                    "type": "string"
+                }
+            }
+        },
         "handlers.TOTPActivateRequest": {
             "type": "object",
             "properties": {
@@ -14137,6 +16309,43 @@
                     "items": {
                         "type": "string"
                     }
+                }
+            }
+        },
+        "handlers.UpdateOrganizationMemberRequest": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "description": "Status is \"active\" or \"suspended\".",
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpdateOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "display_name": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "description": "IsActive false suspends the organisation and signs everyone out of it.",
+                    "type": "boolean"
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {}
+                }
+            }
+        },
+        "handlers.UpdateOrganizationSettingsRequest": {
+            "type": "object",
+            "properties": {
+                "force": {
+                    "description": "Force allows \"required\" while some users belong to no organization.\nThey will be unable to sign in until they are added to one.",
+                    "type": "boolean"
+                },
+                "organizations_mode": {
+                    "type": "string"
                 }
             }
         },
@@ -14319,6 +16528,13 @@
                     "type": "string"
                 },
                 "name": {
+                    "type": "string"
+                },
+                "org_id": {
+                    "description": "OrgID and OrgName identify the organisation the presented token is signed\nin to (Organizations). Omitted for every token that is not, which is every\ntoken of an application in organizations_mode \"off\". Identity, not\nauthorisation: roles and permissions stay in the access token.",
+                    "type": "string"
+                },
+                "org_name": {
                     "type": "string"
                 },
                 "sub": {

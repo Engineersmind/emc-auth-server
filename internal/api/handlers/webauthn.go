@@ -323,6 +323,13 @@ func (h *WebAuthnHandler) loginFailure(c echo.Context, err error) error {
 		return h.loginRejected(c)
 	}
 
+	// The passkey verified and only the organisation step remains: choose one,
+	// or no access. Answered like every other sign-in method, not as a
+	// verification failure.
+	if handled, resp := organizationSignInError(c, err); handled {
+		return resp
+	}
+
 	// Policy refusals are told apart from verification failures: "your
 	// organisation has not enabled this" is actionable and reveals nothing about
 	// any account, since the decision was made before a credential was named.

@@ -22,6 +22,9 @@
 //   - emc_auth_risk_signals_total            — risk signals raised (signal)
 //   - emc_auth_audit_enrichment_errors_total — enrichment failures (stage)
 //   - emc_auth_email_delivery_total          — email delivery (outcome)
+//   - emc_auth_organization_mints_total      — organisation-aware mints (outcome)
+//   - emc_auth_organization_param_ignored_total — org parameter ignored (feature off)
+//   - emc_auth_organization_switches_total   — organisation switches (outcome)
 package metrics
 
 import (
@@ -712,4 +715,45 @@ var PasswordHashQueueWait = promauto.NewHistogram(
 		Help:      "Time a password derivation waited for a concurrency slot.",
 		Buckets:   []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5},
 	},
+)
+
+// OrganizationMints counts token mints that went through organisation
+// resolution, by outcome. Only organisation-enabled applications reach this, so
+// it reads zero while every application is in mode 'off' — which is the first
+// thing to check after deploying the feature dark.
+//
+// Outcomes: bound (signed in to an organisation), none (no organisation —
+// optional mode or a personal switch), selection_required (the user must
+// choose), denied (refused), unavailable (organisation state could not be read;
+// the mint failed closed), revoked (a refresh found the membership gone).
+var OrganizationMints = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "emc_auth",
+		Name:      "organization_mints_total",
+		Help:      "Organisation-aware token mints by outcome.",
+	},
+	[]string{"outcome"},
+)
+
+// OrganizationParamIgnored counts sign-ins that named an organisation for an
+// application where organisations do not apply (mode 'off', the feature
+// switched off, or a tenant-level user). The parameter is ignored rather than
+// refused so an early client cannot break sign-in; this counter is how a
+// misconfigured client shows up.
+var OrganizationParamIgnored = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Namespace: "emc_auth",
+		Name:      "organization_param_ignored_total",
+		Help:      "Organisation parameters ignored because organisations do not apply.",
+	},
+)
+
+// OrganizationSwitches counts organisation switches by outcome (ok, denied).
+var OrganizationSwitches = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "emc_auth",
+		Name:      "organization_switches_total",
+		Help:      "Organisation switches by outcome.",
+	},
+	[]string{"outcome"},
 )

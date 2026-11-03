@@ -132,6 +132,27 @@ type Claims struct {
 	// counter reads zero for a full refresh-token lifetime the fallback can go.
 	Gty string `json:"gty,omitempty"`
 
+	// Organisation claims. Present ONLY when the session is signed in to an
+	// organisation of an organisation-enabled application; every other token —
+	// including every token for an application in organizations_mode 'off' —
+	// omits all four, so its payload is unchanged.
+	//
+	// They sit beside, not inside, role/roles/permissions on purpose. Those keep
+	// meaning "application-wide grants", which is what every existing relying
+	// party already reads them as; folding organisation roles into them would
+	// change a live claim's meaning and re-create the problem organisations
+	// exist to solve. A relying party acting on an organisation's data checks
+	// that org_id matches the organisation in the request, then org_permissions.
+	//
+	// OrgID is the organisation's public id (org_…), never a row id. OrgName is
+	// its immutable slug, for display and logs only. OrgRoles and OrgPermissions
+	// are omitted for a member who holds no organisation role; OrgID is what
+	// says the session is inside an organisation.
+	OrgID          string   `json:"org_id,omitempty"`
+	OrgName        string   `json:"org_name,omitempty"`
+	OrgRoles       []string `json:"org_roles,omitempty"`
+	OrgPermissions []string `json:"org_permissions,omitempty"`
+
 	jwt.RegisteredClaims
 }
 

@@ -472,13 +472,18 @@ func TestDiscovery_OmitsUnimplementedEndpoints(t *testing.T) {
 	for _, field := range []string{
 		"end_session_endpoint",
 		"check_session_iframe",
-		"introspection_endpoint",
 		"registration_endpoint",
 		"acr_values_supported",
 	} {
 		if _, present := raw[field]; present {
 			t.Errorf("document advertises %q, which this server does not implement", field)
 		}
+	}
+
+	// RFC 7662 introspection is implemented (Organizations), so it must now be
+	// advertised — and at the route the server actually registers.
+	if got, want := raw["introspection_endpoint"], env.base+PathOAuthIntrospect; got != want {
+		t.Errorf("introspection_endpoint = %v, want %q", got, want)
 	}
 
 	// The negative capability flags are the opposite case: present, and false.

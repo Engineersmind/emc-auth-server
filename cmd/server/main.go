@@ -366,6 +366,7 @@ func main() {
 			RequireAudience:                        cfg.RequireAudience,
 			OAuthRequireState:                      cfg.OAuthRequireState,
 			CaptchaEnabled:                         cfg.CaptchaEnabled,
+			OrganizationsEnabled:                   cfg.OrganizationsEnabled,
 			CaptchaHMACKey:                         cfg.CaptchaHMACKey,
 			CaptchaTTLSeconds:                      cfg.CaptchaTTLSeconds,
 		},

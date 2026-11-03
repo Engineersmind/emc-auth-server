@@ -248,6 +248,13 @@ func graceToAuthClaims(g *auth.GraceResult) *auth.Claims {
 		// hole in which a single-session revoke was not enforced.
 		SessionID:   strconv.FormatInt(g.SessionID, 10),
 		Permissions: g.Permissions,
+		// The session's organisation, re-validated by checkGraceWindow, so a
+		// handler behind this path sees the same org_* claims a fresh token
+		// would carry.
+		OrgID:          g.OrgID,
+		OrgName:        g.OrgName,
+		OrgRoles:       g.OrgRoles,
+		OrgPermissions: g.OrgPermissions,
 	}
 }
 

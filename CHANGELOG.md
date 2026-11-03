@@ -9,6 +9,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Organizations** — per-organisation membership and roles inside an
+  application ("Admin at Acme, Viewer at Globex"). See `docs/ORGANIZATIONS.md`.
+  - Opt-in twice: `ORGANIZATIONS_ENABLED` (default `false`) and a per-application
+    `organizations_mode` (`off` by default, `optional`, `required`). With either
+    off, tokens and sign-in are unchanged.
+  - New token claims `org_id`, `org_name`, `org_roles`, `org_permissions`, present
+    only inside an organisation. `role`/`roles`/`permissions` keep their meaning.
+  - `organization` parameter on `/auth/apps/login` and `/oauth/authorize`;
+    organisation selection (`409 organization_selection_required`), a hosted
+    picker, password-less switching (`/auth/apps/switch-organization`) that
+    cannot extend a session, and `GET /auth/apps/me/organizations`.
+  - Management APIs for application backends (client credentials) and the admin
+    console: organisations, members, suspension, organisation roles,
+    invitations with roles (branded email or application-delivered token).
+  - Membership changes revoke the affected sessions; refresh re-validates
+    membership and fails closed.
+  - RFC 7662 token introspection at `/oauth/introspect` (confidential clients,
+    own application's tokens), advertised in discovery.
+  - Database-enforced isolation: members and organisation roles cannot cross
+    applications. Migrations `00100`–`00104`, all additive.
+  - Audit events `organization.*`, `audit_logs.organization_id`, and metrics
+    `emc_auth_organization_*`.
+
 ### Security
 - **Committed credentials removed and production DSNs require TLS**
   ([GHSA-hv5j-m2r7-r4cr](https://github.com/Engineersmind/emc-auth-server/security/advisories/GHSA-hv5j-m2r7-r4cr)).

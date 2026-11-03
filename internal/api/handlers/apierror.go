@@ -104,6 +104,17 @@ var errorMessages = map[string]string{
 	"account_locked":      "Too many failed sign-in attempts. Try again shortly, or reset your password to unlock the account now.",
 	"session_terminated":  "Your session was ended for security reasons. Sign in again to continue.",
 
+	// --- Organizations ---------------------------------------------------
+	//
+	// organization_access_denied is one message for every reason — unknown
+	// organisation, not a member, suspended, deactivated — so sign-in cannot
+	// be used to learn which organisations exist or who belongs to them.
+	"organization_selection_required": "Choose which organization to sign in to.",
+	"organization_access_denied":      "You don't have access to that organization. Ask an administrator of the organization to invite you.",
+	"organization_unavailable":        "We couldn't check your organization access just now. Try again in a moment.",
+	"organization_selection_invalid":  "This organization choice has expired. Sign in again to continue.",
+	"organizations_not_enabled":       "Organizations are not enabled for this application.",
+
 	// --- Multi-factor ----------------------------------------------------
 	"mfa_code_invalid":     "That code wasn't right. Check your authenticator app and enter the current code.",
 	"mfa_code_expired":     "That code has expired. Request a new one and enter it within a few minutes.",
