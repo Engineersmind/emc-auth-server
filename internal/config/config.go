@@ -220,6 +220,18 @@ type Config struct {
 	// users. Neither can turn it on alone.
 	CaptchaEnabled bool
 
+	// OrganizationsEnabled is the deployment-level switch for Organizations —
+	// per-organisation membership and roles inside an application (migrations
+	// 00100–00104). Set via ORGANIZATIONS_ENABLED; false by default.
+	//
+	// Two switches, like CAPTCHA and passkeys: this one, and an application's
+	// organizations_mode ('off' on every existing application). While this is
+	// false every application behaves as 'off' — organisation parameters are
+	// ignored, no organisation claims are minted and the organisation routes
+	// answer 404 — whatever the database says. Turning it off is therefore the
+	// whole-feature rollback, and needs no migration.
+	OrganizationsEnabled bool
+
 	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
 	// Required when CaptchaEnabled is true — the server refuses to start
 	// without it rather than degrading to an unkeyed hash.
@@ -434,6 +446,7 @@ func Load() *Config {
 		// Default true — see the field comment. Only an explicit "false" opts out.
 		WebAuthnRequireUserVerification: getEnv("WEBAUTHN_REQUIRE_UV", "true") != "false",
 		CaptchaEnabled:                  getEnv("CAPTCHA_ENABLED", "false") == "true",
+		OrganizationsEnabled:            getEnv("ORGANIZATIONS_ENABLED", "false") == "true",
 		CaptchaHMACKey:                  getEnv("CAPTCHA_HMAC_KEY", ""),
 		CaptchaTTLSeconds:               mustAtoi(getEnv("CAPTCHA_TTL_SECONDS", "120")),
 		GeoIPDatabasePath:               getEnv("GEOIP_DATABASE_PATH", ""),

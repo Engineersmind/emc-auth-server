@@ -38,6 +38,9 @@ const (
 	OAuthUserInfo = "/oauth/userinfo"
 	// OAuthRevoke is the RFC 7009 revocation endpoint (issue #6).
 	OAuthRevoke = "/oauth/revoke"
+	// OAuthIntrospect is the RFC 7662 introspection endpoint (Organizations):
+	// a live check of a token for the application it was issued to.
+	OAuthIntrospect = "/oauth/introspect"
 )
 
 // Tenant-scoped public documents.

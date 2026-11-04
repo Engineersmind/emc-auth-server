@@ -40,7 +40,16 @@ button:hover{background:#1d4ed8}
   border:1px solid #fecaca;color:#991b1b;font-size:14px}
 .code-input{letter-spacing:.35em;text-align:center;font-size:20px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .foot{margin:20px 0 0;text-align:center;font-size:12px;color:#8b929e}
+.orgs{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.org{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;
+  background:#fff;color:#1f2328;border:1px solid #d0d5dd;padding:12px 14px}
+.org:hover,.org:focus-visible{background:#f0f5ff;border-color:#2563eb}
+.org-name{font-weight:600}
+.org-slug{font-size:13px;font-weight:400;color:#5c6470}
 @media (prefers-color-scheme:dark){
+  .org{background:#12151a;color:#e6e8eb;border-color:#333a45}
+  .org:hover,.org:focus-visible{background:#18233a;border-color:#2563eb}
+  .org-slug{color:#9aa3af}
   body{background:#15181d;color:#e6e8eb}
   .card{background:#1c2027;box-shadow:0 1px 3px rgba(0,0,0,.4)}
   .sub{color:#9aa3af}.app{color:#e6e8eb}label{color:#c3c9d2}

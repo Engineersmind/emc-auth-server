@@ -547,6 +547,12 @@ type AppLoginRequest struct {
 	// the response is 428 captcha_required and the credentials are never read.
 	CaptchaID     string `json:"captcha_id"`
 	CaptchaAnswer string `json:"captcha_answer"`
+
+	// Organization is the organisation (id org_… or slug) to sign in to, for an
+	// application with organisations enabled. Omitted — the normal case — keeps
+	// today's behaviour; for an application in organizations_mode "off" it is
+	// ignored. Checked only after the password and any second factor succeed.
+	Organization string `json:"organization,omitempty"`
 }
 
 // appCredentialsFromRequest resolves and requires the calling application's
@@ -701,8 +707,13 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		Password:     req.Password,
 		Persistent:   req.RememberMe,
 		Roles:        req.Roles,
+		Organization: req.Organization,
 	})
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodPassword, clientID, req.Email); handled {
+			h.captchaClearFailures(c, appLoginScope)
+			return resp
+		}
 		h.captchaRecordFailure(c, appLoginScope)
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("app login failed")
 		ev := audit.Event{
@@ -857,6 +868,9 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 
 	result, err := h.svc.VerifyMagicLink(c.Request().Context(), clientID, clientSecret, req.Token)
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodMagicLink, clientID, ""); handled {
+			return resp
+		}
 		h.logger.Warn().Err(err).Msg("magic link verify failed")
 		ev := audit.Event{
 			Action:       audit.ActionAuthLoginFailed,
@@ -951,6 +965,10 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 		Code:            req.Code,
 	})
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodMFA, "", ""); handled {
+			h.captchaClearFailures(c, otpScope)
+			return resp
+		}
 		h.captchaRecordFailure(c, otpScope)
 		h.logger.Warn().Err(err).Msg("login OTP failed")
 		action := audit.ActionAuthMFAChallengeFailed
@@ -1091,6 +1109,9 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 
 	result, session, err := h.svc.ActivatePending(c.Request().Context(), req.EnrollmentToken, req.Code)
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodTOTP, "", ""); handled {
+			return resp
+		}
 		h.logger.Warn().Err(err).Msg("pending MFA activate failed")
 		event := audit.Event{
 			Action:       audit.ActionAuthMFAChallengeFailed,

@@ -1034,6 +1034,19 @@ definitions:
           type: string
         type: array
     type: object
+  auth.AcceptedOrganizationInvitation:
+    properties:
+      account_created:
+        type: boolean
+      organization:
+        $ref: '#/definitions/auth.OrganizationRef'
+      roles:
+        items:
+          type: string
+        type: array
+      user_id:
+        type: string
+    type: object
   auth.AgentAnalysis:
     properties:
       agent_id:
@@ -1399,6 +1412,33 @@ definitions:
       updated_at:
         type: string
     type: object
+  auth.CreatedOrganizationInvitation:
+    properties:
+      accepted_at:
+        type: string
+      created_at:
+        type: string
+      email:
+        type: string
+      email_sent:
+        type: boolean
+      expires_at:
+        type: string
+      id:
+        type: string
+      invitation_url:
+        type: string
+      organization_id:
+        type: string
+      roles:
+        items:
+          type: string
+        type: array
+      status:
+        type: string
+      token:
+        type: string
+    type: object
   auth.EffectiveBranding:
     properties:
       logo_url:
@@ -1515,6 +1555,60 @@ definitions:
           type: string
         type: array
       otp_uri:
+        type: string
+    type: object
+  auth.IntrospectionResult:
+    properties:
+      active:
+        type: boolean
+      app_id:
+        type: string
+      aud:
+        items:
+          type: string
+        type: array
+      client_id:
+        type: string
+      exp:
+        type: integer
+      gty:
+        description: EMC extensions — the same names the access token carries.
+        type: string
+      iat:
+        type: integer
+      iss:
+        type: string
+      org_id:
+        type: string
+      org_name:
+        type: string
+      org_permissions:
+        items:
+          type: string
+        type: array
+      org_roles:
+        items:
+          type: string
+        type: array
+      permissions:
+        items:
+          type: string
+        type: array
+      roles:
+        items:
+          type: string
+        type: array
+      scope:
+        type: string
+      sid:
+        type: string
+      sub:
+        type: string
+      tenant_id:
+        type: string
+      token_type:
+        type: string
+      username:
         type: string
     type: object
   auth.InvitationPreview:
@@ -1645,6 +1739,21 @@ definitions:
         type: string
       email:
         type: string
+      org_id:
+        description: |-
+          Organisation claims of the presented token, omitted when it is not
+          signed in to an organisation. See Claims.OrgID.
+        type: string
+      org_name:
+        type: string
+      org_permissions:
+        items:
+          type: string
+        type: array
+      org_roles:
+        items:
+          type: string
+        type: array
       permissions:
         items:
           type: string
@@ -1663,6 +1772,154 @@ definitions:
         type: string
       user_id:
         type: string
+    type: object
+  auth.MemberRolesResult:
+    properties:
+      assigned:
+        description: Assigned lists only roles this call added.
+        items:
+          type: string
+        type: array
+      removed:
+        description: Removed lists roles this call removed (replace mode or a single
+          removal).
+        items:
+          type: string
+        type: array
+      roles:
+        description: Roles is every organisation role the member holds after the call.
+        items:
+          type: string
+        type: array
+      user_id:
+        type: string
+    type: object
+  auth.Organization:
+    properties:
+      created_at:
+        type: string
+      display_name:
+        type: string
+      id:
+        type: string
+      is_active:
+        type: boolean
+      member_count:
+        type: integer
+      metadata:
+        additionalProperties: {}
+        type: object
+      slug:
+        type: string
+      updated_at:
+        type: string
+    type: object
+  auth.OrganizationInvitation:
+    properties:
+      accepted_at:
+        type: string
+      created_at:
+        type: string
+      email:
+        type: string
+      expires_at:
+        type: string
+      id:
+        type: string
+      organization_id:
+        type: string
+      roles:
+        items:
+          type: string
+        type: array
+      status:
+        type: string
+    type: object
+  auth.OrganizationInvitationPreview:
+    properties:
+      account_exists:
+        description: |-
+          AccountExists tells the client whether to ask the invitee to sign in or
+          to choose a password. Shown only to the holder of the token, who already
+          knows the address it was sent to.
+        type: boolean
+      email:
+        type: string
+      expires_at:
+        type: string
+      organization:
+        $ref: '#/definitions/auth.OrganizationRef'
+      roles:
+        items:
+          type: string
+        type: array
+    type: object
+  auth.OrganizationMember:
+    properties:
+      email:
+        type: string
+      first_name:
+        type: string
+      joined_at:
+        type: string
+      last_name:
+        type: string
+      roles:
+        items:
+          type: string
+        type: array
+      status:
+        type: string
+      user_id:
+        type: string
+    type: object
+  auth.OrganizationMembersPage:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/auth.OrganizationMember'
+        type: array
+      limit:
+        type: integer
+      offset:
+        type: integer
+      total:
+        type: integer
+    type: object
+  auth.OrganizationMembership:
+    properties:
+      joined_at:
+        type: string
+      organization:
+        $ref: '#/definitions/auth.OrganizationRef'
+      roles:
+        items:
+          type: string
+        type: array
+      status:
+        type: string
+    type: object
+  auth.OrganizationRef:
+    properties:
+      display_name:
+        type: string
+      id:
+        type: string
+      slug:
+        type: string
+    type: object
+  auth.OrganizationsPage:
+    properties:
+      items:
+        items:
+          $ref: '#/definitions/auth.Organization'
+        type: array
+      limit:
+        type: integer
+      offset:
+        type: integer
+      total:
+        type: integer
     type: object
   auth.PasskeyPolicy:
     properties:
@@ -1947,6 +2204,27 @@ definitions:
     required:
     - token
     type: object
+  handlers.AcceptOrganizationInvitationRequest:
+    properties:
+      first_name:
+        type: string
+      last_name:
+        type: string
+      password:
+        description: |-
+          Password, FirstName and LastName create the account when the invitee has
+          none. Ignored when the request carries the invitee's own access token.
+        type: string
+      token:
+        type: string
+    type: object
+  handlers.AddOrganizationMemberRequest:
+    properties:
+      roles:
+        items:
+          type: string
+        type: array
+    type: object
   handlers.AppLimitRequest:
     properties:
       burst:
@@ -1968,6 +2246,13 @@ definitions:
           the response is 428 captcha_required and the credentials are never read.
         type: string
       email:
+        type: string
+      organization:
+        description: |-
+          Organization is the organisation (id org_… or slug) to sign in to, for an
+          application with organisations enabled. Omitted — the normal case — keeps
+          today's behaviour; for an application in organizations_mode "off" it is
+          ignored. Checked only after the password and any second factor succeed.
         type: string
       password:
         type: string
@@ -2144,6 +2429,43 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  handlers.CreateOrganizationInvitationRequest:
+    properties:
+      email:
+        type: string
+      expires_in_hours:
+        description: ExpiresInHours defaults to 72; 1–720.
+        type: integer
+      invitation_url:
+        description: |-
+          InvitationURL is the application's page that accepts invitations. Must be
+          on one of the application's registered redirect URI origins; the
+          invitation and organization query parameters are appended.
+        type: string
+      inviter_name:
+        type: string
+      roles:
+        items:
+          type: string
+        type: array
+      send_email:
+        description: |-
+          SendEmail asks EMC to send the invitation using the application's branded
+          template. Requires invitation_url.
+        type: boolean
+    type: object
+  handlers.CreateOrganizationRequest:
+    properties:
+      display_name:
+        type: string
+      metadata:
+        additionalProperties: {}
+        type: object
+      slug:
+        description: 'Slug is the immutable handle: 1-63 lowercase letters, digits
+          or hyphens.'
+        type: string
     type: object
   handlers.CreatePermissionRequest:
     properties:
@@ -2348,6 +2670,17 @@ definitions:
       token:
         type: string
     type: object
+  handlers.MyOrganizationsResponse:
+    properties:
+      current:
+        description: Current is the organisation this token is signed in to, empty
+          for none.
+        type: string
+      organizations:
+        items:
+          $ref: '#/definitions/auth.OrganizationMembership'
+        type: array
+    type: object
   handlers.MyTenantsResponse:
     properties:
       can_create_tenant:
@@ -2402,6 +2735,9 @@ definitions:
         items:
           type: string
         type: array
+      introspection_endpoint:
+        description: IntrospectionEndpoint is RFC 7662 / RFC 8414 introspection_endpoint.
+        type: string
       issuer:
         description: |-
           Issuer must be byte-identical to the "iss" claim of every token this
@@ -2444,6 +2780,27 @@ definitions:
           type: string
         type: array
       userinfo_endpoint:
+        type: string
+    type: object
+  handlers.OrganizationMemberRolesRequest:
+    properties:
+      mode:
+        description: Mode is "add" (default) or "replace".
+        type: string
+      roles:
+        items:
+          type: string
+        type: array
+    type: object
+  handlers.OrganizationSettings:
+    properties:
+      organizations_enabled:
+        description: |-
+          Enabled reports the deployment switch, so the console can explain why
+          a mode has no effect.
+        type: boolean
+      organizations_mode:
+        description: Mode is "off", "optional" or "required".
         type: string
     type: object
   handlers.ReachableTenantCapabilities:
@@ -2536,6 +2893,14 @@ definitions:
       new_password:
         type: string
       token:
+        type: string
+    type: object
+  handlers.SelectOrganizationRequest:
+    properties:
+      organization:
+        description: Organization is the chosen id (org_…) or slug, from the 409 response.
+        type: string
+      selection_token:
         type: string
     type: object
   handlers.SendTestEmailRequest:
@@ -2702,6 +3067,20 @@ definitions:
       slug:
         type: string
     type: object
+  handlers.SwitchOrganizationRequest:
+    properties:
+      organization:
+        description: Organization is the target id (org_…) or slug.
+        type: string
+      personal:
+        description: |-
+          Personal asks for a session with no organisation. Refused when the
+          application requires one.
+        type: boolean
+      refresh_token:
+        description: RefreshToken of the current session. Required, in the body.
+        type: string
+    type: object
   handlers.TOTPActivateRequest:
     properties:
       code:
@@ -2819,6 +3198,34 @@ definitions:
         items:
           type: string
         type: array
+    type: object
+  handlers.UpdateOrganizationMemberRequest:
+    properties:
+      status:
+        description: Status is "active" or "suspended".
+        type: string
+    type: object
+  handlers.UpdateOrganizationRequest:
+    properties:
+      display_name:
+        type: string
+      is_active:
+        description: IsActive false suspends the organisation and signs everyone out
+          of it.
+        type: boolean
+      metadata:
+        additionalProperties: {}
+        type: object
+    type: object
+  handlers.UpdateOrganizationSettingsRequest:
+    properties:
+      force:
+        description: |-
+          Force allows "required" while some users belong to no organization.
+          They will be unable to sign in until they are added to one.
+        type: boolean
+      organizations_mode:
+        type: string
     type: object
   handlers.UpdatePasskeyPolicyRequest:
     properties:
@@ -2945,6 +3352,15 @@ definitions:
       given_name:
         type: string
       name:
+        type: string
+      org_id:
+        description: |-
+          OrgID and OrgName identify the organisation the presented token is signed
+          in to (Organizations). Omitted for every token that is not, which is every
+          token of an application in organizations_mode "off". Identity, not
+          authorisation: roles and permissions stay in the access token.
+        type: string
+      org_name:
         type: string
       sub:
         description: |-
@@ -5198,6 +5614,38 @@ paths:
       summary: Verify a magic sign-in link
       tags:
       - AUTH
+  /api/v1/auth/apps/login/organization:
+    post:
+      consumes:
+      - application/json
+      description: Completes a sign-in that answered 409 organization_selection_required.
+        The selection_token is single-use and valid for 5 minutes; the organization
+        must be one of those offered.
+      parameters:
+      - description: Selection
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SelectOrganizationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "400":
+          description: organization_selection_invalid
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "403":
+          description: organization_access_denied
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Choose an organization to finish signing in
+      tags:
+      - AUTH
   /api/v1/auth/apps/me:
     get:
       description: Same payload as GET /auth/me, but additionally proves the token
@@ -5244,6 +5692,509 @@ paths:
       security:
       - BearerAuth: []
       summary: Current user, scoped to the calling application
+      tags:
+      - AUTH
+  /api/v1/auth/apps/me/organizations:
+    get:
+      description: The organizations the signed-in user can sign in to in this application,
+        and which one the presented token is for.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.MyOrganizationsResponse'
+      security:
+      - BearerAuth: []
+      summary: List my organizations
+      tags:
+      - AUTH
+  /api/v1/auth/apps/organizations:
+    get:
+      parameters:
+      - description: Match slug or display name
+        in: query
+        name: search
+        type: string
+      - description: Page size (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
+      - description: Offset
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationsPage'
+      summary: List organizations
+      tags:
+      - organizations
+    post:
+      consumes:
+      - application/json
+      description: 'Creates a customer organization inside the application. Allowed
+        while the application''s organizations_mode is still "off", so organizations
+        can be prepared before sign-in depends on them. Application backends authenticate
+        with Authorization: Basic (client credentials); the admin console with a bearer
+        token. 404 when ORGANIZATIONS_ENABLED is false.'
+      parameters:
+      - description: Organization
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateOrganizationRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.Organization'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Slug taken or limit reached
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Create an organization
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/{org}:
+    delete:
+      description: 'Soft-deletes the organization: sign-in to it stops, every session
+        in it is revoked and pending invitations are closed. Members and roles are
+        kept for the audit trail.'
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      summary: Delete an organization
+      tags:
+      - organizations
+    get:
+      parameters:
+      - description: Organization id (org_…) or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.Organization'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get an organization
+      tags:
+      - organizations
+    patch:
+      consumes:
+      - application/json
+      description: Changes display_name, metadata or is_active. The slug is immutable.
+        Setting is_active=false signs every member out of the organization.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Changes
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateOrganizationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.Organization'
+      summary: Update an organization
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/{org}/invitations:
+    get:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Include accepted, revoked and expired
+        in: query
+        name: include_closed
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.OrganizationInvitation'
+            type: array
+      summary: List organization invitations
+      tags:
+      - organizations
+    post:
+      consumes:
+      - application/json
+      description: Creates an invitation carrying the organization and roles. The
+        raw token is returned once in the response and never stored. With send_email
+        EMC delivers it; otherwise the application sends its own email using the token.
+        A pending invitation for the same address is replaced.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Invitation
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateOrganizationInvitationRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.CreatedOrganizationInvitation'
+      summary: Invite to an organization
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/{org}/invitations/{inv}:
+    delete:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Invitation id (inv_…)
+        in: path
+        name: inv
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Revoke an organization invitation
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/{org}/members:
+    get:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Match email or name
+        in: query
+        name: search
+        type: string
+      - description: Page size (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
+      - description: Offset
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMembersPage'
+      summary: List organization members
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/{org}/members/{uid}:
+    delete:
+      description: Deletes the membership and its organization roles and revokes the
+        member's sessions in this organization. The user's account is untouched.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      summary: Remove an organization member
+      tags:
+      - organizations
+    get:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+      summary: Get an organization member
+      tags:
+      - organizations
+    patch:
+      consumes:
+      - application/json
+      description: status "suspended" keeps the membership and roles but refuses sign-in
+        to the organization and revokes the member's sessions in it. "active" restores
+        it from the next sign-in.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Status
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateOrganizationMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+      summary: Suspend or reactivate an organization member
+      tags:
+      - organizations
+    put:
+      consumes:
+      - application/json
+      description: 'Adds one of the application''s users to the organization, optionally
+        with organization roles. Idempotent: an existing member answers 200 and gains
+        any additional roles; a new member answers 201.'
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Roles
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/handlers.AddOrganizationMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Add an organization member
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/{org}/members/{uid}/roles:
+    post:
+      consumes:
+      - application/json
+      description: Grants roles that apply only inside this organization. Roles are
+        names of the application's own roles; unknown or system roles refuse the whole
+        call. mode=add (default) keeps existing organization roles, mode=replace discards
+        them. The member's access tokens are invalidated so the change applies at
+        their next refresh.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Roles
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.OrganizationMemberRolesRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MemberRolesResult'
+      summary: Assign organization roles to a member
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/{org}/members/{uid}/roles/{role}:
+    delete:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Role name
+        in: path
+        name: role
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MemberRolesResult'
+      summary: Remove an organization role from a member
+      tags:
+      - organizations
+  /api/v1/auth/apps/organizations/invitations/accept:
+    post:
+      consumes:
+      - application/json
+      description: 'Two modes. With the invitee''s own access token in Authorization:
+        Bearer, the signed-in account joins the organization — it must be the invited
+        email in the same application. Without one, a new verified account is created
+        with the given password. Either way the membership and its roles are created
+        atomically. Sign in with organization=<id> afterwards.'
+      parameters:
+      - description: Acceptance
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.AcceptOrganizationInvitationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AcceptedOrganizationInvitation'
+        "400":
+          description: Invalid or expired invitation, or weak password
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Account exists - sign in and accept with the access token
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Accept an organization invitation
+      tags:
+      - AUTH
+  /api/v1/auth/apps/organizations/invitations/preview:
+    get:
+      parameters:
+      - description: Invitation token
+        in: query
+        name: token
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationInvitationPreview'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Preview an organization invitation
       tags:
       - AUTH
   /api/v1/auth/apps/register:
@@ -5314,6 +6265,60 @@ paths:
       summary: Register an end user via application credentials
       tags:
       - AUTH
+  /api/v1/auth/apps/switch-organization:
+    post:
+      consumes:
+      - application/json
+      description: Creates a new session in another organization from the current
+        one, without asking for a password again. The new session keeps the original
+        authentication time and methods, so it can never outlive the session it came
+        from. The current session is left as it is. Set personal=true (and no organization)
+        to leave organizations, when the application allows it.
+      parameters:
+      - description: Target
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.SwitchOrganizationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.AuthResult'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+        "403":
+          description: organization_access_denied
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      summary: Switch organization
+      tags:
+      - AUTH
+  /api/v1/auth/apps/users/{uid}/organizations:
+    get:
+      parameters:
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.OrganizationMembership'
+            type: array
+      summary: List a user's organizations
+      tags:
+      - organizations
   /api/v1/auth/apps/users/roles:
     post:
       consumes:
@@ -9223,6 +10228,499 @@ paths:
       summary: Test a social login provider configuration
       tags:
       - oauth
+  /api/v1/tenants/{tid}/applications/{appID}/organization-settings:
+    get:
+      parameters:
+      - description: Tenant id
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Application id
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.OrganizationSettings'
+      security:
+      - BearerAuth: []
+      summary: Get an application's organization settings
+      tags:
+      - organizations
+    put:
+      consumes:
+      - application/json
+      description: 'off (default): tokens are unchanged and organization parameters
+        are ignored. optional: a session may be inside one organization or none. required:
+        every end-user session is inside exactly one organization. Moving to "required"
+        is refused (409) while active users belong to no organization unless force=true,
+        and revokes organization-less sessions. Moving to "off" revokes organization
+        sessions so users sign in again with a plain token.'
+      parameters:
+      - description: Tenant id
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Application id
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Mode
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateOrganizationSettingsRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.OrganizationSettings'
+        "409":
+          description: Users without an organization
+          schema:
+            additionalProperties: true
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Change an application's organization mode
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations:
+    get:
+      parameters:
+      - description: Match slug or display name
+        in: query
+        name: search
+        type: string
+      - description: Page size (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
+      - description: Offset
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationsPage'
+      summary: List organizations
+      tags:
+      - organizations
+    post:
+      consumes:
+      - application/json
+      description: 'Creates a customer organization inside the application. Allowed
+        while the application''s organizations_mode is still "off", so organizations
+        can be prepared before sign-in depends on them. Application backends authenticate
+        with Authorization: Basic (client credentials); the admin console with a bearer
+        token. 404 when ORGANIZATIONS_ENABLED is false.'
+      parameters:
+      - description: Organization
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateOrganizationRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.Organization'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "401":
+          description: Unauthorized
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: Slug taken or limit reached
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Create an organization
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations/{org}:
+    delete:
+      description: 'Soft-deletes the organization: sign-in to it stops, every session
+        in it is revoked and pending invitations are closed. Members and roles are
+        kept for the audit trail.'
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      summary: Delete an organization
+      tags:
+      - organizations
+    get:
+      parameters:
+      - description: Organization id (org_…) or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.Organization'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Get an organization
+      tags:
+      - organizations
+    patch:
+      consumes:
+      - application/json
+      description: Changes display_name, metadata or is_active. The slug is immutable.
+        Setting is_active=false signs every member out of the organization.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Changes
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateOrganizationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.Organization'
+      summary: Update an organization
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/invitations:
+    get:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Include accepted, revoked and expired
+        in: query
+        name: include_closed
+        type: boolean
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.OrganizationInvitation'
+            type: array
+      summary: List organization invitations
+      tags:
+      - organizations
+    post:
+      consumes:
+      - application/json
+      description: Creates an invitation carrying the organization and roles. The
+        raw token is returned once in the response and never stored. With send_email
+        EMC delivers it; otherwise the application sends its own email using the token.
+        A pending invitation for the same address is replaced.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Invitation
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.CreateOrganizationInvitationRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.CreatedOrganizationInvitation'
+      summary: Invite to an organization
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/invitations/{inv}:
+    delete:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Invitation id (inv_…)
+        in: path
+        name: inv
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Revoke an organization invitation
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members:
+    get:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: Match email or name
+        in: query
+        name: search
+        type: string
+      - description: Page size (default 25, max 100)
+        in: query
+        name: limit
+        type: integer
+      - description: Offset
+        in: query
+        name: offset
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMembersPage'
+      summary: List organization members
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}:
+    delete:
+      description: Deletes the membership and its organization roles and revokes the
+        member's sessions in this organization. The user's account is untouched.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      responses:
+        "204":
+          description: No Content
+      summary: Remove an organization member
+      tags:
+      - organizations
+    get:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+      summary: Get an organization member
+      tags:
+      - organizations
+    patch:
+      consumes:
+      - application/json
+      description: status "suspended" keeps the membership and roles but refuses sign-in
+        to the organization and revokes the member's sessions in it. "active" restores
+        it from the next sign-in.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Status
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.UpdateOrganizationMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+      summary: Suspend or reactivate an organization member
+      tags:
+      - organizations
+    put:
+      consumes:
+      - application/json
+      description: 'Adds one of the application''s users to the organization, optionally
+        with organization roles. Idempotent: an existing member answers 200 and gains
+        any additional roles; a new member answers 201.'
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Roles
+        in: body
+        name: body
+        schema:
+          $ref: '#/definitions/handlers.AddOrganizationMemberRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+        "201":
+          description: Created
+          schema:
+            $ref: '#/definitions/auth.OrganizationMember'
+        "404":
+          description: Not Found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Add an organization member
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}/roles:
+    post:
+      consumes:
+      - application/json
+      description: Grants roles that apply only inside this organization. Roles are
+        names of the application's own roles; unknown or system roles refuse the whole
+        call. mode=add (default) keeps existing organization roles, mode=replace discards
+        them. The member's access tokens are invalidated so the change applies at
+        their next refresh.
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Roles
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.OrganizationMemberRolesRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MemberRolesResult'
+      summary: Assign organization roles to a member
+      tags:
+      - organizations
+  /api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}/roles/{role}:
+    delete:
+      parameters:
+      - description: Organization id or slug
+        in: path
+        name: org
+        required: true
+        type: string
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      - description: Role name
+        in: path
+        name: role
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.MemberRolesResult'
+      summary: Remove an organization role from a member
+      tags:
+      - organizations
   /api/v1/tenants/{tid}/applications/{appID}/rate-limit:
     delete:
       description: Removes the custom rate limit; the app falls back to the default.
@@ -9529,6 +11027,26 @@ paths:
       summary: Set an application's per-user rate limits
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/users/{uid}/organizations:
+    get:
+      parameters:
+      - description: User id
+        in: path
+        name: uid
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            items:
+              $ref: '#/definitions/auth.OrganizationMembership'
+            type: array
+      summary: List a user's organizations
+      tags:
+      - organizations
   /api/v1/tenants/{tid}/audiences:
     get:
       description: Returns every audience registered in the tenant, with its owning
@@ -10734,6 +12252,39 @@ paths:
         "400":
           description: HTML error page — client_id or redirect_uri invalid
       summary: OAuth 2.0 authorization endpoint
+      tags:
+      - oauth
+  /oauth/introspect:
+    post:
+      consumes:
+      - application/x-www-form-urlencoded
+      description: 'RFC 7662. Confidential clients only, authenticated with client_secret_basic
+        or client_secret_post. Returns {"active": false} for any token that is invalid,
+        expired, revoked, issued to another application, or whose user or organization
+        membership is no longer active; otherwise the token''s claims, including org_id
+        and org_permissions for an organization session.'
+      parameters:
+      - description: The token
+        in: formData
+        name: token
+        required: true
+        type: string
+      - description: access_token or refresh_token
+        in: formData
+        name: token_type_hint
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/auth.IntrospectionResult'
+        "401":
+          description: invalid_client
+          schema:
+            $ref: '#/definitions/handlers.tokenError'
+      summary: Introspect a token
       tags:
       - oauth
   /oauth/revoke:
