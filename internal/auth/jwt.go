@@ -749,10 +749,19 @@ func (s *JWTService) EncryptAllTenantSecrets(ctx context.Context) (int, error) {
 // falls back to it transparently, and Encrypt always seals under the primary.
 // One boot is then enough to retire the previous key — leave
 // JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS set for one restart, then remove it.
+// The companion sweep SigningKeyService.ReencryptPrivateKeys covers the other
+// ciphertext family the same box seals (signing_keys.private_key_enc), which
+// has no rewrite path either; both must run before the previous key goes away.
+//
+// The same zero-key guard as EncryptAllTenantSecrets applies: a box on the
+// development all-zero key must not rewrite rows — decrypting with the
+// previous key and re-sealing under the zero key would leave every row
+// unreadable the moment a real primary key is restored. The skip is silent
+// here (JWTService carries no logger); the startup caller warns.
 //
 // Idempotent and a no-op when no rotation is configured.
 func (s *JWTService) ReencryptTenantSecrets(ctx context.Context) (int, error) {
-	if s.secretBox == nil || !s.secretBox.HasPreviousKey() {
+	if s.secretBox == nil || !s.secretBox.HasPreviousKey() || s.secretBox.UsesInsecureZeroKey() {
 		return 0, nil
 	}
 	rows, err := s.pool.Query(ctx,

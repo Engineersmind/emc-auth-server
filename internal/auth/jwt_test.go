@@ -191,6 +191,159 @@ func TestJWTService_TenantSecretEncryptedAtRest(t *testing.T) {
 	}
 }
 
+// TestJWTService_ReencryptTenantSecrets_RotatesEncryptedRows pins the sweep's
+// contract: a jwt_secret_enc row sealed under the PREVIOUS encryption key must
+// come out sealed under the new primary, or removing
+// JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS orphans the ciphertext.
+// why: the sweep is the only rewrite path jwt_secret_enc has — without it the
+// first deploy after a key rotation leaves every row decryptable only by the
+// key the operator was told to remove.
+func TestJWTService_ReencryptTenantSecrets_RotatesEncryptedRows(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	testhelper.CleanupTables(t, pool)
+
+	ctx := context.Background()
+	logger := testhelper.TestLogger()
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	oldKeyHex := strings.Repeat("aa", 32)
+	newKeyHex := strings.Repeat("bb", 32)
+
+	// Simulate a row sealed under the OLD key — the pre-rotation state.
+	oldBox, err := auth.NewSecretBox(oldKeyHex, "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(old): %v", err)
+	}
+	encOld, err := oldBox.Encrypt("tenant-secret-under-old-key")
+	if err != nil {
+		t.Fatalf("Encrypt under old key: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE tenants SET jwt_secret_enc = $1, jwt_secret = '' WHERE id = $2`,
+		encOld, tenantID,
+	); err != nil {
+		t.Fatalf("seed old-key ciphertext: %v", err)
+	}
+
+	// Rotation posture: new primary, old key still accepted for decrypts.
+	newBox, err := auth.NewSecretBox(newKeyHex, "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(new): %v", err)
+	}
+	if err := newBox.WithPreviousKey(oldKeyHex, "JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS_TEST"); err != nil {
+		t.Fatalf("WithPreviousKey: %v", err)
+	}
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local").WithSecretBox(newBox)
+
+	n, err := jwtSvc.ReencryptTenantSecrets(ctx)
+	if err != nil {
+		t.Fatalf("ReencryptTenantSecrets() error = %v", err)
+	}
+	if n != 1 {
+		t.Errorf("ReencryptTenantSecrets re-sealed = %d, want 1", n)
+	}
+
+	var encAfter string
+	if err := pool.QueryRow(ctx,
+		`SELECT jwt_secret_enc FROM tenants WHERE id = $1`, tenantID,
+	).Scan(&encAfter); err != nil {
+		t.Fatalf("fetch post-sweep ciphertext: %v", err)
+	}
+	if encAfter == encOld {
+		t.Error("jwt_secret_enc unchanged — the row was not re-sealed under the new key")
+	}
+
+	// The mechanism, not the symptom: with the previous key REMOVED the row
+	// must still decrypt — that is what makes the rotation safe to finish.
+	soloBox, err := auth.NewSecretBox(newKeyHex, "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(solo): %v", err)
+	}
+	dec, err := soloBox.Decrypt(encAfter)
+	if err != nil {
+		t.Fatalf("Decrypt post-sweep ciphertext under new key alone: %v", err)
+	}
+	if dec != "tenant-secret-under-old-key" {
+		t.Errorf("Decrypt post-sweep = %q, want the original plaintext", dec)
+	}
+}
+
+// TestJWTService_ReencryptTenantSecrets_SkipsZeroKeyPrimary pins the zero-key
+// guard: with the primary key unset (the development all-zero fallback) and a
+// previous key set, the sweep must write nothing — re-sealing under the
+// publicly known zero key would leave every row unreadable the moment a real
+// JWT_SIGNING_KEY_ENCRYPTION_KEY is restored.
+// why: before the guard, a dev/test deploy with PREVIOUS set and primary unset
+// rewrote every row under the zero key, and a later real primary could not
+// read any of them.
+func TestJWTService_ReencryptTenantSecrets_SkipsZeroKeyPrimary(t *testing.T) {
+	pool := testhelper.NewTestDB(t)
+	testhelper.CleanupTables(t, pool)
+
+	ctx := context.Background()
+	logger := testhelper.TestLogger()
+	if err := store.RunSeed(ctx, pool, logger); err != nil {
+		t.Fatalf("RunSeed: %v", err)
+	}
+	var tenantID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
+		t.Fatalf("fetch seed tenant id: %v", err)
+	}
+
+	oldKeyHex := strings.Repeat("aa", 32)
+
+	oldBox, err := auth.NewSecretBox(oldKeyHex, "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(old): %v", err)
+	}
+	encOld, err := oldBox.Encrypt("tenant-secret-under-old-key")
+	if err != nil {
+		t.Fatalf("Encrypt under old key: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE tenants SET jwt_secret_enc = $1, jwt_secret = '' WHERE id = $2`,
+		encOld, tenantID,
+	); err != nil {
+		t.Fatalf("seed old-key ciphertext: %v", err)
+	}
+
+	// Primary unset → development zero key; previous set → rotation looks
+	// configured, so an unguarded sweep would decrypt via the previous key and
+	// re-seal under the zero key.
+	zeroBox, err := auth.NewSecretBox("", "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(zero): %v", err)
+	}
+	if err := zeroBox.WithPreviousKey(oldKeyHex, "JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS_TEST"); err != nil {
+		t.Fatalf("WithPreviousKey: %v", err)
+	}
+	jwtSvc := newTestJWTService(t, pool, "https://auth.emc.local").WithSecretBox(zeroBox)
+
+	n, err := jwtSvc.ReencryptTenantSecrets(ctx)
+	if err != nil {
+		t.Fatalf("ReencryptTenantSecrets() error = %v", err)
+	}
+	if n != 0 {
+		t.Errorf("ReencryptTenantSecrets re-sealed = %d, want 0 — a zero-key primary must not write", n)
+	}
+
+	var encAfter string
+	if err := pool.QueryRow(ctx,
+		`SELECT jwt_secret_enc FROM tenants WHERE id = $1`, tenantID,
+	).Scan(&encAfter); err != nil {
+		t.Fatalf("fetch post-sweep ciphertext: %v", err)
+	}
+	if encAfter != encOld {
+		t.Error("jwt_secret_enc was rewritten under the zero key — the guard did not hold")
+	}
+}
+
 func TestJWTService_Verify_ExpiredToken(t *testing.T) {
 	pool := testhelper.NewTestDB(t)
 	testhelper.CleanupTables(t, pool)
