@@ -693,8 +693,8 @@ func storedPrivateKeyEnc(t *testing.T, ctx context.Context, pool *pgxpool.Pool, 
 // and the tenant can no longer sign (load decrypts the active key's private
 // half on every cache fill).
 // why: private_key_enc has no other rewrite path, so without the sweep the
-// "one restart, then remove the previous key" rotation guidance breaks RS256
-// issuance on the second boot.
+// "remove the previous key once the rotation-complete log line appears"
+// guidance breaks RS256 issuance on the boot after the key is dropped.
 func TestSigningKeyService_ReencryptPrivateKeys_RotatesEncryptedRows(t *testing.T) {
 	ctx, _, keys, tenantID, _ := signingFixture(t)
 	pool := testhelper.NewTestDB(t)
@@ -708,11 +708,15 @@ func TestSigningKeyService_ReencryptPrivateKeys_RotatesEncryptedRows(t *testing.
 	if err != nil {
 		t.Fatalf("EnsureTenantKey: %v", err)
 	}
+	// Retire the extra key BEFORE PrepareRotation: retireKey inserts it as
+	// 'next' first, and migration 00065's signing_keys_one_next_per_tenant
+	// index allows only one 'next' row per tenant — creating it while the
+	// rotation candidate already exists would violate that index.
+	retiredKID := retireKey(t, ctx, pool, keys, tenantID)
 	next, err := keys.PrepareRotation(ctx, tenantID)
 	if err != nil {
 		t.Fatalf("PrepareRotation: %v", err)
 	}
-	retiredKID := retireKey(t, ctx, pool, keys, tenantID)
 
 	activeBefore := storedPrivateKeyEnc(t, ctx, pool, active.KID)
 	nextBefore := storedPrivateKeyEnc(t, ctx, pool, next.KID)
