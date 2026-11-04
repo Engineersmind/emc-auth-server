@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1649,8 +1650,14 @@ func (h *AuthHandler) ConsoleForgotPassword(c echo.Context) error {
 		"message": "if that email address is registered, a password reset link has been sent",
 	}
 
+	// Parsed exactly as PasswordResetRateLimiter peeks the email: one JSON
+	// document, the same 64 KiB cap, nothing after it. c.Bind would accept
+	// `{"email":"victim"} {}` or a form body, which the limiter cannot read, and
+	// the per-email bucket would be skipped for a request that still sends mail.
+	// A body the limiter could not key on is refused here with the generic 200.
 	var req ForgotPasswordRequest
-	if err := c.Bind(&req); err != nil {
+	data, err := io.ReadAll(io.LimitReader(c.Request().Body, 1<<16))
+	if err != nil || json.Unmarshal(data, &req) != nil {
 		return c.JSON(http.StatusOK, genericOK)
 	}
 

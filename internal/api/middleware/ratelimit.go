@@ -386,6 +386,9 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 //     unboundedly. The address is peeked from the body without consuming it
 //     (same technique as loginEmailFromBody); reset-password carries no email
 //     so that bucket simply doesn't apply there.
+//
+// Each 429 names its bucket in "limiter" — ip, app, user — the vocabulary the
+// application rate limiters use, so a client can tell which wait it is in.
 func PasswordResetRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	startCleanup()
 
@@ -401,6 +404,7 @@ func PasswordResetRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many password reset requests from your IP address",
+					"limiter":     "ip",
 					"retry_after": "60",
 				})
 			}
@@ -414,6 +418,7 @@ func PasswordResetRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 					c.Response().Header().Set("Retry-After", "60")
 					return c.JSON(http.StatusTooManyRequests, map[string]string{
 						"error":       "too many password reset requests for this client",
+						"limiter":     "app",
 						"retry_after": "60",
 					})
 				}
@@ -428,6 +433,7 @@ func PasswordResetRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 					c.Response().Header().Set("Retry-After", "60")
 					return c.JSON(http.StatusTooManyRequests, map[string]string{
 						"error":       "too many password reset requests for this email",
+						"limiter":     "user",
 						"retry_after": "60",
 					})
 				}

@@ -108,8 +108,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resets only its own account through the existing `POST /auth/reset-password`. It
   always answers the same `200` (RESET-03), or `428` when the platform captcha policy
   demands a challenge. Limits are the `PasswordResetRateLimiter` buckets the
-  application endpoint already uses: 5/min per IP and 10/min per recipient email,
-  both shared with `/forgot-password` and `/reset-password`.
+  application endpoint already uses: 5/min per IP (`limiter: "ip"`) and 10/min per
+  recipient email (`limiter: "user"`), both shared with `/forgot-password` and
+  `/reset-password`. Those 429s now carry the `limiter` field on all three routes,
+  an additive change. The body must be a single JSON object: one the limiter cannot
+  read (trailing data, form encoding) gets the generic `200` and sends nothing, so
+  it cannot slip past the per-email bucket.
   Each request counts toward the adaptive captcha trigger. Each issued token is
   audited as `auth.password_reset_requested` with its tenant and no application.
   The application endpoint is unchanged.

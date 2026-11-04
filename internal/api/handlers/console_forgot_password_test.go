@@ -11,6 +11,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/testhelper"
 )
 
 // ---------------------------------------------------------------------------
@@ -75,5 +76,27 @@ func TestConsoleForgotPassword_EveryRequestArmsTheAdaptiveGate(t *testing.T) {
 	rec := consoleForgotRequest(h, ip, `{"email":""}`)
 	if rec.Code != http.StatusPreconditionRequired {
 		t.Errorf("after %d requests: status = %d, want 428 — the gate did not arm", policy.TriggerAfterFailures, rec.Code)
+	}
+}
+
+// TestConsoleForgotPassword_RefusesBodiesTheLimiterCannotRead pins that the
+// handler parses the body as strictly as PasswordResetRateLimiter does. The
+// handler has no reset service wired, so any body accepted here would reach
+// the lookup and panic instead of answering the generic 200.
+func TestConsoleForgotPassword_RefusesBodiesTheLimiterCannotRead(t *testing.T) {
+	h := NewAuthHandler(nil, nil, nil, testhelper.TestLogger())
+
+	for name, body := range map[string]string{
+		"trailing object":  `{"email":"victim@example.test"} {}`,
+		"two objects":      `{"email":"victim@example.test"}{"email":"other@example.test"}`,
+		"trailing garbage": `{"email":"victim@example.test"}x`,
+		"form encoded":     `email=victim@example.test`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rec := consoleForgotRequest(h, uniqueTestIP(), body)
+			if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "if that email address is registered") {
+				t.Fatalf("status = %d body = %s, want the generic 200", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }

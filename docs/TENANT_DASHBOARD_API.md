@@ -686,7 +686,7 @@ Content-Type: application/json
 |---|---|---|
 | `200` | `{"message":"if that email address is registered, a password reset link has been sent"}` | Always the same, registered or not. Show it as-is. |
 | `428` | `{"error":"captcha_required"}` or `{"error":"captcha_invalid"}` | Fetch `POST /api/v1/captcha/challenge`, show it, retry with the answer. |
-| `429` | `{"error":"too many password reset requests from your IP address" \| "…for this email","retry_after":"60"}` | 5/min per IP address or 10/min per email, shared with the other reset endpoints. Wait `Retry-After`. |
+| `429` | `{"error":"…","limiter":"ip"\|"user","retry_after":"60"}` | 5/min per IP address (`ip`) or 10/min per email (`user`), shared with the other reset endpoints. Wait `Retry-After`. |
 
 An address that owns console accounts in several tenants gets one email per
 account. Each link resets only the account it was sent for.
