@@ -71,3 +71,13 @@ A malformed `code_challenge` (not 43 base64url chars), or a method other than
 PKCE additionally means that even a leaked callback URL is useless without the
 verifier, which never leaves your backend. Use PKCE when the callback lands on a
 different origin than your session cookie, or when you want defence in depth.
+
+## Implementation notes
+
+- When `state` is echoed, the callback URL is rebuilt with standard query
+  encoding, so any query parameters already present on your allow-listed
+  `redirect` may be re-ordered or re-encoded. Compare individual query
+  parameters (`state`, `login_code`), never the raw callback URL string.
+- On the platform side, sending `state` (and ideally `code_challenge`) is not
+  enough on its own: the callback handler must verify them, otherwise the
+  login CSRF remains open in your application.
