@@ -23,14 +23,15 @@ the default, and the permissive window is an explicit opt-in
 | Piece | Where | State |
 |---|---|---|
 | `JWT_ALLOW_LEGACY_HS256` env var | `internal/config/config.go` | defaults to `false` — strict; set `true` only for a migration window |
-| Deploy-path pin | `infra/docker-compose.prod.yml` | pins `JWT_ALLOW_LEGACY_HS256: ${JWT_ALLOW_LEGACY_HS256:-true}` so an upgrade does not flag-day live tokens — delete the pin to complete the cutover |
+| Deploy-path pin | `infra/docker-compose.prod.yml` | forwards `JWT_ALLOW_LEGACY_HS256` with the same secure default (`:-false`) — an operator opens ONE migration window by setting it `true` in `.env`, then removes it |
 | Both algorithm pins narrow to RS256 | `internal/auth/jwt.go` — `WithValidMethods` **and** the keyfunc's HMAC branch | active when the flag is `false` |
 | Startup warning while the window is open | `internal/api/routes.go` | active — logs `JWT_ALLOW_LEGACY_HS256=true — HS256 tokens are still ACCEPTED` until the flag is off |
 | Rejection counter | `emc_auth_legacy_hs256_verifications_total{reason="rejected"}` | active |
 | Test coverage | `TestJWTService_Phase4Cutover` | passing |
 
 So step 2 below is an **env var change and a restart**, not a code change —
-and for the shipped compose deployment it means removing the migration pin.
+and for the shipped compose deployment it means unsetting the variable an
+operator set for the migration window (or never having set it at all).
 
 ---
 
@@ -98,12 +99,13 @@ appears in that list. If it does not, **stop** — cutover would reject everythi
 ### Step 2 — reject HS256
 
 Since GHSA-4x5m-3gph-938r the flag **defaults to false** — deployments that
-never set it are already strict. If the shipped `docker-compose.prod.yml`
-migration pin (`JWT_ALLOW_LEGACY_HS256: ${JWT_ALLOW_LEGACY_HS256:-true}`) is in
-place, the cutover is:
+never set it are already strict, and the shipped `docker-compose.prod.yml`
+defers to that default (`JWT_ALLOW_LEGACY_HS256: ${JWT_ALLOW_LEGACY_HS256:-false}`).
+If an operator opened a migration window by setting `JWT_ALLOW_LEGACY_HS256=true`
+in `.env`, the cutover is to remove it:
 
 ```bash
-# remove the pin from the compose environment block, or set explicitly:
+# delete the JWT_ALLOW_LEGACY_HS256=true line from .env, or set explicitly:
 JWT_ALLOW_LEGACY_HS256=false
 ```
 
