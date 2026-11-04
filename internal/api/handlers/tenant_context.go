@@ -228,7 +228,7 @@ func (h *AuthHandler) TenantContext(c echo.Context) error {
 			ResourceType: "tenant",
 			ResourceID:   req.TenantID,
 			Status:       audit.StatusFailure,
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     map[string]any{"reason": "no administrative grant in the requested tenant"},
 		})
@@ -259,7 +259,7 @@ func (h *AuthHandler) TenantContext(c echo.Context) error {
 		ResourceType: "tenant",
 		ResourceID:   req.TenantID,
 		Status:       audit.StatusSuccess,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata: map[string]any{
 			"from_tenant": claims.TenantID,

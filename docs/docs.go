@@ -2009,6 +2009,259 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/server-trust": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's registered server IPs and whether it may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Registers the application backend's egress IPs (requests from them skip the per-IP flood guard; the application quota and per-user limits still apply) and turns forwarding of the end user's IP on or off. A forwarded IP is believed only when the client secret verifies and the request comes from one of the registered server IPs, so forwarding needs at least one. Omitted fields are left unchanged. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Settings to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ServerTrustRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid address or range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/server-trust/suggestions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists the addresses that served several different users of the application recently (from the audit log, administrator actions excluded) — likely the application backend's outbound addresses — and whether each is already registered. Suggestions only; nothing is registered until the server IPs are saved. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Suggest an application's server addresses",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ServerIPSuggestions"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/user-limits": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists every per-user limit on the application end-user routes (sign in, password reset, magic link, OTP, ...) with the server default, the application's override if any, the effective value, and the highest override accepted. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's per-user limit overrides. Each value is requests per minute, between 1 and that limit's max; a limit left out returns to the server default, and {\"overrides\": {}} clears them all. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UserLimitsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown limit or value out of range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/users/{uid}/mfa": {
             "delete": {
                 "security": [
@@ -2755,6 +3008,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AppLoginRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2784,6 +3043,15 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2823,6 +3091,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MagicLinkRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2855,6 +3129,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "Magic link not enabled for this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2894,6 +3177,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MagicLinkVerifyRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2919,6 +3208,61 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/login/organization": {
+            "post": {
+                "description": "Completes a sign-in that answered 409 organization_selection_required. The selection_token is single-use and valid for 5 minutes; the organization must be one of those offered.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Choose an organization to finish signing in",
+                "parameters": [
+                    {
+                        "description": "Selection",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SelectOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "400": {
+                        "description": "organization_selection_invalid",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "organization_access_denied",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -2953,6 +3297,12 @@ const docTemplate = `{
                         "name": "X-Client-Authorization",
                         "in": "header",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2969,6 +3319,743 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/me/organizations": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "The organizations the signed-in user can sign in to in this application, and which one the presented token is for.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "List my organizations",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MyOrganizationsResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Match slug or display name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationsPage"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates a customer organization inside the application. Allowed while the application's organizations_mode is still \"off\", so organizations can be prepared before sign-in depends on them. Application backends authenticate with Authorization: Basic (client credentials); the admin console with a bearer token. 404 when ORGANIZATIONS_ENABLED is false.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Create an organization",
+                "parameters": [
+                    {
+                        "description": "Organization",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Slug taken or limit reached",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/invitations/accept": {
+            "post": {
+                "description": "Two modes. With the invitee's own access token in Authorization: Bearer, the signed-in account joins the organization — it must be the invited email in the same application. Without one, a new verified account is created with the given password. Either way the membership and its roles are created atomically. Sign in with organization=\u003cid\u003e afterwards.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Accept an organization invitation",
+                "parameters": [
+                    {
+                        "description": "Acceptance",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AcceptOrganizationInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AcceptedOrganizationInvitation"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid or expired invitation, or weak password",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Account exists - sign in and accept with the access token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/invitations/preview": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Preview an organization invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Invitation token",
+                        "name": "token",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationInvitationPreview"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id (org_…) or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Soft-deletes the organization: sign-in to it stops, every session in it is revoked and pending invitations are closed. Members and roles are kept for the audit trail.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Delete an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "Changes display_name, metadata or is_active. The slug is immutable. Setting is_active=false signs every member out of the organization.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Update an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Changes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/invitations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization invitations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Include accepted, revoked and expired",
+                        "name": "include_closed",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationInvitation"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates an invitation carrying the organization and roles. The raw token is returned once in the response and never stored. With send_email EMC delivers it; otherwise the application sends its own email using the token. A pending invitation for the same address is replaced.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Invite to an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Invitation",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.CreatedOrganizationInvitation"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/invitations/{inv}": {
+            "delete": {
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Revoke an organization invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Invitation id (inv_…)",
+                        "name": "inv",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization members",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Match email or name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMembersPage"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members/{uid}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Adds one of the application's users to the organization, optionally with organization roles. Idempotent: an existing member answers 200 and gains any additional roles; a new member answers 201.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Add an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AddOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Deletes the membership and its organization roles and revokes the member's sessions in this organization. The user's account is untouched.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "status \"suspended\" keeps the membership and roles but refuses sign-in to the organization and revokes the member's sessions in it. \"active\" restores it from the next sign-in.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Suspend or reactivate an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Status",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members/{uid}/roles": {
+            "post": {
+                "description": "Grants roles that apply only inside this organization. Roles are names of the application's own roles; unknown or system roles refuse the whole call. mode=add (default) keeps existing organization roles, mode=replace discards them. The member's access tokens are invalidated so the change applies at their next refresh.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Assign organization roles to a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationMemberRolesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/organizations/{org}/members/{uid}/roles/{role}": {
+            "delete": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization role from a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Role name",
+                        "name": "role",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
                         }
                     }
                 }
@@ -3003,6 +4090,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AppRegisterRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3047,6 +4140,61 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/switch-organization": {
+            "post": {
+                "description": "Creates a new session in another organization from the current one, without asking for a password again. The new session keeps the original authentication time and methods, so it can never outlive the session it came from. The current session is left as it is. Set personal=true (and no organization) to leave organizations, when the application allows it.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Switch organization",
+                "parameters": [
+                    {
+                        "description": "Target",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.SwitchOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "organization_access_denied",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
                     }
                 }
             }
@@ -3080,6 +4228,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AssignAppUserRolesRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3113,6 +4267,46 @@ const docTemplate = `{
                             "type": "object",
                             "additionalProperties": {
                                 "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/users/{uid}/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List a user's organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationMembership"
                             }
                         }
                     }
@@ -3229,6 +4423,61 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/console/forgot-password": {
+            "post": {
+                "description": "Sends a reset link to every first-party (management-console) account registered to the email, one email per account, naming its tenant, and at most one per account per minute. The emails are sent after the response. No client credentials: this is the browser flow for console administrators; applications use POST /api/v1/auth/forgot-password. ALWAYS returns 200 with the same body whether or not the email is registered (prevents email enumeration). Redeem the emailed token with POST /api/v1/auth/reset-password.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Request a console password reset",
+                "parameters": [
+                    {
+                        "description": "Email address",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ForgotPasswordRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user = this email, ip = this address); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/forgot-password": {
             "post": {
                 "description": "Sends a reset link to the email address for the authenticated application's user. The application authenticates with Authorization: Basic base64(client_id:client_secret) — this identifies both the tenant and application, scoping the reset to that app's account. ALWAYS returns 200 for a valid client regardless of whether the email is registered (prevents email enumeration).",
@@ -3258,6 +4507,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ForgotPasswordRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3281,6 +4536,15 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3412,6 +4676,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAActivateRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3473,6 +4749,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAEmailPendingRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3546,6 +4834,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAEnrollRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3566,6 +4866,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Invalid or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3598,6 +4907,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.LoginOTPRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3668,6 +4989,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.LoginOTPResendRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4079,6 +5412,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.OAuthExchangeRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4099,6 +5444,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4628,6 +5982,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "429": {
+                        "description": "Rate limited per IP; wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -4649,6 +6012,18 @@ const docTemplate = `{
                         "name": "ceremony_token",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4669,6 +6044,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5028,11 +6412,32 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ResendVerificationRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
                     "200": {
                         "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5065,6 +6470,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ResetPasswordRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional; send it when your backend calls this for a user, or the call is limited as an anonymous browser (5/min per IP)",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -5079,6 +6496,15 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -8596,6 +10022,718 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/organization-settings": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an application's organization settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant id",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Application id",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationSettings"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "off (default): tokens are unchanged and organization parameters are ignored. optional: a session may be inside one organization or none. required: every end-user session is inside exactly one organization. Moving to \"required\" is refused (409) while active users belong to no organization unless force=true, and revokes organization-less sessions. Moving to \"off\" revokes organization sessions so users sign in again with a plain token.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Change an application's organization mode",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant id",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Application id",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Mode",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationSettingsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationSettings"
+                        }
+                    },
+                    "409": {
+                        "description": "Users without an organization",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Match slug or display name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationsPage"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates a customer organization inside the application. Allowed while the application's organizations_mode is still \"off\", so organizations can be prepared before sign-in depends on them. Application backends authenticate with Authorization: Basic (client credentials); the admin console with a bearer token. 404 when ORGANIZATIONS_ENABLED is false.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Create an organization",
+                "parameters": [
+                    {
+                        "description": "Organization",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Slug taken or limit reached",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id (org_…) or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Soft-deletes the organization: sign-in to it stops, every session in it is revoked and pending invitations are closed. Members and roles are kept for the audit trail.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Delete an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "Changes display_name, metadata or is_active. The slug is immutable. Setting is_active=false signs every member out of the organization.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Update an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Changes",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.Organization"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/invitations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization invitations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "boolean",
+                        "description": "Include accepted, revoked and expired",
+                        "name": "include_closed",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationInvitation"
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "description": "Creates an invitation carrying the organization and roles. The raw token is returned once in the response and never stored. With send_email EMC delivers it; otherwise the application sends its own email using the token. A pending invitation for the same address is replaced.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Invite to an organization",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Invitation",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.CreateOrganizationInvitationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.CreatedOrganizationInvitation"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/invitations/{inv}": {
+            "delete": {
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Revoke an organization invitation",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Invitation id (inv_…)",
+                        "name": "inv",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List organization members",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Match email or name",
+                        "name": "search",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Page size (default 25, max 100)",
+                        "name": "limit",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Offset",
+                        "name": "offset",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMembersPage"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Get an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "description": "Adds one of the application's users to the organization, optionally with organization roles. Idempotent: an existing member answers 200 and gains any additional roles; a new member answers 201.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Add an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AddOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "201": {
+                        "description": "Created",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "description": "Deletes the membership and its organization roles and revokes the member's sessions in this organization. The user's account is untouched.",
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "204": {
+                        "description": "No Content"
+                    }
+                }
+            },
+            "patch": {
+                "description": "status \"suspended\" keeps the membership and roles but refuses sign-in to the organization and revokes the member's sessions in it. \"active\" restores it from the next sign-in.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Suspend or reactivate an organization member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Status",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateOrganizationMemberRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.OrganizationMember"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}/roles": {
+            "post": {
+                "description": "Grants roles that apply only inside this organization. Roles are names of the application's own roles; unknown or system roles refuse the whole call. mode=add (default) keeps existing organization roles, mode=replace discards them. The member's access tokens are invalidated so the change applies at their next refresh.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Assign organization roles to a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Roles",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.OrganizationMemberRolesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/organizations/{org}/members/{uid}/roles/{role}": {
+            "delete": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "Remove an organization role from a member",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Organization id or slug",
+                        "name": "org",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Role name",
+                        "name": "role",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MemberRolesResult"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/rate-limit": {
             "get": {
                 "security": [
@@ -8748,6 +10886,320 @@ const docTemplate = `{
                             "type": "object",
                             "additionalProperties": {
                                 "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/server-trust": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's registered server IPs and whether it may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Registers the application backend's egress IPs (requests from them skip the per-IP flood guard; the application quota and per-user limits still apply) and turns forwarding of the end user's IP on or off. A forwarded IP is believed only when the client secret verifies and the request comes from one of the registered server IPs, so forwarding needs at least one. Omitted fields are left unchanged. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Settings to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ServerTrustRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid address or range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/server-trust/suggestions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists the addresses that served several different users of the application recently (from the audit log, administrator actions excluded) — likely the application backend's outbound addresses — and whether each is already registered. Suggestions only; nothing is registered until the server IPs are saved. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Suggest an application's server addresses",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ServerIPSuggestions"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/user-limits": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists every per-user limit on the application end-user routes (sign in, password reset, magic link, OTP, ...) with the server default, the application's override if any, the effective value, and the highest override accepted. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's per-user limit overrides. Each value is requests per minute, between 1 and that limit's max; a limit left out returns to the server default, and {\"overrides\": {}} clears them all. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UserLimitsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown limit or value out of range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/organizations": {
+            "get": {
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "organizations"
+                ],
+                "summary": "List a user's organizations",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "User id",
+                        "name": "uid",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.OrganizationMembership"
                             }
                         }
                     }
@@ -10320,9 +12772,10 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Opaque value echoed back on the redirect",
+                        "description": "Opaque value echoed back on the redirect — required unless OAUTH_REQUIRE_STATE=false",
                         "name": "state",
-                        "in": "query"
+                        "in": "query",
+                        "required": true
                     },
                     {
                         "type": "string",
@@ -10351,6 +12804,50 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "HTML error page — client_id or redirect_uri invalid"
+                    }
+                }
+            }
+        },
+        "/oauth/introspect": {
+            "post": {
+                "description": "RFC 7662. Confidential clients only, authenticated with client_secret_basic or client_secret_post. Returns {\"active\": false} for any token that is invalid, expired, revoked, issued to another application, or whose user or organization membership is no longer active; otherwise the token's claims, including org_id and org_permissions for an organization session.",
+                "consumes": [
+                    "application/x-www-form-urlencoded"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "oauth"
+                ],
+                "summary": "Introspect a token",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The token",
+                        "name": "token",
+                        "in": "formData",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "access_token or refresh_token",
+                        "name": "token_type_hint",
+                        "in": "formData"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.IntrospectionResult"
+                        }
+                    },
+                    "401": {
+                        "description": "invalid_client",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
                     }
                 }
             }
@@ -10610,6 +13107,24 @@ const docTemplate = `{
                         "name": "client_id",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Optional opaque value (max 512 printable ASCII chars) echoed unchanged on the redirect back; use it to bind the callback to the browser that started the flow",
+                        "name": "state",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Optional PKCE S256 challenge base64url(SHA256(code_verifier)); when set, exchange requires the code_verifier",
+                        "name": "code_challenge",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must be S256 when code_challenge is set",
+                        "name": "code_challenge_method",
+                        "in": "query"
                     },
                     {
                         "type": "string",
@@ -12093,6 +14608,26 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AcceptedOrganizationInvitation": {
+            "type": "object",
+            "properties": {
+                "account_created": {
+                    "type": "boolean"
+                },
+                "organization": {
+                    "$ref": "#/definitions/auth.OrganizationRef"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.AgentAnalysis": {
             "type": "object",
             "properties": {
@@ -12367,6 +14902,55 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AppServerIP": {
+            "type": "object",
+            "properties": {
+                "cidr": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.AppServerIPInput": {
+            "type": "object",
+            "properties": {
+                "cidr": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.AppServerTrust": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "integer"
+                },
+                "per_ip_limit": {
+                    "description": "PerIPLimit is the per-IP limit, per minute, that requests from the server\nIPs skip. Set by the admin API from configuration; 0 when unknown.",
+                    "type": "integer"
+                },
+                "server_ips": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.AppServerIP"
+                    }
+                },
+                "tenant_id": {
+                    "type": "integer"
+                },
+                "trust_forwarded_ip": {
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.AppsPage": {
             "type": "object",
             "properties": {
@@ -12503,6 +15087,47 @@ const docTemplate = `{
                     }
                 },
                 "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.CreatedOrganizationInvitation": {
+            "type": "object",
+            "properties": {
+                "accepted_at": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "email_sent": {
+                    "type": "boolean"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "invitation_url": {
+                    "type": "string"
+                },
+                "organization_id": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                },
+                "token": {
                     "type": "string"
                 }
             }
@@ -12661,6 +15286,87 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.IntrospectionResult": {
+            "type": "object",
+            "properties": {
+                "active": {
+                    "type": "boolean"
+                },
+                "app_id": {
+                    "type": "string"
+                },
+                "aud": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "client_id": {
+                    "type": "string"
+                },
+                "exp": {
+                    "type": "integer"
+                },
+                "gty": {
+                    "description": "EMC extensions — the same names the access token carries.",
+                    "type": "string"
+                },
+                "iat": {
+                    "type": "integer"
+                },
+                "iss": {
+                    "type": "string"
+                },
+                "org_id": {
+                    "type": "string"
+                },
+                "org_name": {
+                    "type": "string"
+                },
+                "org_permissions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "org_roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "permissions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "scope": {
+                    "type": "string"
+                },
+                "sid": {
+                    "type": "string"
+                },
+                "sub": {
+                    "type": "string"
+                },
+                "tenant_id": {
+                    "type": "string"
+                },
+                "token_type": {
+                    "type": "string"
+                },
+                "username": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.InvitationPreview": {
             "type": "object",
             "properties": {
@@ -12796,6 +15502,25 @@ const docTemplate = `{
                 "email": {
                     "type": "string"
                 },
+                "org_id": {
+                    "description": "Organisation claims of the presented token, omitted when it is not\nsigned in to an organisation. See Claims.OrgID.",
+                    "type": "string"
+                },
+                "org_name": {
+                    "type": "string"
+                },
+                "org_permissions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "org_roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "permissions": {
                     "type": "array",
                     "items": {
@@ -12817,6 +15542,224 @@ const docTemplate = `{
                 },
                 "user_id": {
                     "type": "string"
+                }
+            }
+        },
+        "auth.MemberRolesResult": {
+            "type": "object",
+            "properties": {
+                "assigned": {
+                    "description": "Assigned lists only roles this call added.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "removed": {
+                    "description": "Removed lists roles this call removed (replace mode or a single removal).",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "roles": {
+                    "description": "Roles is every organisation role the member holds after the call.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.Organization": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "display_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "type": "boolean"
+                },
+                "member_count": {
+                    "type": "integer"
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "slug": {
+                    "type": "string"
+                },
+                "updated_at": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationInvitation": {
+            "type": "object",
+            "properties": {
+                "accepted_at": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "organization_id": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationInvitationPreview": {
+            "type": "object",
+            "properties": {
+                "account_exists": {
+                    "description": "AccountExists tells the client whether to ask the invitee to sign in or\nto choose a password. Shown only to the holder of the token, who already\nknows the address it was sent to.",
+                    "type": "boolean"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "expires_at": {
+                    "type": "string"
+                },
+                "organization": {
+                    "$ref": "#/definitions/auth.OrganizationRef"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "auth.OrganizationMember": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "first_name": {
+                    "type": "string"
+                },
+                "joined_at": {
+                    "type": "string"
+                },
+                "last_name": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationMembersPage": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.OrganizationMember"
+                    }
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.OrganizationMembership": {
+            "type": "object",
+            "properties": {
+                "joined_at": {
+                    "type": "string"
+                },
+                "organization": {
+                    "$ref": "#/definitions/auth.OrganizationRef"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "status": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationRef": {
+            "type": "object",
+            "properties": {
+                "display_name": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string"
+                },
+                "slug": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.OrganizationsPage": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.Organization"
+                    }
+                },
+                "limit": {
+                    "type": "integer"
+                },
+                "offset": {
+                    "type": "integer"
+                },
+                "total": {
+                    "type": "integer"
                 }
             }
         },
@@ -13010,6 +15953,42 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.ServerIPSuggestion": {
+            "type": "object",
+            "properties": {
+                "ip": {
+                    "type": "string"
+                },
+                "last_seen": {
+                    "type": "string"
+                },
+                "registered": {
+                    "description": "Registered is true when the address is already covered by the allowlist.",
+                    "type": "boolean"
+                },
+                "users": {
+                    "description": "Users is how many different users of the application signed in, registered\nor were otherwise acted on from this address in the window.",
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.ServerIPSuggestions": {
+            "type": "object",
+            "properties": {
+                "min_users": {
+                    "type": "integer"
+                },
+                "suggestions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.ServerIPSuggestion"
+                    }
+                },
+                "window_days": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.StoredCredential": {
             "type": "object",
             "properties": {
@@ -13132,6 +16111,35 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.AcceptOrganizationInvitationRequest": {
+            "type": "object",
+            "properties": {
+                "first_name": {
+                    "type": "string"
+                },
+                "last_name": {
+                    "type": "string"
+                },
+                "password": {
+                    "description": "Password, FirstName and LastName create the account when the invitee has\nnone. Ignored when the request carries the invitee's own access token.",
+                    "type": "string"
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.AddOrganizationMemberRequest": {
+            "type": "object",
+            "properties": {
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
         "handlers.AppLimitRequest": {
             "type": "object",
             "properties": {
@@ -13161,6 +16169,10 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "email": {
+                    "type": "string"
+                },
+                "organization": {
+                    "description": "Organization is the organisation (id org_… or slug) to sign in to, for an\napplication with organisations enabled. Omitted — the normal case — keeps\ntoday's behaviour; for an application in organizations_mode \"off\" it is\nignored. Checked only after the password and any second factor succeed.",
                     "type": "string"
                 },
                 "password": {
@@ -13205,6 +16217,23 @@ const docTemplate = `{
                 "password": {
                     "type": "string",
                     "minLength": 8
+                }
+            }
+        },
+        "handlers.AppUserLimits": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "integer"
+                },
+                "limits": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.UserLimitView"
+                    }
+                },
+                "tenant_id": {
+                    "type": "integer"
                 }
             }
         },
@@ -13323,6 +16352,51 @@ const docTemplate = `{
                     "items": {
                         "type": "string"
                     }
+                }
+            }
+        },
+        "handlers.CreateOrganizationInvitationRequest": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "expires_in_hours": {
+                    "description": "ExpiresInHours defaults to 72; 1–720.",
+                    "type": "integer"
+                },
+                "invitation_url": {
+                    "description": "InvitationURL is the application's page that accepts invitations. Must be\non one of the application's registered redirect URI origins; the\ninvitation and organization query parameters are appended.",
+                    "type": "string"
+                },
+                "inviter_name": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "send_email": {
+                    "description": "SendEmail asks EMC to send the invitation using the application's branded\ntemplate. Requires invitation_url.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "handlers.CreateOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "display_name": {
+                    "type": "string"
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {}
+                },
+                "slug": {
+                    "description": "Slug is the immutable handle: 1-63 lowercase letters, digits or hyphens.",
+                    "type": "string"
                 }
             }
         },
@@ -13581,6 +16655,21 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.MyOrganizationsResponse": {
+            "type": "object",
+            "properties": {
+                "current": {
+                    "description": "Current is the organisation this token is signed in to, empty for none.",
+                    "type": "string"
+                },
+                "organizations": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.OrganizationMembership"
+                    }
+                }
+            }
+        },
         "handlers.MyTenantsResponse": {
             "type": "object",
             "properties": {
@@ -13603,6 +16692,10 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "client_id": {
+                    "type": "string"
+                },
+                "code_verifier": {
+                    "description": "CodeVerifier is required iff code_challenge was sent to the login endpoint.",
                     "type": "string"
                 },
                 "login_code": {
@@ -13644,6 +16737,10 @@ const docTemplate = `{
                     "items": {
                         "type": "string"
                     }
+                },
+                "introspection_endpoint": {
+                    "description": "IntrospectionEndpoint is RFC 7662 / RFC 8414 introspection_endpoint.",
+                    "type": "string"
                 },
                 "issuer": {
                     "description": "Issuer must be byte-identical to the \"iss\" claim of every token this\ntenant issues. This is the one field a conformant client hard-fails on:\ngo-oidc, openid-client, MSAL and Spring Security all compare the string\nthey fetched discovery from against this value and refuse a mismatch.",
@@ -13696,6 +16793,34 @@ const docTemplate = `{
                     }
                 },
                 "userinfo_endpoint": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.OrganizationMemberRolesRequest": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "description": "Mode is \"add\" (default) or \"replace\".",
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "handlers.OrganizationSettings": {
+            "type": "object",
+            "properties": {
+                "organizations_enabled": {
+                    "description": "Enabled reports the deployment switch, so the console can explain why\na mode has no effect.",
+                    "type": "boolean"
+                },
+                "organizations_mode": {
+                    "description": "Mode is \"off\", \"optional\" or \"required\".",
                     "type": "string"
                 }
             }
@@ -13831,6 +16956,18 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.SelectOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "organization": {
+                    "description": "Organization is the chosen id (org_…) or slug, from the 409 response.",
+                    "type": "string"
+                },
+                "selection_token": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.SendTestEmailRequest": {
             "type": "object",
             "properties": {
@@ -13874,6 +17011,22 @@ const docTemplate = `{
                 },
                 "used_custom_template": {
                     "description": "UsedCustomTemplate distinguishes \"your saved template was sent\" from \"the\nbuilt-in default was sent instead\".\n\nThe second happens for a reason that is invisible from the send itself: a\nstored template with is_active = false is skipped by Resolve, so an admin\nwho saved a customisation while its Status toggle was off receives the\ndefault and concludes the save failed. The template screen turns this into\nan explanation rather than a mystery.",
+                    "type": "boolean"
+                }
+            }
+        },
+        "handlers.ServerTrustRequest": {
+            "type": "object",
+            "properties": {
+                "server_ips": {
+                    "description": "ServerIPs replaces the application's registered egress addresses. Each\nentry is an address or CIDR range (IPv4 /24 or narrower, IPv6 /48 or\nnarrower), at most 50.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.AppServerIPInput"
+                    }
+                },
+                "trust_forwarded_ip": {
+                    "description": "TrustForwardedIP lets the application report its end user's address in\nX-EMC-Forwarded-For.",
                     "type": "boolean"
                 }
             }
@@ -13990,6 +17143,23 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "slug": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.SwitchOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "organization": {
+                    "description": "Organization is the target id (org_…) or slug.",
+                    "type": "string"
+                },
+                "personal": {
+                    "description": "Personal asks for a session with no organisation. Refused when the\napplication requires one.",
+                    "type": "boolean"
+                },
+                "refresh_token": {
+                    "description": "RefreshToken of the current session. Required, in the body.",
                     "type": "string"
                 }
             }
@@ -14143,6 +17313,43 @@ const docTemplate = `{
                     "items": {
                         "type": "string"
                     }
+                }
+            }
+        },
+        "handlers.UpdateOrganizationMemberRequest": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "description": "Status is \"active\" or \"suspended\".",
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.UpdateOrganizationRequest": {
+            "type": "object",
+            "properties": {
+                "display_name": {
+                    "type": "string"
+                },
+                "is_active": {
+                    "description": "IsActive false suspends the organisation and signs everyone out of it.",
+                    "type": "boolean"
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": {}
+                }
+            }
+        },
+        "handlers.UpdateOrganizationSettingsRequest": {
+            "type": "object",
+            "properties": {
+                "force": {
+                    "description": "Force allows \"required\" while some users belong to no organization.\nThey will be unable to sign in until they are added to one.",
+                    "type": "boolean"
+                },
+                "organizations_mode": {
+                    "type": "string"
                 }
             }
         },
@@ -14327,6 +17534,13 @@ const docTemplate = `{
                 "name": {
                     "type": "string"
                 },
+                "org_id": {
+                    "description": "OrgID and OrgName identify the organisation the presented token is signed\nin to (Organizations). Omitted for every token that is not, which is every\ntoken of an application in organizations_mode \"off\". Identity, not\nauthorisation: roles and permissions stay in the access token.",
+                    "type": "string"
+                },
+                "org_name": {
+                    "type": "string"
+                },
                 "sub": {
                     "description": "Subject is the stable, permanent identifier for the user.\n\nThis is the raw user id, deliberately, and it must stay consistent with the\n\"sub\" already carried in every access token (JWTService.Sign sets\nSubject: c.UserID). OIDC Core requires the token's sub and UserInfo's sub to\nmatch; returning a pairwise (per-client) subject here while tokens carry the\nraw id would violate that and give the same person two identities.\n\nPairwise subjects are the privacy-preserving alternative, keeping two\napplications from correlating the same user. Adding them later means\nchanging BOTH this and the token claim, and is only safe for a client that\nhas never received a subject in the current format — a relying party stores\nsub as its primary key for the user, so changing it orphans every linked\naccount. The natural place is a per-client setting introduced with the\nclient registry in issue #6/#8, applied from that client's first token.",
                     "type": "string"
@@ -14334,6 +17548,57 @@ const docTemplate = `{
                 "updated_at": {
                     "description": "UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,\nwhich is what the rest of this API returns for timestamps.",
                     "type": "integer"
+                }
+            }
+        },
+        "handlers.UserLimitView": {
+            "type": "object",
+            "properties": {
+                "default": {
+                    "description": "Default is the server-wide value, per minute.",
+                    "type": "integer"
+                },
+                "effective": {
+                    "description": "Effective is what the limiter enforces for this application.",
+                    "type": "integer"
+                },
+                "endpoints": {
+                    "description": "Endpoints are the routes the limit applies to.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "key": {
+                    "description": "Key names the limit in the API and in app_user_rate_limits.limits.",
+                    "type": "string"
+                },
+                "keyed_by": {
+                    "description": "KeyedBy says what one bucket is: whose requests share the allowance.",
+                    "type": "string"
+                },
+                "max": {
+                    "description": "Max is the highest override accepted, per minute.",
+                    "type": "integer"
+                },
+                "name": {
+                    "description": "Name is the human label shown in the admin console.",
+                    "type": "string"
+                },
+                "override": {
+                    "description": "Override is the application's own value, or null when it uses the default.",
+                    "type": "integer"
+                }
+            }
+        },
+        "handlers.UserLimitsRequest": {
+            "type": "object",
+            "properties": {
+                "overrides": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
                 }
             }
         },

@@ -130,7 +130,7 @@ func (h *AuthHandler) RevokeMySession(c echo.Context) error {
 		AuthMethod:   audit.AuthMethodRefreshToken,
 		ResourceType: "session",
 		ResourceID:   strconv.FormatInt(familyID, 10),
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"scope": "single"},
 	})
@@ -172,7 +172,7 @@ func (h *AuthHandler) RevokeMyOtherSessions(c echo.Context) error {
 		Action:       audit.ActionSessionEndedUser,
 		AuthMethod:   audit.AuthMethodRefreshToken,
 		ResourceType: "session",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"scope": "others", "revoked": revoked},
 	})

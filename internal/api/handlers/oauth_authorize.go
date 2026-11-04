@@ -32,7 +32,7 @@ var authzTemplateFS embed.FS
 // fixed at runtime and every authorize request would fail, so panicking at
 // startup is the honest outcome rather than discovering it on the first login.
 var authzPages = func() map[string]*template.Template {
-	pages := []string{"login.html", "mfa.html", "error.html"}
+	pages := []string{"login.html", "mfa.html", "organization.html", "error.html"}
 	out := make(map[string]*template.Template, len(pages))
 	for _, p := range pages {
 		out[p] = template.Must(template.ParseFS(authzTemplateFS,
@@ -50,6 +50,9 @@ const (
 	errInvalidScope            = "invalid_scope"
 	errServerError             = "server_error"
 	errConsentRequired         = "consent_required"
+	// errAccessDenied is RFC 6749 §4.1.2.1 access_denied: the user signed in but
+	// may not use the organisation the request named.
+	errAccessDenied = "access_denied"
 	// errInvalidTarget is RFC 8707 §2 — the requested resource/audience is not
 	// one this client may have. Defined here alongside the RFC 6749 codes
 	// because both endpoints report it and the value must be identical on each.
@@ -63,6 +66,8 @@ const (
 const (
 	authzOutcomeCodeIssued         = "code_issued"
 	authzOutcomeLoginShown         = "login_shown"
+	authzOutcomeOrganizationShown  = "organization_shown"
+	authzOutcomeOrganizationDenied = "organization_denied"
 	authzOutcomeInvalidClient      = "invalid_client"
 	authzOutcomeInvalidRedirect    = "invalid_redirect"
 	authzOutcomeConsentRequired    = "consent_required"
@@ -101,6 +106,8 @@ type pageData struct {
 	Error         string
 	Message       string
 	Detail        string
+	// Organizations are the choices on the organisation page.
+	Organizations []auth.OrganizationRef
 }
 
 // OAuthAuthorizeHandler serves GET /oauth/authorize and the two hosted login
@@ -124,10 +131,17 @@ type OAuthAuthorizeHandler struct {
 	audit     *audit.Logger
 	logger    zerolog.Logger
 	secure    bool
+	// requireState rejects authorize requests that omit `state`
+	// (OAUTH_REQUIRE_STATE). The flag exists for the migration window only —
+	// a client that omits state has no CSRF binding on its callback
+	// (GHSA-6fcw-g2xw-v42w).
+	requireState bool
 }
 
 // NewOAuthAuthorizeHandler builds the handler. secure controls the Secure flag
-// on the SSO cookie and must be true in production.
+// on the SSO cookie and must be true in production. requireState controls the
+// missing-state rejection — a constructor argument rather than a setter so the
+// secure value cannot be silently left at its permissive zero value.
 func NewOAuthAuthorizeHandler(
 	authz *auth.AuthorizationServer,
 	sessions *auth.AuthzSessionStore,
@@ -135,11 +149,13 @@ func NewOAuthAuthorizeHandler(
 	auditLog *audit.Logger,
 	logger zerolog.Logger,
 	secure bool,
+	requireState bool,
 ) *OAuthAuthorizeHandler {
 	return &OAuthAuthorizeHandler{
 		authz: authz, sessions: sessions, authSvc: authSvc,
 		audiences: authSvc.Audiences(),
 		audit:     auditLog, logger: logger, secure: secure,
+		requireState: requireState,
 	}
 }
 
@@ -153,7 +169,7 @@ func NewOAuthAuthorizeHandler(
 // @Param        redirect_uri           query  string  false  "Must exactly match a registered redirect_uri. Optional only when exactly one is registered."
 // @Param        response_type          query  string  true   "Must be 'code'"
 // @Param        scope                  query  string  false  "Space-delimited. Unregistered scopes are dropped, not rejected."
-// @Param        state                  query  string  false  "Opaque value echoed back on the redirect"
+// @Param        state                  query  string  true   "Opaque value echoed back on the redirect — required unless OAUTH_REQUIRE_STATE=false"
 // @Param        nonce                  query  string  false  "OIDC nonce, echoed into the ID token"
 // @Param        code_challenge         query  string  true   "base64url(SHA256(code_verifier))"
 // @Param        code_challenge_method  query  string  true   "Must be 'S256'"
@@ -208,12 +224,18 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 	// the response to its own request.
 	state := q.Get("state")
 	if state == "" {
-		// Spec-permitted (RFC 6749 §4.1.1 marks state RECOMMENDED, not required),
-		// so this is a warning and not a rejection — refusing would break
-		// conformant clients. But a client that omits state has no way to bind the
-		// callback to the request it started, which is the CSRF defence for the
-		// redirect leg, so the omission is worth a log line an integrator can be
-		// pointed at.
+		// RFC 6749 §4.1.1 marks state RECOMMENDED, not required — but a client
+		// that omits it has no way to bind the callback to the request it
+		// started, which is the CSRF defence for the redirect leg. Only
+		// first-party clients reach this point (third-party is refused above),
+		// and the operator controls those, so GHSA-6fcw-g2xw-v42w makes the
+		// omission an invalid_request rejection by default. The warning path
+		// remains for the OAUTH_REQUIRE_STATE=false migration window.
+		if h.requireState {
+			countAuthorize(authzOutcomeInvalidRequest)
+			return h.redirectError(c, redirectURI, state, errInvalidRequest,
+				"state parameter is required")
+		}
 		h.logger.Warn().Str("client_id", client.ClientID).
 			Msg("authorize: request omitted state — no CSRF binding on the callback")
 	}
@@ -341,6 +363,7 @@ func (h *OAuthAuthorizeHandler) Authorize(c echo.Context) error {
 		Nonce:         q.Get("nonce"),
 		CodeChallenge: challenge,
 		Audience:      requestedAudience,
+		Organization:  q.Get("organization"),
 		// Captured from the LookupClient above so the login and MFA pages never
 		// re-query for a display name.
 		AppName: client.Name,
@@ -534,6 +557,15 @@ func (h *OAuthAuthorizeHandler) completeLogin(c echo.Context, handle string, req
 func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle string, req *auth.AuthzRequest, sess *auth.AuthzSession) error {
 	ctx := c.Request().Context()
 
+	// Organisation, resolved BEFORE the nonce is burned or a code exists, so a
+	// user who must still choose leaves no half-spent state behind. For an
+	// application in organizations_mode 'off' this is one read and a nil
+	// result, and everything below runs exactly as it did before.
+	orgID, done, err := h.resolveOrganization(c, handle, req, sess)
+	if done {
+		return err
+	}
+
 	// Nonce burn-on-use (security audit 2026-08-07, FED-3). Placed HERE, at the
 	// moment a code is actually minted, and deliberately not where the authorize
 	// request arrives.
@@ -583,6 +615,9 @@ func (h *OAuthAuthorizeHandler) issueCodeAndRedirect(c echo.Context, handle stri
 		// Read off the parked request, which captured it at authorize time after
 		// the grant check — never off the login form.
 		Audience: req.Audience,
+		// Bound to the code so the exchange mints into exactly this
+		// organisation; /oauth/token re-checks the membership.
+		OrganizationID: orgID,
 	})
 	if err != nil {
 		// No code was minted, so the nonce was not really consumed. Give it back,
@@ -749,7 +784,7 @@ func (h *OAuthAuthorizeHandler) auditEvent(c echo.Context, action string, req *a
 		ResourceType:  "oauth_client",
 		ResourceID:    req.ClientID,
 		Status:        audit.StatusSuccess,
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 		Metadata:      map[string]any{"scopes": req.Scopes},
 	}
@@ -763,4 +798,85 @@ func (h *OAuthAuthorizeHandler) auditEvent(c echo.Context, action string, req *a
 		ev.Metadata["reason"] = reason
 	}
 	h.audit.Log(c.Request().Context(), ev)
+}
+
+// resolveOrganization decides which organisation the code being issued is
+// bound to. done reports that the response has already been written — an
+// organisation picker or an error redirect — and the caller must return err.
+//
+// The decision is OrganizationService.DecideOrganization, the same rule every
+// other sign-in uses, applied here because the hosted flow defers it out of
+// Login (see LoginInput.VerifiedApp): the user is already signed in, and the
+// choice — if one is needed — is made on this server's own page.
+func (h *OAuthAuthorizeHandler) resolveOrganization(c echo.Context, handle string, req *auth.AuthzRequest, sess *auth.AuthzSession) (orgID *int64, done bool, err error) {
+	ctx := c.Request().Context()
+	dec, err := h.authSvc.Organizations().DecideOrganization(ctx, sess.UserID, req.AppRowID, req.Organization, false)
+	if err != nil {
+		if handle != "" {
+			h.sessions.DeleteRequest(ctx, handle)
+		}
+		if errors.Is(err, auth.ErrOrganizationAccessDenied) {
+			h.auditEvent(c, "oauth.authorize_denied", req, sess.UserID, false, "organization access denied")
+			countAuthorize(authzOutcomeOrganizationDenied)
+			// One description for every reason — unknown organisation, not a
+			// member, suspended — so the redirect cannot be used to probe.
+			return nil, true, h.redirectError(c, req.RedirectURI, req.State, errAccessDenied,
+				"the user may not sign in to the requested organization")
+		}
+		h.logger.Error().Err(err).Msg("authorize: organization resolution failed")
+		countAuthorize(authzOutcomeError)
+		return nil, true, h.redirectError(c, req.RedirectURI, req.State, errServerError, "sign-in failed")
+	}
+
+	if len(dec.Choices) == 0 {
+		return dec.OrgRowID, false, nil
+	}
+
+	// A choice is needed. The SSO branch of Authorize reaches here without a
+	// parked request; park one now so the picker has a handle to post back.
+	if handle == "" {
+		handle, err = h.sessions.SaveRequest(ctx, req)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("authorize: could not park request for organization choice")
+			countAuthorize(authzOutcomeError)
+			return nil, true, h.redirectError(c, req.RedirectURI, req.State, errServerError, "could not start sign-in")
+		}
+	}
+	countAuthorize(authzOutcomeOrganizationShown)
+	return nil, true, h.render(c, http.StatusOK, "organization.html", pageData{
+		Title: "Choose an organization", AppName: appName(req),
+		RequestHandle: handle, Organizations: dec.Choices,
+	})
+}
+
+// OrganizationSubmit handles POST /oauth/authorize/organization — the user's
+// choice on the organisation page.
+//
+// The identity is the SSO session from the cookie, never the form; the choice
+// is re-checked against live membership by issueCodeAndRedirect. A forged or
+// stale value therefore ends in access_denied, never in a code for an
+// organisation the user does not belong to.
+func (h *OAuthAuthorizeHandler) OrganizationSubmit(c echo.Context) error {
+	ctx := c.Request().Context()
+	handle := c.FormValue("request")
+
+	req, err := h.sessions.GetRequest(ctx, handle)
+	if err != nil {
+		countAuthorize(authzOutcomeRequestExpired)
+		return h.renderError(c, http.StatusBadRequest, "Sign-in expired",
+			"This sign-in request has expired. Please start again from the application.", "")
+	}
+	sess := h.currentSession(c)
+	if sess == nil || sess.TenantID != req.TenantID {
+		countAuthorize(authzOutcomeLoginShown)
+		return h.renderLogin(c, http.StatusOK, appName(req), handle, "", "Please sign in again.")
+	}
+	choice := c.FormValue("organization")
+	if choice == "" {
+		countAuthorize(authzOutcomeInvalidRequest)
+		return h.renderError(c, http.StatusBadRequest, "No organization chosen",
+			"Please go back and choose an organization.", "")
+	}
+	req.Organization = choice
+	return h.issueCodeAndRedirect(c, handle, req, sess)
 }

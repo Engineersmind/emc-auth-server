@@ -347,13 +347,13 @@ This link is valid for {{.TTLMinutes}} minutes. If you did not create an account
 - {{.ProductName}}`,
 	},
 	TemplatePasswordReset: {
-		Subject: "Password Reset Request",
+		Subject: "Password Reset Request{{if .TenantName}} — {{.TenantName}}{{end}}",
 		HTML: shell(`<h2>Reset your password</h2>
-<p>You requested a password reset for your account.</p>
+<p>You requested a password reset for your account{{if .TenantName}} in <strong>{{.TenantName}}</strong>{{end}}.</p>
 <p>Click the button below to choose a new password. This link is valid for {{.TTLMinutes}} minutes.</p>
 ` + fmt.Sprintf(button, "Reset password") + `
 <p>If you did not request this, you can safely ignore this email — your password will not change.</p>`),
-		Text: `You requested a password reset for your account.
+		Text: `You requested a password reset for your account{{if .TenantName}} in {{.TenantName}}{{end}}.
 
 {{.Link}}
 

@@ -1,0 +1,27 @@
+{{define "content"}}
+<h1>Choose an organization</h1>
+<p class="sub">to continue to <span class="app">{{.AppName}}</span></p>
+
+{{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+
+<!--
+  Like the login and MFA pages, the form carries only the request handle and
+  the user's choice. The signed-in identity comes from the SSO cookie and the
+  authorization request from the server-side store; the choice itself is
+  checked against the user's live memberships before any code is issued, so a
+  hand-edited value can only be refused.
+-->
+<form method="POST" action="/oauth/authorize/organization">
+  <input type="hidden" name="request" value="{{.RequestHandle}}">
+  <ul class="orgs">
+    {{range .Organizations}}
+    <li>
+      <button type="submit" name="organization" value="{{.ID}}" class="org">
+        <span class="org-name">{{.DisplayName}}</span>
+        <span class="org-slug">{{.Slug}}</span>
+      </button>
+    </li>
+    {{end}}
+  </ul>
+</form>
+{{end}}

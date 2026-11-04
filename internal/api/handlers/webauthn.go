@@ -188,6 +188,7 @@ func (h *WebAuthnHandler) RegisterComplete(c echo.Context) error {
 // @Produce      json
 // @Success      200  {object}  webauthnBeginResponse
 // @Failure      403  {object}  map[string]string  "passkeys or passwordless sign-in disabled, or origin not allowed"
+// @Failure      429  {object}  map[string]string  "Rate limited per IP; wait Retry-After seconds"
 // @Router       /api/v1/auth/passkey/login/begin [post]
 func (h *WebAuthnHandler) LoginBegin(c echo.Context) error {
 	assertion, token, err := h.svc.LoginBegin(c.Request().Context(), requestOrigin(c))
@@ -212,6 +213,9 @@ func (h *WebAuthnHandler) LoginBegin(c echo.Context) error {
 // @Success      200  {object}  auth.AuthResult
 // @Failure      401  {object}  map[string]string
 // @Failure      403  {object}  map[string]string
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited; wait Retry-After seconds"
 // @Router       /api/v1/auth/passkey/login/complete [post]
 func (h *WebAuthnHandler) LoginComplete(c echo.Context) error {
 	result, id, err := h.authSvc.LoginWebAuthn(c.Request().Context(), c.QueryParam("ceremony_token"), c.Request())
@@ -321,6 +325,13 @@ func (h *WebAuthnHandler) loginFailure(c echo.Context, err error) error {
 		// user learns about it from the session-ended notification and their
 		// passkey list, not from this response.
 		return h.loginRejected(c)
+	}
+
+	// The passkey verified and only the organisation step remains: choose one,
+	// or no access. Answered like every other sign-in method, not as a
+	// verification failure.
+	if handled, resp := organizationSignInError(c, err); handled {
+		return resp
 	}
 
 	// Policy refusals are told apart from verification failures: "your
@@ -552,7 +563,7 @@ func (h *WebAuthnHandler) auditPasskey(c echo.Context, tenantID, userID int64, e
 		AuthMethod:   audit.AuthMethodPasskey,
 		ResourceType: "passkey",
 		ResourceID:   credID,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     meta,
 	}
@@ -579,7 +590,7 @@ func (h *WebAuthnHandler) auditPasskeyLogin(c echo.Context, id *auth.WebAuthnIde
 		AuthMethod:    audit.AuthMethodPasskey,
 		ResourceType:  "passkey",
 		ResourceID:    strconv.FormatInt(id.CredentialRowID, 10),
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 		Metadata: map[string]any{
 			"passkey_name":  id.CredentialLabel,
@@ -614,7 +625,7 @@ func (h *WebAuthnHandler) auditLoginFailed(c echo.Context, err error) {
 		Action:       audit.ActionAuthPasskeyLoginFailed,
 		AuthMethod:   audit.AuthMethodPasskey,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		HTTPStatus:   http.StatusUnauthorized,
 	}

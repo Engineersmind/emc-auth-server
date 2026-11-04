@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -136,6 +137,9 @@ type ResendVerificationRequest struct {
 // @Produce      json
 // @Param        body           body      ResendVerificationRequest  true  "Email to resend to"
 // @Success      200            {object}  map[string]string
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited; wait Retry-After seconds"
 // @Router       /api/v1/auth/resend-verification [post]
 func (h *AuthHandler) ResendVerification(c echo.Context) error {
 	if h.verifSvc == nil {
@@ -148,7 +152,13 @@ func (h *AuthHandler) ResendVerification(c echo.Context) error {
 	if req.Email == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "email is required"})
 	}
-	if err := h.verifSvc.ResendVerification(c.Request().Context(), req.Email); err != nil {
+	// A trusted backend's lifted rate limit reaches only its own tenant's
+	// accounts; anyone else is unscoped, exactly as before.
+	var scopeTenantID int64
+	if caller, ok := mw.CallerFrom(c); ok && caller.TenantID > 0 && mw.TrustedBackend(c) {
+		scopeTenantID = caller.TenantID
+	}
+	if err := h.verifSvc.ResendVerificationInTenant(c.Request().Context(), req.Email, scopeTenantID); err != nil {
 		h.logger.Error().Err(err).Msg("auth: resend verification failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to process request"})
 	}
@@ -353,7 +363,7 @@ func (h *AuthHandler) Register(c echo.Context) error {
 		Action:        audit.ActionAuthRegister,
 		AuthMethod:    audit.AuthMethodPassword,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -447,7 +457,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 			Action:       audit.ActionAuthLoginFailed,
 			AuthMethod:   audit.AuthMethodPassword,
 			ResourceType: "user",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     softLockMeta(err, nil),
 		}, err)
@@ -479,7 +489,7 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		Action:        audit.ActionAuthLogin,
 		AuthMethod:    audit.AuthMethodPassword,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -538,6 +548,12 @@ type AppLoginRequest struct {
 	// the response is 428 captcha_required and the credentials are never read.
 	CaptchaID     string `json:"captcha_id"`
 	CaptchaAnswer string `json:"captcha_answer"`
+
+	// Organization is the organisation (id org_… or slug) to sign in to, for an
+	// application with organisations enabled. Omitted — the normal case — keeps
+	// today's behaviour; for an application in organizations_mode "off" it is
+	// ignored. Checked only after the password and any second factor succeed.
+	Organization string `json:"organization,omitempty"`
 }
 
 // appCredentialsFromRequest resolves and requires the calling application's
@@ -570,6 +586,8 @@ func appCredentialsFromRequest(c echo.Context) (clientID, clientSecret string, e
 // @Failure      401  {object}  map[string]string  "Invalid application credentials"
 // @Failure      409  {object}  map[string]string  "Email already registered in this application"
 // @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/apps/register [post]
 func (h *AuthHandler) AppRegister(c echo.Context) error {
 	var req AppRegisterRequest
@@ -629,7 +647,7 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		Action:        audit.ActionAuthRegister,
 		AuthMethod:    audit.AuthMethodPassword,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -651,6 +669,8 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 // @Failure      400  {object}  map[string]string
 // @Failure      401  {object}  map[string]string  "Invalid application or user credentials"
 // @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/apps/login [post]
 func (h *AuthHandler) AppLogin(c echo.Context) error {
 	var req AppLoginRequest
@@ -688,8 +708,13 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		Password:     req.Password,
 		Persistent:   req.RememberMe,
 		Roles:        req.Roles,
+		Organization: req.Organization,
 	})
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodPassword, clientID, req.Email); handled {
+			h.captchaClearFailures(c, appLoginScope)
+			return resp
+		}
 		h.captchaRecordFailure(c, appLoginScope)
 		h.logger.Warn().Err(err).Str("email", req.Email).Msg("app login failed")
 		ev := audit.Event{
@@ -697,7 +722,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 			Action:       audit.ActionAuthLoginFailed,
 			AuthMethod:   audit.AuthMethodPassword,
 			ResourceType: "user",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     softLockMeta(err, nil),
 		}
@@ -740,7 +765,7 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		Action:        audit.ActionAuthLogin,
 		AuthMethod:    audit.AuthMethodPassword,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -769,6 +794,8 @@ type MagicLinkRequest struct {
 // @Failure      400  {object}  map[string]string
 // @Failure      401  {object}  map[string]string  "Invalid application credentials"
 // @Failure      403  {object}  map[string]string  "Magic link not enabled for this application"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/apps/login/magic [post]
 func (h *AuthHandler) AppMagicLink(c echo.Context) error {
 	var req MagicLinkRequest
@@ -801,7 +828,7 @@ func (h *AuthHandler) AppMagicLink(c echo.Context) error {
 		Action:       audit.ActionAuthMagicLinkRequested,
 		AuthMethod:   audit.AuthMethodMagicLink,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 
@@ -826,6 +853,8 @@ type MagicLinkVerifyRequest struct {
 // @Success      200  {object}  auth.AuthResult
 // @Failure      401  {object}  map[string]string  "Invalid application credentials or invalid/expired link"
 // @Failure      403  {object}  map[string]string  "MFA enrollment required"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/apps/login/magic/verify [post]
 func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 	var req MagicLinkVerifyRequest
@@ -840,12 +869,15 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 
 	result, err := h.svc.VerifyMagicLink(c.Request().Context(), clientID, clientSecret, req.Token)
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodMagicLink, clientID, ""); handled {
+			return resp
+		}
 		h.logger.Warn().Err(err).Msg("magic link verify failed")
 		ev := audit.Event{
 			Action:       audit.ActionAuthLoginFailed,
 			AuthMethod:   audit.AuthMethodMagicLink,
 			ResourceType: "user",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 		}
 		attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
@@ -874,7 +906,7 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 		Action:        audit.ActionAuthLogin,
 		AuthMethod:    audit.AuthMethodMagicLink,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -908,6 +940,8 @@ type LoginOTPRequest struct {
 // @Failure      401   {object}  map[string]string
 // @Failure      429   {object}  map[string]string  "Attempt budget exhausted — restart login"
 // @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
 // @Router       /api/v1/auth/login/otp [post]
 func (h *AuthHandler) LoginOTP(c echo.Context) error {
 	var req LoginOTPRequest
@@ -932,6 +966,10 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 		Code:            req.Code,
 	})
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodMFA, "", ""); handled {
+			h.captchaClearFailures(c, otpScope)
+			return resp
+		}
 		h.captchaRecordFailure(c, otpScope)
 		h.logger.Warn().Err(err).Msg("login OTP failed")
 		action := audit.ActionAuthMFAChallengeFailed
@@ -944,7 +982,7 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 			Action:       action,
 			AuthMethod:   audit.AuthMethodMFA,
 			ResourceType: "user",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     map[string]any{"transaction_id": transactionID(req.OTPSessionToken)},
 		}, err)
@@ -976,7 +1014,7 @@ func (h *AuthHandler) LoginOTP(c echo.Context) error {
 		Action:        audit.ActionAuthLogin,
 		AuthMethod:    audit.AuthMethodMFA,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 		Metadata:      map[string]any{"transaction_id": transactionID(req.OTPSessionToken)},
 	})
@@ -1005,6 +1043,9 @@ type MFAEnrollRequest struct {
 // @Success      200   {object}  auth.EnrollResult
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string  "Invalid or expired enrollment token"
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited; wait Retry-After seconds"
 // @Router       /api/v1/auth/login/mfa/enroll [post]
 func (h *AuthHandler) MFAEnrollPending(c echo.Context) error {
 	var req MFAEnrollRequest
@@ -1032,7 +1073,7 @@ func (h *AuthHandler) MFAEnrollPending(c echo.Context) error {
 		Action:        audit.ActionAuthMFAEnrolled,
 		AuthMethod:    audit.AuthMethodTOTP,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -1058,6 +1099,8 @@ type MFAActivateRequest struct {
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string  "Invalid code or expired enrollment token"
 // @Failure      429   {object}  map[string]string  "Attempt budget exhausted — restart login"
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
 // @Router       /api/v1/auth/login/mfa/activate [post]
 func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 	var req MFAActivateRequest
@@ -1067,12 +1110,15 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 
 	result, session, err := h.svc.ActivatePending(c.Request().Context(), req.EnrollmentToken, req.Code)
 	if err != nil {
+		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodTOTP, "", ""); handled {
+			return resp
+		}
 		h.logger.Warn().Err(err).Msg("pending MFA activate failed")
 		event := audit.Event{
 			Action:       audit.ActionAuthMFAChallengeFailed,
 			AuthMethod:   audit.AuthMethodTOTP,
 			ResourceType: "user",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     map[string]any{"phase": "enrollment"},
 		}
@@ -1102,7 +1148,7 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 		Action:        audit.ActionAuthMFAActivated,
 		AuthMethod:    audit.AuthMethodTOTP,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 	h.auditEvent(c, audit.Event{
@@ -1113,7 +1159,7 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 		Action:        audit.ActionAuthLogin,
 		AuthMethod:    audit.AuthMethodTOTP,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -1197,6 +1243,8 @@ const appClientAuthHeader = mw.ClientAuthHeader
 // @Param        X-Client-Authorization  header  string  true  "Basic base64(client_id:client_secret)"
 // @Success      200  {object}  auth.MeResult
 // @Failure      401  {object}  map[string]string  "token_invalid — generic for every rejection reason"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/apps/me [get]
 func (h *AuthHandler) AppMe(c echo.Context) error {
 	claims, ok := c.Get("user").(*auth.Claims)
@@ -1301,7 +1349,7 @@ func (h *AuthHandler) rejectAppScope(c echo.Context, clientLabel, reason string)
 			ResourceID:   clientLabel,
 			Status:       audit.StatusFailure,
 			HTTPStatus:   http.StatusUnauthorized,
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     map[string]any{"reason": reason},
 		})
@@ -1385,7 +1433,7 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 			Action:       action,
 			AuthMethod:   audit.AuthMethodRefreshToken,
 			ResourceType: "session",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 		}
 		attachTokenOwner(c.Request().Context(), &ev, h.svc, req.RefreshToken)
@@ -1422,7 +1470,7 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		Action:        audit.ActionAuthTokenRefresh,
 		AuthMethod:    audit.AuthMethodRefreshToken,
 		ResourceType:  "session",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -1489,7 +1537,7 @@ func (h *AuthHandler) Logout(c echo.Context) error {
 		Action:       audit.ActionAuthLogout,
 		AuthMethod:   audit.AuthMethodRefreshToken,
 		ResourceType: "session",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	}
 	// Attribute the logout to the token's owner (resolves even though it was just
@@ -1524,6 +1572,8 @@ type ForgotPasswordRequest struct {
 // @Success      200            {object}  map[string]string
 // @Failure      401            {object}  map[string]string  "Invalid client credentials"
 // @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/forgot-password [post]
 func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 	genericOK := map[string]string{
@@ -1597,12 +1647,96 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 		ActorEmail:    req.Email,
 		Action:        audit.ActionAuthPasswordResetReq,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
 	return c.JSON(http.StatusOK, genericOK)
 }
+
+// ConsoleForgotPassword handles POST /api/v1/auth/console/forgot-password
+// (issue #179, RESET-01, RESET-03).
+//
+// The first-party counterpart of ForgotPassword, for management-console
+// administrators. The console is a browser SPA and never holds a client_secret,
+// and its accounts have no application (application_id IS NULL), so the
+// application-authenticated endpoint can never reach them. The token this
+// emails is redeemed through the existing POST /auth/reset-password.
+//
+// @Summary      Request a console password reset
+// @Description  Sends a reset link to every first-party (management-console) account registered to the email, one email per account, naming its tenant, and at most one per account per minute. The emails are sent after the response. No client credentials: this is the browser flow for console administrators; applications use POST /api/v1/auth/forgot-password. ALWAYS returns 200 with the same body whether or not the email is registered (prevents email enumeration). Redeem the emailed token with POST /api/v1/auth/reset-password.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        body  body      ForgotPasswordRequest  true  "Email address"
+// @Success      200   {object}  map[string]string
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry"
+// @Failure      429   {object}  map[string]string  "Rate limited. The limiter field says which limit (user = this email, ip = this address); wait Retry-After seconds"
+// @Router       /api/v1/auth/console/forgot-password [post]
+func (h *AuthHandler) ConsoleForgotPassword(c echo.Context) error {
+	genericOK := map[string]string{
+		"message": "if that email address is registered, a password reset link has been sent",
+	}
+
+	// mw.DecodeBody, not c.Bind: the per-email limit keys on the email the
+	// middleware reads, so the handler must read the body the same way. A body
+	// it cannot read (form encoding, not JSON) gets the generic 200 and sends
+	// nothing, rather than mail for an address the limiter never saw.
+	var req ForgotPasswordRequest
+	if err := mw.DecodeBody(c, &req); err != nil {
+		return c.JSON(http.StatusOK, genericOK)
+	}
+
+	// No tenant is known before the lookup, so the platform-default policy
+	// decides, as for console login (see captchaCheck on the zero tenant), on
+	// a failure counter of its own (see consoleResetCaptchaScope).
+	scope := consoleResetCaptchaScope()
+	if handled, capErr := h.captchaCheck(c, scope, auth.CaptchaFlowForgotPassword, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
+	}
+	// Every request counts, because none can be told apart from a probe
+	// without revealing whether the address is registered. Counting only
+	// unknown addresses would be that oracle; counting nothing would leave the
+	// adaptive gate unable to arm on an email-sending route.
+	h.captchaRecordFailure(c, scope)
+
+	if req.Email == "" {
+		return c.JSON(http.StatusOK, genericOK)
+	}
+
+	// The lookup, the tokens and the emails run after the response. Done
+	// inline, the response time would say whether the address owns accounts
+	// and roughly how many (one SMTP round trip each), which the identical body
+	// exists to hide. Detached from the request so a client that disconnects
+	// cannot cut the fan-out off halfway; bounded by its own timeout instead.
+	base := audit.Event{
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthPasswordResetReq,
+		ResourceType: "user",
+		IPAddress:    clientIP(c),
+	}
+	enrichAudit(c, &base)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request().Context()), consoleResetTimeout)
+	go func() {
+		defer cancel()
+		issued, err := h.resetSvc.ForgotPasswordFirstParty(ctx, req.Email)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("console forgot-password: unexpected service error")
+		}
+		for _, tenantID := range issued {
+			e := base
+			e.TenantID = &tenantID
+			e.Metadata = maps.Clone(base.Metadata)
+			h.audit.Log(ctx, e)
+		}
+	}()
+
+	return c.JSON(http.StatusOK, genericOK)
+}
+
+// consoleResetTimeout bounds the background work of one console
+// forgot-password request: one lookup and up to MaxConsoleResetFanOut emails.
+const consoleResetTimeout = 2 * time.Minute
 
 // ResetPasswordRequest is the JSON body for POST /api/v1/auth/reset-password.
 type ResetPasswordRequest struct {
@@ -1618,8 +1752,11 @@ type ResetPasswordRequest struct {
 // @Accept       json
 // @Produce      json
 // @Param        body  body      ResetPasswordRequest  true  "Token + new password"
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional; send it when your backend calls this for a user, or the call is limited as an anonymous browser (5/min per IP)"
 // @Success      200   {object}  map[string]string
 // @Failure      400   {object}  map[string]string
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
 // @Router       /api/v1/auth/reset-password [post]
 func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	var req ResetPasswordRequest
@@ -1633,10 +1770,20 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "new_password is required"})
 	}
 
-	err := h.resetSvc.ResetPassword(c.Request().Context(), auth.ResetPasswordInput{
+	in := auth.ResetPasswordInput{
 		RawToken:    req.Token,
 		NewPassword: req.NewPassword,
-	})
+	}
+	// An application's backend may only redeem its own users' tokens. Its
+	// limits on this route are per application (higher than the per-IP limit a
+	// browser gets), so without this scope a tenant holding valid credentials
+	// could spend them guessing OTHER tenants' tokens. Callers that are not a
+	// proven backend stay unscoped, exactly as before.
+	if caller, ok := mw.CallerFrom(c); ok && caller.AppID > 0 && mw.TrustedBackend(c) {
+		appID := caller.AppID
+		in.ScopeTenantID, in.ScopeApplicationID = caller.TenantID, &appID
+	}
+	err := h.resetSvc.ResetPassword(c.Request().Context(), in)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidResetToken) {
 			return fail(c, http.StatusBadRequest, "reset_link_invalid")
@@ -1651,7 +1798,7 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	h.auditEvent(c, audit.Event{
 		Action:       audit.ActionAuthPasswordResetDone,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 
@@ -1724,7 +1871,7 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 		ActorEmail:   claims.Email,
 		Action:       audit.ActionAuthMFAEnrolled,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 
@@ -1777,7 +1924,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 		ActorEmail:   claims.Email,
 		Action:       audit.ActionAuthMFAActivated,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 
@@ -1877,7 +2024,7 @@ func (h *AuthHandler) TOTPRegenerateCodes(c echo.Context) error {
 		ActorEmail:   claims.Email,
 		Action:       audit.ActionAuthMFACodesRegenerated,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 
@@ -1911,7 +2058,7 @@ func (h *AuthHandler) auditMFA(c echo.Context, tenantID, userID int64, email, ac
 		ActorEmail:   email,
 		Action:       action,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 }
@@ -2116,6 +2263,8 @@ type LoginOTPResendRequest struct {
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string  "Invalid or expired session"
 // @Failure      429   {object}  map[string]string  "Re-send budget exhausted"
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
 // @Router       /api/v1/auth/login/otp/resend [post]
 func (h *AuthHandler) LoginOTPResend(c echo.Context) error {
 	var req LoginOTPResendRequest
@@ -2162,6 +2311,8 @@ type MFAEmailPendingRequest struct {
 // @Failure      401   {object}  map[string]string  "Invalid or expired enrollment token"
 // @Failure      403   {object}  map[string]string  "Email method not allowed for this application"
 // @Failure      429   {object}  map[string]string  "Re-send budget exhausted"
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
 // @Router       /api/v1/auth/login/mfa/email [post]
 func (h *AuthHandler) MFAEmailPending(c echo.Context) error {
 	var req MFAEmailPendingRequest
@@ -2249,7 +2400,7 @@ func (h *AuthHandler) TOTPDisable(c echo.Context) error {
 		ActorEmail:   claims.Email,
 		Action:       audit.ActionAuthMFADisabled,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 
@@ -2304,7 +2455,7 @@ func (h *AuthHandler) CreateAPIKey(c echo.Context) error {
 		Action:       audit.ActionAuthAPIKeyCreated,
 		AuthMethod:   audit.AuthMethodAPIKey,
 		ResourceType: "api_key",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"name": req.Name, "permissions": req.Permissions},
 	})
@@ -2382,7 +2533,7 @@ func (h *AuthHandler) RevokeAPIKey(c echo.Context) error {
 		AuthMethod:   audit.AuthMethodAPIKey,
 		ResourceType: "api_key",
 		ResourceID:   strconv.FormatInt(keyID, 10),
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 
@@ -2429,7 +2580,7 @@ func (h *AuthHandler) ManagementToken(c echo.Context) error {
 			Action:       audit.ActionAuthManagementTokenFailed,
 			AuthMethod:   audit.AuthMethodAPIKey,
 			ResourceType: "api_key",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 		}, err)
 		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid or revoked API key"})
@@ -2448,7 +2599,7 @@ func (h *AuthHandler) ManagementToken(c echo.Context) error {
 		Action:       audit.ActionAuthManagementToken,
 		AuthMethod:   audit.AuthMethodAPIKey,
 		ResourceType: "api_key",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"permissions": identity.Permissions},
 	})
@@ -2696,7 +2847,7 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 			Action:       audit.ActionAuthLoginFailed,
 			AuthMethod:   audit.AuthMethodPassword,
 			ResourceType: "user",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     softLockMeta(err, map[string]any{"flow": "session"}),
 		}, err)
@@ -2741,7 +2892,7 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		Action:        audit.ActionAuthLogin,
 		AuthMethod:    audit.AuthMethodPassword,
 		ResourceType:  "user",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -2780,7 +2931,7 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 			Action:       action,
 			AuthMethod:   audit.AuthMethodRefreshToken,
 			ResourceType: "session",
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     map[string]any{"flow": "session"},
 		}
@@ -2839,7 +2990,7 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		Action:        audit.ActionAuthTokenRefresh,
 		AuthMethod:    audit.AuthMethodRefreshToken,
 		ResourceType:  "session",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 
@@ -2877,7 +3028,7 @@ func (h *AuthHandler) SessionLogout(c echo.Context) error {
 		Action:       audit.ActionAuthLogout,
 		AuthMethod:   audit.AuthMethodRefreshToken,
 		ResourceType: "session",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"flow": "session", "tokens_revoked": revoked},
 	}
@@ -3083,7 +3234,7 @@ func (h *AuthHandler) Token(c echo.Context) error {
 			AuthMethod:   audit.AuthMethodClientCredentials,
 			ResourceType: "oauth_client",
 			ResourceID:   req.ClientID,
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 			Metadata:     map[string]any{"grant_type": req.GrantType},
 		}
@@ -3123,7 +3274,7 @@ func (h *AuthHandler) Token(c echo.Context) error {
 		AuthMethod:    audit.AuthMethodClientCredentials,
 		ResourceType:  "oauth_client",
 		ResourceID:    strconv.FormatInt(appID, 10),
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 		Metadata:      map[string]any{"grant_type": req.GrantType},
 	})

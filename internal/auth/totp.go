@@ -447,6 +447,14 @@ type OTPSession struct {
 	// short non-persistent idle clock — the users most likely to want a
 	// remembered device being exactly the ones who enabled a second factor.
 	Persistent bool
+
+	// OrgRequest and SkipOrganization carry the organisation intent from the
+	// password step through the second factor, for the same reason ActiveRoles
+	// does: the choice is made before MFA and consumed by the mint after it.
+	// Dropping it would make an MFA-protected login ignore the organisation the
+	// client asked for. Neither is authority — the mint re-checks membership.
+	OrgRequest       string `json:",omitempty"`
+	SkipOrganization bool   `json:",omitempty"`
 }
 
 // OTPSessionTTL is how long the intermediate TOTP challenge state lives.

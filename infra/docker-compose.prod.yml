@@ -6,6 +6,18 @@
 ##   2. Set TOTP_ENCRYPTION_KEY to a 32-byte hex string (openssl rand -hex 32)
 ##   3. Set SEED_ADMIN_PASSWORD to a strong password
 ##   4. Set JWT_ISSUER to your public domain
+##   5. Generate the postgres TLS certs before first boot (deploy.sh does this
+##      automatically via setup_db_tls; standalone deploys run it manually):
+##        mkdir -p infra/tls/postgres
+##        openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+##          -keyout infra/tls/postgres/server.key \
+##          -out    infra/tls/postgres/server.crt \
+##          -subj "/CN=postgres" -addext "subjectAltName=DNS:postgres"
+##        chown 70:70 infra/tls/postgres/server.*   # alpine postgres uid
+##        chmod 600 infra/tls/postgres/server.key
+##   6. Set DASHBOARD_BASE_URL to the admin console origin — emailed reset and
+##      invitation links land on it. Unset, the container defaults to the Vite
+##      dev server (http://localhost:5173) and every emailed link is dead.
 
 version: "3.9"
 
@@ -22,6 +34,7 @@ services:
       REDIS_URL: ${REDIS_URL}
       JWT_ISSUER: ${JWT_ISSUER}
       APP_BASE_URL: ${APP_BASE_URL}
+      DASHBOARD_BASE_URL: ${DASHBOARD_BASE_URL}
       TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
       SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD}
       LOG_LEVEL: info
@@ -33,6 +46,34 @@ services:
       SMTP_FROM: ${SMTP_FROM:-noreply@emc.local}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
       SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # GHSA-4r4c-348x-w452 (L-02): forwarded explicitly like every other
+      # secret — without this line METRICS_TOKEN never reaches the container
+      # even when set in .env, and /metrics silently fails to register in
+      # production while the bundled Prometheus scrapes a 404.
+      # deploy.sh --create-secret generates the token and the matching
+      # prometheus.generated.yml (authorization.credentials) automatically.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # ── GHSA-6fcw-g2xw-v42w (L-05) migration window ──────────────────
+      # The code defaults are the SECURE ones (legacy issuer rejected,
+      # audience required, state required). The pins below preserve the
+      # pre-advisory behaviour for existing deployments so this release is
+      # NOT a flag-day cutover — outstanding 30-day refresh tokens keep
+      # verifying and first-party clients get a window to add `state`.
+      #
+      # Migration window: ONE refresh-token lifetime (30 days) after this
+      # deploy. Flip each pin to the secure value — or delete the line and
+      # let the code default take over — once:
+      #   • JWT_ALLOW_LEGACY_ISSUER → false when
+      #     emc_auth_legacy_issuer_verifications_total has been flat at zero
+      #     (longest-lived affected token: the 1 h agent token)
+      #   • REQUIRE_AUDIENCE → true when every first-party client enforces
+      #     on its own oauth_clients.require_audience flag (issue #132)
+      #   • OAUTH_REQUIRE_STATE → true when every first-party client sends
+      #     `state` on /oauth/authorize (watch the
+      #     "authorize: request omitted state" warning going silent)
+      JWT_ALLOW_LEGACY_ISSUER: ${JWT_ALLOW_LEGACY_ISSUER:-true}
+      REQUIRE_AUDIENCE: ${REQUIRE_AUDIENCE:-false}
+      OAUTH_REQUIRE_STATE: ${OAUTH_REQUIRE_STATE:-false}
     depends_on:
       redis:
         condition: service_healthy
@@ -61,10 +102,25 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-emc_auth}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      # REQUIRED — no default. Note: on an existing postgres_data volume the
+      # stored password wins and this variable is ignored; rotate with
+      #   ALTER USER emc_auth WITH PASSWORD '...';
+      # inside the container, or recreate the volume on a fresh deploy.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD — no default exists}
       POSTGRES_DB: ${POSTGRES_DB:-emc_auth}
+    # TLS is mandatory — ENV=production rejects DATABASE_URL sslmodes other
+    # than require/verify-ca/verify-full (GHSA-hv5j-m2r7-r4cr).
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.crt
+      - -c
+      - ssl_key_file=/certs/server.key
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./tls/postgres:/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-emc_auth}"]
       interval: 5s
@@ -78,11 +134,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme} --maxmemory 128mb --maxmemory-policy allkeys-lru --save ""
+    command: redis-server --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD — no default exists} --maxmemory 128mb --maxmemory-policy allkeys-lru --save ""
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?set REDIS_PASSWORD — no default exists}", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -109,7 +165,7 @@ services:
     image: grafana/grafana:latest
     restart: unless-stopped
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-changeme}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD — no default exists}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
     volumes:

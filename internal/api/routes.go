@@ -50,13 +50,18 @@ type RoutesConfig struct {
 	JWTIssuer string
 	// Env is "development" or "production" — controls HTTPS enforcement behaviour.
 	Env string
-	// MetricsToken optionally gates GET /metrics behind a bearer token. Empty
-	// leaves it open, relying on the reverse proxy / network policy as before.
+	// MetricsToken gates GET /metrics behind a bearer token. In
+	// production/staging the endpoint is not registered at all when this is
+	// empty (GHSA-4r4c-348x-w452); in development/test it is served open for
+	// local scraping. See middleware.MetricsRouteEnabled.
 	MetricsToken string
 	// PasswordHashMaxConcurrent caps simultaneous Argon2id derivations, bounding
 	// worst-case hashing memory. 0 means NumCPU (floored at 2). See
 	// config.Config.PasswordHashMaxConcurrent.
 	PasswordHashMaxConcurrent int
+	// AppRateLimits sizes the limits on the application end-user routes. Zero
+	// fields take the middleware defaults. See config.AppRateLimitConfig.
+	AppRateLimits mw.AppS2SConfig
 	// AppBaseURL is prepended to the reset token link in emails.
 	AppBaseURL string
 	// DashboardBaseURL is the admin console origin, used for emailed links whose
@@ -131,6 +136,11 @@ type RoutesConfig struct {
 	// answering 404 captcha_disabled, which is byte-identical to the behaviour
 	// before this feature existed.
 	CaptchaEnabled bool
+	// OrganizationsEnabled is the deployment-level switch for Organizations.
+	// False makes every application behave as organizations_mode 'off' and the
+	// organisation routes answer 404 — byte-identical to the behaviour before
+	// the feature existed. See config.Config.OrganizationsEnabled.
+	OrganizationsEnabled bool
 	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
 	// Required when CaptchaEnabled is true.
 	CaptchaHMACKey string
@@ -142,6 +152,9 @@ type RoutesConfig struct {
 	// that carries a real one is always held to its route's policy. See
 	// config.Config.RequireAudience and middleware/audience.go.
 	RequireAudience bool
+	// OAuthRequireState rejects /oauth/authorize requests that omit `state`
+	// (GHSA-6fcw-g2xw-v42w). See config.Config.OAuthRequireState.
+	OAuthRequireState bool
 }
 
 // securityHeaders returns an Echo middleware that injects security-related
@@ -318,9 +331,18 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// that is missing — a catch-all `location /` in nginx publishes this
 	// endpoint alongside the API, and the registry exposes tenant identifiers,
 	// login/token volumes, lockout and risk-signal counts, and the route table.
-	// Unset (the default) preserves the previous open behaviour so enabling the
-	// guard is a deliberate act that cannot silently break an existing scrape.
-	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()), mw.MetricsAuth(deps.Config.MetricsToken))
+	//
+	// GHSA-4r4c-348x-w452 (L-02): in production/staging the endpoint is not
+	// registered at all unless METRICS_TOKEN is set — defence in depth cannot
+	// depend on an empty-string bypass. Development/test keeps the open
+	// endpoint so local scraping keeps working without a token. The decision
+	// is extracted into mw.MetricsRouteEnabled so a unit test can pin it
+	// without standing up RegisterRoutes' full dependency set.
+	if mw.MetricsRouteEnabled(deps.Config.Env, deps.Config.MetricsToken) {
+		e.GET("/metrics", echo.WrapHandler(promhttp.Handler()), mw.MetricsAuth(deps.Config.MetricsToken))
+	} else {
+		deps.Logger.Warn().Msg("METRICS_TOKEN unset — /metrics endpoint DISABLED in production/staging; set METRICS_TOKEN to expose it behind bearer auth")
+	}
 
 	// Swagger UI — available at /swagger/index.html
 	// Override CSP for Swagger: its bundled JS uses inline scripts that require
@@ -360,11 +382,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	jwtSvc.WithTenantIssuers(issuerResolver).
 		WithLegacyIssuer(deps.Config.JWTAllowLegacyIssuer).
 		WithRequireAudience(deps.Config.RequireAudience)
-	if !deps.Config.JWTAllowLegacyIssuer {
-		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_ISSUER=false — tokens carrying the old global JWT_ISSUER are REJECTED (issue #7 cutover). Any token minted before per-tenant issuers went live will fail.")
+	if deps.Config.JWTAllowLegacyIssuer {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_ISSUER=true — tokens carrying the old global JWT_ISSUER are still ACCEPTED (issue #7 migration window). Set to false once emc_auth_legacy_issuer_verifications_total has been flat at zero.")
 	}
-	if deps.Config.RequireAudience {
-		deps.Logger.Warn().Msg("REQUIRE_AUDIENCE=true — the audience is MANDATORY server-wide (issue #132 cutover). Tokens carrying no gty claim and tokens resolving to no audience are REJECTED across every tenant on this server. Rollback is REQUIRE_AUDIENCE=false, config only, no deploy.")
+	if !deps.Config.RequireAudience {
+		deps.Logger.Warn().Msg("REQUIRE_AUDIENCE=false — the audience backstop is DISABLED server-wide (issue #132 rollout window). Tokens carrying no gty claim or resolving to no audience are still accepted. Set to true once every client that matters enforces its own flag.")
 	}
 	deps.Logger.Info().
 		Str("issuer_base_url", issuerResolver.BaseURL()).
@@ -449,7 +471,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		Logger:         deps.Logger,
 	})
 	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
-		WithHasher(passwordHasher)
+		WithHasher(passwordHasher).
+		// Reset links open the console's reset-password page, not the API —
+		// the page POSTs the token in the body so it never lands in URL logs
+		// (GHSA-2267-r48x-9fh2).
+		WithDashboardURL(deps.Config.DashboardBaseURL)
 
 	// White-label email senders (issue #63 follow-on) — transactional emails
 	// resolve their sender application → tenant → global. Providers: SMTP or SendGrid.
@@ -506,6 +532,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithHasher(passwordHasher).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
+	// Organizations (migrations 00100–00104): per-organisation membership and
+	// roles inside an application. Two switches — ORGANIZATIONS_ENABLED here and
+	// each application's organizations_mode — and with either off, every token
+	// and every login behaves exactly as before. Invitation mail reuses the same
+	// sender and template resolvers as every other flow, so it is branded and
+	// customisable per application.
+	orgSvc := auth.NewOrganizationService(deps.Pool, deps.Redis, deps.Config.OrganizationsEnabled, deps.Logger).
+		WithHasher(passwordHasher).
+		WithNotifier(auth.NewEmailNotifier(m, deps.Logger).WithSenders(senderSvc).WithTemplates(tmplSvc))
+	authSvc.WithOrganizations(orgSvc)
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
@@ -558,7 +594,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// config (default "failures") and always redacts secrets + PII.
 	e.Use(mw.AuditCapture(auditLog, deps.Config.AuditCaptureResponseBody))
 
-	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain)
+	// TrustedOrigins carry GLOBAL_CORS_ORIGINS into the CSRF check — the same
+	// origins allowed credentialed CORS are the ones allowed to do
+	// cookie-authenticated writes (GHSA-jv2c-x735-vff7).
+	cookieCfg := mw.BuildCookieConfig(deps.Config.Env, deps.Config.CookieDomain, deps.Config.GlobalCORSOrigins...)
 
 	authHandler := handlers.NewAuthHandler(authSvc, resetSvc, auditLog, deps.Logger).
 		WithTOTP(totpSvc).
@@ -572,6 +611,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithInvitations(invSvc).
 		WithEmailChange(emailChangeSvc).
 		WithAccountBlocking(blockSvc)
+
+	// One handler serves organisation management to both the admin console and
+	// an application's own backend; only the scope resolver differs per mount.
+	orgHandler := handlers.NewOrganizationHandler(orgSvc, authSvc, appSvc, jwtSvc, auditLog, cookieCfg, deps.Logger)
 
 	// Admin service (Phase 5)
 	adminSvc := admin.New(deps.Pool, resetSvc, deps.Logger).
@@ -626,6 +669,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// Per-app rate limit service (08-02) — DB-backed, Redis-cached, 60s TTL.
 	appLimitSvc := auth.NewAppRateLimitService(deps.Pool, deps.Redis, deps.Logger)
 
+	// Server-to-server trust (registered server IPs, forwarded end-user IP) for
+	// application backends. The request path reads an in-memory snapshot that
+	// this refreshes every 30s; see auth.AppTrustService.
+	trustSvc := auth.NewAppTrustService(deps.Pool, deps.Logger)
+	stopTrustRefresh := trustSvc.Start(context.Background())
+
+	// Per-application overrides of the per-user limits, read on the request
+	// path from a snapshot refreshed like the trust settings above.
+	userLimitSvc := auth.NewAppUserLimitService(deps.Pool, deps.Logger)
+	stopUserLimitRefresh := userLimitSvc.Start(context.Background())
+
 	// Per-tenant CORS service — DB-backed, Redis-cached, 60s TTL. Slug-less
 	// requests (e.g. /auth/login) fall back to the global allow-list instead.
 	corsSvc := mw.NewTenantCORSService(deps.Pool, deps.Redis, deps.Logger).
@@ -633,6 +687,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 
 	adminHandler := handlers.NewAdminHandler(adminSvc, auditLog, deps.Logger).
 		WithAppRateLimits(appLimitSvc).
+		WithServerTrust(trustSvc).
 		WithApplications(appSvc).
 		WithTOTP(totpSvc).
 		WithEmailSenders(senderSvc).
@@ -758,7 +813,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authHandler.WithCaptcha(captchaSvc)
 	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
 	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
-		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure)
+		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure,
+		deps.Config.OAuthRequireState)
 	oauthTokenHandler := handlers.NewOAuthTokenHandler(
 		authzSvc, authSvc, jwtSvc, appSvc, auditLog, deps.Logger)
 
@@ -771,6 +827,33 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// appClientRateLimit enforces the same per-app limit on the Basic-auth
 	// application endpoints (token + /apps/*), keyed on the client_id.
 	appClientRateLimit := mw.AppClientRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
+
+	// appCallerRateLimit charges the quota of the application a resolver PROVED
+	// (verified secret, or client_id from its registered server IP). Used, behind
+	// BackendsOnly, on routes where credentials are optional.
+	appCallerRateLimit := mw.AppCallerRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
+
+	// Application end-user routes — the ones a product backend calls for every
+	// one of its users, from one egress IP with one client_id. They used to sit
+	// behind TokenRateLimiter / PasswordResetRateLimiter (5/min per IP, 10/min
+	// per client_id), which throttled a whole product as if it were one person.
+	// Each now runs, in this order:
+	//
+	//	s2s.Resolve(...)    identify the caller; per-IP flood guard (skipped for
+	//	                    the application's registered server IPs); AUTH-07
+	//	                    5/min per IP for credentials that do not verify
+	//	appClientRateLimit  the application's quota (app_rate_limits)
+	//	s2s.UserLimit(...)  per end user, keyed on the application + the user
+	//	                    the request is about
+	//
+	// See middleware/apps2s.go for the reasoning and auth.AppTrustService for
+	// server IPs and the forwarded end-user IP.
+	s2s := mw.NewAppS2S(deps.Config.AppRateLimits, trustSvc, appSvc, deps.Logger).
+		WithAppLimits(appLimitSvc).
+		WithUserLimitOverrides(userLimitSvc).
+		WithRedis(deps.Redis)
+	userLimits := s2s.UserLimits()
+	adminHandler.WithUserLimits(userLimitSvc, userLimits.ByKey(), s2s.PerIPRate())
 
 	// TenantCORS middleware — applies per-tenant CORS headers (reads X-Tenant-Slug header).
 	e.Use(mw.TenantCORS(corsSvc))
@@ -800,8 +883,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// client_id here and passed every request straight through. See PR #147
 	// review — the per-application bucket this comment claimed was mounted did
 	// not exist until the body-aware variant replaced it.
+	//
+	// ResolveBodyClient keeps browsers at the AUTH-07 5/min per IP the token
+	// limiter gave them (a body client_id carries no secret, so the caller never
+	// verifies), while a backend fetching challenges for its users from a
+	// registered server IP is exempt.
 	apiV1.POST("/captcha/challenge", captchaHandler.IssueChallenge,
-		mw.TokenRateLimiter(rlCfg),
+		s2s.ResolveBodyClient(mw.SurfaceApp),
 		mw.AppClientBodyRateLimiter(appLimitSvc, deps.Redis, deps.Logger))
 	authGroup.POST("/register", authHandler.Register)
 	// Login is rate-limited at route level (not global) to avoid impacting other endpoints.
@@ -811,11 +899,35 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// hard per-session cap of auth.MaxOTPAttempts incorrect codes lives in the
 	// service layer (Redis INCR), so a 6-digit code cannot be brute-forced
 	// within the challenge TTL.
-	authGroup.POST("/login/otp", authHandler.LoginOTP, mw.OTPRateLimiter(rlCfg))                    // complete MFA-gated login (TOTP, backup, or emailed code)
-	authGroup.POST("/login/otp/resend", authHandler.LoginOTPResend, mw.OTPRateLimiter(rlCfg))       // re-send the emailed login code (max 3/challenge)
-	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, mw.OTPRateLimiter(rlCfg))     // forced enrollment, TOTP path: get QR + backup codes
-	authGroup.POST("/login/mfa/email", authHandler.MFAEmailPending, mw.OTPRateLimiter(rlCfg))       // forced enrollment, email path: send code to inbox
-	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, mw.OTPRateLimiter(rlCfg)) // forced enrollment: first code → tokens
+	//
+	// These are called by an application's backend as often as by a browser —
+	// the challenge follows /auth/apps/login. A backend that sends its Basic
+	// credentials (optional here) is no longer counted per IP: the per-session
+	// bucket in OTPRateLimiter still bounds code guessing, the per-user limit
+	// keys on the forwarded end-user IP, and the application quota applies.
+	// Callers that send no credentials keep OTPRateLimiter exactly as before.
+	//
+	// ScopeToCaller: a backend is trusted only for its own users' pending
+	// sign-ins. A session from another tenant or application keeps
+	// OTPRateLimiter's per-IP limit (PR #174 review). Each chain reads the
+	// token field its handlers bind — a scope check reading one field while
+	// the handler acts on another would be a bypass.
+	mfaChain := func(scope mw.SubjectScopeFunc) []echo.MiddlewareFunc {
+		return []echo.MiddlewareFunc{
+			s2s.ResolveOptional(mw.SurfaceMFA),
+			mw.ScopeToCaller(scope),
+			mw.BackendsOnly(appCallerRateLimit),
+			mw.BackendsOnly(s2s.UserLimit("app_mfa_challenge_user", userLimits.MFAChallenge, mw.SubjectEndUserIP)),
+			mw.OTPRateLimiter(rlCfg),
+		}
+	}
+	otpChain := mfaChain(mw.ScopeByBodyToken("otp_session_token", authSvc.OTPSessionScope))
+	enrollChain := mfaChain(mw.ScopeByBodyToken("enrollment_token", authSvc.EnrollmentSessionScope))
+	authGroup.POST("/login/otp", authHandler.LoginOTP, otpChain...)                       // complete MFA-gated login (TOTP, backup, or emailed code)
+	authGroup.POST("/login/otp/resend", authHandler.LoginOTPResend, otpChain...)          // re-send the emailed login code (max 3/challenge)
+	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, enrollChain...)     // forced enrollment, TOTP path: get QR + backup codes
+	authGroup.POST("/login/mfa/email", authHandler.MFAEmailPending, enrollChain...)       // forced enrollment, email path: send code to inbox
+	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, enrollChain...) // forced enrollment: first code → tokens
 	authGroup.POST("/refresh", authHandler.Refresh)
 	authGroup.POST("/logout", authHandler.Logout)
 
@@ -848,13 +960,43 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.GET("/my-tenants", authHandler.MyTenants,
 		mw.JWTRequired(jwtSvc, mw.Grants(auth.HumanGrants, auth.AdminGrants)...),
 		identityAudience)
-	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
-	authGroup.POST("/reset-password", authHandler.ResetPassword)
+	// The forgot/reset pair (GHSA-2267-r48x-9fh2). Inbox flooding is bounded per
+	// recipient: the per-user limit on forgot-password keys on the application
+	// and the email.
+	authGroup.POST("/forgot-password", authHandler.ForgotPassword,
+		s2s.Resolve(mw.SurfaceReset), appClientRateLimit,
+		s2s.UserLimit("app_forgot_password_user", userLimits.ForgotPassword, mw.SubjectEmail))
+	// The console's forgot-password (issue #179): first-party, from a browser,
+	// with no client credentials. ResolveAnonymous holds every caller to the
+	// AUTH-07 5/min per IP on a surface of its own, so an admin asking for links
+	// cannot use up the budget for redeeming one at /reset-password. The
+	// per-email limit bounds one recipient from many addresses; the handler adds
+	// the platform captcha, the fan-out cap and the per-account cooldown.
+	authGroup.POST("/console/forgot-password", authHandler.ConsoleForgotPassword,
+		s2s.ResolveAnonymous(mw.SurfaceConsoleReset),
+		s2s.UserLimit("console_forgot_password_user", userLimits.ForgotPassword, mw.SubjectEmail))
+	// reset-password consumes a bearer credential — without a limiter it is an
+	// online brute-force oracle on reset tokens. The presented value IS the
+	// guess, so a per-token bucket could never fill: the meaningful key is who
+	// is guessing. A browser calling directly carries no credentials and gets
+	// the AUTH-07 5/min per IP in Resolve; a backend calling for its users is
+	// limited per forwarded end-user IP, or per application when it does not
+	// forward (GuessLimit). A backend's reset only redeems its own
+	// application's tokens.
+	authGroup.POST("/reset-password", authHandler.ResetPassword,
+		s2s.Resolve(mw.SurfaceReset), appClientRateLimit,
+		s2s.GuessLimit("app_reset_password_user", userLimits.ResetPassword))
 
 	// Email verification — link is clicked (GET) from the email; resend is
 	// rate-limited and enumeration-safe (tenant via X-Tenant-Slug).
 	authGroup.GET("/verify-email", authHandler.VerifyEmail)
-	authGroup.POST("/resend-verification", authHandler.ResendVerification, mw.TokenRateLimiter(rlCfg))
+	// A backend sending its Basic credentials (optional) is limited per email
+	// and by its quota instead of per IP; others keep TokenRateLimiter.
+	authGroup.POST("/resend-verification", authHandler.ResendVerification,
+		s2s.ResolveOptional(mw.SurfaceAccount),
+		mw.BackendsOnly(appCallerRateLimit),
+		mw.BackendsOnly(s2s.UserLimit("app_resend_verification_user", userLimits.ResendVerification, mw.SubjectEmail)),
+		mw.TokenRateLimiter(rlCfg))
 
 	// Landing points for the invitation, email-change, and unblock emails. All
 	// three are token-authenticated (the token IS the credential), so they are
@@ -896,19 +1038,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/session/mfa/enroll/activate", authHandler.SessionMFAEnrollActivate, mw.OTPRateLimiter(rlCfg), sessionCSRF)
 
 	// Client credentials token endpoint — machine-to-machine auth (no user).
-	// TokenRateLimiter keys per client_id (not email) so each M2M client gets
-	// an isolated bucket instead of all sharing one email-less fallback bucket;
-	// appClientRateLimit layers the tenant-configured per-app limit on top,
-	// keyed on the same client_id → application.
-	authGroup.POST("/token", authHandler.Token, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	// There is no end user to limit, so the application's quota is the limit;
+	// Resolve still holds callers whose secret does not verify to AUTH-07's
+	// 5/min per IP, which is what bounds secret guessing here.
+	authGroup.POST("/token", authHandler.Token, s2s.Resolve(mw.SurfaceApp), appClientRateLimit)
 
 	// Application-authenticated end-user register/login (Auth0-style
 	// integration): the calling application authenticates itself via
 	// Authorization: Basic, and gets its own isolated end-user base, distinct
 	// from /register and /login above (which are tenant-level, first-party
-	// only). Rate-limited per client_id — same reasoning as /token.
-	authGroup.POST("/apps/register", authHandler.AppRegister, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
-	authGroup.POST("/apps/login", authHandler.AppLogin, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	// only). Limited per application and per end user (by email) — see s2s above.
+	authGroup.POST("/apps/register", authHandler.AppRegister,
+		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
+		s2s.UserLimit("app_register_user", userLimits.Register, mw.SubjectEmail))
+	authGroup.POST("/apps/login", authHandler.AppLogin,
+		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
+		s2s.UserLimit("app_login_user", userLimits.Login, mw.SubjectEmailAndUserIP))
 
 	// Attach roles to one of the application's own users after registration
 	// (#146). Sits beside /apps/register and /apps/login because it shares their
@@ -921,15 +1066,59 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	//
 	// Rate-limited like the other credential endpoints: it presents a secret on
 	// every call AND changes what a user may do, so it is both a brute-force
-	// surface and a privilege-churn surface.
+	// surface and a privilege-churn surface. Per user, by the user_id it changes.
 	authGroup.POST("/apps/users/roles", authHandler.AssignAppUserRoles,
-		mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
+		s2s.UserLimit("app_roles_user", userLimits.Roles, mw.SubjectUserID))
 
 	// Passwordless magic-link sign-in (issue #63 follow-on) — per-application
 	// opt-in. The link replaces only the password step: verification runs the
 	// same MFA gate as /apps/login, so a 'required' app still challenges.
-	authGroup.POST("/apps/login/magic", authHandler.AppMagicLink, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
-	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify, mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	// Requesting a link sends email, so it is limited per recipient; verifying
+	// one presents a one-time token, so — as with reset-password — it is
+	// limited per end-user IP, not per token.
+	authGroup.POST("/apps/login/magic", authHandler.AppMagicLink,
+		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
+		s2s.UserLimit("app_magic_link_user", userLimits.MagicLink, mw.SubjectEmail))
+	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify,
+		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
+		s2s.GuessLimit("app_magic_link_verify_user", userLimits.MagicLinkVerify))
+
+	// Organizations — end-user flows. Each answers 404 while
+	// ORGANIZATIONS_ENABLED is false. They carry no client secret (a browser
+	// or mobile client calls them), so they sit behind the per-IP token limiter
+	// like the other unauthenticated credential exchanges.
+	//
+	// The static invitation paths are registered alongside /:org below; Echo
+	// prefers a static segment over a parameter, so they never collide.
+	authGroup.POST("/apps/login/organization", orgHandler.SelectOrganization, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/switch-organization", orgHandler.SwitchOrganization, mw.TokenRateLimiter(rlCfg))
+	authGroup.GET("/apps/organizations/invitations/preview", orgHandler.PreviewInvitation, mw.TokenRateLimiter(rlCfg))
+	authGroup.POST("/apps/organizations/invitations/accept", orgHandler.AcceptInvitation, mw.TokenRateLimiter(rlCfg))
+
+	// Organizations — management by an application's own backend, with its
+	// client credentials in Authorization: Basic, exactly like
+	// /apps/users/roles. The scope is the authenticated application, so a
+	// leaked secret reaches only that application's organisations.
+	appOrgScope := orgHandler.AppScope
+	appOrgs := authGroup.Group("/apps/organizations", mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	appOrgs.POST("", orgHandler.CreateOrganization(appOrgScope))
+	appOrgs.GET("", orgHandler.ListOrganizations(appOrgScope))
+	appOrgs.GET("/:org", orgHandler.GetOrganization(appOrgScope))
+	appOrgs.PATCH("/:org", orgHandler.UpdateOrganization(appOrgScope))
+	appOrgs.DELETE("/:org", orgHandler.DeleteOrganization(appOrgScope))
+	appOrgs.GET("/:org/members", orgHandler.ListMembers(appOrgScope))
+	appOrgs.PUT("/:org/members/:uid", orgHandler.AddMember(appOrgScope))
+	appOrgs.GET("/:org/members/:uid", orgHandler.GetMember(appOrgScope))
+	appOrgs.PATCH("/:org/members/:uid", orgHandler.UpdateMember(appOrgScope))
+	appOrgs.DELETE("/:org/members/:uid", orgHandler.RemoveMember(appOrgScope))
+	appOrgs.POST("/:org/members/:uid/roles", orgHandler.AssignMemberRoles(appOrgScope))
+	appOrgs.DELETE("/:org/members/:uid/roles/:role", orgHandler.RemoveMemberRole(appOrgScope))
+	appOrgs.POST("/:org/invitations", orgHandler.CreateInvitation(appOrgScope))
+	appOrgs.GET("/:org/invitations", orgHandler.ListInvitations(appOrgScope))
+	appOrgs.DELETE("/:org/invitations/:inv", orgHandler.RevokeInvitation(appOrgScope))
+	authGroup.GET("/apps/users/:uid/organizations", orgHandler.ListUserOrganizations(appOrgScope),
+		mw.TokenRateLimiter(rlCfg), appClientRateLimit)
 
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates
@@ -969,15 +1158,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	//
 	// Middleware order matters here, and Echo runs them left-to-right:
 	//
-	//	TokenRateLimiter → appClientRateLimit → Normalize… → jwtRenew → AppMe
+	//	s2s.Resolve → appClientRateLimit → Normalize… → jwtRenew → s2s.UserLimit → AppMe
 	//
-	// Both limiters sit AHEAD of jwtRenew. Behind it, they would only ever run
-	// for callers who already hold a valid token, so anyone with an expired or
-	// forged one could drive the app lookups underneath at full speed — the
-	// unauthenticated traffic a limiter exists for would be the traffic it never
-	// saw. TokenRateLimiter is first because it is purely in-memory and per IP:
-	// it fences the DB read appClientRateLimit performs to resolve a client_id.
-	// This is the same pairing every other /apps/* route uses.
+	// The per-IP guard and the application quota sit AHEAD of jwtRenew. Behind
+	// it, they would only ever run for callers who already hold a valid token,
+	// so anyone with an expired or forged one could drive the app lookups
+	// underneath at full speed — the unauthenticated traffic a limiter exists
+	// for would be the traffic it never saw. s2s.Resolve is first because its
+	// per-IP guard is charged before any database work: it fences the client
+	// verification and the app lookup behind it.
+	//
+	// The per-user limit is the exception and sits BEHIND jwtRenew, keyed on
+	// the verified token's user, so a backend serving many users from one IP is
+	// not throttled as one caller. Ahead of jwtRenew it could only read the
+	// token unverified, and a forged token naming a victim spent the victim's
+	// bucket (PR #174 review). Inside NormalizeAppScopeUnauthorized is fine: it
+	// rewrites only 401s, so this limiter's 429 and Retry-After pass through.
 	//
 	// appClientRateLimit rather than appRateLimit: this endpoint bears client
 	// credentials, so it is keyed on client_id like every other /apps/* route.
@@ -991,8 +1187,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// reveals nothing about the token, and disguising it as 401 would strip the
 	// Retry-After signal a well-behaved client needs.
 	authGroup.GET("/apps/me", authHandler.AppMe,
-		mw.TokenRateLimiter(rlCfg), appClientRateLimit, mw.NormalizeAppScopeUnauthorized, jwtRenew)
+		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
+		mw.NormalizeAppScopeUnauthorized, jwtRenew,
+		s2s.UserLimit("app_me_user", userLimits.Me, mw.SubjectSignedInUser))
 	authGroup.GET("/my-activity", authHandler.MyActivity, jwtRenew, appRateLimit)
+	// The organisations the signed-in user can switch to (Organizations).
+	authGroup.GET("/apps/me/organizations", orgHandler.MyOrganizations, jwtRenew, appRateLimit)
 
 	// Self-service session management — "these are your signed-in devices; sign the
 	// ones you do not recognise out". Every mainstream IdP offers this, and SOC 2
@@ -1035,7 +1235,20 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// to start it, and prove control of the new inbox to finish it (the GET
 	// confirm route above). Rate-limited so the confirmation mail cannot be used
 	// to spam an arbitrary address.
-	authGroup.POST("/change-email", authHandler.ChangeEmail, jwtRenew, appRateLimit, mw.TokenRateLimiter(rlCfg))
+	//
+	// Everyone keeps TokenRateLimiter's 5/min per IP — keyed per user alone, one
+	// address holding many accounts could send that many times the mail. A
+	// backend acting for its users opts in with its application credentials in
+	// X-Client-Authorization (Authorization carries the user's token): once
+	// verified it skips the per-IP limit, which its users all share, and is
+	// limited per signed-in user instead — but only for a user of its own
+	// tenant (and application, for an application user). Another tenant's
+	// user keeps the per-IP limit (ScopeToCaller, PR #174 review).
+	authGroup.POST("/change-email", authHandler.ChangeEmail, jwtRenew, appRateLimit,
+		s2s.ResolveOptional(mw.SurfaceAccount),
+		mw.ScopeToCaller(mw.ScopeSignedInUser),
+		mw.BackendsOnly(mw.SignedInUserRateLimiter("change_email_user", rlCfg.PerIPRate)),
+		mw.TokenRateLimiter(rlCfg))
 
 	// TOTP management — protected (03-01)
 	// The caller's MFA state across every method, including whether it is
@@ -1098,8 +1311,25 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		// PasskeyBeginRateLimiter; see PasskeyBeginPerIPRate for the sizing.
 		// /login/complete verifies a signature and mints a session, so it keeps
 		// the tighter TokenRateLimiter.
-		authGroup.POST("/passkey/login/begin", webauthnHandler.LoginBegin, mw.PasskeyBeginRateLimiter())
-		authGroup.POST("/passkey/login/complete", webauthnHandler.LoginComplete, mw.TokenRateLimiter(rlCfg))
+		//
+		// A backend relaying /login/complete for its users can send its Basic
+		// credentials (optional) to be limited per end user and by its quota
+		// rather than as one IP; others keep the limiters above unchanged.
+		//
+		// /login/begin keeps PasskeyBeginRateLimiter for every caller,
+		// credentials or not. It names no user and no application — the
+		// relying party comes from the Origin header — so there is nothing to
+		// check a backend's credentials against, and any tenant's credentials
+		// lifted the per-IP limit for every other tenant's origins (PR #174
+		// review). Its 300/min per IP was sized for page views and is what
+		// master gives every caller.
+		authGroup.POST("/passkey/login/begin", webauthnHandler.LoginBegin,
+			mw.PasskeyBeginRateLimiter())
+		authGroup.POST("/passkey/login/complete", webauthnHandler.LoginComplete,
+			s2s.ResolveOptional(mw.SurfacePasskey),
+			mw.BackendsOnly(appCallerRateLimit),
+			mw.BackendsOnly(s2s.UserLimit("app_passkey_login_user", userLimits.PasskeyLogin, mw.SubjectEndUserIP)),
+			mw.TokenRateLimiter(rlCfg))
 
 		// Cookie-session variant for browser clients (the admin console), which
 		// cannot use the body tokens /login/complete returns — nothing in
@@ -1330,6 +1560,31 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/permissions", adminHandler.UpdateRolePermissions, appRolesWrite)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/roles/:id/default", adminHandler.SetDefaultApplicationRole, appRolesWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/roles/:id", adminHandler.DeleteRole, appRolesWrite)
+
+	// Organizations (admin console). The mode is an application setting
+	// (apps:*); organisations and their members are user administration
+	// (users:*), the same permission that already governs the application's
+	// users and their roles.
+	adminGroup.GET("/tenants/:tid/applications/:appID/organization-settings", orgHandler.GetSettings, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/organization-settings", orgHandler.UpdateSettings, appAppsWrite)
+	adminOrgScope := orgHandler.AdminScope
+	adminOrgs := "/tenants/:tid/applications/:appID/organizations"
+	adminGroup.POST(adminOrgs, orgHandler.CreateOrganization(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs, orgHandler.ListOrganizations(adminOrgScope), appUsersRead)
+	adminGroup.GET(adminOrgs+"/:org", orgHandler.GetOrganization(adminOrgScope), appUsersRead)
+	adminGroup.PATCH(adminOrgs+"/:org", orgHandler.UpdateOrganization(adminOrgScope), appUsersWrite)
+	adminGroup.DELETE(adminOrgs+"/:org", orgHandler.DeleteOrganization(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs+"/:org/members", orgHandler.ListMembers(adminOrgScope), appUsersRead)
+	adminGroup.PUT(adminOrgs+"/:org/members/:uid", orgHandler.AddMember(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs+"/:org/members/:uid", orgHandler.GetMember(adminOrgScope), appUsersRead)
+	adminGroup.PATCH(adminOrgs+"/:org/members/:uid", orgHandler.UpdateMember(adminOrgScope), appUsersWrite)
+	adminGroup.DELETE(adminOrgs+"/:org/members/:uid", orgHandler.RemoveMember(adminOrgScope), appUsersWrite)
+	adminGroup.POST(adminOrgs+"/:org/members/:uid/roles", orgHandler.AssignMemberRoles(adminOrgScope), appUsersWrite)
+	adminGroup.DELETE(adminOrgs+"/:org/members/:uid/roles/:role", orgHandler.RemoveMemberRole(adminOrgScope), appUsersWrite)
+	adminGroup.POST(adminOrgs+"/:org/invitations", orgHandler.CreateInvitation(adminOrgScope), appUsersWrite)
+	adminGroup.GET(adminOrgs+"/:org/invitations", orgHandler.ListInvitations(adminOrgScope), appUsersRead)
+	adminGroup.DELETE(adminOrgs+"/:org/invitations/:inv", orgHandler.RevokeInvitation(adminOrgScope), appUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/organizations", orgHandler.ListUserOrganizations(adminOrgScope), appUsersRead)
 
 	// End-user application permissions under the canonical family.
 	adminGroup.POST("/tenants/:tid/applications/:appID/permissions", adminHandler.CreatePermission, appPermsWrite)
@@ -1725,6 +1980,23 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/rate-limit", adminHandler.SetAppLimit, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/rate-limit", adminHandler.DeleteAppLimit, appAppsWrite)
 
+	// Server-to-server trust: the application backend's registered egress IPs
+	// and whether it may forward its end users' IP. Same guards as the rate
+	// limit above — both decide how the application's traffic is limited.
+	adminGroup.GET("/applications/:appID/server-trust", adminHandler.GetServerTrust, appsRead)
+	adminGroup.PUT("/applications/:appID/server-trust", adminHandler.SetServerTrust, appsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/server-trust", adminHandler.GetServerTrust, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/server-trust", adminHandler.SetServerTrust, appAppsWrite)
+	adminGroup.GET("/applications/:appID/server-trust/suggestions", adminHandler.SuggestServerIPs, appsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/server-trust/suggestions", adminHandler.SuggestServerIPs, appAppsRead)
+
+	// Per-user limit overrides (login per email, reset per user IP, ...), within
+	// the ceilings in auth.UserLimitDefs. Same guards as the two above.
+	adminGroup.GET("/applications/:appID/user-limits", adminHandler.GetUserLimits, appsRead)
+	adminGroup.PUT("/applications/:appID/user-limits", adminHandler.SetUserLimits, appsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/user-limits", adminHandler.GetUserLimits, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/user-limits", adminHandler.SetUserLimits, appAppsWrite)
+
 	// JWT signing-key management (issue #95) — tenant:manage, because rotating a
 	// signing key is a tenant-wide security operation, not an application-level one.
 	//
@@ -1830,14 +2102,32 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	e.GET(handlers.PathOAuthAuthorize, authorizeHandler.Authorize, authorizeLimit)
 	e.POST(handlers.PathOAuthAuthorize+"/login", authorizeHandler.LoginSubmit, authorizeLimit)
 	e.POST(handlers.PathOAuthAuthorize+"/mfa", authorizeHandler.MFASubmit, authorizeLimit)
+	// The organisation picker (Organizations). Rendered only for an application
+	// in organizations_mode "required" whose user belongs to several; same
+	// limiter as the login and MFA steps it follows.
+	e.POST(handlers.PathOAuthAuthorize+"/organization", authorizeHandler.OrganizationSubmit, authorizeLimit)
 
 	// Token endpoint — form-encoded (RFC 6749 §4.1.3), unlike the JSON
 	// POST /auth/token which keeps working as a documented-deprecated alias.
-	e.POST(handlers.PathOAuthToken, oauthTokenHandler.Token, mw.OAuthTokenRateLimiter())
+	//
+	// A confidential client whose secret verifies is limited at the larger of
+	// the fixed 120/min and its application's quota, so an OIDC product's code
+	// exchanges and refreshes are not capped below what it was sized for.
+	// Public clients and unverified secrets keep the fixed limit.
+	e.POST(handlers.PathOAuthToken, oauthTokenHandler.Token,
+		s2s.ResolveOAuthClient(mw.SurfaceOAuth, mw.OAuthTokenLegacyExhausted), s2s.OAuthTokenLimit())
 
 	// Revocation (RFC 7009). Always 200, so the limiter is what stops it being
-	// used to probe token validity at volume.
-	e.POST(handlers.PathOAuthRevoke, oauthTokenHandler.Revoke, mw.RevokeRateLimiter())
+	// used to probe token validity at volume. Per IP for everyone except a
+	// client whose secret verified, which is limited per client instead (a
+	// backend revoking on its users' sign-out shares one IP).
+	e.POST(handlers.PathOAuthRevoke, oauthTokenHandler.Revoke,
+		s2s.ResolveOAuthClient(mw.SurfaceOAuth, mw.OAuthRevokeLegacyExhausted), s2s.OAuthRevokeLimit())
+	// RFC 7662 introspection — the live check behind a locally verified JWT.
+	// Confidential clients only, for their own application's tokens. Uses the
+	// revocation route's per-IP limiter (RevokeRateLimiter): both are
+	// client-authenticated token lookups.
+	e.POST(handlers.PathOAuthIntrospect, oauthTokenHandler.Introspect, mw.RevokeRateLimiter())
 
 	// Social login browser endpoints — public, top-level like SAML, but with
 	// the dedicated rate limiting SAML's routes lack (issue #64).
@@ -1846,7 +2136,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 
 	// Login-code exchange — the tenant app swaps the one-time code for the
 	// standard token pair. Per-IP limited; codes are single-use and ≤60s.
-	authGroup.POST("/oauth/exchange", oauthHandler.Exchange, mw.OAuthRateLimiter(rlCfg))
+	//
+	// Always called by the application's backend, so per IP it capped every
+	// social sign-in of a product at 5/min. A trusted backend — Basic
+	// credentials that verify, or the body client_id from that application's
+	// registered server IP — skips the per-IP bucket and is limited per
+	// forwarded end-user IP (or per application when it does not forward) and
+	// by its quota; login codes are bound to the client_id. Everyone else:
+	// unchanged.
+	authGroup.POST("/oauth/exchange", oauthHandler.Exchange,
+		s2s.ResolveOptionalBodyClient(mw.SurfaceOAuth),
+		mw.BackendsOnly(appCallerRateLimit),
+		mw.BackendsOnly(s2s.GuessLimit("app_oauth_exchange_user", userLimits.OAuthExchange)),
+		mw.OAuthRateLimiter(rlCfg))
 
 	// Identity provider (social login) admin config — apps:read / apps:write.
 	adminGroup.GET("/applications/:appID/identity-providers", oauthHandler.ListProviderConfigs, appsRead)
@@ -1891,5 +2193,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 
 	return func() {
 		stopImportWorker()
+		stopTrustRefresh()
+		stopUserLimitRefresh()
 	}
 }

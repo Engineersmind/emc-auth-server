@@ -34,6 +34,9 @@ func NewOAuthHandler(svc *auth.OAuthLoginService, idpSvc *auth.IdentityProviderS
 // @Tags         oauth
 // @Param        provider   path   string  true   "Provider (google, github)"
 // @Param        client_id  query  string  true   "Application client_id"
+// @Param        state      query  string  false  "Optional opaque value (max 512 printable ASCII chars) echoed unchanged on the redirect back; use it to bind the callback to the browser that started the flow"
+// @Param        code_challenge         query  string  false  "Optional PKCE S256 challenge base64url(SHA256(code_verifier)); when set, exchange requires the code_verifier"
+// @Param        code_challenge_method  query  string  false  "Must be S256 when code_challenge is set"
 // @Param        redirect   query  string  false  "Post-login redirect target (must be in the application's allow-list; optional when the list has exactly one entry)"
 // @Success      302  "Redirect to provider"
 // @Failure      400  {object}  map[string]string
@@ -44,7 +47,11 @@ func (h *OAuthHandler) Login(c echo.Context) error {
 	clientID := c.QueryParam("client_id")
 	redirect := c.QueryParam("redirect")
 
-	authURL, err := h.svc.BuildAuthURL(c.Request().Context(), provider, clientID, redirect)
+	authURL, err := h.svc.BuildAuthURL(c.Request().Context(), provider, clientID, redirect, auth.LoginBinding{
+		State:         c.QueryParam("state"),
+		CodeChallenge: c.QueryParam("code_challenge"),
+		Method:        c.QueryParam("code_challenge_method"),
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrProviderNotSupported):
@@ -53,6 +60,8 @@ func (h *OAuthHandler) Login(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusNotFound, "social login is not available for this application")
 		case errors.Is(err, auth.ErrInvalidClient):
 			return echo.NewHTTPError(http.StatusBadRequest, "invalid client_id")
+		case errors.Is(err, auth.ErrInvalidLoginBinding):
+			return echo.NewHTTPError(http.StatusBadRequest, "invalid state or code_challenge")
 		case errors.Is(err, auth.ErrInvalidRedirectURI):
 			return echo.NewHTTPError(http.StatusBadRequest, "redirect target is not allowed for this application")
 		default:
@@ -95,7 +104,7 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 	// to the allow-listed target with a generic code.
 	if errParam := c.QueryParam("error"); errParam != "" {
 		h.auditLoginFailed(c, st, "consent_denied")
-		return c.Redirect(http.StatusFound, auth.AppendLoginError(st.Redirect, "access_denied"))
+		return c.Redirect(http.StatusFound, auth.AppendState(auth.AppendLoginError(st.Redirect, "access_denied"), st.ClientState))
 	}
 
 	result, err := h.svc.HandleCallback(ctx, st, c.QueryParam("code"))
@@ -112,7 +121,7 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 			h.logger.Error().Err(err).Str("provider", provider).Msg("oauth: callback failed")
 		}
 		h.auditLoginFailed(c, st, code)
-		return c.Redirect(http.StatusFound, auth.AppendLoginError(st.Redirect, code))
+		return c.Redirect(http.StatusFound, auth.AppendState(auth.AppendLoginError(st.Redirect, code), st.ClientState))
 	}
 
 	// st.Provider is validated server-stored state, safe to label audit
@@ -126,7 +135,7 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 		AuthMethod:   audit.SocialAuthMethod(st.Provider),
 		ResourceType: "user",
 		ResourceID:   strconv.FormatInt(result.UserID, 10),
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 	if result.Outcome == "linked" {
@@ -137,7 +146,7 @@ func (h *OAuthHandler) Callback(c echo.Context) error {
 			Action:       audit.SocialLinkedAction(st.Provider),
 			ResourceType: "user",
 			ResourceID:   strconv.FormatInt(result.UserID, 10),
-			IPAddress:    c.RealIP(),
+			IPAddress:    clientIP(c),
 			UserAgent:    c.Request().UserAgent(),
 		})
 	}
@@ -160,7 +169,7 @@ func (h *OAuthHandler) auditLoginFailed(c echo.Context, st *auth.OAuthState, rea
 		AuthMethod:   audit.SocialAuthMethod(provider),
 		ResourceType: "user",
 		ResourceID:   reason,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"reason": reason, "error_code": reason, "provider": c.Param("provider")},
 	}
@@ -175,6 +184,8 @@ func (h *OAuthHandler) auditLoginFailed(c echo.Context, st *auth.OAuthState, rea
 type OAuthExchangeRequest struct {
 	ClientID  string `json:"client_id"`
 	LoginCode string `json:"login_code"`
+	// CodeVerifier is required iff code_challenge was sent to the login endpoint.
+	CodeVerifier string `json:"code_verifier,omitempty"`
 }
 
 // Exchange handles POST /api/v1/auth/oauth/exchange — swaps the one-time
@@ -189,6 +200,9 @@ type OAuthExchangeRequest struct {
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
+// @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
+// @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
+// @Failure      429  {object}  map[string]string  "Rate limited; wait Retry-After seconds"
 // @Router       /api/v1/auth/oauth/exchange [post]
 func (h *OAuthHandler) Exchange(c echo.Context) error {
 	var req OAuthExchangeRequest
@@ -199,8 +213,14 @@ func (h *OAuthHandler) Exchange(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "client_id and login_code are required")
 	}
 
-	tokens, err := h.svc.ExchangeLoginCode(c.Request().Context(), req.ClientID, req.LoginCode)
+	tokens, err := h.svc.ExchangeLoginCode(c.Request().Context(), req.ClientID, req.LoginCode, req.CodeVerifier)
 	if err != nil {
+		// Social sign-in mints at this exchange, so an organisation outcome
+		// (choose one, or no access) surfaces here, after the provider
+		// already proved the identity.
+		if handled, resp := organizationSignInError(c, err); handled {
+			return resp
+		}
 		if errors.Is(err, auth.ErrInvalidLoginCode) {
 			return echo.NewHTTPError(http.StatusUnauthorized, "invalid or expired login code")
 		}
@@ -364,7 +384,7 @@ func (h *OAuthHandler) UnlinkUserIdentity(c echo.Context) error {
 		Action:       audit.ActionAdminUserIdentityUnlinked,
 		ResourceType: "user",
 		ResourceID:   userResourceID(c) + ":" + provider,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 	return c.NoContent(http.StatusNoContent)
@@ -421,7 +441,7 @@ func (h *OAuthHandler) UpsertProviderConfig(c echo.Context) error {
 		Action:        audit.ActionAdminIdPConfigUpdated,
 		ResourceType:  "application",
 		ResourceID:    c.Param("appID") + ":" + detail.Provider,
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 	return c.JSON(http.StatusOK, detail)
@@ -482,7 +502,7 @@ func (h *OAuthHandler) TestProviderConfig(c echo.Context) error {
 			Action:        audit.ActionAdminIdPConfigTested,
 			ResourceType:  "application",
 			ResourceID:    c.Param("appID") + ":" + provider,
-			IPAddress:     c.RealIP(),
+			IPAddress:     clientIP(c),
 			UserAgent:     c.Request().UserAgent(),
 			Status:        status,
 			HTTPStatus:    httpStatus,
@@ -544,7 +564,7 @@ func (h *OAuthHandler) DeleteProviderConfig(c echo.Context) error {
 		Action:        audit.ActionAdminIdPConfigDeleted,
 		ResourceType:  "application",
 		ResourceID:    c.Param("appID") + ":" + provider,
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 	return c.NoContent(http.StatusNoContent)

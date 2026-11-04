@@ -3,15 +3,18 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 
 	"github.com/engineersmind/emc-auth-server/internal/api/paths"
+	"github.com/engineersmind/emc-auth-server/internal/auth"
 )
 
 const (
@@ -63,36 +66,109 @@ func (s *TenantCORSService) WithGlobalOrigins(origins []string) *TenantCORSServi
 	return s
 }
 
-// IsOriginAllowed reports whether any active tenant permits this browser origin.
+// corsScope identifies which tenant's cors_origins governs a request.
 //
-// This is the question CORS actually asks, and it needs no tenant identifier
-// from the caller. The middleware previously read X-Tenant-Slug to pick a
-// tenant's origin list, which put a machine-facing identifier — the tenant's
-// OIDC issuer path — into the contract of every browser request. Worse, a
-// preflight OPTIONS carries no body and no credentials, so the header was the
-// only thing a browser could send, and any client that forgot it silently fell
-// back to the global list.
+// The scope is resolved from the request itself — see requestCORSScope for the
+// ordering — and is deliberately not a value the caller picks freely: a
+// credential's tenant_id claim scopes its own request, so an origin listed by
+// tenant A cannot earn credentialed access for a request authenticating as
+// tenant B (GHSA-8jgj-mwx4-q9wr).
+type corsScope struct {
+	tenantID int64  // credential-scoped: this tenant's list applies
+	slug     string // credentialess but tenant-named: that tenant's list applies
+	any      bool   // credentialess and unnamed: any active tenant may match
+	deny     bool   // credentialed but tenant unreadable: per-tenant never applies
+}
+
+// cachePrefix namespaces the Redis decision per scope so an "allowed for
+// tenant A" answer cannot be replayed for tenant B.
+func (s corsScope) cachePrefix() string {
+	switch {
+	case s.tenantID != 0:
+		return "cors:origin:t" + strconv.FormatInt(s.tenantID, 10) + ":"
+	case s.slug != "":
+		return "cors:origin:s" + s.slug + ":"
+	default:
+		return "cors:origin:*:"
+	}
+}
+
+// requestCORSScope resolves which tenant's cors_origins governs this request.
 //
-// Resolving from the Origin removes that entirely: the browser already sends the
-// one value the decision depends on.
+// The resolution order is the trust order:
 //
-// The check deliberately does not identify WHICH tenant matched. CORS decides
-// only whether a browser origin may talk to this server at all; which tenant the
-// caller belongs to is settled later by the token or client credentials, and is
-// enforced by every handler independently. Two tenants sharing a staging domain
-// is therefore not a conflict — both permit the origin, and neither gains access
-// to the other's data by saying so.
+//  1. A presented credential decides whose data the request can reach, so it
+//     decides the scope. The tenant_id claim is read WITHOUT signature
+//     verification — the same trust model as auth's keyfunc tenant scoping
+//     (jwt.go: naming a different tenant only makes the lookup miss; the
+//     request still has to survive JWTRequired afterwards to reach anything).
+//     A credential that carries no readable tenant — a malformed token, or an
+//     API key, whose tenant is not exposed in the header — fails closed:
+//     per-tenant origins never apply to it.
+//  2. A credentialess request names its tenant through the route's :slug path
+//     parameter or the X-Tenant-Slug header. The value is client-chosen, but
+//     the response it could reach carries no credentials, so narrowing the
+//     allowlist to the named tenant is strict improvement over any-tenant.
+//  3. A credentialess request naming no tenant at all (a preflight OPTIONS —
+//     which per spec never carries credentials — or a cross-origin login from
+//     a tenant frontend) falls back to the any-tenant check. That answer can
+//     only ever authorize an unauthenticated response, so it cannot expose one
+//     tenant's data to another's origin.
+func requestCORSScope(c echo.Context) corsScope {
+	req := c.Request()
+
+	if raw, ok := bearerToken(c); ok && raw != "" {
+		return scopeFromToken(raw)
+	}
+	if cookie, err := c.Cookie(AccessTokenCookie); err == nil && cookie.Value != "" {
+		return scopeFromToken(cookie.Value)
+	}
+	if req.Header.Get(APIKeyHeader) != "" ||
+		strings.HasPrefix(req.Header.Get("Authorization"), "ApiKey ") {
+		return corsScope{deny: true}
+	}
+
+	if slug := c.Param("slug"); slug != "" {
+		return corsScope{slug: slug}
+	}
+	if slug := req.Header.Get("X-Tenant-Slug"); slug != "" {
+		return corsScope{slug: slug}
+	}
+	return corsScope{any: true}
+}
+
+// scopeFromToken scopes a credentialed request to the token's tenant_id claim.
+// An unparseable token or a missing/invalid claim fails closed.
+func scopeFromToken(token string) corsScope {
+	var claims auth.Claims
+	if _, _, err := gojwt.NewParser().ParseUnverified(token, &claims); err != nil {
+		return corsScope{deny: true}
+	}
+	if tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64); err == nil {
+		return corsScope{tenantID: tenantID}
+	}
+	return corsScope{deny: true}
+}
+
+// IsOriginAllowed reports whether the tenant identified by scope permits this
+// browser origin — and only that tenant.
 //
-// Per-application origins are the planned direction: those will be scoped to a
-// client_id rather than a tenant, and will resolve the same way — ask whether
-// the origin is permitted, not who is asking. The signature is shaped for that,
-// taking the origin alone.
-func (s *TenantCORSService) IsOriginAllowed(ctx context.Context, origin string) bool {
-	if origin == "" {
+// GHSA-8jgj-mwx4-q9wr: the previous implementation asked whether ANY active
+// tenant lists the origin, so one tenant whitelisting an origin granted that
+// origin credentialed cross-origin access to every other tenant's API. The
+// check is now scoped to the tenant the request's credential authenticates to
+// (requestCORSScope); an origin on tenant A's list no longer authorizes a
+// request carrying tenant B's session.
+//
+// scope.any — used only when the request carries no credential and names no
+// tenant — retains the broad check, because a credentialess response is the
+// most such a request can produce.
+func (s *TenantCORSService) IsOriginAllowed(ctx context.Context, origin string, scope corsScope) bool {
+	if origin == "" || scope.deny {
 		return false
 	}
 
-	cacheKey := "cors:origin:" + origin
+	cacheKey := scope.cachePrefix() + origin
 	if v, err := s.redisCli.Get(ctx, cacheKey).Result(); err == nil {
 		return v == "1"
 	}
@@ -100,13 +176,33 @@ func (s *TenantCORSService) IsOriginAllowed(ctx context.Context, origin string) 
 	// cors_origins is a text[]; @> is the containment operator, which a GIN
 	// index on that column can answer directly.
 	var allowed bool
-	err := s.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-		    SELECT 1 FROM tenants
-		    WHERE is_active = true AND deleted_at IS NULL
-		      AND cors_origins @> ARRAY[$1]::text[]
-		)
-	`, origin).Scan(&allowed)
+	var err error
+	switch {
+	case scope.tenantID != 0:
+		err = s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+			    SELECT 1 FROM tenants
+			    WHERE id = $2 AND is_active = true AND deleted_at IS NULL
+			      AND cors_origins @> ARRAY[$1]::text[]
+			)
+		`, origin, scope.tenantID).Scan(&allowed)
+	case scope.slug != "":
+		err = s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+			    SELECT 1 FROM tenants
+			    WHERE slug = $2 AND is_active = true AND deleted_at IS NULL
+			      AND cors_origins @> ARRAY[$1]::text[]
+			)
+		`, origin, scope.slug).Scan(&allowed)
+	default:
+		err = s.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+			    SELECT 1 FROM tenants
+			    WHERE is_active = true AND deleted_at IS NULL
+			      AND cors_origins @> ARRAY[$1]::text[]
+			)
+		`, origin).Scan(&allowed)
+	}
 	if err != nil {
 		// Fail closed on a database error: a CORS decision made without data is
 		// not a decision, and wrongly allowing an origin is the harmful
@@ -125,15 +221,29 @@ func (s *TenantCORSService) IsOriginAllowed(ctx context.Context, origin string) 
 	return allowed
 }
 
-// InvalidateOriginCache clears the cached decision for one origin. Called when a
-// tenant's origin list changes.
+// InvalidateOriginCache clears every scoped cached decision for one origin.
+// Called when a tenant's origin list changes. Decisions are keyed per scope
+// (cors:origin:<scope>:<origin>), so clearing takes a SCAN over the
+// cors:origin:*: keyspace — small, and the write path is rare.
 func (s *TenantCORSService) InvalidateOriginCache(ctx context.Context, origins ...string) {
 	for _, o := range origins {
 		if o == "" {
 			continue
 		}
-		if err := s.redisCli.Del(ctx, "cors:origin:"+o).Err(); err != nil {
-			s.logger.Warn().Err(err).Str("origin", o).Msg("failed to invalidate CORS origin cache")
+		var cursor uint64
+		for {
+			keys, next, err := s.redisCli.Scan(ctx, cursor, "cors:origin:*:"+o, 100).Result()
+			if err != nil {
+				s.logger.Warn().Err(err).Str("origin", o).Msg("failed to invalidate CORS origin cache")
+				break
+			}
+			if len(keys) > 0 {
+				s.redisCli.Del(ctx, keys...) //nolint:errcheck
+			}
+			if next == 0 {
+				break
+			}
+			cursor = next
 		}
 	}
 }
@@ -164,20 +274,21 @@ func isPublicCORSExempt(path string) bool {
 
 // TenantCORS returns middleware that applies per-tenant CORS headers.
 //
-// The decision is made from the request's Origin, which is the only thing it
-// depends on and the one value a browser always sends.
-//
-// This replaced a lookup keyed on the X-Tenant-Slug header. That was wrong twice
-// over: it put the tenant's OIDC issuer identifier into the contract of every
-// browser request, and a preflight OPTIONS carries only a header's NAME, never
-// its value — so the slug was unavoidably empty on exactly the request that had
-// to be answered first. An entire branch existed to reflect the origin
-// permissively for such preflights, which is the shape of a workaround for a key
-// that should not have been required.
+// The decision depends on the request's Origin and on which tenant the request
+// can reach (requestCORSScope): the credential it carries, the tenant it names,
+// or — for credentialess, unnamed requests such as preflights — any tenant's
+// list. Scoping the per-tenant check to the credential's own tenant is what
+// keeps tenant A's origin list from authorizing credentialed requests that
+// authenticate as tenant B (GHSA-8jgj-mwx4-q9wr).
 //
 // Behaviour:
 //   - Origin permitted by the global allow-list → allowed, no database round trip.
-//   - Otherwise, if any active tenant lists it in cors_origins → allowed.
+//   - Otherwise, if the tenant the request is scoped to lists it in
+//     cors_origins → allowed. The scope is the credential's tenant_id claim
+//     for authenticated requests (GHSA-8jgj-mwx4-q9wr), the named slug for
+//     credentialess tenant-scoped requests, or any active tenant only for
+//     requests that carry no credential and name no tenant — the most such a
+//     request can ever yield is an unauthenticated response.
 //   - No origins resolved either way → no CORS headers set (pass through).
 //   - Valid Origin present in the resolved list → standard CORS headers applied.
 //   - Preflight (OPTIONS) → 204 with CORS headers; request chain stops.
@@ -208,34 +319,17 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 
 			requestOrigin := req.Header.Get("Origin")
 
-			// Resolved from the Origin, not from X-Tenant-Slug.
-			//
-			// The header used to select which tenant's origin list to consult,
-			// which was wrong twice over. It put the tenant's OIDC issuer
-			// identifier into the contract of every browser request; and a
-			// preflight OPTIONS carries no body and no credentials, so a client
-			// that did not send it silently fell back to the global list — the
-			// per-tenant configuration quietly did nothing. An entire branch
-			// existed here to paper over preflights that merely ANNOUNCED the
-			// header without a value, which is the shape of a workaround for a
-			// key that should never have been required.
-			//
-			// The browser already sends the one value the decision depends on.
-			//
-			// Global origins are still consulted first: they are deployment-wide
+			// Global origins are consulted first: they are deployment-wide
 			// configuration and answer without a database round trip. The
 			// per-tenant lookup runs only when the global list does not already
-			// permit the origin.
-			//
-			// Planned: per-application origins scoped to a client_id will resolve
-			// the same way — ask whether the origin is permitted, never who is
-			// asking. Tenant identity is settled by the token or client
-			// credentials afterwards, and enforced by every handler on its own.
+			// permit the origin — and is scoped to the tenant this request can
+			// actually reach (requestCORSScope), never "any tenant"
+			// (GHSA-8jgj-mwx4-q9wr).
 			origins := svc.globalOrigins
 			if requestOrigin != "" && !originListAllows(origins, requestOrigin) &&
-				svc.IsOriginAllowed(req.Context(), requestOrigin) {
-				// A tenant permits it; treat it as allowed for the rest of this
-				// decision without needing to know which tenant.
+				svc.IsOriginAllowed(req.Context(), requestOrigin, requestCORSScope(c)) {
+				// The scoped tenant permits it; treat the origin as allowed
+				// for the rest of this decision.
 				origins = append(append([]string{}, origins...), requestOrigin)
 			}
 

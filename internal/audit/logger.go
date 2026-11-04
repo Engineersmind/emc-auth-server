@@ -79,12 +79,32 @@ const (
 	// with no users.id behind it: the grant is attributed to a client_id in the
 	// event metadata, and an investigation asking "which human did this" needs to
 	// see immediately that the answer is "none".
-	ActionAppUserRolesAssigned    = "app.user_roles_assigned"
-	ActionAdminForcePasswordReset = "admin.force_password_reset"
-	ActionAdminUserBlocked        = "admin.user_blocked"
-	ActionAdminUserUnblocked      = "admin.user_unblocked"
-	ActionAdminUserSessionRevoked = "admin.user_session_revoked"
-	ActionAdminUserSessionsPurged = "admin.user_sessions_purged"
+	ActionAppUserRolesAssigned = "app.user_roles_assigned"
+
+	// Organizations (migrations 00100–00104). The organisation itself is carried
+	// in Event.OrganizationID and, by public id, in the metadata. Each is emitted
+	// by both the admin console and an application backend; the actor fields say
+	// which (a user, or metadata.client_id with no user).
+	ActionOrganizationCreated        = "organization.created"
+	ActionOrganizationUpdated        = "organization.updated"
+	ActionOrganizationDeleted        = "organization.deleted"
+	ActionOrganizationModeChanged    = "organization.mode_changed"
+	ActionOrganizationMemberAdded    = "organization.member_added"
+	ActionOrganizationMemberUpdated  = "organization.member_updated"
+	ActionOrganizationMemberRemoved  = "organization.member_removed"
+	ActionOrganizationRolesAssigned  = "organization.member_roles_assigned"
+	ActionOrganizationRoleRevoked    = "organization.member_role_revoked"
+	ActionOrganizationInviteSent     = "organization.invitation_sent"
+	ActionOrganizationInviteAccepted = "organization.invitation_accepted"
+	ActionOrganizationInviteRevoked  = "organization.invitation_revoked"
+	ActionOrganizationSwitched       = "organization.switched"
+	ActionOrganizationSelected       = "organization.selected"
+	ActionOrganizationLoginDenied    = "organization.login_denied"
+	ActionAdminForcePasswordReset    = "admin.force_password_reset"
+	ActionAdminUserBlocked           = "admin.user_blocked"
+	ActionAdminUserUnblocked         = "admin.user_unblocked"
+	ActionAdminUserSessionRevoked    = "admin.user_session_revoked"
+	ActionAdminUserSessionsPurged    = "admin.user_sessions_purged"
 	// A directory export leaves the building as a file. Recorded so an incident
 	// review can answer who took a copy of the user list, when, and how much of
 	// it — the same question asked of an audit-trail export.
@@ -100,6 +120,11 @@ const (
 	ActionAdminAppLimitCreated = "admin.app_limit_created"
 	ActionAdminAppLimitUpdated = "admin.app_limit_updated"
 	ActionAdminAppLimitDeleted = "admin.app_limit_deleted"
+
+	// Admin — application server-to-server trust (server IPs, forwarded IP)
+	ActionAdminAppServerTrustUpdated = "admin.app_server_trust_updated"
+	// Admin — application per-user rate limit overrides
+	ActionAdminAppUserLimitsUpdated = "admin.app_user_limits_updated"
 
 	// Admin — tenant CORS configuration
 	ActionAdminCORSUpdated = "admin.cors_origins_updated"
@@ -412,6 +437,10 @@ type Event struct {
 	// ApplicationID is the oauth_clients.id the action occurred under.
 	// Nil for tenant-level events with no application context.
 	ApplicationID *int64
+	// OrganizationID is the organizations.id the action concerns (migration
+	// 00103). Nil for every event that is not about an organisation, which is
+	// every event emitted before organisations existed.
+	OrganizationID *int64
 	// ActorEmail is the email of the actor (denormalized at log time).
 	ActorEmail string
 	// Action is one of the Action* constants above.

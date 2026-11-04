@@ -10,3 +10,12 @@ scrape_configs:
     static_configs:
       - targets: ["app:9090"]
     metrics_path: /metrics
+    # GHSA-4r4c-348x-w452 (L-02): in production/staging the endpoint only exists
+    # when METRICS_TOKEN is set, so this scrape must present it. Point the file
+    # at a mounted secret containing the token — e.g.
+    #   authorization:
+    #     credentials_file: /run/secrets/metrics_token
+    # Development/test keep the endpoint open, so this block stays commented
+    # for the local compose stack.
+    # authorization:
+    #   credentials_file: /run/secrets/metrics_token

@@ -132,7 +132,7 @@ func enrichAudit(c echo.Context, e *audit.Event) {
 		}
 	}
 	if e.IPAddress == "" {
-		e.IPAddress = c.RealIP()
+		e.IPAddress = clientIP(c)
 	}
 	if e.UserAgent == "" {
 		e.UserAgent = c.Request().UserAgent()

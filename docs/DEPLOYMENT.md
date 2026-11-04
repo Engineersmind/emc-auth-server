@@ -18,11 +18,11 @@ This runbook covers first-time production deployment, environment configuration,
 | REDIS_URL | Yes | — | Redis URL e.g. `redis://:password@host:6379/0` |
 | JWT_ISSUER | Yes | `https://auth.emc.local` | Base URL of this server placed in the `iss` JWT claim. Verified on every token — the server refuses to start if it is empty, and changing it invalidates all tokens already minted |
 | APP_BASE_URL | Yes | `http://localhost:8080` | Same as JWT_ISSUER — prepended to password-reset link URLs in emails |
-| SEED_ADMIN_PASSWORD | Yes | `ChangeMe123!` | First-run super-admin password — **change after first login** |
+| SEED_ADMIN_PASSWORD | Yes (deployed envs, first boot) | dev-only fallback | First-run super-admin password — outside development/test the server **refuses to seed** a fresh super-admin without it; once the credential row exists it may be left unset. **Change after first login** |
 | TOTP_ENCRYPTION_KEY | Yes | — | 64-char hex AES-256 key for TOTP secret encryption. Generate: `openssl rand -hex 32` |
 | TRUSTED_PROXIES | Yes (production/staging) | — | Comma-separated CIDRs of **this server's own** reverse proxies; `X-Forwarded-For` is believed only from them. The server refuses to start without it outside development. See [Client IP and trusted proxies](#client-ip-and-trusted-proxies) |
 | PORT | No | `8080` | HTTP listen port |
-| ENV | No | `development` | Set to `production` to enable HTTPS redirect and production mailer |
+| ENV | Yes | `production` | GHSA-vgf9-64q8-gj87: an **unset** ENV defaults to the production posture (fails closed on missing COOKIE_DOMAIN/TOTP_ENCRYPTION_KEY/TRUSTED_PROXIES); set `development` explicitly for local runs. Unrecognised values refuse to boot |
 | LOG_LEVEL | No | `info` | Zerolog level: `debug` / `info` / `warn` / `error` |
 | SMTP_HOST | No | — | SMTP server hostname (required in production for password-reset emails) |
 | SMTP_PORT | No | `587` | SMTP server port (587 for STARTTLS, 465 for SSL) |
