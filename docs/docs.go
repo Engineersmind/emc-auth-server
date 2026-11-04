@@ -13055,6 +13055,24 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
+                        "description": "Optional opaque value (max 512 printable ASCII chars) echoed unchanged on the redirect back; use it to bind the callback to the browser that started the flow",
+                        "name": "state",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Optional PKCE S256 challenge base64url(SHA256(code_verifier)); when set, exchange requires the code_verifier",
+                        "name": "code_challenge",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Must be S256 when code_challenge is set",
+                        "name": "code_challenge_method",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
                         "description": "Post-login redirect target (must be in the application's allow-list; optional when the list has exactly one entry)",
                         "name": "redirect",
                         "in": "query"
@@ -16619,6 +16637,10 @@ const docTemplate = `{
             "type": "object",
             "properties": {
                 "client_id": {
+                    "type": "string"
+                },
+                "code_verifier": {
+                    "description": "CodeVerifier is required iff code_challenge was sent to the login endpoint.",
                     "type": "string"
                 },
                 "login_code": {
