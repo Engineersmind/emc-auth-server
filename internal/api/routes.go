@@ -751,8 +751,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 
 	// Encrypt plaintext tenants.jwt_secret rows in place (GHSA-4x5m-3gph-938r).
 	// Non-fatal for the same reason as the key backfill: tenantSecret falls back
-	// to the plaintext column until this pass reaches the row.
-	if encrypted, err := jwtSvc.EncryptAllTenantSecrets(startupCtx); err != nil {
+	// to the plaintext column until this pass reaches the row. Each encryption
+	// pass runs on its own context and deadline rather than sharing the key
+	// backfill's startupCtx — a slow backfill would otherwise hand a
+	// re-encryption sweep a mostly-spent context, and a sweep cut short
+	// leaves old-key ciphertext behind while the boot reads as healthy.
+	encBackfillCtx, cancelEncBackfill := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelEncBackfill()
+	if encrypted, err := jwtSvc.EncryptAllTenantSecrets(encBackfillCtx); err != nil {
 		deps.Logger.Error().Err(err).Msg("jwt_secret encryption backfill failed — plaintext secrets remain until next startup")
 	} else if encrypted > 0 {
 		deps.Logger.Info().Int("tenants", encrypted).Msg("encrypted tenant jwt_secret values at rest")
@@ -764,23 +770,43 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// JWT_SIGNING_KEY_ENCRYPTION_KEY while the previous one is still
 	// configured. Without these sweeps retiring the previous key would orphan
 	// old-key ciphertext, and an undecryptable signing key stops a tenant
-	// issuing at all (GHSA-4x5m-3gph-938r review). One boot suffices —
-	// afterwards JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS can be removed.
+	// issuing at all (GHSA-4x5m-3gph-938r review). The previous key is safe to
+	// remove only once the startup log shows the "encryption-key rotation
+	// complete" line below — a failed or unfinished sweep means it must stay.
 	//
 	// Both sweeps refuse to write when the primary key is the development
 	// zero key; surface that skip here, since JWTService carries no logger.
-	if signingKeyBox.HasPreviousKey() && signingKeyBox.UsesInsecureZeroKey() {
-		deps.Logger.Warn().Msg("re-encryption sweeps skipped — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS is set while the primary key is the development zero key; re-sealing under it would orphan every row once a real key is set")
+	previousKeyConfigured := signingKeyBox.HasPreviousKey()
+	zeroKeyPrimary := signingKeyBox.UsesInsecureZeroKey()
+	if previousKeyConfigured && zeroKeyPrimary {
+		deps.Logger.Warn().Msg("re-encryption sweeps skipped — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS is set while the primary key is the development zero key; re-sealing under it would orphan every row once a real key is set — the previous key must be kept")
 	}
-	if reencrypted, err := jwtSvc.ReencryptTenantSecrets(startupCtx); err != nil {
-		deps.Logger.Error().Err(err).Msg("jwt_secret_enc re-encryption sweep failed — old-key ciphertext remains until next startup")
+	sweepsOK := true
+	secretsSweepCtx, cancelSecretsSweep := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelSecretsSweep()
+	if reencrypted, err := jwtSvc.ReencryptTenantSecrets(secretsSweepCtx); err != nil {
+		sweepsOK = false
+		deps.Logger.Error().Err(err).Msg("jwt_secret_enc re-encryption sweep failed — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS must be kept: old-key ciphertext remains until next startup")
 	} else if reencrypted > 0 {
 		deps.Logger.Info().Int("tenants", reencrypted).Msg("re-encrypted tenant jwt_secret values under the new key")
 	}
-	if resealed, err := signingKeySvc.ReencryptPrivateKeys(startupCtx); err != nil {
-		deps.Logger.Error().Err(err).Msg("signing_keys.private_key_enc re-encryption sweep failed — old-key ciphertext remains until next startup")
+	keysSweepCtx, cancelKeysSweep := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelKeysSweep()
+	if resealed, err := signingKeySvc.ReencryptPrivateKeys(keysSweepCtx); err != nil {
+		sweepsOK = false
+		deps.Logger.Error().Err(err).Msg("signing_keys.private_key_enc re-encryption sweep failed — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS must be kept: old-key ciphertext remains until next startup")
 	} else if resealed > 0 {
 		deps.Logger.Info().Int("signing_keys", resealed).Msg("re-encrypted signing private keys under the new encryption key")
+	}
+	// The operator-facing signal the rotation guidance keys on. A zero-key
+	// skip is NOT completion: the sweeps refused to write, so the old-key
+	// rows are untouched and the previous key is still needed to read them.
+	if previousKeyConfigured && !zeroKeyPrimary {
+		if sweepsOK {
+			deps.Logger.Info().Msg("encryption-key rotation complete — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS can now be removed")
+		} else {
+			deps.Logger.Warn().Msg("encryption-key rotation incomplete — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS must be kept until a startup logs the rotation-complete line")
+		}
 	}
 
 	// Drop retired keys whose grace window has elapsed. Without this every rotation

@@ -684,9 +684,10 @@ func (s *SigningKeyService) BackfillAllTenants(ctx context.Context) (int, error)
 // active key's private half on every cache fill (GHSA-4x5m-3gph-938r review).
 // Run at startup while the box carries a previous key: Decrypt falls back to
 // it transparently, and Encrypt always seals under the primary. Together with
-// JWTService.ReencryptTenantSecrets this is what makes "leave
-// JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS for one restart, then remove it"
-// safe — both ciphertext families the box protects are covered.
+// JWTService.ReencryptTenantSecrets this is what lets a boot log
+// "encryption-key rotation complete" — the signal that
+// JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS can be removed, because both
+// ciphertext families the box protects are covered.
 //
 // Only 'active' and 'next' rows are touched: a retired key's private half is
 // never loaded (load decrypts the active key only) and the row is collected

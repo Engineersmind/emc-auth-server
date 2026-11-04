@@ -747,8 +747,10 @@ func (s *JWTService) EncryptAllTenantSecrets(ctx context.Context) (int, error) {
 // key is retired (GHSA-4x5m-3gph-938r review). Run at startup right after
 // EncryptAllTenantSecrets whenever the box carries a previous key: Decrypt
 // falls back to it transparently, and Encrypt always seals under the primary.
-// One boot is then enough to retire the previous key — leave
-// JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS set for one restart, then remove it.
+// Retire the previous key only once a startup logs the "encryption-key
+// rotation complete" line — a boot whose sweeps failed or ran out of context
+// leaves old-key ciphertext JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS still
+// decrypts.
 // The companion sweep SigningKeyService.ReencryptPrivateKeys covers the other
 // ciphertext family the same box seals (signing_keys.private_key_enc), which
 // has no rewrite path either; both must run before the previous key goes away.

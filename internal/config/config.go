@@ -123,11 +123,17 @@ type Config struct {
 	// startup sweeps re-seal both ciphertext families the box protects that
 	// have no rewrite path of their own: tenants.jwt_secret_enc
 	// (JWTService.ReencryptTenantSecrets) and the live signing_keys.private_key_enc
-	// rows (SigningKeyService.ReencryptPrivateKeys). Leave it set for ONE
-	// restart after rotating — once a boot has re-sealed both families it can
-	// be removed safely. Note this rotates the ENCRYPTION key, not the signing
-	// keys themselves — signing-key rotation is a separate operation (see the
-	// admin rotate endpoint).
+	// rows (SigningKeyService.ReencryptPrivateKeys). Remove it only after a
+	// startup log shows "encryption-key rotation complete" — a boot whose
+	// sweeps failed or were cut short leaves old-key ciphertext this key
+	// still decrypts. With more than one app instance, every instance must
+	// first run with the new primary AND the old key as previous before any
+	// instance's sweep result is relied on — the first instance on the new
+	// primary re-seals shared rows an old-primary-only instance can no
+	// longer decrypt; a single instance needs nothing extra. Note this
+	// rotates the
+	// ENCRYPTION key, not the signing keys themselves — signing-key rotation
+	// is a separate operation (see the admin rotate endpoint).
 	JWTSigningKeyEncryptionKeyPrevious string
 
 	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable during the
