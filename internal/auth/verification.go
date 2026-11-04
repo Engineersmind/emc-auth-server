@@ -196,6 +196,19 @@ func (s *VerificationService) VerifyEmail(ctx context.Context, rawToken string) 
 // ALWAYS returns nil to prevent email enumeration, mirroring ForgotPassword.
 // Already-verified or unknown emails silently succeed.
 func (s *VerificationService) ResendVerification(ctx context.Context, email string) error {
+	return s.ResendVerificationInTenant(ctx, email, 0)
+}
+
+// ResendVerificationInTenant is ResendVerification restricted to one tenant
+// when scopeTenantID is non-zero: an account in any other tenant reads as
+// absent (still nil, nothing sent).
+//
+// For an application's backend calling on behalf of its users. Its verified
+// credentials lift the per-IP limit on this route, so unscoped they let any
+// tenant drive verification mail to unverified accounts in every other tenant
+// at its own quota (PR #174 review). Scoped, the lifted limit only ever
+// reaches the caller's own tenant.
+func (s *VerificationService) ResendVerificationInTenant(ctx context.Context, email string, scopeTenantID int64) error {
 	email = emailaddr.Normalize(email)
 
 	// Resolved from the email alone, exactly as Login does.
@@ -227,9 +240,10 @@ func (s *VerificationService) ResendVerification(ctx context.Context, email stri
 		WHERE u.email = $1 AND u.application_id IS NULL
 		  AND u.is_active = true AND u.deleted_at IS NULL AND u.email_verified = false
 		  AND t.is_active = true AND t.deleted_at IS NULL
+		  AND ($2::bigint = 0 OR u.tenant_id = $2)
 		ORDER BY u.id
 		LIMIT 1
-	`, email).Scan(&userID, &tenantID)
+	`, email, scopeTenantID).Scan(&userID, &tenantID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Enumeration-safe: the handler answers 200 either way, so an absent

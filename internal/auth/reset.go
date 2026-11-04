@@ -218,6 +218,14 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 type ResetPasswordInput struct {
 	RawToken    string
 	NewPassword string
+	// ScopeTenantID and ScopeApplicationID, when set, restrict the token to
+	// users of that tenant and application. Set when an application's backend
+	// redeems the token on its users' behalf: it may only redeem its own
+	// users' tokens, so a tenant holding valid credentials cannot use its own
+	// (higher, per-application) limits to guess another tenant's tokens. Zero
+	// / nil means unscoped, as for a browser calling directly.
+	ScopeTenantID      int64
+	ScopeApplicationID *int64
 }
 
 // ErrInvalidResetToken is returned when the reset token is invalid, expired, or already used.
@@ -241,7 +249,9 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 		WHERE t.token_hash = $1
 		  AND t.used_at IS NULL
 		  AND t.expires_at > NOW()
-	`, tokenHash).Scan(&tokenID, &userID, &tenantID, &email, &appRowID)
+		  AND ($2::bigint = 0 OR t.tenant_id = $2)
+		  AND ($3::bigint IS NULL OR u.application_id = $3)
+	`, tokenHash, in.ScopeTenantID, in.ScopeApplicationID).Scan(&tokenID, &userID, &tenantID, &email, &appRowID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrInvalidResetToken

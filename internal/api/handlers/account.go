@@ -40,7 +40,7 @@ func (h *AuthHandler) notifyRiskySignIn(c echo.Context, tenantID, userID, appID 
 	if h.blockSvc == nil || tenantID == nil || userID == nil {
 		return
 	}
-	h.blockSvc.NotifyIfRisky(c.Request().Context(), *tenantID, appID, *userID, email, c.RealIP(), c.Request().UserAgent())
+	h.blockSvc.NotifyIfRisky(c.Request().Context(), *tenantID, appID, *userID, email, clientIP(c), c.Request().UserAgent())
 }
 
 // AcceptInvitationRequest is the body for POST /api/v1/auth/accept-invitation.
@@ -159,7 +159,7 @@ func (h *AuthHandler) AcceptInvitation(c echo.Context) error {
 		ActorEmail:   target.Email,
 		Action:       audit.ActionAuthInvitationAccepted,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 	return c.JSON(http.StatusOK, map[string]string{"message": "invitation accepted — you can now sign in"})
@@ -219,7 +219,7 @@ func (h *AuthHandler) ChangeEmail(c echo.Context) error {
 		ActorEmail:   claims.Email,
 		Action:       audit.ActionAuthEmailChangeReq,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 	})
 	return c.JSON(http.StatusAccepted, map[string]string{"message": "confirmation link sent to the new address"})
@@ -264,7 +264,7 @@ func (h *AuthHandler) ConfirmEmailChange(c echo.Context) error {
 		ActorEmail:   res.NewEmail,
 		Action:       audit.ActionAuthEmailChanged,
 		ResourceType: "user",
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"previous_email": res.OldEmail},
 	})
