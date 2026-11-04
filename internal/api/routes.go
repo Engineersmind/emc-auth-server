@@ -947,6 +947,14 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword,
 		s2s.Resolve(mw.SurfaceReset), appClientRateLimit,
 		s2s.UserLimit("app_forgot_password_user", userLimits.ForgotPassword, mw.SubjectEmail))
+	// The console's forgot-password (issue #179): first-party, from a browser,
+	// with no client credentials. ResolveAnonymous holds every caller to the
+	// AUTH-07 5/min per IP, shared with /reset-password on the reset surface,
+	// and the per-email limit bounds inbox flooding of one recipient from many
+	// addresses. The handler adds the platform captcha and the fan-out cap.
+	authGroup.POST("/console/forgot-password", authHandler.ConsoleForgotPassword,
+		s2s.ResolveAnonymous(mw.SurfaceReset),
+		s2s.UserLimit("console_forgot_password_user", userLimits.ForgotPassword, mw.SubjectEmail))
 	// reset-password consumes a bearer credential — without a limiter it is an
 	// online brute-force oracle on reset tokens. The presented value IS the
 	// guess, so a per-token bucket could never fill: the meaningful key is who

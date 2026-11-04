@@ -116,17 +116,85 @@ func auditEmailSuppressed(ctx context.Context, a *audit.Logger, tenantID int64, 
 // resolved tenant + application. ALWAYS returns nil to prevent email
 // enumeration (RESET-03).
 func (s *ResetService) ForgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string) error {
-	return s.forgotPassword(ctx, tenantID, appRowID, email, true)
+	_, err := s.forgotPassword(ctx, tenantID, appRowID, email, true)
+	return err
 }
 
 // ForgotPasswordForced is the admin-initiated variant (ForcePasswordReset): it
 // ignores the template disable flag so a super-admin force-reset always sends,
 // regardless of the tenant/app template configuration.
 func (s *ResetService) ForgotPasswordForced(ctx context.Context, tenantID int64, appRowID *int64, email string) error {
-	return s.forgotPassword(ctx, tenantID, appRowID, email, false)
+	_, err := s.forgotPassword(ctx, tenantID, appRowID, email, false)
+	return err
 }
 
-func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string, honorSuppression bool) error {
+// MaxConsoleResetFanOut caps how many first-party accounts one console
+// forgot-password request may issue reset tokens for. An email holds at most
+// one first-party account per tenant, so this is a cap on tenants. It bounds
+// the work and the mail one unauthenticated request can cause; accounts past
+// the cap are skipped and logged, never reported to the caller.
+const MaxConsoleResetFanOut = 10
+
+// ForgotPasswordFirstParty is the console variant of ForgotPassword (issue
+// #179). The console is a browser and holds no client credentials, so there is
+// no application to scope the lookup to and no tenant slug to pick a tenant.
+// Unlike Login it has no password to tell same-email accounts apart, so it
+// issues one token per first-party account (application_id IS NULL) the email
+// owns, each in its own email. A token resolves to exactly one user, so each
+// link resets only its own account.
+//
+// Returns the tenant ids a token was issued for, for the caller to audit. The
+// caller must not let the result change its response (RESET-03).
+func (s *ResetService) ForgotPasswordFirstParty(ctx context.Context, email string) ([]int64, error) {
+	email = emailaddr.Normalize(email)
+
+	// One row past the cap, so an overflow can be logged rather than silently
+	// truncated. Same tenant and account filters as console Login.
+	rows, err := s.pool.Query(ctx, `
+		SELECT u.tenant_id
+		FROM users u
+		JOIN tenants t ON t.id = u.tenant_id
+		WHERE u.email = $1
+		  AND u.application_id IS NULL
+		  AND u.is_active = true
+		  AND u.deleted_at IS NULL
+		  AND t.is_active = true
+		  AND t.deleted_at IS NULL
+		ORDER BY u.tenant_id
+		LIMIT $2
+	`, email, MaxConsoleResetFanOut+1)
+	if err != nil {
+		return nil, fmt.Errorf("lookup first-party accounts for forgot-password: %w", err)
+	}
+	tenantIDs, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, fmt.Errorf("scan first-party accounts for forgot-password: %w", err)
+	}
+	if len(tenantIDs) > MaxConsoleResetFanOut {
+		s.logger.Warn().Int("cap", MaxConsoleResetFanOut).Msg("forgot-password: first-party accounts exceed the fan-out cap — skipping the rest")
+		tenantIDs = tenantIDs[:MaxConsoleResetFanOut]
+	}
+
+	var issued []int64
+	for _, tenantID := range tenantIDs {
+		// One account failing must not stop the others: each is independent.
+		ok, err := s.forgotPassword(ctx, tenantID, nil, email, true)
+		if err != nil {
+			s.logger.Error().Err(err).Int64("tenant_id", tenantID).Msg("forgot-password: first-party reset failed")
+			continue
+		}
+		if ok {
+			issued = append(issued, tenantID)
+		}
+	}
+	return issued, nil
+}
+
+// forgotPassword reports whether a reset token was issued, which callers audit.
+// It is false, with a nil error, when there is no such user or the template is
+// suppressed. A failed send still reports true: the token exists and is
+// redeemable, so the audit trail must show it even though no email went out.
+func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string, honorSuppression bool) (bool, error) {
 	email = emailaddr.Normalize(email)
 
 	// Suppression: if the reset template is disabled at this scope, don't send —
@@ -134,7 +202,7 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 	if honorSuppression && !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordReset) {
 		s.logger.Info().Int64("tenant_id", tenantID).Msg("forgot-password: reset template disabled at this scope — not sending")
 		auditEmailSuppressed(ctx, s.audit, tenantID, appRowID, mailer.TemplatePasswordReset)
-		return nil
+		return false, nil
 	}
 
 	// Scope the lookup to the authenticated application: an email may hold
@@ -148,14 +216,14 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			s.logger.Debug().Str("email", email).Msg("forgot-password: user not found, silently succeeding")
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("lookup user for forgot-password: %w", err)
+		return false, fmt.Errorf("lookup user for forgot-password: %w", err)
 	}
 
 	rawToken, err := GenerateRefreshToken()
 	if err != nil {
-		return fmt.Errorf("generate reset token: %w", err)
+		return false, fmt.Errorf("generate reset token: %w", err)
 	}
 	tokenHash := HashToken(rawToken)
 
@@ -164,7 +232,7 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 		VALUES ($1, $2, $3, $4)
 	`, userID, tenantID, tokenHash, time.Now().UTC().Add(ResetTokenTTL))
 	if err != nil {
-		return fmt.Errorf("persist reset token: %w", err)
+		return false, fmt.Errorf("persist reset token: %w", err)
 	}
 
 	// The link goes to the dashboard reset page, not the API endpoint — a query
@@ -203,7 +271,7 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 	}
 	if sendErr != nil {
 		s.logger.Error().Err(sendErr).Str("email", email).Msg("forgot-password: email dispatch failed")
-		return nil
+		return true, nil
 	}
 
 	s.logger.Info().
@@ -211,7 +279,7 @@ func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRo
 		Str("user_id", strconv.FormatInt(userID, 10)).
 		Msg("forgot-password: reset token issued")
 
-	return nil
+	return true, nil
 }
 
 // ResetPasswordInput is the payload for the reset-password endpoint.

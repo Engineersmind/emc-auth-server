@@ -663,6 +663,34 @@ X-Tenant-Slug: acme
 | `POST /api/v1/auth/login` | Defaults to tenant `emc` |
 | `POST /api/v1/auth/session` | Defaults to tenant `emc` |
 
+### POST `/api/v1/auth/console/forgot-password` (#179)
+
+<!-- Frontend use: the console's /forgot-password page. The emailed link opens
+     <DASHBOARD_BASE_URL>/reset-password?token=…, which POSTs the token to
+     /api/v1/auth/reset-password. -->
+
+The console's forgot-password. **No client credentials, no tenant slug.**
+`POST /api/v1/auth/forgot-password` is for applications only (Basic client
+credentials) and cannot reach console accounts.
+
+```http
+POST /api/v1/auth/console/forgot-password
+Content-Type: application/json
+
+{ "email": "admin@acme.com", "captcha_id": "…", "captcha_answer": "…" }
+```
+
+`captcha_id` / `captcha_answer` are optional, needed only after a `428`.
+
+| Status | Body | Meaning |
+|---|---|---|
+| `200` | `{"message":"if that email address is registered, a password reset link has been sent"}` | Always the same, registered or not. Show it as-is. |
+| `428` | `{"error":"captcha_required"}` or `{"error":"captcha_invalid"}` | Fetch `POST /api/v1/captcha/challenge`, show it, retry with the answer. |
+| `429` | `{"error":"…","limiter":"ip"\|"user","retry_after":"60"}` | 5/min per address (`ip`) or 5/min per email (`user`). Wait `Retry-After`. |
+
+An address that owns console accounts in several tenants gets one email per
+account. Each link resets only the account it was sent for.
+
 ### GET `/api/v1/auth/my-activity`
 
 <!-- Frontend use: "My activity" section on the user's own profile page —

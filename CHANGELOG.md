@@ -74,6 +74,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `docs/AUTH_TOKEN_MIGRATION.md`. The `Sunset` date is a proposal under review.
 
 ### Fixed
+- **Console administrators could not reset a forgotten password** (#179) — once
+  `POST /api/v1/auth/forgot-password` became application-only (Basic client
+  credentials, lookup scoped to the application), nothing could reach a first-party
+  account (`application_id IS NULL`) from a browser. New
+  **`POST /api/v1/auth/console/forgot-password`** takes `{email, captcha_id?,
+  captcha_answer?}` and no credentials. It emails one reset link per active
+  first-party account the address owns (one per tenant, capped at 10); each token
+  resets only its own account through the existing `POST /auth/reset-password`. It
+  always answers the same `200` (RESET-03), or `428` when the platform captcha policy
+  demands a challenge. Limits: AUTH-07 5/min per IP (`limiter: "ip"`; any client
+  credentials sent are ignored) and 5/min per recipient email (`limiter: "user"`).
+  Each request counts toward the adaptive captcha trigger. Each issued token is
+  audited as `auth.password_reset_requested` with its tenant and no application.
+  The application endpoint is unchanged.
 - **`POST /api/v1/auth/refresh` returned no tokens to application-scoped clients** (#108)
   — the rotated pair was delivered only through `setAuthCookies`, which deliberately
   writes nothing for an identity carrying an `app_id` claim ("cookies are for the portal,

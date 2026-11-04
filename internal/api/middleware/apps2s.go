@@ -493,6 +493,17 @@ func (s *AppS2S) Resolve(surface string) echo.MiddlewareFunc {
 	return s.resolve(surface, resolveMode{}, headerCredentials)
 }
 
+// ResolveAnonymous is Resolve for first-party browser routes that take no
+// application credentials at all (POST /auth/console/forgot-password). Any
+// credentials sent are ignored, so every caller is anonymous: the flood guard
+// and the strict AUTH-07 per-IP limit always apply, and valid credentials for
+// some application cannot lift them on a route that acts for no application.
+func (s *AppS2S) ResolveAnonymous(surface string) echo.MiddlewareFunc {
+	return s.resolve(surface, resolveMode{}, func(echo.Context) (string, string, bool) {
+		return "", "", false
+	})
+}
+
 // ResolveBodyClient is Resolve for routes that name the application by a
 // client_id in the JSON body and carry no secret (POST /captcha/challenge). The
 // caller can never verify, so only the server list can lift the strict limit.
