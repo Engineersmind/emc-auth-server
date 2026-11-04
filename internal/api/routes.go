@@ -758,15 +758,29 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		deps.Logger.Info().Int("tenants", encrypted).Msg("encrypted tenant jwt_secret values at rest")
 	}
 
-	// Re-seal jwt_secret_enc under the new JWT_SIGNING_KEY_ENCRYPTION_KEY while
-	// the previous one is still configured. jwt_secret_enc has no rewrite path
-	// of its own, so without this sweep retiring the previous key would orphan
-	// old-key ciphertext (GHSA-4x5m-3gph-938r review). One boot suffices —
+	// Re-seal the two ciphertext families the signing-key box protects that
+	// have no rewrite path of their own — tenants.jwt_secret_enc and the live
+	// signing_keys.private_key_enc rows — under the new
+	// JWT_SIGNING_KEY_ENCRYPTION_KEY while the previous one is still
+	// configured. Without these sweeps retiring the previous key would orphan
+	// old-key ciphertext, and an undecryptable signing key stops a tenant
+	// issuing at all (GHSA-4x5m-3gph-938r review). One boot suffices —
 	// afterwards JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS can be removed.
+	//
+	// Both sweeps refuse to write when the primary key is the development
+	// zero key; surface that skip here, since JWTService carries no logger.
+	if signingKeyBox.HasPreviousKey() && signingKeyBox.UsesInsecureZeroKey() {
+		deps.Logger.Warn().Msg("re-encryption sweeps skipped — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS is set while the primary key is the development zero key; re-sealing under it would orphan every row once a real key is set")
+	}
 	if reencrypted, err := jwtSvc.ReencryptTenantSecrets(startupCtx); err != nil {
 		deps.Logger.Error().Err(err).Msg("jwt_secret_enc re-encryption sweep failed — old-key ciphertext remains until next startup")
 	} else if reencrypted > 0 {
 		deps.Logger.Info().Int("tenants", reencrypted).Msg("re-encrypted tenant jwt_secret values under the new key")
+	}
+	if resealed, err := signingKeySvc.ReencryptPrivateKeys(startupCtx); err != nil {
+		deps.Logger.Error().Err(err).Msg("signing_keys.private_key_enc re-encryption sweep failed — old-key ciphertext remains until next startup")
+	} else if resealed > 0 {
+		deps.Logger.Info().Int("signing_keys", resealed).Msg("re-encrypted signing private keys under the new encryption key")
 	}
 
 	// Drop retired keys whose grace window has elapsed. Without this every rotation
