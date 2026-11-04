@@ -210,7 +210,7 @@ func newOAuthTestEnv(t *testing.T, sg *stubGoogle) *oauthTestEnv {
 // returned authorization URL.
 func (env *oauthTestEnv) startLogin(t *testing.T) string {
 	t.Helper()
-	authURL, err := env.svc.BuildAuthURL(context.Background(), ProviderGoogle, env.clientID, env.redirect)
+	authURL, err := env.svc.BuildAuthURL(context.Background(), ProviderGoogle, env.clientID, env.redirect, LoginBinding{})
 	if err != nil {
 		t.Fatalf("BuildAuthURL: %v", err)
 	}
@@ -268,7 +268,7 @@ func TestGoogleLoginFlowIntegration(t *testing.T) {
 		// Login-code exchange → real token pair via issueTokenPair.
 		u, _ := url.Parse(result.RedirectURI)
 		code := u.Query().Get("login_code")
-		tokens, err := env.svc.ExchangeLoginCode(ctx, env.clientID, code)
+		tokens, err := env.svc.ExchangeLoginCode(ctx, env.clientID, code, "")
 		if err != nil {
 			t.Fatalf("ExchangeLoginCode: %v", err)
 		}
@@ -277,7 +277,7 @@ func TestGoogleLoginFlowIntegration(t *testing.T) {
 		}
 
 		// Replay of the same login code must fail.
-		if _, err := env.svc.ExchangeLoginCode(ctx, env.clientID, code); !errors.Is(err, ErrInvalidLoginCode) {
+		if _, err := env.svc.ExchangeLoginCode(ctx, env.clientID, code, ""); !errors.Is(err, ErrInvalidLoginCode) {
 			t.Fatalf("login code replay: err = %v, want ErrInvalidLoginCode", err)
 		}
 

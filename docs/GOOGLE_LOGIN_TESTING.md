@@ -36,6 +36,13 @@ that touches the flow, and attach the filled-in copy to the PR.
 
 - [ ] **Replay login_code:** second `POST /auth/oauth/exchange` with the same
       code → 401
+- [ ] **Client state echo (#177):** `/oauth/google/login?...&state=abc` → callback
+      URL carries `state=abc` unchanged (also on `error=` redirects); without
+      `state` the callback has none
+- [ ] **PKCE binding (#177):** login with `code_challenge` (S256) → exchange
+      without/with wrong `code_verifier` → 401 (code NOT burned); with the right
+      one → tokens. Oversized `state` / bad `code_challenge` → 400. See
+      `SOCIAL_LOGIN_INTEGRATION.md`
 - [ ] **Replay callback:** re-open the callback URL from browser history → 400
       invalid/expired (state single-use)
 - [ ] **Denied consent:** click Cancel on Google → redirected back with

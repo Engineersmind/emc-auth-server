@@ -2,10 +2,13 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -268,6 +271,82 @@ type OAuthState struct {
 	Provider string `json:"provider"`
 	Verifier string `json:"verifier"` // PKCE code verifier (S256)
 	Redirect string `json:"redirect"` // validated against redirect_allow at initiation
+
+	// ClientState is the integrator's opaque state, echoed unchanged on the
+	// redirect back (issue #177). Empty when the integrator sent none.
+	ClientState string `json:"client_state,omitempty"`
+	// ClientChallenge is the integrator's PKCE S256 challenge; when set, the
+	// login_code is redeemable only with the matching code_verifier.
+	ClientChallenge string `json:"client_challenge,omitempty"`
+}
+
+// maxClientStateLen caps the integrator-supplied state (issue #177).
+const maxClientStateLen = 512
+
+// ErrInvalidLoginBinding is returned for a malformed client state or
+// code_challenge; the handler maps it to 400.
+var ErrInvalidLoginBinding = errors.New("invalid state or code_challenge")
+
+var (
+	challengeRe = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+	verifierRe  = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
+)
+
+// LoginBinding carries the optional integrator-supplied values that let the
+// integrator's backend bind the callback to the browser that started the flow
+// (login CSRF defence). Both are optional.
+type LoginBinding struct {
+	State         string // opaque, echoed back unchanged
+	CodeChallenge string // base64url(SHA256(code_verifier))
+	Method        string // empty or "S256"
+}
+
+// Validate rejects oversized/malformed values. State must be printable ASCII
+// and at most maxClientStateLen bytes.
+func (b LoginBinding) Validate() error {
+	if len(b.State) > maxClientStateLen {
+		return ErrInvalidLoginBinding
+	}
+	for i := 0; i < len(b.State); i++ {
+		if b.State[i] < 0x20 || b.State[i] > 0x7e {
+			return ErrInvalidLoginBinding
+		}
+	}
+	if b.CodeChallenge == "" {
+		if b.Method != "" {
+			return ErrInvalidLoginBinding
+		}
+		return nil
+	}
+	if b.Method != "" && b.Method != "S256" {
+		return ErrInvalidLoginBinding
+	}
+	if !challengeRe.MatchString(b.CodeChallenge) {
+		return ErrInvalidLoginBinding
+	}
+	return nil
+}
+
+// pkceS256 returns base64url(SHA256(verifier)) without padding.
+func pkceS256(verifier string) string {
+	sum := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// AppendState adds the integrator's state to a redirect target, unchanged.
+// No-op when state is empty.
+func AppendState(redirect, state string) string {
+	if state == "" {
+		return redirect
+	}
+	u, err := url.Parse(redirect)
+	if err != nil {
+		return redirect
+	}
+	q := u.Query()
+	q.Set("state", state)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 func oauthStateKey(state string) string {
@@ -278,7 +357,10 @@ func oauthStateKey(state string) string {
 // config + redirect target, generates state and a PKCE S256 verifier, stores
 // the attempt in Redis, and returns the provider authorization URL to
 // redirect the browser to.
-func (s *OAuthLoginService) BuildAuthURL(ctx context.Context, providerName, clientID, requestedRedirect string) (string, error) {
+func (s *OAuthLoginService) BuildAuthURL(ctx context.Context, providerName, clientID, requestedRedirect string, bind LoginBinding) (string, error) {
+	if err := bind.Validate(); err != nil {
+		return "", err
+	}
 	if !supportedProviders[providerName] {
 		return "", ErrProviderNotSupported
 	}
@@ -325,6 +407,9 @@ func (s *OAuthLoginService) BuildAuthURL(ctx context.Context, providerName, clie
 		Provider: providerName,
 		Verifier: verifier,
 		Redirect: redirect,
+
+		ClientState:     bind.State,
+		ClientChallenge: bind.CodeChallenge,
 	})
 	if err != nil {
 		return "", fmt.Errorf("marshal oauth state: %w", err)
@@ -441,7 +526,7 @@ func (s *OAuthLoginService) HandleCallback(ctx context.Context, st *OAuthState, 
 		return nil, err
 	}
 
-	redirectURI, err := appendLoginCode(st.Redirect, loginCode)
+	redirectURI, err := appendLoginCode(AppendState(st.Redirect, st.ClientState), loginCode)
 	if err != nil {
 		return nil, err
 	}
@@ -638,16 +723,23 @@ func (s *OAuthLoginService) createLoginCode(ctx context.Context, st *OAuthState,
 	if err != nil {
 		return "", fmt.Errorf("generate login code: %w", err)
 	}
+	// Optional integrator binding (issue #177): NULL when not requested.
+	var challenge, method *string
+	if st.ClientChallenge != "" {
+		c, m := st.ClientChallenge, "S256"
+		challenge, method = &c, &m
+	}
 	// grant_kind is written explicitly rather than relying on the column
 	// default. The default exists to backfill pre-#6 rows; a new insert that
 	// leaves the discriminator implicit would silently change meaning if that
 	// default were ever altered.
 	_, err = s.pool.Exec(ctx, `
 		INSERT INTO oauth_authorization_codes
-		    (tenant_id, client_id, user_id, code_hash, redirect_uri, scopes, grant_kind, expires_at)
-		VALUES ($1, $2, $3, $4, $5, '{}', $6, $7)
+		    (tenant_id, client_id, user_id, code_hash, redirect_uri, scopes, grant_kind, expires_at,
+		     code_challenge, code_challenge_method)
+		VALUES ($1, $2, $3, $4, $5, '{}', $6, $7, $8, $9)
 	`, st.TenantID, st.ClientID, userID, HashToken(raw), st.Redirect,
-		GrantKindLoginCode, time.Now().UTC().Add(loginCodeTTL))
+		GrantKindLoginCode, time.Now().UTC().Add(loginCodeTTL), challenge, method)
 	if err != nil {
 		return "", fmt.Errorf("persist login code: %w", err)
 	}
@@ -685,9 +777,23 @@ func AppendLoginError(redirect, errCode string) string {
 // refresh token pair. The code must be unused, unexpired, and bound to the
 // presented client_id. Consumption is a single atomic UPDATE — two concurrent
 // exchanges of the same code cannot both succeed.
-func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, rawCode string) (*AuthResult, error) {
+func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, rawCode, codeVerifier string) (*AuthResult, error) {
 	if clientID == "" || rawCode == "" {
 		return nil, ErrInvalidLoginCode
+	}
+	// Issue #177: the code's stored challenge must equal S256(code_verifier).
+	// With no verifier the stored challenge must be NULL (unchanged legacy
+	// path), so a code minted WITH a challenge is never redeemable without its
+	// verifier, and a verifier presented for a code without a challenge is
+	// rejected (no downgrade). The comparison is inside the atomic UPDATE, so a
+	// wrong verifier matches no row and does NOT consume the code.
+	var wantChallenge *string
+	if codeVerifier != "" {
+		if !verifierRe.MatchString(codeVerifier) {
+			return nil, ErrInvalidLoginCode
+		}
+		c := pkceS256(codeVerifier)
+		wantChallenge = &c
 	}
 
 	// grant_kind = 'login_code' is NOT optional (migration 00067).
@@ -712,9 +818,10 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 		SET    used_at = NOW()
 		WHERE  code_hash = $1 AND client_id = $2
 		  AND  grant_kind = $3
+		  AND  code_challenge IS NOT DISTINCT FROM $4
 		  AND  used_at IS NULL AND expires_at > NOW()
 		RETURNING tenant_id, user_id
-	`, HashToken(rawCode), clientID, GrantKindLoginCode).Scan(&tenantID, &userID)
+	`, HashToken(rawCode), clientID, GrantKindLoginCode, wantChallenge).Scan(&tenantID, &userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidLoginCode
