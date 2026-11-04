@@ -212,7 +212,7 @@ func newGitHubTestEnv(t *testing.T, sg *stubGitHub) *githubTestEnv {
 // startLogin runs BuildAuthURL and extracts the state parameter.
 func (env *githubTestEnv) startLogin(t *testing.T) string {
 	t.Helper()
-	authURL, err := env.svc.BuildAuthURL(context.Background(), ProviderGitHub, env.clientID, env.redirect)
+	authURL, err := env.svc.BuildAuthURL(context.Background(), ProviderGitHub, env.clientID, env.redirect, LoginBinding{})
 	if err != nil {
 		t.Fatalf("BuildAuthURL: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestGitHubLoginFlowIntegration(t *testing.T) {
 		// Login-code exchange → standard EMC token pair.
 		u, _ := url.Parse(result.RedirectURI)
 		code := u.Query().Get("login_code")
-		tokens, err := env.svc.ExchangeLoginCode(ctx, env.clientID, code)
+		tokens, err := env.svc.ExchangeLoginCode(ctx, env.clientID, code, "")
 		if err != nil {
 			t.Fatalf("ExchangeLoginCode: %v", err)
 		}

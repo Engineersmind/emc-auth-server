@@ -363,3 +363,64 @@ func TestCreateRole_ReusesTheNameOfADeletedRole(t *testing.T) {
 		t.Fatalf("CreateRole() reusing a deleted role's name: %v", err)
 	}
 }
+
+// A user who holds a role ONLY inside an organisation (#175) carries its
+// permissions in org_permissions. Deleting the role must count them as a
+// holder — so their sessions are denied — and strip the organisation grant,
+// just as it does for user_roles. PR #176 review.
+func TestDeleteRole_IncludesOrganizationOnlyHolders(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+
+	role, err := f.svc.CreateRole(ctx, f.tenantID, &f.appID, "org-approver", nil)
+	if err != nil {
+		t.Fatalf("CreateRole() error = %v", err)
+	}
+	roleID := parseID(t, role.ID)
+	member := newUserOnRole(t, f, "org-only-holder@example.com", nil)
+
+	var orgID int64
+	if err := f.pool.QueryRow(ctx, `
+		INSERT INTO organizations (public_id, tenant_id, application_id, slug, display_name)
+		VALUES ('org_reviewtest0000000001', $1, $2, 'review-org', 'Review Org')
+		RETURNING id
+	`, f.tenantID, f.appID).Scan(&orgID); err != nil {
+		t.Fatalf("insert organization: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO organization_members (organization_id, application_id, user_id, tenant_id)
+		VALUES ($1, $2, $3, $4)
+	`, orgID, f.appID, member, f.tenantID); err != nil {
+		t.Fatalf("insert membership: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `
+		INSERT INTO organization_member_roles (organization_id, user_id, role_id, application_id, tenant_id)
+		VALUES ($1, $2, $3, $4, $5)
+	`, orgID, member, roleID, f.appID, f.tenantID); err != nil {
+		t.Fatalf("insert organization role: %v", err)
+	}
+
+	holders, err := f.svc.DeleteRole(ctx, f.tenantID, roleID)
+	if err != nil {
+		t.Fatalf("DeleteRole() error = %v", err)
+	}
+	found := false
+	for _, h := range holders {
+		if h == member {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("DeleteRole() holders = %v, want the organisation-only holder %d", holders, member)
+	}
+
+	var n int
+	if err := f.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM organization_member_roles WHERE role_id = $1`, roleID,
+	).Scan(&n); err != nil {
+		t.Fatalf("count organization grants: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("%d organisation grants survive the role's deletion, want 0", n)
+	}
+}

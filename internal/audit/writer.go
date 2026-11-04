@@ -61,6 +61,7 @@ var auditColumns = []string{
 	"actor_email", "action", "auth_method", "resource_type", "resource_id",
 	"ip_address", "user_agent", "status", "http_status", "request_id",
 	"metadata", "created_at", "row_hash", "prev_hash",
+	"organization_id",
 }
 
 // sensitiveKeyPart flags metadata keys whose values must never be persisted,
@@ -265,6 +266,7 @@ func (l *Logger) copyBatch(batch []Event) error {
 			parseINET(e.IPAddress), e.UserAgent,
 			status, httpStatus, e.RequestID, buildMetadata(meta), e.createdAt,
 			rowHash, prevHash,
+			e.OrganizationID,
 		}
 	}
 

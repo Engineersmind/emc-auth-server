@@ -15,11 +15,11 @@ Base URL below: `http://localhost:9090` (dev). All bodies are JSON
 # 1. Postgres + Redis (dev containers)
 docker start emc-mfa-test-pg emc-mfa-test-redis   # or create:
 # docker run -d --name emc-mfa-test-pg -e POSTGRES_DB=emc_auth -e POSTGRES_USER=emc_auth \
-#   -e POSTGRES_PASSWORD=password -p 55432:5432 postgres:16-alpine
+#   -e POSTGRES_PASSWORD=local-dev-only -p 55432:5432 postgres:16-alpine
 # docker run -d --name emc-mfa-test-redis -p 56379:6379 redis:7-alpine
 
 # 2. Server (migrations + seed run automatically)
-DATABASE_URL='postgres://emc_auth:password@127.0.0.1:55432/emc_auth?sslmode=disable' \
+DATABASE_URL='postgres://emc_auth:local-dev-only@127.0.0.1:55432/emc_auth?sslmode=disable' \
 REDIS_URL='redis://127.0.0.1:56379/0' ENV=development PORT=9090 go run ./cmd/server
 ```
 

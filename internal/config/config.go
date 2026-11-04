@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -19,10 +20,10 @@ type Config struct {
 	Env         string
 	JWTIssuer   string
 
-	// MetricsToken optionally gates GET /metrics behind a bearer token, set via
-	// METRICS_TOKEN. Empty (the default) leaves the endpoint open, preserving
-	// the original contract: bind it to localhost and restrict it at the
-	// reverse proxy.
+	// MetricsToken gates GET /metrics behind a bearer token, set via
+	// METRICS_TOKEN. In production/staging the endpoint is NOT REGISTERED at
+	// all when this is empty (GHSA-4r4c-348x-w452); in development/test it is
+	// served open for local scraping.
 	//
 	// This exists because that network-level control is the ONLY thing standing
 	// between the Prometheus registry and the public internet, and it is easy to
@@ -159,10 +160,11 @@ type Config struct {
 	// JWTAllowLegacyIssuer keeps tokens carrying the old global JWT_ISSUER
 	// verifiable during the migration to per-tenant issuers (issue #7).
 	//
-	// Same shape and same discipline as JWTAllowLegacyHS256: defaults to true so
-	// the switch does not invalidate tokens minted seconds earlier, and is flipped
-	// to false only once emc_auth_legacy_issuer_verifications_total has been flat
-	// at zero. The longest-lived affected token is the 1 h agent token.
+	// GHSA-6fcw-g2xw-v42w (L-05): defaults to false — the legacy issuer is
+	// rejected unless an operator explicitly sets JWT_ALLOW_LEGACY_ISSUER=true
+	// for a migration window. Flip it back to false once
+	// emc_auth_legacy_issuer_verifications_total has been flat at zero. The
+	// longest-lived affected token is the 1 h agent token.
 	JWTAllowLegacyIssuer bool
 
 	// CookieDomain sets the Domain attribute on auth cookies.
@@ -220,6 +222,18 @@ type Config struct {
 	// capability exists at all; a tenant decides whether it applies to their
 	// users. Neither can turn it on alone.
 	CaptchaEnabled bool
+
+	// OrganizationsEnabled is the deployment-level switch for Organizations —
+	// per-organisation membership and roles inside an application (migrations
+	// 00100–00104). Set via ORGANIZATIONS_ENABLED; false by default.
+	//
+	// Two switches, like CAPTCHA and passkeys: this one, and an application's
+	// organizations_mode ('off' on every existing application). While this is
+	// false every application behaves as 'off' — organisation parameters are
+	// ignored, no organisation claims are minted and the organisation routes
+	// answer 404 — whatever the database says. Turning it off is therefore the
+	// whole-feature rollback, and needs no migration.
+	OrganizationsEnabled bool
 
 	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
 	// Required when CaptchaEnabled is true — the server refuses to start
@@ -295,6 +309,12 @@ type Config struct {
 	// PASSWORD_HASH_MAX_CONCURRENT.
 	PasswordHashMaxConcurrent int
 
+	// AppRateLimits sizes the limits on the application end-user routes
+	// (/auth/apps/*, forgot/reset-password, /auth/token) that product backends
+	// call for every one of their users. 0 means the built-in default, never
+	// unlimited. Env: RATE_LIMIT_APP_*.
+	AppRateLimits AppRateLimitConfig
+
 	// AuditSIEMWebhookURL, when set, streams every persisted audit event as a
 	// JSON POST to this URL (Datadog/Splunk/S3-proxy/generic webhook). Empty
 	// disables streaming. Must be https and resolve to a public IP — private,
@@ -335,8 +355,23 @@ type Config struct {
 	// fallback code is a separate, later release, once this flag has stayed on
 	// without incident for longer than a refresh token's lifetime.
 	//
-	// Set via REQUIRE_AUDIENCE. Defaults to false.
+	// Set via REQUIRE_AUDIENCE. GHSA-6fcw-g2xw-v42w (L-05): defaults to true —
+	// the backstop is on unless an operator explicitly sets it false to stage
+	// the per-client rollout. Set it back to true as soon as the clients that
+	// matter enforce on their own flag.
 	RequireAudience bool
+
+	// OAuthRequireState rejects /oauth/authorize requests that omit the `state`
+	// parameter — the advisory's third component (GHSA-6fcw-g2xw-v42w). RFC
+	// 6749 §4.1.1 marks state RECOMMENDED, but a client that omits it has no
+	// CSRF binding on its callback, and only first-party clients use the flow
+	// here (third-party is refused at the consent gate), so the operator
+	// controls every affected integrator.
+	//
+	// Set via OAUTH_REQUIRE_STATE. Defaults to true — only the exact string
+	// "false" keeps the permissive RFC-default behaviour, for the migration
+	// window while first-party clients add the parameter.
+	OAuthRequireState bool
 
 	// AuditSIEMWebhookSecret, when set, signs every outbound SIEM payload with
 	// HMAC-SHA256 in the X-EMC-Audit-Signature header so the receiver can
@@ -349,11 +384,22 @@ type Config struct {
 func Load() *Config {
 	smtpPort, _ := strconv.Atoi(getEnv("SMTP_PORT", "587"))
 	return &Config{
-		Port:                                   getEnv("PORT", "9090"),
-		DatabaseURL:                            getEnv("DATABASE_URL", "postgres://emc_auth:password@localhost:5433/emc_auth?sslmode=disable"),
-		RedisURL:                               getEnv("REDIS_URL", "redis://localhost:6379/0"),
-		LogLevel:                               getEnv("LOG_LEVEL", "info"),
-		Env:                                    getEnv("ENV", "development"),
+		Port: getEnv("PORT", "9090"),
+		// GHSA-hv5j-m2r7-r4cr (L-06): no committed DSN default — the old fallback
+		// embedded credentials and sslmode=disable. DATABASE_URL must be set
+		// explicitly; Validate() refuses to boot without it.
+		DatabaseURL: getEnv("DATABASE_URL", ""),
+		RedisURL:    getEnv("REDIS_URL", "redis://localhost:6379/0"),
+		LogLevel:    getEnv("LOG_LEVEL", "info"),
+		// GHSA-vgf9-64q8-gj87 (M-03): unset ENV must mean the STRICT posture, not
+		// development. With "development" as the default a deploy that forgets
+		// ENV ships SameSite=Lax insecure cookies, no CSRF check, and no HTTPS
+		// redirect — silently. Defaulting to production makes the omission loud:
+		// Validate() refuses to boot without COOKIE_DOMAIN, so the operator is
+		// forced to choose rather than inheriting the lax path. Local dev is
+		// unaffected — .env.example and docker-compose set ENV=development
+		// explicitly.
+		Env:                                    getEnv("ENV", "production"),
 		MetricsToken:                           getEnv("METRICS_TOKEN", ""),
 		JWTIssuer:                              getEnv("JWT_ISSUER", "https://auth.emc.local"),
 		EmailProvider:                          getEnv("EMAIL_PROVIDER", ""),
@@ -377,17 +423,20 @@ func Load() *Config {
 		// opt-in for the duration of a migration window, not something a
 		// misconfigured deploy gets for free.
 		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "false") == "true",
-		// Fails closed towards COMPATIBILITY, not towards strictness: only the
-		// exact string "false" disables legacy verification, so a typo cannot
-		// accidentally reject every live token.
-		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "true") != "false",
-		// The same fail-towards-COMPATIBILITY rule as the two legacy flags
-		// above, with the polarity mirrored: those default true and only the
-		// exact string "false" tightens them, whereas this defaults false and
-		// only the exact string "true" tightens it. Either way a typo leaves
-		// every live token working rather than refusing all of them, which is
-		// the only direction a misread env var may fail in.
-		RequireAudience: getEnv("REQUIRE_AUDIENCE", "false") == "true",
+		// GHSA-6fcw-g2xw-v42w (L-05): the legacy issuer is now opt-IN, not
+		// opt-out — only the exact string "true" re-accepts old global
+		// JWT_ISSUER tokens during a migration window. An unset or mistyped
+		// variable rejects them rather than silently widening verification.
+		JWTAllowLegacyIssuer: getEnv("JWT_ALLOW_LEGACY_ISSUER", "false") == "true",
+		// GHSA-6fcw-g2xw-v42w (L-05): audience enforcement defaults ON
+		// server-wide; only the exact string "false" opens the per-client
+		// rollout window. An unset or mistyped variable enforces rather than
+		// silently accepting audience-less tokens.
+		RequireAudience: getEnv("REQUIRE_AUDIENCE", "true") != "false",
+		// GHSA-6fcw-g2xw-v42w (L-05): same polarity as RequireAudience — the
+		// rejection defaults ON; only the exact string "false" keeps the
+		// permissive RFC-6749 behaviour during the migration window.
+		OAuthRequireState: getEnv("OAUTH_REQUIRE_STATE", "true") != "false",
 		// Defaults to APP_BASE_URL: in the single-binary deployment the auth server
 		// and the origin used for email links are the same host, so requiring both
 		// to be set would be a config trap with one obviously correct answer.
@@ -400,6 +449,7 @@ func Load() *Config {
 		// Default true — see the field comment. Only an explicit "false" opts out.
 		WebAuthnRequireUserVerification: getEnv("WEBAUTHN_REQUIRE_UV", "true") != "false",
 		CaptchaEnabled:                  getEnv("CAPTCHA_ENABLED", "false") == "true",
+		OrganizationsEnabled:            getEnv("ORGANIZATIONS_ENABLED", "false") == "true",
 		CaptchaHMACKey:                  getEnv("CAPTCHA_HMAC_KEY", ""),
 		CaptchaTTLSeconds:               mustAtoi(getEnv("CAPTCHA_TTL_SECONDS", "120")),
 		GeoIPDatabasePath:               getEnv("GEOIP_DATABASE_PATH", ""),
@@ -412,9 +462,26 @@ func Load() *Config {
 		AuditCaptureResponseBody:  getEnv("AUDIT_CAPTURE_RESPONSE_BODY", "failures"),
 		AuditRetentionDays:        mustAtoi(getEnv("AUDIT_RETENTION_DAYS", "0")),
 		PasswordHashMaxConcurrent: mustAtoi(getEnv("PASSWORD_HASH_MAX_CONCURRENT", "0")),
-		AuditSIEMWebhookURL:       getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
-		AuditSIEMWebhookSecret:    getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
-		AudienceScheme:            getEnv("AUDIENCE_SCHEME", "api://"),
+		AppRateLimits: AppRateLimitConfig{
+			PerIP:                   mustAtoi(getEnv("RATE_LIMIT_APP_PER_IP", "0")),
+			UnverifiedPerIP:         mustAtoi(getEnv("RATE_LIMIT_APP_UNVERIFIED_PER_IP", "0")),
+			BadCredentialsPerClient: mustAtoi(getEnv("RATE_LIMIT_APP_BAD_CREDENTIALS_PER_CLIENT", "0")),
+			UserRegister:            mustAtoi(getEnv("RATE_LIMIT_APP_USER_REGISTER", "0")),
+			UserLogin:               mustAtoi(getEnv("RATE_LIMIT_APP_USER_LOGIN", "0")),
+			UserMagicLink:           mustAtoi(getEnv("RATE_LIMIT_APP_USER_MAGIC_LINK", "0")),
+			UserMagicLinkVerify:     mustAtoi(getEnv("RATE_LIMIT_APP_USER_MAGIC_LINK_VERIFY", "0")),
+			UserForgotPassword:      mustAtoi(getEnv("RATE_LIMIT_APP_USER_FORGOT_PASSWORD", "0")),
+			UserResetPassword:       mustAtoi(getEnv("RATE_LIMIT_APP_USER_RESET_PASSWORD", "0")),
+			UserRoles:               mustAtoi(getEnv("RATE_LIMIT_APP_USER_ROLES", "0")),
+			UserMe:                  mustAtoi(getEnv("RATE_LIMIT_APP_USER_ME", "0")),
+			UserMFAChallenge:        mustAtoi(getEnv("RATE_LIMIT_APP_USER_MFA_CHALLENGE", "0")),
+			UserOAuthExchange:       mustAtoi(getEnv("RATE_LIMIT_APP_USER_OAUTH_EXCHANGE", "0")),
+			UserPasskeyLogin:        mustAtoi(getEnv("RATE_LIMIT_APP_USER_PASSKEY_LOGIN", "0")),
+			UserResendVerification:  mustAtoi(getEnv("RATE_LIMIT_APP_USER_RESEND_VERIFICATION", "0")),
+		},
+		AuditSIEMWebhookURL:    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
+		AuditSIEMWebhookSecret: getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
+		AudienceScheme:         getEnv("AUDIENCE_SCHEME", "api://"),
 	}
 }
 
@@ -434,12 +501,30 @@ func Load() *Config {
 // check in NewTOTPService, keys off ENV; a misspelling such as "prodution" would
 // otherwise skip all of them and boot a deployment with development defaults.
 func (c *Config) Validate() error {
+	// GHSA-hv5j-m2r7-r4cr (L-06): DATABASE_URL is required in every environment —
+	// there is no committed fallback anymore, and an empty DSN would only fail
+	// later at pool-connect with a less obvious error.
+	if c.DatabaseURL == "" {
+		return errors.New("DATABASE_URL must be set: there is no default DSN (committed defaults previously embedded credentials and sslmode=disable)")
+	}
+	if err := c.AppRateLimits.validate(); err != nil {
+		return err
+	}
 	switch c.Env {
 	case "development", "test":
 		return nil
 	case "production", "staging":
 	default:
 		return fmt.Errorf("ENV=%q is not recognised: it must be development, test, staging or production", c.Env)
+	}
+	// GHSA-hv5j-m2r7-r4cr (L-06): the TLS requirement is checked on the parsed
+	// sslmode value, not a substring — a missing sslmode defaults to "prefer",
+	// which silently falls back to plaintext, and allow/prefer/disable all
+	// permit an unencrypted hop to the database.
+	switch sslModeOf(c.DatabaseURL) {
+	case "require", "verify-ca", "verify-full":
+	default:
+		return errors.New("DATABASE_URL must set sslmode=require, verify-ca or verify-full when ENV=production or staging: a missing sslmode defaults to prefer, which falls back to an unencrypted connection")
 	}
 	if c.CookieDomain == "" {
 		return errors.New("COOKIE_DOMAIN must be set when ENV=production or staging: cookie sessions and the CSRF trusted-origin check both derive from it, and the CSRF check fails closed without it")
@@ -458,6 +543,65 @@ func (c *Config) Validate() error {
 	}
 	if _, err := c.TrustedProxyNets(); err != nil {
 		return err
+	}
+	// The CSRF check (GHSA-jv2c-x735-vff7) allowlists cookie-authenticated
+	// writes against this list, so an empty list is no longer "no CORS" — it
+	// is every login and portal write 403ing at runtime. Fail at boot instead.
+	if len(c.GlobalCORSOrigins) == 0 {
+		return errors.New("GLOBAL_CORS_ORIGINS must list at least the portal origin when ENV=production or staging: it is now the CSRF trusted-origin allowlist, and empty fails every cookie-authenticated write at runtime")
+	}
+	return nil
+}
+
+// AppRateLimitConfig sizes the limits on application end-user routes, per
+// minute. Every field is optional: 0 means the default in
+// middleware.AppS2SConfig.
+type AppRateLimitConfig struct {
+	// PerIP is the per-IP flood guard for callers not on an application's
+	// registered server IPs (default 600). RATE_LIMIT_APP_PER_IP.
+	PerIP int
+	// UnverifiedPerIP applies to callers whose client credentials did not
+	// verify (default 5, AUTH-07). RATE_LIMIT_APP_UNVERIFIED_PER_IP.
+	UnverifiedPerIP int
+	// BadCredentialsPerClient bounds wrong client secrets for one client_id
+	// across every IP (default 10). RATE_LIMIT_APP_BAD_CREDENTIALS_PER_CLIENT.
+	BadCredentialsPerClient int
+	// Per end user, per application. RATE_LIMIT_APP_USER_<ROUTE>.
+	UserRegister           int
+	UserLogin              int
+	UserMagicLink          int
+	UserMagicLinkVerify    int
+	UserForgotPassword     int
+	UserResetPassword      int
+	UserRoles              int
+	UserMe                 int
+	UserMFAChallenge       int
+	UserOAuthExchange      int
+	UserPasskeyLogin       int
+	UserResendVerification int
+}
+
+func (a AppRateLimitConfig) validate() error {
+	for name, v := range map[string]int{
+		"RATE_LIMIT_APP_PER_IP":                     a.PerIP,
+		"RATE_LIMIT_APP_UNVERIFIED_PER_IP":          a.UnverifiedPerIP,
+		"RATE_LIMIT_APP_BAD_CREDENTIALS_PER_CLIENT": a.BadCredentialsPerClient,
+		"RATE_LIMIT_APP_USER_REGISTER":              a.UserRegister,
+		"RATE_LIMIT_APP_USER_LOGIN":                 a.UserLogin,
+		"RATE_LIMIT_APP_USER_MAGIC_LINK":            a.UserMagicLink,
+		"RATE_LIMIT_APP_USER_MAGIC_LINK_VERIFY":     a.UserMagicLinkVerify,
+		"RATE_LIMIT_APP_USER_FORGOT_PASSWORD":       a.UserForgotPassword,
+		"RATE_LIMIT_APP_USER_RESET_PASSWORD":        a.UserResetPassword,
+		"RATE_LIMIT_APP_USER_ROLES":                 a.UserRoles,
+		"RATE_LIMIT_APP_USER_ME":                    a.UserMe,
+		"RATE_LIMIT_APP_USER_MFA_CHALLENGE":         a.UserMFAChallenge,
+		"RATE_LIMIT_APP_USER_OAUTH_EXCHANGE":        a.UserOAuthExchange,
+		"RATE_LIMIT_APP_USER_PASSKEY_LOGIN":         a.UserPasskeyLogin,
+		"RATE_LIMIT_APP_USER_RESEND_VERIFICATION":   a.UserResendVerification,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s must be 0 (default) or a positive number of requests per minute, got %d", name, v)
+		}
 	}
 	return nil
 }
@@ -488,6 +632,29 @@ func (c *Config) TrustedProxyNets() ([]*net.IPNet, error) {
 		nets = append(nets, n)
 	}
 	return nets, nil
+}
+
+// sslModeOf extracts the sslmode from a PostgreSQL DSN in either form —
+// URL ("postgres://...?sslmode=require") or keyword/value
+// ("host=db sslmode=verify-full"). Returns "" when unset or unparseable,
+// which the caller treats as unsafe (pgx/libpq defaults to "prefer").
+func sslModeOf(dsn string) string {
+	if strings.Contains(dsn, "://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return ""
+		}
+		return strings.ToLower(u.Query().Get("sslmode"))
+	}
+	// Keyword/value form: space-separated key=value pairs; values may be
+	// single-quoted. pgconn's own parser is not exported at the level we need,
+	// and a full kwparser is overkill — sslmode values are bare words.
+	for _, field := range strings.Fields(dsn) {
+		if k, v, ok := strings.Cut(field, "="); ok && strings.EqualFold(strings.TrimSpace(k), "sslmode") {
+			return strings.ToLower(strings.Trim(v, "'"))
+		}
+	}
+	return ""
 }
 
 // mustAtoi parses an integer env value, returning 0 on any parse error so a

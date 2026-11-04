@@ -251,7 +251,7 @@ func (h *SigningKeyHandler) record(c echo.Context, tenantID int64, action, kid s
 		ResourceType: "signing_key",
 		ResourceID:   kid,
 		Status:       audit.StatusSuccess,
-		IPAddress:    c.RealIP(),
+		IPAddress:    clientIP(c),
 		UserAgent:    c.Request().UserAgent(),
 		Metadata:     map[string]any{"kid": kid},
 	})

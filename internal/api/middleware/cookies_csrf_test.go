@@ -81,7 +81,8 @@ func TestClearAuthCookies_PathsMatchBuild(t *testing.T) {
 }
 
 func TestCookieCSRF(t *testing.T) {
-	prodCfg := BuildCookieConfig("production", ".engineersmind.com")
+	prodCfg := BuildCookieConfig("production", ".engineersmind.com",
+		"https://admin.engineersmind.com", "https://engineersmind.com")
 
 	tests := []struct {
 		name       string
@@ -93,12 +94,34 @@ func TestCookieCSRF(t *testing.T) {
 		wantStatus int
 	}{
 		{
-			name:       "cookie write from trusted origin passes",
+			name:       "cookie write from allowlisted origin passes",
 			cfg:        prodCfg,
 			method:     http.MethodPost,
 			origin:     "https://admin.engineersmind.com",
 			cookie:     true,
 			wantStatus: http.StatusOK,
+		},
+		{
+			// GHSA-jv2c-x735-vff7 (L-04): every subdomain of the cookie domain
+			// used to be trusted — an attacker-controlled or abandoned
+			// subdomain could CSRF. Unlisted subdomains are now rejected.
+			name:       "unlisted sibling subdomain is rejected",
+			cfg:        prodCfg,
+			method:     http.MethodPost,
+			origin:     "https://staging.engineersmind.com",
+			cookie:     true,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			// GHSA-jv2c-x735-vff7 (L-04): no-Origin requests with an ambient
+			// cookie used to pass. Browsers send Origin on every POST, so a
+			// missing header is a non-browser client or a stripped-header
+			// attack — rejected now.
+			name:       "missing origin with cookie is rejected",
+			cfg:        prodCfg,
+			method:     http.MethodPost,
+			cookie:     true,
+			wantStatus: http.StatusForbidden,
 		},
 		{
 			name:       "cookie write from attacker origin is rejected",
@@ -166,10 +189,10 @@ func TestCookieCSRF(t *testing.T) {
 			wantStatus: http.StatusOK,
 		},
 		{
-			// Fail-closed: ENV=production with COOKIE_DOMAIN unset must not
-			// degrade into accepting every origin.
-			name:       "missing cookie domain fails closed",
-			cfg:        BuildCookieConfig("production", ""),
+			// Fail-closed: ENV=production with no trusted origins configured
+			// must not degrade into accepting every origin.
+			name:       "empty trusted origins fails closed",
+			cfg:        BuildCookieConfig("production", ".engineersmind.com"),
 			method:     http.MethodPost,
 			origin:     "https://admin.engineersmind.com",
 			cookie:     true,
@@ -233,7 +256,8 @@ func TestCookieCSRF(t *testing.T) {
 // assertion is the point: a rotation that happens behind a 403 has still
 // revoked the victim's refresh token.
 func TestSessionCSRF(t *testing.T) {
-	prodCfg := BuildCookieConfig("production", ".engineersmind.com")
+	prodCfg := BuildCookieConfig("production", ".engineersmind.com",
+		"https://admin.engineersmind.com", "https://engineersmind.com")
 
 	tests := []struct {
 		name       string
@@ -241,13 +265,14 @@ func TestSessionCSRF(t *testing.T) {
 		origin     string
 		wantStatus int
 	}{
-		{"trusted subdomain passes", prodCfg, "https://admin.engineersmind.com", http.StatusOK},
-		{"exact domain passes", prodCfg, "https://engineersmind.com", http.StatusOK},
-		{"missing origin passes", prodCfg, "", http.StatusOK},
+		{"allowlisted subdomain passes", prodCfg, "https://admin.engineersmind.com", http.StatusOK},
+		{"allowlisted domain passes", prodCfg, "https://engineersmind.com", http.StatusOK},
+		{"unlisted subdomain is rejected", prodCfg, "https://staging.engineersmind.com", http.StatusForbidden},
+		{"missing origin is rejected", prodCfg, "", http.StatusForbidden},
 		{"attacker origin is rejected", prodCfg, "https://evil.example.com", http.StatusForbidden},
 		{"lookalike domain is rejected", prodCfg, "https://evil-engineersmind.com", http.StatusForbidden},
 		{"opaque origin is rejected", prodCfg, "null", http.StatusForbidden},
-		{"unset cookie domain fails closed", BuildCookieConfig("production", ""), "https://admin.engineersmind.com", http.StatusForbidden},
+		{"empty trusted origins fails closed", BuildCookieConfig("production", ".engineersmind.com"), "https://admin.engineersmind.com", http.StatusForbidden},
 		{"development skips the check", BuildCookieConfig("development", ""), "https://evil.example.com", http.StatusOK},
 	}
 

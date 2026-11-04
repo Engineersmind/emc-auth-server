@@ -129,7 +129,7 @@ dropping the column.
 
 Only after step 2 has been stable and `..._total{reason="rejected"}` is not climbing.
 
-Add this as the next migration (`00063_drop_tenant_jwt_secret.sql`). It is **not** in the
+Add this as the next migration (`00106_drop_tenant_jwt_secret.sql`). It is **not** in the
 repo yet on purpose: goose auto-applies on boot, so committing it earlier would drop the
 column on the very first deploy, while HS256 verification was still expected to work.
 

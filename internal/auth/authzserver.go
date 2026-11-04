@@ -264,6 +264,12 @@ type IssueAuthorizationCodeParams struct {
 	// request to its later token exchange. Without this column the audience
 	// cannot survive the exchange at all — see the correction on issue #131.
 	Audience string
+
+	// OrganizationID is the organisation the hosted login resolved for this
+	// authorization (row id), nil for none. Persisted on the code for the same
+	// reason as Audience: the exchange must mint into exactly the organisation
+	// the user chose, and cannot be allowed to pick another.
+	OrganizationID *int64
 }
 
 // IssueAuthorizationCode mints a code and persists only its SHA-256 hash.
@@ -291,12 +297,12 @@ func (s *AuthorizationServer) IssueAuthorizationCode(ctx context.Context, p Issu
 		INSERT INTO oauth_authorization_codes
 		    (tenant_id, client_id, user_id, code_hash, code_challenge,
 		     code_challenge_method, redirect_uri, scopes, nonce, auth_time,
-		     grant_kind, audience, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		     grant_kind, audience, expires_at, organization_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`, p.TenantID, p.ClientID, p.UserID, HashToken(raw), p.CodeChallenge,
 		PKCEMethodS256, p.RedirectURI, scopes, nullIfEmpty(p.Nonce), authTime,
 		GrantKindAuthzCode, nullIfEmpty(p.Audience),
-		time.Now().UTC().Add(AuthorizationCodeTTL))
+		time.Now().UTC().Add(AuthorizationCodeTTL), p.OrganizationID)
 	if err != nil {
 		return "", fmt.Errorf("persist authorization code: %w", err)
 	}
@@ -329,6 +335,8 @@ type RedeemedCode struct {
 	// could name its own audience at exchange time would make the authorize-time
 	// grant check decorative.
 	Audience string
+	// OrganizationID is the organisation bound at /oauth/authorize, nil for none.
+	OrganizationID *int64
 }
 
 // RedeemAuthorizationCode consumes a code and returns what it was bound to.
@@ -369,10 +377,10 @@ func (s *AuthorizationServer) RedeemAuthorizationCode(ctx context.Context, clien
 		  AND  used_at IS NULL
 		  AND  expires_at > NOW()
 		RETURNING tenant_id, user_id, redirect_uri, scopes,
-		          code_challenge, code_challenge_method, nonce, auth_time, audience
+		          code_challenge, code_challenge_method, nonce, auth_time, audience, organization_id
 	`, codeHash, clientID, GrantKindAuthzCode).Scan(
 		&r.TenantID, &r.UserID, &r.RedirectURI, &r.Scopes,
-		&challenge, &method, &nonce, &authTime, &audience)
+		&challenge, &method, &nonce, &authTime, &audience, &r.OrganizationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Distinguish replay from unknown/expired for the audit trail. This

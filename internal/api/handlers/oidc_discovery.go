@@ -40,6 +40,7 @@ const (
 	PathOAuthToken      = paths.OAuthToken
 	PathOAuthUserInfo   = paths.OAuthUserInfo
 	PathOAuthRevoke     = paths.OAuthRevoke
+	PathOAuthIntrospect = paths.OAuthIntrospect
 	PathTenantJWKS      = paths.TenantJWKS
 	PathTenantDiscovery = paths.TenantDiscovery
 )
@@ -91,6 +92,8 @@ type OIDCDiscoveryDocument struct {
 	UserInfoEndpoint      string `json:"userinfo_endpoint"`
 	JWKSURI               string `json:"jwks_uri"`
 	RevocationEndpoint    string `json:"revocation_endpoint"`
+	// IntrospectionEndpoint is RFC 7662 / RFC 8414 introspection_endpoint.
+	IntrospectionEndpoint string `json:"introspection_endpoint"`
 
 	ScopesSupported        []string `json:"scopes_supported"`
 	ResponseTypesSupported []string `json:"response_types_supported"`
@@ -132,9 +135,6 @@ type OIDCDiscoveryDocument struct {
 //
 //	end_session_endpoint, check_session_iframe  RP-Initiated Logout and Session
 //	                                            Management are not implemented
-//	introspection_endpoint                      RFC 7662 introspection does not
-//	                                            exist (revocation does, and is
-//	                                            advertised)
 //	registration_endpoint                       Dynamic Client Registration is
 //	                                            not implemented; #8 is an
 //	                                            admin-managed client API, which
@@ -149,6 +149,7 @@ func buildDiscoveryDocument(base, slug string) OIDCDiscoveryDocument {
 		UserInfoEndpoint:      base + PathOAuthUserInfo,
 		JWKSURI:               base + tenantPath(PathTenantJWKS, slug),
 		RevocationEndpoint:    base + PathOAuthRevoke,
+		IntrospectionEndpoint: base + PathOAuthIntrospect,
 
 		// The four reserved OIDC scopes from application.go. Permission scopes
 		// (resource:action) share that column but are not advertised here: they

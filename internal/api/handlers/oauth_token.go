@@ -265,8 +265,19 @@ func (h *OAuthTokenHandler) authorizationCodeGrant(c echo.Context) error {
 	}
 
 	issued, err := h.authSvc.IssueTokensForAuthorizationCode(
-		ctx, redeemed.TenantID, redeemed.UserID, client.RowID, redeemed.Scopes, redeemed.Audience)
+		ctx, redeemed.TenantID, redeemed.UserID, client.RowID, redeemed.Scopes, redeemed.Audience,
+		redeemed.OrganizationID)
 	if err != nil {
+		// The organisation chosen at /oauth/authorize is re-checked here. A
+		// membership removed in the code's 60-second life, or an application
+		// moved to 'required' after a code was issued without one, ends the
+		// grant the same way a deactivated user does.
+		var sel *auth.OrganizationSelectionRequiredError
+		if errors.Is(err, auth.ErrOrganizationAccessDenied) || errors.As(err, &sel) {
+			metrics.OAuthGrants.WithLabelValues("authorization_code", "organization_denied").Inc()
+			return h.fail(c, http.StatusBadRequest, errInvalidGrant,
+				"the authorization is no longer valid for this organization")
+		}
 		// The most likely cause is a user deactivated or deleted between the
 		// authorize redirect and this exchange — 60 seconds is short but not
 		// zero. invalid_grant is the correct code: the grant is no longer good.
@@ -561,7 +572,7 @@ func (h *OAuthTokenHandler) auditCode(c echo.Context, action string, client *aut
 		ResourceID:    client.ClientID,
 		Status:        audit.StatusSuccess,
 		AuthMethod:    "authorization_code",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	}
 	if !success {
@@ -593,7 +604,7 @@ func (h *OAuthTokenHandler) auditRevoke(c echo.Context, client *auth.AuthzClient
 		ResourceID:    client.ClientID,
 		Status:        audit.StatusSuccess,
 		AuthMethod:    "client_credentials",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 }

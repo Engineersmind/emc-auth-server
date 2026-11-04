@@ -367,7 +367,7 @@ func (s *AuthService) adminMFAGate(ctx context.Context, userID, tenantID int64, 
 		if !slices.Contains(methods, MFAMethodEmail) && slices.Contains(usable, MFAMethodEmail) {
 			methods = append(methods, MFAMethodEmail)
 		}
-		challenge, err := s.createOTPSessionWith(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, false)
+		challenge, err := s.createOTPSessionWith(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, orgSessionRequest{}, false)
 		if err != nil {
 			return nil, fmt.Errorf("create OTP session: %w", err)
 		}
@@ -382,7 +382,7 @@ func (s *AuthService) adminMFAGate(ctx context.Context, userID, tenantID int64, 
 		return &LoginResult{OTPChallenge: challenge}, nil
 	}
 
-	challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, usable, persistent, activeRoles)
+	challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, usable, persistent, activeRoles, orgSessionRequest{})
 	if err != nil {
 		return nil, fmt.Errorf("create MFA enrollment session: %w", err)
 	}
