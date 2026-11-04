@@ -71,7 +71,7 @@ on:
     branches: ["master"]
 
 env:
-  GO_VERSION: "1.25"
+  GO_VERSION: "1.26"
 
 jobs:
   # ─── Test + Coverage ────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ jobs:
       # [CI-09] golang-jwt v3 vulnerability eliminated by upgrading echo v4.12→v4.15.2
       # [CI-10] stdlib net/textproto + x509 vulns are fixed since go1.25.11 —
       #         the warn-only carve-out ended; every finding now blocks the build.
-      #         go.mod's `go 1.25.13` directive is itself the floor: with
+      #         go.mod's `go 1.26.0` directive is itself the floor: with
       #         GOTOOLCHAIN=auto the toolchain under scan cannot silently be an
       #         older patch release.
       - name: govulncheck
