@@ -6080,6 +6080,48 @@ paths:
       summary: Confirm an email change
       tags:
       - AUTH
+  /api/v1/auth/console/forgot-password:
+    post:
+      consumes:
+      - application/json
+      description: 'Sends a reset link to every first-party (management-console) account
+        registered to the email, one email per account. No client credentials: this
+        is the browser flow for console administrators; applications use POST /api/v1/auth/forgot-password.
+        ALWAYS returns 200 with the same body whether or not the email is registered
+        (prevents email enumeration). Redeem the emailed token with POST /api/v1/auth/reset-password.'
+      parameters:
+      - description: Email address
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/handlers.ForgotPasswordRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "428":
+          description: captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge
+            and retry
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "429":
+          description: Rate limited. The limiter field says which limit (user = this
+            email, ip = this address); wait Retry-After seconds
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Request a console password reset
+      tags:
+      - AUTH
   /api/v1/auth/forgot-password:
     post:
       consumes:

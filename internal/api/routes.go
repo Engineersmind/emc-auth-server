@@ -893,6 +893,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// per-IP for token guessing, per-client for application volume, per-email
 	// for inbox flooding on forgot-password (GHSA-2267-r48x-9fh2).
 	authGroup.POST("/forgot-password", authHandler.ForgotPassword, mw.PasswordResetRateLimiter(rlCfg), appClientRateLimit)
+	// The console's forgot-password (issue #179): first-party, from a browser,
+	// with no client credentials, so no appClientRateLimit. The same limiter as
+	// the pair above, sharing its buckets: 5/min per IP (with /reset-password)
+	// and per-email inbox flooding (with /forgot-password). The handler adds the
+	// platform captcha and the fan-out cap.
+	authGroup.POST("/console/forgot-password", authHandler.ConsoleForgotPassword, mw.PasswordResetRateLimiter(rlCfg))
 	// reset-password consumes a bearer credential — without a limiter it is an
 	// online brute-force oracle on reset tokens. Per-IP is the only meaningful
 	// key here: the presented value IS the guess, so a per-token bucket can
