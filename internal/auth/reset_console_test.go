@@ -100,6 +100,15 @@ func (e *consoleResetEnv) user(t *testing.T, tenantID int64, appID *int64, email
 	return id
 }
 
+func (e *consoleResetEnv) tenantName(t *testing.T, tenantID int64) string {
+	t.Helper()
+	var name string
+	if err := e.pool.QueryRow(e.ctx, `SELECT name FROM tenants WHERE id = $1`, tenantID).Scan(&name); err != nil {
+		t.Fatalf("read tenant name: %v", err)
+	}
+	return name
+}
+
 func (e *consoleResetEnv) passwordHash(t *testing.T, userID int64) string {
 	t.Helper()
 	var h string
@@ -142,9 +151,15 @@ func TestForgotPasswordFirstParty_OneEmailPerAccount_EachTokenResetsOnlyItsOwn(t
 	if len(e.mail.resets) != 2 {
 		t.Fatalf("reset emails sent = %d, want one per account (2)", len(e.mail.resets))
 	}
-	for _, r := range e.mail.resets {
+	// Each email names its own tenant, or the recipient cannot tell which link
+	// resets which account. The emails are in tenant-id order.
+	wantNames := []string{e.tenantName(t, min(tenantA, tenantB)), e.tenantName(t, max(tenantA, tenantB))}
+	for i, r := range e.mail.resets {
 		if r.To != email {
 			t.Errorf("reset email To = %q, want %q", r.To, email)
+		}
+		if r.TenantName != wantNames[i] {
+			t.Errorf("email %d TenantName = %q, want %q", i+1, r.TenantName, wantNames[i])
 		}
 	}
 
@@ -276,5 +291,87 @@ func TestForgotPasswordFirstParty_FailedSendIsStillReportedIssued(t *testing.T) 
 	}
 	if tokens != 1 {
 		t.Errorf("stored tokens = %d, want 1", tokens)
+	}
+}
+
+// TestForgotPasswordFirstParty_CooldownBoundsMailPerAccount pins that a request
+// inside ConsoleResetCooldown mails no account that was just mailed. The
+// per-email rate limit counts requests, and one request mails every account the
+// address owns, so without the cooldown the inbox would get one email per
+// account per allowed request.
+func TestForgotPasswordFirstParty_CooldownBoundsMailPerAccount(t *testing.T) {
+	e := newConsoleResetEnv(t)
+	email := uniqueEmail("console-cooldown")
+	userA := e.user(t, e.tenant(t, "console-cool-a", true), nil, email, true)
+	e.user(t, e.tenant(t, "console-cool-b", true), nil, email, true)
+
+	if issued, err := e.svc.ForgotPasswordFirstParty(e.ctx, email); err != nil || len(issued) != 2 {
+		t.Fatalf("first request: issued %v, err %v; want both accounts", issued, err)
+	}
+	if issued, err := e.svc.ForgotPasswordFirstParty(e.ctx, email); err != nil || len(issued) != 0 {
+		t.Fatalf("request inside the cooldown: issued %v, err %v; want none", issued, err)
+	}
+	if len(e.mail.resets) != 2 {
+		t.Fatalf("reset emails sent = %d, want 2 (none for the second request)", len(e.mail.resets))
+	}
+
+	// The cooldown is per account: once account A's token is older than the
+	// window, A is mailed again and B, still inside it, is not.
+	if _, err := e.pool.Exec(e.ctx,
+		`UPDATE password_reset_tokens SET created_at = NOW() - $2 * INTERVAL '1 second' WHERE user_id = $1`,
+		userA, int64(2*auth.ConsoleResetCooldown/time.Second)); err != nil {
+		t.Fatalf("age token: %v", err)
+	}
+	issued, err := e.svc.ForgotPasswordFirstParty(e.ctx, email)
+	if err != nil || len(issued) != 1 {
+		t.Fatalf("after A's cooldown: issued %v, err %v; want exactly account A", issued, err)
+	}
+}
+
+// templateCaptureMailer records the template each reset email was sent with.
+type templateCaptureMailer struct {
+	captureMailer
+	templates []*mailer.Template
+}
+
+func (m *templateCaptureMailer) SendReset(ctx context.Context, sender *mailer.SMTPConfig, tmpl *mailer.Template, e mailer.ResetEmail) error {
+	m.templates = append(m.templates, tmpl)
+	return m.captureMailer.SendReset(ctx, sender, tmpl, e)
+}
+
+// TestForgotPasswordFirstParty_IgnoresTenantTemplateSettings pins that a
+// tenant's password_reset template settings do not reach platform console
+// accounts. A tenant that turns the template off because its applications send
+// their own reset email must not lock its console administrators out of reset,
+// and a tenant's branding must not be put on a platform email.
+func TestForgotPasswordFirstParty_IgnoresTenantTemplateSettings(t *testing.T) {
+	e := newConsoleResetEnv(t)
+	tenant := e.tenant(t, "console-tmpl", true)
+	email := uniqueEmail("console-tmpl")
+	e.user(t, tenant, nil, email, true)
+	for _, active := range []bool{false, true} {
+		if _, err := e.pool.Exec(e.ctx, `
+			INSERT INTO email_templates (tenant_id, template_type, subject, html_body, is_active)
+			VALUES ($1, 'password_reset', 'Tenant subject', '<p>tenant body</p>', $2)
+			ON CONFLICT (tenant_id, template_type) WHERE application_id IS NULL
+			DO UPDATE SET is_active = EXCLUDED.is_active
+		`, tenant, active); err != nil {
+			t.Fatalf("store tenant template: %v", err)
+		}
+		mail := &templateCaptureMailer{}
+		svc := auth.NewResetService(e.pool, mail, "http://localhost:8080", testhelper.TestLogger()).
+			WithDashboardURL(consoleDashboardURL).
+			WithTemplates(auth.NewEmailTemplateService(e.pool, testhelper.TestLogger()))
+		if _, err := e.pool.Exec(e.ctx, `DELETE FROM password_reset_tokens WHERE tenant_id = $1`, tenant); err != nil {
+			t.Fatalf("clear cooldown: %v", err)
+		}
+
+		issued, err := svc.ForgotPasswordFirstParty(e.ctx, email)
+		if err != nil || len(issued) != 1 {
+			t.Fatalf("tenant template active=%v: issued %v, err %v; want the console account mailed", active, issued, err)
+		}
+		if len(mail.templates) != 1 || mail.templates[0] != nil {
+			t.Errorf("tenant template active=%v: sent with %v, want the built-in platform template (nil)", active, mail.templates)
+		}
 	}
 }

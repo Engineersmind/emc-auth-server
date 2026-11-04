@@ -76,9 +76,47 @@ func TestConsoleForgotPassword_Route(t *testing.T) {
 		return body["limiter"]
 	}
 
+	// A first-party console account with an address unique to this run. The
+	// seeded admin@emc.local would share one per-email bucket across every run
+	// and every package that resets it.
+	var seedTenant int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&seedTenant); err != nil {
+		t.Fatalf("seed tenant: %v", err)
+	}
+	consoleUser := func(t *testing.T, label string) (userID int64, address string) {
+		t.Helper()
+		address = email(label)
+		if err := pool.QueryRow(ctx, `
+			INSERT INTO users (tenant_id, application_id, email, first_name, last_name, is_active, email_verified)
+			VALUES ($1, NULL, $2, 'C', 'R', true, true) RETURNING id
+		`, seedTenant, address).Scan(&userID); err != nil {
+			t.Fatalf("seed console user: %v", err)
+		}
+		return userID, address
+	}
+	tokens := func(t *testing.T, userID int64) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM password_reset_tokens WHERE user_id = $1`, userID).Scan(&n); err != nil {
+			t.Fatalf("count tokens: %v", err)
+		}
+		return n
+	}
+	// The fan-out runs after the response, so issuance is observed by polling.
+	awaitTokens := func(t *testing.T, userID int64, want int) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for tokens(t, userID) < want && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if got := tokens(t, userID); got != want {
+			t.Fatalf("reset tokens = %d, want %d", got, want)
+		}
+	}
+
 	t.Run("registered and unknown emails get the identical 200 with no credentials", func(t *testing.T) {
-		// admin@emc.local is the seeded first-party console account.
-		known := forgot(ip(1, 1), "", "admin@emc.local")
+		userID, address := consoleUser(t, "known")
+		known := forgot(ip(1, 1), "", address)
 		unknown := forgot(ip(1, 2), "", email("nobody"))
 		if known.Code != http.StatusOK || unknown.Code != http.StatusOK {
 			t.Fatalf("status known=%d unknown=%d, want 200 for both", known.Code, unknown.Code)
@@ -86,13 +124,14 @@ func TestConsoleForgotPassword_Route(t *testing.T) {
 		if known.Body.String() != unknown.Body.String() {
 			t.Errorf("bodies differ (RESET-03):\n known:   %s\n unknown: %s", known.Body.String(), unknown.Body.String())
 		}
+		awaitTokens(t, userID, 1)
 	})
 
 	t.Run("per-IP limit answers 429 limiter=ip", func(t *testing.T) {
 		addr := ip(2, 1)
 		for i := 0; i < 5; i++ {
 			if rec := forgot(addr, "", email(fmt.Sprintf("ip-%d", i))); rec.Code != http.StatusOK {
-				t.Fatalf("request %d: status %d, want 200 within the 5/min per IP", i+1, rec.Code)
+				t.Fatalf("request %d: status %d, want 200 within AUTH-07's 5/min", i+1, rec.Code)
 			}
 		}
 		rec := forgot(addr, "", email("ip-6"))
@@ -101,11 +140,23 @@ func TestConsoleForgotPassword_Route(t *testing.T) {
 		}
 	})
 
+	t.Run("asking for links does not spend the budget for redeeming one", func(t *testing.T) {
+		// An admin behind one address who asks five times must still be able to
+		// use the link: /reset-password is on a different surface.
+		addr := ip(7, 1)
+		for i := 0; i < 5; i++ {
+			forgot(addr, "", email(fmt.Sprintf("surface-%d", i)))
+		}
+		rec := post("/api/v1/auth/reset-password", addr, "", `{"token":"not-a-real-token","new_password":"Whatever-Passw0rd!"}`)
+		if rec.Code == http.StatusTooManyRequests {
+			t.Fatalf("reset-password from the same address: 429 %s — the console route spent its budget", rec.Body.String())
+		}
+	})
+
 	t.Run("per-email limit holds across addresses and answers 429 limiter=user", func(t *testing.T) {
-		// Mixed case and padding normalise into the same recipient bucket, which
-		// allows PerTenantRate (10/min) per address.
+		// Mixed case and padding normalise into the same recipient bucket.
 		to := email("flood")
-		for i := 0; i < 10; i++ {
+		for i := 0; i < 5; i++ {
 			variant := to
 			if i%2 == 1 {
 				variant = "  " + strings.ToUpper(to)
@@ -116,16 +167,12 @@ func TestConsoleForgotPassword_Route(t *testing.T) {
 		}
 		rec := forgot(ip(3, 99), "", to)
 		if rec.Code != http.StatusTooManyRequests || limiter(t, rec) != "user" {
-			t.Fatalf("11th request for one recipient: status %d body %s, want 429 limiter=user", rec.Code, rec.Body.String())
+			t.Fatalf("6th request for one recipient: status %d body %s, want 429 limiter=user", rec.Code, rec.Body.String())
 		}
 	})
 
 	t.Run("valid application credentials do not lift the per-IP limit", func(t *testing.T) {
-		var tenantID int64
-		if err := pool.QueryRow(ctx, `SELECT id FROM tenants WHERE slug = 'emc' AND deleted_at IS NULL`).Scan(&tenantID); err != nil {
-			t.Fatalf("seed tenant: %v", err)
-		}
-		app, err := auth.NewApplicationService(pool, logger).CreateApplication(ctx, tenantID, fmt.Sprintf("console-reset-%d", run), "web", nil)
+		app, err := auth.NewApplicationService(pool, logger).CreateApplication(ctx, seedTenant, fmt.Sprintf("console-reset-%d", run), "web", nil)
 		if err != nil {
 			t.Fatalf("CreateApplication: %v", err)
 		}
@@ -140,59 +187,39 @@ func TestConsoleForgotPassword_Route(t *testing.T) {
 		}
 		rec := forgot(addr, basic, email("creds-6"))
 		if rec.Code != http.StatusTooManyRequests || limiter(t, rec) != "ip" {
-			t.Fatalf("6th request with credentials: status %d body %s, want 429 limiter=ip — credentials must not lift it", rec.Code, rec.Body.String())
+			t.Fatalf("6th request with credentials: status %d body %s, want 429 limiter=ip — credentials must be ignored here", rec.Code, rec.Body.String())
 		}
 	})
 
 	t.Run("a body the limiter cannot key on sends no email", func(t *testing.T) {
-		// PasswordResetRateLimiter reads the email with json.Unmarshal; a body it
-		// rejects skips the per-email bucket. If the handler still accepted such
-		// a body (c.Bind takes the first JSON value, or form fields), rotating
+		// The per-email limiter reads a form body as no email at all. If the
+		// handler still acted on it (c.Bind reads form fields), rotating
 		// addresses would mail one recipient without limit.
-		const to = "admin@emc.local"
-		var before int64
-		if err := pool.QueryRow(ctx, `SELECT COALESCE(MAX(t.id), 0) FROM password_reset_tokens t
-			JOIN users u ON u.id = t.user_id WHERE u.email = $1`, to).Scan(&before); err != nil {
-			t.Fatalf("read tokens: %v", err)
-		}
-		issuedSince := func() int {
-			var n int
-			if err := pool.QueryRow(ctx, `SELECT count(*) FROM password_reset_tokens t
-				JOIN users u ON u.id = t.user_id WHERE u.email = $1 AND t.id > $2`, to, before).Scan(&n); err != nil {
-				t.Fatalf("count tokens: %v", err)
-			}
-			return n
-		}
-
-		for i, body := range []string{
-			fmt.Sprintf(`{"email":%q} {}`, to),
-			fmt.Sprintf(`{"email":%q}{"email":"other@example.test"}`, to),
-		} {
-			if rec := post(route, ip(6, i), "", body); rec.Code != http.StatusOK {
-				t.Fatalf("trailing JSON %d: status %d, want the generic 200", i+1, rec.Code)
-			}
-		}
-		req := httptest.NewRequest(http.MethodPost, route, strings.NewReader("email="+to))
+		userID, address := consoleUser(t, "form")
+		req := httptest.NewRequest(http.MethodPost, route, strings.NewReader("email="+address))
 		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationForm)
-		req.RemoteAddr = "[" + ip(6, 9) + "]:40000"
+		req.RemoteAddr = "[" + ip(6, 1) + "]:40000"
 		rec := httptest.NewRecorder()
 		e.ServeHTTP(rec, req)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("form body: status %d, want the generic 200", rec.Code)
 		}
-		if n := issuedSince(); n != 0 {
-			t.Fatalf("%d reset token(s) issued for bodies the per-email limiter cannot read", n)
+
+		// Checked before the control, which the per-account cooldown would
+		// otherwise mask: the fan-out takes milliseconds, so a second is ample.
+		time.Sleep(time.Second)
+		if n := tokens(t, userID); n != 0 {
+			t.Fatalf("%d reset token(s) issued for a body the per-email limiter cannot read", n)
 		}
 
-		// Control: the same recipient with a well-formed body IS mailed, so the
+		// Control: a well-formed body for the same recipient IS mailed, so the
 		// zero above is the refusal and not a broken probe.
-		if rec := forgot(ip(6, 10), "", to); rec.Code != http.StatusOK {
+		if rec := forgot(ip(6, 2), "", address); rec.Code != http.StatusOK {
 			t.Fatalf("well-formed body: status %d, want 200", rec.Code)
 		}
-		if n := issuedSince(); n != 1 {
-			t.Fatalf("well-formed body issued %d token(s), want 1", n)
-		}
+		awaitTokens(t, userID, 1)
 	})
+
 	t.Run("application forgot-password still requires client credentials", func(t *testing.T) {
 		rec := post("/api/v1/auth/forgot-password", ip(5, 1), "", fmt.Sprintf(`{"email":%q}`, email("app")))
 		if rec.Code != http.StatusUnauthorized {

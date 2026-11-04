@@ -2355,6 +2355,37 @@ func (s *AuthService) storePreAuthSession(ctx context.Context, keyFn func(string
 
 // loadOTPSession retrieves and decodes a pre-auth session from Redis by its
 // full storage key (otpSessionKey(...) or mfaEnrollKey(...)).
+// OTPSessionScope reports the tenant and application (0 for a tenant-level
+// login) the pending MFA challenge named by otpSessionToken belongs to. Read
+// only: it neither consumes the session nor counts an attempt. ok is false when
+// the token names no live session.
+//
+// For the rate limiter, which trusts an application's backend on these routes
+// only for its own users (see middleware.ScopeToCaller).
+func (s *AuthService) OTPSessionScope(ctx context.Context, otpSessionToken string) (tenantID, appID int64, ok bool) {
+	return s.pendingSessionScope(ctx, otpSessionKey(otpSessionToken))
+}
+
+// EnrollmentSessionScope is OTPSessionScope for a forced-enrollment session
+// (enrollment_token).
+func (s *AuthService) EnrollmentSessionScope(ctx context.Context, enrollmentToken string) (tenantID, appID int64, ok bool) {
+	return s.pendingSessionScope(ctx, mfaEnrollKey(enrollmentToken))
+}
+
+func (s *AuthService) pendingSessionScope(ctx context.Context, key string) (tenantID, appID int64, ok bool) {
+	if s.redisCli == nil {
+		return 0, 0, false
+	}
+	session, err := s.loadOTPSession(ctx, key)
+	if err != nil {
+		return 0, 0, false
+	}
+	if id := appRowIDFromClaim(session.AppID); id != nil {
+		appID = *id
+	}
+	return session.TenantID, appID, true
+}
+
 func (s *AuthService) loadOTPSession(ctx context.Context, key string) (*OTPSession, error) {
 	data, err := s.redisCli.Get(ctx, key).Bytes()
 	if err != nil {

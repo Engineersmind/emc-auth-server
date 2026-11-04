@@ -686,10 +686,16 @@ Content-Type: application/json
 |---|---|---|
 | `200` | `{"message":"if that email address is registered, a password reset link has been sent"}` | Always the same, registered or not. Show it as-is. |
 | `428` | `{"error":"captcha_required"}` or `{"error":"captcha_invalid"}` | Fetch `POST /api/v1/captcha/challenge`, show it, retry with the answer. |
-| `429` | `{"error":"…","limiter":"ip"\|"user","retry_after":"60"}` | 5/min per IP address (`ip`) or 10/min per email (`user`), shared with the other reset endpoints. Wait `Retry-After`. |
+| `429` | `{"error":"…","limiter":"ip"\|"user","retry_after":"60"}` | 5/min per IP address (`ip`) or 5/min per email (`user`). Wait `Retry-After`. Asking for links never uses up the budget for redeeming one at `/reset-password`. |
 
 An address that owns console accounts in several tenants gets one email per
-account. Each link resets only the account it was sent for.
+account, and each email names its tenant in the subject and body. Each link resets
+only the account it was sent for. An account mailed in the last minute is not mailed
+again, so "send again" within a minute changes nothing; tell the user to wait for the
+email or check spam.
+
+The emails are sent after the `200` is returned, so they can arrive a few seconds
+later. Don't treat the response as confirmation that anything was sent.
 
 ### GET `/api/v1/auth/my-activity`
 

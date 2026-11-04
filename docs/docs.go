@@ -2009,6 +2009,259 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/server-trust": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's registered server IPs and whether it may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Registers the application backend's egress IPs (requests from them skip the per-IP flood guard; the application quota and per-user limits still apply) and turns forwarding of the end user's IP on or off. A forwarded IP is believed only when the client secret verifies and the request comes from one of the registered server IPs, so forwarding needs at least one. Omitted fields are left unchanged. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Settings to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ServerTrustRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid address or range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/server-trust/suggestions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists the addresses that served several different users of the application recently (from the audit log, administrator actions excluded) — likely the application backend's outbound addresses — and whether each is already registered. Suggestions only; nothing is registered until the server IPs are saved. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Suggest an application's server addresses",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ServerIPSuggestions"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/user-limits": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists every per-user limit on the application end-user routes (sign in, password reset, magic link, OTP, ...) with the server default, the application's override if any, the effective value, and the highest override accepted. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's per-user limit overrides. Each value is requests per minute, between 1 and that limit's max; a limit left out returns to the server default, and {\"overrides\": {}} clears them all. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UserLimitsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown limit or value out of range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/users/{uid}/mfa": {
             "delete": {
                 "security": [
@@ -2755,6 +3008,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AppLoginRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2784,6 +3043,15 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2823,6 +3091,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MagicLinkRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2855,6 +3129,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "Magic link not enabled for this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2894,6 +3177,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MagicLinkVerifyRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -2914,6 +3203,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "MFA enrollment required",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -2999,6 +3297,12 @@ const docTemplate = `{
                         "name": "X-Client-Authorization",
                         "in": "header",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3010,6 +3314,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "token_invalid — generic for every rejection reason",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3777,6 +4090,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AppRegisterRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3815,6 +4134,15 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -3900,6 +4228,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.AssignAppUserRolesRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -3929,6 +4263,15 @@ const docTemplate = `{
                     },
                     "404": {
                         "description": "User not found in this application",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4082,7 +4425,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/console/forgot-password": {
             "post": {
-                "description": "Sends a reset link to every first-party (management-console) account registered to the email, one email per account. No client credentials: this is the browser flow for console administrators; applications use POST /api/v1/auth/forgot-password. ALWAYS returns 200 with the same body whether or not the email is registered (prevents email enumeration). Redeem the emailed token with POST /api/v1/auth/reset-password.",
+                "description": "Sends a reset link to every first-party (management-console) account registered to the email, one email per account, naming its tenant, and at most one per account per minute. The emails are sent after the response. No client credentials: this is the browser flow for console administrators; applications use POST /api/v1/auth/forgot-password. ALWAYS returns 200 with the same body whether or not the email is registered (prevents email enumeration). Redeem the emailed token with POST /api/v1/auth/reset-password.",
                 "consumes": [
                     "application/json"
                 ],
@@ -4164,6 +4507,12 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ForgotPasswordRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4187,6 +4536,15 @@ const docTemplate = `{
                     },
                     "428": {
                         "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4318,6 +4676,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAActivateRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4379,6 +4749,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAEmailPendingRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4452,6 +4834,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.MFAEnrollRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4472,6 +4866,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Invalid or expired enrollment token",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -4504,6 +4907,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.LoginOTPRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4574,6 +4989,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.LoginOTPResendRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -4985,6 +5412,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.OAuthExchangeRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -5005,6 +5444,15 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5534,6 +5982,15 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "429": {
+                        "description": "Rate limited per IP; wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
                     }
                 }
             }
@@ -5555,6 +6012,18 @@ const docTemplate = `{
                         "name": "ceremony_token",
                         "in": "query",
                         "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -5575,6 +6044,15 @@ const docTemplate = `{
                     },
                     "403": {
                         "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5934,11 +6412,32 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ResendVerificationRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
                     "200": {
                         "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -5971,6 +6470,18 @@ const docTemplate = `{
                         "schema": {
                             "$ref": "#/definitions/handlers.ResetPasswordRequest"
                         }
+                    },
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret). Optional; send it when your backend calls this for a user, or the call is limited as an anonymous browser (5/min per IP)",
+                        "name": "Authorization",
+                        "in": "header"
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
                     }
                 ],
                 "responses": {
@@ -5985,6 +6496,15 @@ const docTemplate = `{
                     },
                     "400": {
                         "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -10372,6 +10892,289 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/server-trust": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the application's registered server IPs and whether it may forward its end users' IP in X-EMC-Forwarded-For. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Registers the application backend's egress IPs (requests from them skip the per-IP flood guard; the application quota and per-user limits still apply) and turns forwarding of the end user's IP on or off. A forwarded IP is believed only when the client secret verifies and the request comes from one of the registered server IPs, so forwarding needs at least one. Omitted fields are left unchanged. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's server-to-server settings",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Settings to change",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ServerTrustRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AppServerTrust"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid address or range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/server-trust/suggestions": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists the addresses that served several different users of the application recently (from the audit log, administrator actions excluded) — likely the application backend's outbound addresses — and whether each is already registered. Suggestions only; nothing is registered until the server IPs are saved. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Suggest an application's server addresses",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.ServerIPSuggestions"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/user-limits": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Lists every per-user limit on the application end-user routes (sign in, password reset, magic link, OTP, ...) with the server default, the application's override if any, the effective value, and the highest override accepted. Requires apps:read.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Get an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's per-user limit overrides. Each value is requests per minute, between 1 and that limit's max; a limit left out returns to the server default, and {\"overrides\": {}} clears them all. Changes apply on this instance immediately and on others within 30 seconds. Requires apps:write.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rate-limits"
+                ],
+                "summary": "Set an application's per-user rate limits",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Tenant ID (super_admin cross-tenant mirror)",
+                        "name": "tid",
+                        "in": "path"
+                    },
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UserLimitsRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.AppUserLimits"
+                        }
+                    },
+                    "400": {
+                        "description": "Unknown limit or value out of range",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/organizations": {
             "get": {
                 "produces": [
@@ -14081,6 +14884,55 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.AppServerIP": {
+            "type": "object",
+            "properties": {
+                "cidr": {
+                    "type": "string"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.AppServerIPInput": {
+            "type": "object",
+            "properties": {
+                "cidr": {
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.AppServerTrust": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "integer"
+                },
+                "per_ip_limit": {
+                    "description": "PerIPLimit is the per-IP limit, per minute, that requests from the server\nIPs skip. Set by the admin API from configuration; 0 when unknown.",
+                    "type": "integer"
+                },
+                "server_ips": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.AppServerIP"
+                    }
+                },
+                "tenant_id": {
+                    "type": "integer"
+                },
+                "trust_forwarded_ip": {
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.AppsPage": {
             "type": "object",
             "properties": {
@@ -15083,6 +15935,42 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.ServerIPSuggestion": {
+            "type": "object",
+            "properties": {
+                "ip": {
+                    "type": "string"
+                },
+                "last_seen": {
+                    "type": "string"
+                },
+                "registered": {
+                    "description": "Registered is true when the address is already covered by the allowlist.",
+                    "type": "boolean"
+                },
+                "users": {
+                    "description": "Users is how many different users of the application signed in, registered\nor were otherwise acted on from this address in the window.",
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.ServerIPSuggestions": {
+            "type": "object",
+            "properties": {
+                "min_users": {
+                    "type": "integer"
+                },
+                "suggestions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.ServerIPSuggestion"
+                    }
+                },
+                "window_days": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.StoredCredential": {
             "type": "object",
             "properties": {
@@ -15311,6 +16199,23 @@ const docTemplate = `{
                 "password": {
                     "type": "string",
                     "minLength": 8
+                }
+            }
+        },
+        "handlers.AppUserLimits": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "integer"
+                },
+                "limits": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.UserLimitView"
+                    }
+                },
+                "tenant_id": {
+                    "type": "integer"
                 }
             }
         },
@@ -16088,6 +16993,22 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.ServerTrustRequest": {
+            "type": "object",
+            "properties": {
+                "server_ips": {
+                    "description": "ServerIPs replaces the application's registered egress addresses. Each\nentry is an address or CIDR range (IPv4 /24 or narrower, IPv6 /48 or\nnarrower), at most 50.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.AppServerIPInput"
+                    }
+                },
+                "trust_forwarded_ip": {
+                    "description": "TrustForwardedIP lets the application report its end user's address in\nX-EMC-Forwarded-For.",
+                    "type": "boolean"
+                }
+            }
+        },
         "handlers.SessionLoginRequest": {
             "type": "object",
             "required": [
@@ -16605,6 +17526,57 @@ const docTemplate = `{
                 "updated_at": {
                     "description": "UpdatedAt is seconds since the Unix epoch, per OIDC Core — not RFC 3339,\nwhich is what the rest of this API returns for timestamps.",
                     "type": "integer"
+                }
+            }
+        },
+        "handlers.UserLimitView": {
+            "type": "object",
+            "properties": {
+                "default": {
+                    "description": "Default is the server-wide value, per minute.",
+                    "type": "integer"
+                },
+                "effective": {
+                    "description": "Effective is what the limiter enforces for this application.",
+                    "type": "integer"
+                },
+                "endpoints": {
+                    "description": "Endpoints are the routes the limit applies to.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "key": {
+                    "description": "Key names the limit in the API and in app_user_rate_limits.limits.",
+                    "type": "string"
+                },
+                "keyed_by": {
+                    "description": "KeyedBy says what one bucket is: whose requests share the allowance.",
+                    "type": "string"
+                },
+                "max": {
+                    "description": "Max is the highest override accepted, per minute.",
+                    "type": "integer"
+                },
+                "name": {
+                    "description": "Name is the human label shown in the admin console.",
+                    "type": "string"
+                },
+                "override": {
+                    "description": "Override is the application's own value, or null when it uses the default.",
+                    "type": "integer"
+                }
+            }
+        },
+        "handlers.UserLimitsRequest": {
+            "type": "object",
+            "properties": {
+                "overrides": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "integer"
+                    }
                 }
             }
         },

@@ -22,9 +22,15 @@ import (
 // auth.LoginInput carries no client address, and the gate needs one: the
 // adaptive counter is keyed by IP. Threading an IP through the service would
 // mean changing the signature every caller uses, and reordering authentication
-// logic around a speed bump. The handler already has c.RealIP() and already has
+// logic around a speed bump. The handler already has clientIP(c) and already has
 // a failure branch, so the gate costs two lines per handler and nothing in
 // internal/auth/service.go changes.
+//
+// clientIP, not c.RealIP(): on the application routes a product backend calls
+// for all of its users from one address. Keyed on that address, one person's
+// failed logins armed the gate for every user of the product. When the backend
+// is trusted to forward the user's IP (middleware.AppS2S), the counter keys on
+// the person instead.
 //
 // WHY THE CHECK COMES BEFORE AUTHENTICATION
 //
@@ -81,6 +87,17 @@ type captchaScope struct {
 	// challenge is bound to it, so a challenge minted for one application cannot
 	// be spent by another.
 	ClientID string
+	// Counter, when set, names the adaptive failure counter instead of
+	// ClientID. See consoleResetCaptchaScope.
+	Counter string
+}
+
+// counter is the failure counter this scope reads and writes.
+func (s captchaScope) counter() string {
+	if s.Counter != "" {
+		return s.Counter
+	}
+	return s.ClientID
 }
 
 // captchaCheck runs the gate for one request.
@@ -125,8 +142,9 @@ func (h *AuthHandler) captchaCheck(
 		TenantID:      scope.TenantID,
 		ApplicationID: scope.ApplicationID,
 		ClientID:      scope.ClientID,
+		Counter:       scope.Counter,
 		Flow:          flow,
-		IP:            c.RealIP(),
+		IP:            clientIP(c),
 		ChallengeID:   challengeID,
 		Answer:        answer,
 	})
@@ -157,7 +175,7 @@ func (h *AuthHandler) captchaRecordFailure(c echo.Context, scope captchaScope) {
 	if h.captchaSvc == nil || !h.captchaSvc.Enabled() {
 		return
 	}
-	h.captchaSvc.RecordFailure(c.Request().Context(), scope.TenantID, scope.ApplicationID, scope.ClientID, c.RealIP())
+	h.captchaSvc.RecordFailure(c.Request().Context(), scope.TenantID, scope.ApplicationID, scope.counter(), clientIP(c))
 }
 
 // captchaClearFailures drops the origin's counter after a successful
@@ -171,7 +189,7 @@ func (h *AuthHandler) captchaClearFailures(c echo.Context, scope captchaScope) {
 	if h.captchaSvc == nil || !h.captchaSvc.Enabled() {
 		return
 	}
-	h.captchaSvc.ClearFailures(c.Request().Context(), scope.ClientID, c.RealIP())
+	h.captchaSvc.ClearFailures(c.Request().Context(), scope.counter(), clientIP(c))
 }
 
 // appCaptchaScope builds the scope for an application-authenticated flow, where
@@ -184,6 +202,20 @@ func appCaptchaScope(tenantID, appID int64, clientID string) captchaScope {
 // which resolves against the platform-default policy. See captchaCheck.
 func firstPartyCaptchaScope() captchaScope {
 	return captchaScope{}
+}
+
+// consoleResetCaptchaCounter is the console forgot-password failure counter.
+// The "#" cannot occur in a client_id, so it never collides with an
+// application counter.
+const consoleResetCaptchaCounter = "#console-forgot"
+
+// consoleResetCaptchaScope is firstPartyCaptchaScope with its own failure
+// counter. Console login, register and OTP share the platform counter and clear
+// it on success; sharing it here would let reset requests arm the captcha on
+// console login from the same address, and let any successful first-party
+// sign-in from that address disarm the reset route.
+func consoleResetCaptchaScope() captchaScope {
+	return captchaScope{Counter: consoleResetCaptchaCounter}
 }
 
 // appCaptchaScopeFor builds the scope for an application-authenticated flow

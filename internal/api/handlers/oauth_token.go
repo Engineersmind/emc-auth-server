@@ -572,7 +572,7 @@ func (h *OAuthTokenHandler) auditCode(c echo.Context, action string, client *aut
 		ResourceID:    client.ClientID,
 		Status:        audit.StatusSuccess,
 		AuthMethod:    "authorization_code",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	}
 	if !success {
@@ -604,7 +604,7 @@ func (h *OAuthTokenHandler) auditRevoke(c echo.Context, client *auth.AuthzClient
 		ResourceID:    client.ClientID,
 		Status:        audit.StatusSuccess,
 		AuthMethod:    "client_credentials",
-		IPAddress:     c.RealIP(),
+		IPAddress:     clientIP(c),
 		UserAgent:     c.Request().UserAgent(),
 	})
 }

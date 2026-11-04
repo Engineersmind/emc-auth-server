@@ -3,13 +3,13 @@ package middleware
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/labstack/echo/v4"
@@ -62,35 +62,136 @@ type limiterEntry struct {
 // Redis client can be injected via RateLimitConfig.RedisClient field (add it then).
 type limiterStore struct {
 	store sync.Map
+	// max caps how many keys the store holds; 0 means unbounded. Only stores
+	// keyed on something an outsider can mint freely at volume (one key per end
+	// user) set it. See getOrCreateWith for what happens at the cap.
+	max int64
+	// partition and partitionMax cap how many of those keys one partition (for
+	// appUserStore, one limiter label + one application) may hold, so a single
+	// caller minting keys cannot fill the store for every other application.
+	partition    func(key string) string
+	partitionMax int64
+	// idleFull is how long a bucket in this store must sit unused before it is
+	// full again, so evicting it grants nothing waiting would not. Zero means
+	// the store has no such guarantee and is never swept early.
+	idleFull time.Duration
+	// label names the store in the overflow metric when a cap is reached.
+	label string
+	n     atomic.Int64
+	// parts counts keys per partition (string -> *atomic.Int64).
+	parts sync.Map
+	// overflow holds one shared bucket per partition for keys that arrive
+	// while the store or the partition is full (string -> *limiterEntry).
+	overflow  sync.Map
+	lastSweep atomic.Int64
 }
+
+// overflowSweepEvery bounds how often a full store sweeps itself, so an
+// attacker holding it at the cap cannot make every request pay for a scan.
+const overflowSweepEvery = 5 * time.Second
 
 // getOrCreate returns the *rate.Limiter for the given key, creating it if absent.
 // r is requests per minute; burst is the token bucket burst size (= r for login).
 func (s *limiterStore) getOrCreate(key string, r int) *rate.Limiter {
-	ratePerSecond := rate.Every(time.Minute / time.Duration(r))
-	entry, loaded := s.store.LoadOrStore(key, &limiterEntry{
-		limiter:  rate.NewLimiter(ratePerSecond, r),
-		lastSeen: time.Now(),
+	return s.getOrCreateWith(key, func() *rate.Limiter {
+		return rate.NewLimiter(rate.Every(time.Minute/time.Duration(r)), r)
 	})
-	e, _ := entry.(*limiterEntry)
-	if loaded {
-		e.lastSeen = time.Now()
-	}
-	return e.limiter
 }
 
 // getOrCreateEvery is getOrCreate for buckets slower than one token per minute,
 // where the per-minute integer rate cannot express the interval. interval is the
 // time to refill a single token; burst is how many may be spent at once.
 func (s *limiterStore) getOrCreateEvery(key string, interval time.Duration, burst int) *rate.Limiter {
+	return s.getOrCreateWith(key, func() *rate.Limiter {
+		return rate.NewLimiter(rate.Every(interval), burst)
+	})
+}
+
+// getOrCreateWith is where a bounded store enforces its caps. Only the
+// in-process fallback can reach them — with Redis configured these buckets live
+// in Redis.
+//
+// At a cap it first sweeps buckets idle long enough to be full again (idleFull),
+// which loses nothing. If the store is still full, the new key gets its
+// partition's shared overflow bucket: the limit FAILS CLOSED for new subjects in
+// that partition, rather than handing out an unlimited limiter that lifted the
+// per-user limits for every application at once (PR #174 review). With
+// partitions, a caller filling its own partition overflows only itself.
+func (s *limiterStore) getOrCreateWith(key string, newLimiter func() *rate.Limiter) *rate.Limiter {
+	if existing, ok := s.store.Load(key); ok {
+		e, _ := existing.(*limiterEntry)
+		e.lastSeen = time.Now()
+		return e.limiter
+	}
+	part := s.partitionOf(key)
+	var partN *atomic.Int64
+	if s.partitionMax > 0 {
+		partN = s.partCounter(part)
+	}
+	full := func() bool {
+		return (s.max > 0 && s.n.Load() >= s.max) || (partN != nil && partN.Load() >= s.partitionMax)
+	}
+	if full() {
+		s.sweepIdle()
+		if full() {
+			metrics.RateLimitStoreOverflow.WithLabelValues(s.label).Inc()
+			return s.overflowLimiter(part, newLimiter)
+		}
+	}
 	entry, loaded := s.store.LoadOrStore(key, &limiterEntry{
-		limiter:  rate.NewLimiter(rate.Every(interval), burst),
+		limiter:  newLimiter(),
 		lastSeen: time.Now(),
 	})
 	e, _ := entry.(*limiterEntry)
 	if loaded {
 		e.lastSeen = time.Now()
+	} else {
+		s.n.Add(1)
+		if partN != nil {
+			partN.Add(1)
+		}
 	}
+	return e.limiter
+}
+
+func (s *limiterStore) partitionOf(key string) string {
+	if s.partition == nil {
+		return ""
+	}
+	return s.partition(key)
+}
+
+func (s *limiterStore) partCounter(part string) *atomic.Int64 {
+	if v, ok := s.parts.Load(part); ok {
+		n, _ := v.(*atomic.Int64)
+		return n
+	}
+	v, _ := s.parts.LoadOrStore(part, &atomic.Int64{})
+	n, _ := v.(*atomic.Int64)
+	return n
+}
+
+// sweepIdle evicts buckets that are already full again, at most once per
+// overflowSweepEvery.
+func (s *limiterStore) sweepIdle() {
+	if s.idleFull <= 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := s.lastSweep.Load()
+	if now-last >= int64(overflowSweepEvery) && s.lastSweep.CompareAndSwap(last, now) {
+		s.cleanup(s.idleFull)
+	}
+}
+
+func (s *limiterStore) overflowLimiter(part string, newLimiter func() *rate.Limiter) *rate.Limiter {
+	if v, ok := s.overflow.Load(part); ok {
+		e, _ := v.(*limiterEntry)
+		e.lastSeen = time.Now()
+		return e.limiter
+	}
+	v, _ := s.overflow.LoadOrStore(part, &limiterEntry{limiter: newLimiter(), lastSeen: time.Now()})
+	e, _ := v.(*limiterEntry)
 	return e.limiter
 }
 
@@ -101,10 +202,54 @@ func (s *limiterStore) cleanup(ttl time.Duration) {
 	s.store.Range(func(key, value any) bool {
 		e, _ := value.(*limiterEntry)
 		if e.lastSeen.Before(cutoff) {
-			s.store.Delete(key)
+			if _, deleted := s.store.LoadAndDelete(key); deleted {
+				s.n.Add(-1)
+				if s.partitionMax > 0 {
+					k, _ := key.(string)
+					s.partCounter(s.partitionOf(k)).Add(-1)
+				}
+			}
 		}
 		return true
 	})
+	s.overflow.Range(func(part, value any) bool {
+		if e, _ := value.(*limiterEntry); e.lastSeen.Before(cutoff) {
+			s.overflow.Delete(part)
+		}
+		return true
+	})
+}
+
+// exhausted reports whether key's bucket exists and has less than one token,
+// without spending. A key never seen has a full bucket.
+func (s *limiterStore) exhausted(key string) bool {
+	existing, ok := s.store.Load(key)
+	if !ok {
+		return false
+	}
+	e, _ := existing.(*limiterEntry)
+	return e.limiter.Tokens() < 1
+}
+
+// refund gives one token back to key's bucket, if it exists. A negative AllowN
+// adds a token; the limiter caps at burst on its next refill computation, so
+// at most one token over burst is ever outstanding.
+func (s *limiterStore) refund(key string) {
+	existing, ok := s.store.Load(key)
+	if !ok {
+		return
+	}
+	e, _ := existing.(*limiterEntry)
+	e.limiter.AllowN(time.Now(), -1)
+}
+
+// reset empties the store (tests only).
+func (s *limiterStore) reset() {
+	s.store.Range(func(k, _ any) bool { s.store.Delete(k); return true })
+	s.parts.Range(func(k, _ any) bool { s.parts.Delete(k); return true })
+	s.overflow.Range(func(k, _ any) bool { s.overflow.Delete(k); return true })
+	s.n.Store(0)
+	s.lastSweep.Store(0)
 }
 
 // global stores — package-level singletons, one per key space.
@@ -122,8 +267,43 @@ var (
 	// thousands of rows or recompute a 100k-row hash chain, so a tenant admin
 	// must not be able to fan out concurrent calls against the DB.
 	auditMaintStore = &limiterStore{}
-	cleanupOnce     sync.Once
+	// appIPStore holds the per-IP buckets for application end-user routes (see
+	// apps2s.go). Separate from ipStore because its legitimate volume — a whole
+	// product's backend — is nothing like one person's login attempts.
+	appIPStore = &limiterStore{}
+	// appUserStore holds one bucket per end user per application. It is the one
+	// store whose key count tracks the size of every product's user base, so it
+	// is capped, per application as well as in total (see
+	// limiterStore.getOrCreateWith).
+	appUserStore = &limiterStore{
+		max:          appUserStoreMax,
+		partition:    appUserPartition,
+		partitionMax: appUserPartitionMax,
+		// Every bucket here is r per minute with burst r (allowVia), so one
+		// idle for a minute is full again.
+		idleFull: time.Minute,
+		label:    "app_user",
+	}
+	cleanupOnce sync.Once
 )
+
+// appUserStoreMax bounds the in-process per-user buckets. At roughly 200 bytes a
+// bucket this is about 100 MB, reached only when Redis is unavailable and more
+// than this many distinct users act within one minute.
+const appUserStoreMax = 500_000
+
+// appUserPartitionMax is the share of appUserStore one partition may hold, so
+// one application minting subjects (made-up emails through its own credentials
+// and a large self-set quota) overflows only its own partition.
+const appUserPartitionMax = 100_000
+
+// appUserPartition is the limiter label and the key's owner — the application
+// id (or "-") for UserLimit keys, "sub"/"ip" for SignedInUserRateLimiter keys.
+func appUserPartition(key string) string {
+	label, rest, _ := strings.Cut(key, ":")
+	owner, _, _ := strings.Cut(rest, ":")
+	return label + ":" + owner
+}
 
 // startCleanup starts a background goroutine that evicts stale limiter entries
 // every 5 minutes. Called once via sync.Once.
@@ -138,6 +318,8 @@ func startCleanup() {
 				tenantStore.cleanup(10 * time.Minute)
 				oauthClientStore.cleanup(10 * time.Minute)
 				auditMaintStore.cleanup(10 * time.Minute)
+				appIPStore.cleanup(10 * time.Minute)
+				appUserStore.cleanup(10 * time.Minute)
 				jwksStore.cleanup(10 * time.Minute)
 				// Safe at 10 min: UserInfo refills 60/min, i.e. one token per
 				// second, so a bucket idle for ten minutes is already full and
@@ -164,17 +346,13 @@ func startCleanup() {
 // a test suite that reuses the process does not pollute token buckets across runs.
 // MUST NOT be called in production code.
 func ResetStoresForTest() {
-	ipStore.store.Range(func(k, _ any) bool { ipStore.store.Delete(k); return true })
-	tenantStore.store.Range(func(k, _ any) bool { tenantStore.store.Delete(k); return true })
-	oauthClientStore.store.Range(func(k, _ any) bool { oauthClientStore.store.Delete(k); return true })
-	auditMaintStore.store.Range(func(k, _ any) bool { auditMaintStore.store.Delete(k); return true })
-	jwksStore.store.Range(func(k, _ any) bool { jwksStore.store.Delete(k); return true })
-	signingKeyRotationStore.store.Range(func(k, _ any) bool { signingKeyRotationStore.store.Delete(k); return true })
-	userInfoStore.store.Range(func(k, _ any) bool { userInfoStore.store.Delete(k); return true })
-	authorizeStore.store.Range(func(k, _ any) bool { authorizeStore.store.Delete(k); return true })
-	oauthTokenStore.store.Range(func(k, _ any) bool { oauthTokenStore.store.Delete(k); return true })
-	revokeStore.store.Range(func(k, _ any) bool { revokeStore.store.Delete(k); return true })
-	passkeyBeginStore.store.Range(func(k, _ any) bool { passkeyBeginStore.store.Delete(k); return true })
+	for _, s := range []*limiterStore{
+		ipStore, tenantStore, oauthClientStore, auditMaintStore, appIPStore, appUserStore,
+		jwksStore, signingKeyRotationStore, userInfoStore, authorizeStore, oauthTokenStore,
+		revokeStore, passkeyBeginStore,
+	} {
+		s.reset()
+	}
 }
 
 // defaultAuditMaintRate is the per-tenant per-minute cap on the expensive audit
@@ -328,11 +506,20 @@ func LoginRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 // When no client_id can be determined (malformed request), only the per-IP
 // limit applies — a shared fallback bucket would recreate the same
 // cross-tenant collision.
+//
+// On routes that also mount an AppS2S resolver, a trusted backend (see
+// TrustedBackend) skips this limiter entirely: its IP and client_id are shared
+// by every user it serves, and the per-user and application limits mounted
+// beside it apply instead. Everywhere else TrustedBackend is false and nothing
+// changes.
 func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	startCleanup()
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
+			if TrustedBackend(c) {
+				return next(c)
+			}
 			ip := c.RealIP()
 			if ip == "" {
 				ip = c.Request().RemoteAddr
@@ -368,82 +555,6 @@ func TokenRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 	}
 }
 
-// PasswordResetRateLimiter rate-limits the forgot/reset-password pair
-// (GHSA-2267-r48x-9fh2).
-//
-// Three buckets, each guarding a different abuse vector:
-//
-//   - reset_ip:{ip} bounds token-guessing volume at /reset-password. The
-//     endpoint's only meaningful key is the caller IP — keying on the
-//     *presented* token would give every guess a fresh bucket, i.e. no limit
-//     at all. The token itself is 32 bytes of CSPRNG output (~256-bit),
-//     hashed at rest, single-use, 15-minute TTL; at 5 guesses/minute per IP
-//     the brute-force window is not measurable.
-//   - reset_client:{client_id} bounds /forgot-password per calling
-//     application (its Basic credentials), same keying as TokenRateLimiter.
-//   - reset_email:{email} bounds per-victim inbox flooding: without it, an
-//     attacker rotating IPs AND client credentials could mail one victim
-//     unboundedly. The address is peeked from the body without consuming it
-//     (same technique as loginEmailFromBody); reset-password carries no email
-//     so that bucket simply doesn't apply there.
-//
-// Each 429 names its bucket in "limiter" — ip, app, user — the vocabulary the
-// application rate limiters use, so a client can tell which wait it is in.
-func PasswordResetRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
-	startCleanup()
-
-	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
-			ip := c.RealIP()
-			if ip == "" {
-				ip = c.Request().RemoteAddr
-			}
-
-			if !allowVia(c.Request().Context(), ipStore, "reset_ip", "reset-ip:"+ip, cfg.PerIPRate) {
-				metrics.RateLimitHits.WithLabelValues("reset_ip").Inc()
-				c.Response().Header().Set("Retry-After", "60")
-				return c.JSON(http.StatusTooManyRequests, map[string]string{
-					"error":       "too many password reset requests from your IP address",
-					"limiter":     "ip",
-					"retry_after": "60",
-				})
-			}
-
-			if clientID := tokenClientID(c); clientID != "" {
-				if len(clientID) > maxRateLimitEmailLen {
-					clientID = clientID[:maxRateLimitEmailLen]
-				}
-				if !allowVia(c.Request().Context(), tenantStore, "reset_client", "reset-client:"+clientID, cfg.PerTenantRate) {
-					metrics.RateLimitHits.WithLabelValues("reset_client").Inc()
-					c.Response().Header().Set("Retry-After", "60")
-					return c.JSON(http.StatusTooManyRequests, map[string]string{
-						"error":       "too many password reset requests for this client",
-						"limiter":     "app",
-						"retry_after": "60",
-					})
-				}
-			}
-
-			if email := loginEmailFromBody(c); email != "" {
-				if len(email) > maxRateLimitEmailLen {
-					email = email[:maxRateLimitEmailLen]
-				}
-				if !allowVia(c.Request().Context(), tenantStore, "reset_email", "reset-email:"+email, cfg.PerTenantRate) {
-					metrics.RateLimitHits.WithLabelValues("reset_email").Inc()
-					c.Response().Header().Set("Retry-After", "60")
-					return c.JSON(http.StatusTooManyRequests, map[string]string{
-						"error":       "too many password reset requests for this email",
-						"limiter":     "user",
-						"retry_after": "60",
-					})
-				}
-			}
-
-			return next(c)
-		}
-	}
-}
-
 // OTPRateLimiter rate-limits the OTP-challenge completion endpoints
 // (/auth/login/otp, /auth/login/mfa/enroll, /auth/login/mfa/activate).
 // These carry no email and no client credentials — the only stable identifiers
@@ -468,7 +579,10 @@ func OTPRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 				ip = c.Request().RemoteAddr
 			}
 
-			if !allowVia(c.Request().Context(), ipStore, "otp_ip", "otp-ip:"+ip, cfg.PerIPRate*2) {
+			// A trusted backend completing challenges for its users skips the
+			// per-IP bucket (it is shared by all of them) but NOT the per-session
+			// one below, which is what bounds code guessing on one challenge.
+			if !TrustedBackend(c) && !allowVia(c.Request().Context(), ipStore, "otp_ip", "otp-ip:"+ip, cfg.PerIPRate*2) {
 				metrics.RateLimitHits.WithLabelValues("otp_ip").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
@@ -515,7 +629,9 @@ func OAuthRateLimiter(cfg RateLimitConfig) echo.MiddlewareFunc {
 
 			// Own key prefix: a browser social-login redirect must not spend the
 			// same IP's password-login budget (see the note in LoginRateLimiter).
-			if !allowVia(c.Request().Context(), ipStore, "oauth_ip", "oauth-ip:"+ip, cfg.PerIPRate) {
+			// The browser redirect routes never mount a resolver, so this only
+			// ever skips for a trusted backend calling /auth/oauth/exchange.
+			if !TrustedBackend(c) && !allowVia(c.Request().Context(), ipStore, "oauth_ip", "oauth-ip:"+ip, cfg.PerIPRate) {
 				metrics.RateLimitHits.WithLabelValues("oauth_ip").Inc()
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
@@ -605,41 +721,15 @@ const ClientAuthHeader = "X-Client-Authorization"
 // basicClientID extracts the client_id from a "Basic base64(id:secret)" header
 // value, or "" if the value is absent, not Basic, or malformed.
 func basicClientID(header string) string {
-	if !strings.HasPrefix(header, "Basic ") {
-		return ""
-	}
-	decoded, err := base64.StdEncoding.DecodeString(header[len("Basic "):])
-	if err != nil {
-		return ""
-	}
-	if id, _, found := strings.Cut(string(decoded), ":"); found && id != "" {
-		return id
-	}
-	return ""
+	id, _, _ := basicCredentials(header)
+	return id
 }
 
 // loginEmailFromBody peeks the "email" field out of a login request body
 // without consuming it, so the handler can still bind the full body afterward.
 // Returns "" if the body is missing, unreadable, or not valid JSON.
 func loginEmailFromBody(c echo.Context) string {
-	req := c.Request()
-	if req.Body == nil {
-		return ""
-	}
-	data, err := io.ReadAll(io.LimitReader(req.Body, 1<<16)) // cap: login bodies are tiny
-	_ = req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(data))
-	if err != nil {
-		return ""
-	}
-
-	var payload struct {
-		Email string `json:"email"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return ""
-	}
-	return strings.ToLower(strings.TrimSpace(payload.Email))
+	return strings.ToLower(strings.TrimSpace(peekBodyField(c, "email", 1<<16)))
 }
 
 // jwksStore holds the per-IP buckets for the public JWKS endpoint, kept separate
@@ -771,6 +861,39 @@ func UserInfoRateLimiter() echo.MiddlewareFunc {
 	}
 }
 
+// SignedInUserRateLimiter limits a JWT-authenticated route per signed-in user.
+//
+// For routes that used TokenRateLimiter only to bound one person's volume —
+// POST /auth/change-email is the case: it sends mail. Keyed per IP, every user
+// of a product whose backend calls it on their behalf shared one 5/min budget;
+// keyed per user, each person keeps the same 5/min a browser caller always had.
+//
+// Mount AFTER the JWT middleware. Falls back to the client IP when no verified
+// user is present, for the reason UserInfoRateLimiter gives: a key that can
+// silently become empty is either a global outage or no limit at all.
+func SignedInUserRateLimiter(label string, perMinute int) echo.MiddlewareFunc {
+	startCleanup()
+
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			key := label + ":ip:" + c.RealIP()
+			if claims, ok := c.Get("user").(*auth.Claims); ok && claims != nil && claims.UserID != "" {
+				key = label + ":sub:" + claims.TenantID + ":" + claims.UserID
+			}
+			if !allowVia(c.Request().Context(), appUserStore, label, key, perMinute) {
+				metrics.RateLimitHits.WithLabelValues(label).Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many requests for this user — try again later",
+					"limiter":     "user",
+					"retry_after": "60",
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
 // PasskeyBeginRateLimiter bounds the passkey assertion-challenge endpoint per
 // client IP. See PasskeyBeginPerIPRate for why this is not TokenRateLimiter.
 //
@@ -782,6 +905,12 @@ func PasskeyBeginRateLimiter() echo.MiddlewareFunc {
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
+			// A trusted backend relaying page views for all of its users would
+			// otherwise share this per-IP allowance; the application quota
+			// mounted beside it applies instead.
+			if TrustedBackend(c) {
+				return next(c)
+			}
 			ip := c.RealIP()
 			if ip == "" {
 				ip = c.Request().RemoteAddr

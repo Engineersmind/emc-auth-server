@@ -78,6 +78,9 @@ type ResetEmail struct {
 	To         string
 	ResetLink  string
 	TenantSlug string
+	// TenantName, when set, names the account's tenant in the subject and body,
+	// so an address with accounts in several tenants can tell the links apart.
+	TenantName string
 	// TTLMinutes is the link's validity window as stated in the body. Zero falls
 	// back to defaultResetTTLMinutes so an unset value never renders "0 minutes".
 	TTLMinutes int
@@ -393,7 +396,7 @@ func (m *mailerImpl) SendReset(ctx context.Context, sender *SMTPConfig, tmpl *Te
 	if ttl <= 0 {
 		ttl = defaultResetTTLMinutes
 	}
-	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordReset, e.To, TemplateData{Link: e.ResetLink, TTLMinutes: ttl})
+	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordReset, e.To, TemplateData{Link: e.ResetLink, TenantName: e.TenantName, TTLMinutes: ttl})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Msg("password reset email sent")
 	}
