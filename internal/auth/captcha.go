@@ -285,7 +285,11 @@ type CaptchaRequest struct {
 	TenantID      int64
 	ApplicationID *int64
 	ClientID      string
-	Flow          CaptchaFlow
+	// Counter names the adaptive failure counter this request reads. Empty means
+	// ClientID's own counter. A route whose traffic must not arm, or be cleared
+	// by, another flow's counter sets its own (see failureKey).
+	Counter string
+	Flow    CaptchaFlow
 	// IP is the client address, from echo's RealIP.
 	IP string
 	// ChallengeID and Answer are the optional fields on the request body.
@@ -354,7 +358,11 @@ func (s *CaptchaService) gateArmed(ctx context.Context, policy CaptchaPolicy, re
 		return false
 	}
 
-	n, err := s.redis.Get(ctx, s.failureKey(req.ClientID, req.IP)).Int()
+	counter := req.Counter
+	if counter == "" {
+		counter = req.ClientID
+	}
+	n, err := s.redis.Get(ctx, s.failureKey(counter, req.IP)).Int()
 	if err != nil {
 		if !errors.Is(err, redis.Nil) {
 			s.logger.Warn().Err(err).Msg("captcha: failure counter unreadable, gate open")
@@ -488,7 +496,8 @@ const captchaRetryGrace = 30 * time.Second
 
 // RecordFailure counts a failed attempt against the caller's origin.
 //
-// Keyed by IP and client_id, NEVER by email. That is the invariant the whole
+// Keyed by IP and counter (the client_id, or CaptchaRequest.Counter), NEVER by
+// email. That is the invariant the whole
 // adaptive design is shaped around: the existing lockout counter
 // (users.failed_login_attempts) is keyed by user id, so a captcha driven by it
 // would appear only for addresses that belong to a real account — an
@@ -498,7 +507,7 @@ const captchaRetryGrace = 30 * time.Second
 // Best-effort and never returns an error: it is called from the failure branch
 // of a login handler, where a bookkeeping problem must not change what the
 // caller is told.
-func (s *CaptchaService) RecordFailure(ctx context.Context, tenantID int64, applicationID *int64, clientID, ip string) {
+func (s *CaptchaService) RecordFailure(ctx context.Context, tenantID int64, applicationID *int64, counter, ip string) {
 	if !s.Enabled() || ip == "" {
 		return
 	}
@@ -507,7 +516,7 @@ func (s *CaptchaService) RecordFailure(ctx context.Context, tenantID int64, appl
 		return
 	}
 
-	key := s.failureKey(clientID, ip)
+	key := s.failureKey(counter, ip)
 	pipe := s.redis.TxPipeline()
 	incr := pipe.Incr(ctx, key)
 	pipe.Expire(ctx, key, policy.FailureWindow)
@@ -526,24 +535,25 @@ func (s *CaptchaService) RecordFailure(ctx context.Context, tenantID int64, appl
 // ClearFailures drops the counter for an origin. Called after a successful
 // authentication so one good sign-in releases a shared address — an office NAT
 // must not stay gated because one person fumbled their password this morning.
-func (s *CaptchaService) ClearFailures(ctx context.Context, clientID, ip string) {
+func (s *CaptchaService) ClearFailures(ctx context.Context, counter, ip string) {
 	if !s.Enabled() || ip == "" {
 		return
 	}
-	if err := s.redis.Del(ctx, s.failureKey(clientID, ip)).Err(); err != nil {
+	if err := s.redis.Del(ctx, s.failureKey(counter, ip)).Err(); err != nil {
 		s.logger.Debug().Err(err).Msg("captcha: could not clear failure counter")
 	}
 }
 
-// failureKey namespaces the counter by application and origin.
+// failureKey namespaces the counter by application (or a named counter, see
+// CaptchaRequest.Counter) and origin.
 //
 // The IP is hashed rather than stored in the clear. It is not a secret — it is
 // in the access log — but a Redis instance shared with other workloads should
 // not carry a browsable list of the addresses currently failing to sign in, and
 // nothing here ever needs to read the address back.
-func (s *CaptchaService) failureKey(clientID, ip string) string {
+func (s *CaptchaService) failureKey(counter, ip string) string {
 	sum := sha256.Sum256([]byte(ip))
-	app := clientID
+	app := counter
 	if app == "" {
 		app = "-"
 	}

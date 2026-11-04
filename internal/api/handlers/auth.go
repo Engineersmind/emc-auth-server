@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1652,6 +1653,90 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 
 	return c.JSON(http.StatusOK, genericOK)
 }
+
+// ConsoleForgotPassword handles POST /api/v1/auth/console/forgot-password
+// (issue #179, RESET-01, RESET-03).
+//
+// The first-party counterpart of ForgotPassword, for management-console
+// administrators. The console is a browser SPA and never holds a client_secret,
+// and its accounts have no application (application_id IS NULL), so the
+// application-authenticated endpoint can never reach them. The token this
+// emails is redeemed through the existing POST /auth/reset-password.
+//
+// @Summary      Request a console password reset
+// @Description  Sends a reset link to every first-party (management-console) account registered to the email, one email per account, naming its tenant, and at most one per account per minute. The emails are sent after the response. No client credentials: this is the browser flow for console administrators; applications use POST /api/v1/auth/forgot-password. ALWAYS returns 200 with the same body whether or not the email is registered (prevents email enumeration). Redeem the emailed token with POST /api/v1/auth/reset-password.
+// @Tags         AUTH
+// @Accept       json
+// @Produce      json
+// @Param        body  body      ForgotPasswordRequest  true  "Email address"
+// @Success      200   {object}  map[string]string
+// @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry"
+// @Failure      429   {object}  map[string]string  "Rate limited. The limiter field says which limit (user = this email, ip = this address); wait Retry-After seconds"
+// @Router       /api/v1/auth/console/forgot-password [post]
+func (h *AuthHandler) ConsoleForgotPassword(c echo.Context) error {
+	genericOK := map[string]string{
+		"message": "if that email address is registered, a password reset link has been sent",
+	}
+
+	// mw.DecodeBody, not c.Bind: the per-email limit keys on the email the
+	// middleware reads, so the handler must read the body the same way. A body
+	// it cannot read (form encoding, not JSON) gets the generic 200 and sends
+	// nothing, rather than mail for an address the limiter never saw.
+	var req ForgotPasswordRequest
+	if err := mw.DecodeBody(c, &req); err != nil {
+		return c.JSON(http.StatusOK, genericOK)
+	}
+
+	// No tenant is known before the lookup, so the platform-default policy
+	// decides, as for console login (see captchaCheck on the zero tenant), on
+	// a failure counter of its own (see consoleResetCaptchaScope).
+	scope := consoleResetCaptchaScope()
+	if handled, capErr := h.captchaCheck(c, scope, auth.CaptchaFlowForgotPassword, req.CaptchaID, req.CaptchaAnswer); handled {
+		return capErr
+	}
+	// Every request counts, because none can be told apart from a probe
+	// without revealing whether the address is registered. Counting only
+	// unknown addresses would be that oracle; counting nothing would leave the
+	// adaptive gate unable to arm on an email-sending route.
+	h.captchaRecordFailure(c, scope)
+
+	if req.Email == "" {
+		return c.JSON(http.StatusOK, genericOK)
+	}
+
+	// The lookup, the tokens and the emails run after the response. Done
+	// inline, the response time would say whether the address owns accounts
+	// and roughly how many (one SMTP round trip each), which the identical body
+	// exists to hide. Detached from the request so a client that disconnects
+	// cannot cut the fan-out off halfway; bounded by its own timeout instead.
+	base := audit.Event{
+		ActorEmail:   req.Email,
+		Action:       audit.ActionAuthPasswordResetReq,
+		ResourceType: "user",
+		IPAddress:    clientIP(c),
+	}
+	enrichAudit(c, &base)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request().Context()), consoleResetTimeout)
+	go func() {
+		defer cancel()
+		issued, err := h.resetSvc.ForgotPasswordFirstParty(ctx, req.Email)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("console forgot-password: unexpected service error")
+		}
+		for _, tenantID := range issued {
+			e := base
+			e.TenantID = &tenantID
+			e.Metadata = maps.Clone(base.Metadata)
+			h.audit.Log(ctx, e)
+		}
+	}()
+
+	return c.JSON(http.StatusOK, genericOK)
+}
+
+// consoleResetTimeout bounds the background work of one console
+// forgot-password request: one lookup and up to MaxConsoleResetFanOut emails.
+const consoleResetTimeout = 2 * time.Minute
 
 // ResetPasswordRequest is the JSON body for POST /api/v1/auth/reset-password.
 type ResetPasswordRequest struct {

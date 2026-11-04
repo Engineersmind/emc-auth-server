@@ -87,6 +87,17 @@ type captchaScope struct {
 	// challenge is bound to it, so a challenge minted for one application cannot
 	// be spent by another.
 	ClientID string
+	// Counter, when set, names the adaptive failure counter instead of
+	// ClientID. See consoleResetCaptchaScope.
+	Counter string
+}
+
+// counter is the failure counter this scope reads and writes.
+func (s captchaScope) counter() string {
+	if s.Counter != "" {
+		return s.Counter
+	}
+	return s.ClientID
 }
 
 // captchaCheck runs the gate for one request.
@@ -131,6 +142,7 @@ func (h *AuthHandler) captchaCheck(
 		TenantID:      scope.TenantID,
 		ApplicationID: scope.ApplicationID,
 		ClientID:      scope.ClientID,
+		Counter:       scope.Counter,
 		Flow:          flow,
 		IP:            clientIP(c),
 		ChallengeID:   challengeID,
@@ -163,7 +175,7 @@ func (h *AuthHandler) captchaRecordFailure(c echo.Context, scope captchaScope) {
 	if h.captchaSvc == nil || !h.captchaSvc.Enabled() {
 		return
 	}
-	h.captchaSvc.RecordFailure(c.Request().Context(), scope.TenantID, scope.ApplicationID, scope.ClientID, clientIP(c))
+	h.captchaSvc.RecordFailure(c.Request().Context(), scope.TenantID, scope.ApplicationID, scope.counter(), clientIP(c))
 }
 
 // captchaClearFailures drops the origin's counter after a successful
@@ -177,7 +189,7 @@ func (h *AuthHandler) captchaClearFailures(c echo.Context, scope captchaScope) {
 	if h.captchaSvc == nil || !h.captchaSvc.Enabled() {
 		return
 	}
-	h.captchaSvc.ClearFailures(c.Request().Context(), scope.ClientID, clientIP(c))
+	h.captchaSvc.ClearFailures(c.Request().Context(), scope.counter(), clientIP(c))
 }
 
 // appCaptchaScope builds the scope for an application-authenticated flow, where
@@ -190,6 +202,20 @@ func appCaptchaScope(tenantID, appID int64, clientID string) captchaScope {
 // which resolves against the platform-default policy. See captchaCheck.
 func firstPartyCaptchaScope() captchaScope {
 	return captchaScope{}
+}
+
+// consoleResetCaptchaCounter is the console forgot-password failure counter.
+// The "#" cannot occur in a client_id, so it never collides with an
+// application counter.
+const consoleResetCaptchaCounter = "#console-forgot"
+
+// consoleResetCaptchaScope is firstPartyCaptchaScope with its own failure
+// counter. Console login, register and OTP share the platform counter and clear
+// it on success; sharing it here would let reset requests arm the captcha on
+// console login from the same address, and let any successful first-party
+// sign-in from that address disarm the reset route.
+func consoleResetCaptchaScope() captchaScope {
+	return captchaScope{Counter: consoleResetCaptchaCounter}
 }
 
 // appCaptchaScopeFor builds the scope for an application-authenticated flow

@@ -98,6 +98,34 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `docs/AUTH_TOKEN_MIGRATION.md`. The `Sunset` date is a proposal under review.
 
 ### Fixed
+- **Console administrators could not reset a forgotten password** (#179) — once
+  `POST /api/v1/auth/forgot-password` became application-only (Basic client
+  credentials, lookup scoped to the application), nothing could reach a first-party
+  account (`application_id IS NULL`) from a browser. New
+  **`POST /api/v1/auth/console/forgot-password`** takes `{email, captcha_id?,
+  captcha_answer?}` and no credentials. It emails one reset link per active
+  first-party account the address owns (one per tenant, capped at 10, each email
+  naming its tenant); each token resets only its own account through the existing
+  `POST /auth/reset-password`. It always answers the same `200` (RESET-03), or `428`
+  when the platform captcha policy demands a challenge.
+  - **Timing:** the lookup and the emails run after the response, on a context
+    detached from the request with a 2-minute timeout, so the response time does
+    not reveal whether, or in how many tenants, the address is registered.
+  - **Limits:** 5/min per IP on its own surface, so asking for links never spends
+    the budget for redeeming one at `/reset-password` (`limiter: "ip"`), and 5/min
+    per recipient email (`limiter: "user"`). An account mailed in the last minute is
+    skipped, so one inbox gets at most one email per account per minute however
+    many requests arrive. The body is read with the limiters' own reader
+    (`middleware.DecodeBody`); a body they cannot read gets the generic `200` and
+    sends nothing.
+  - **Captcha:** every request counts toward the adaptive trigger, on a failure
+    counter of its own, so reset traffic never puts a captcha on console sign-in
+    and a successful sign-in never disarms the reset route.
+  - **Platform email:** console admins are platform accounts, so a tenant's
+    `password_reset` template suppression, custom template and white-label sender do
+    not apply.
+  - Each issued token is audited as `auth.password_reset_requested` with its tenant
+    and no application. The application endpoint is unchanged.
 - **`POST /api/v1/auth/refresh` returned no tokens to application-scoped clients** (#108)
   — the rotated pair was delivered only through `setAuthCookies`, which deliberately
   writes nothing for an identity carrying an `app_id` claim ("cookies are for the portal,

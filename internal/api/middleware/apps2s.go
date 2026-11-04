@@ -454,6 +454,10 @@ const (
 	SurfaceApp = "app"
 	// SurfaceReset: /auth/forgot-password, /auth/reset-password.
 	SurfaceReset = "reset"
+	// SurfaceConsoleReset: /auth/console/forgot-password. Kept apart from
+	// SurfaceReset so asking for links cannot spend the budget an admin behind
+	// the same address needs to redeem one at /reset-password.
+	SurfaceConsoleReset = "console_reset"
 	// The surfaces below are mounted with the optional resolvers, where only
 	// credentials that FAILED reach the strict bucket; anonymous callers keep
 	// the route's own limiter.
@@ -491,6 +495,16 @@ type resolveMode struct {
 // applies the per-IP limits. Mount it first on every application route.
 func (s *AppS2S) Resolve(surface string) echo.MiddlewareFunc {
 	return s.resolve(surface, resolveMode{}, headerCredentials)
+}
+
+// ResolveAnonymous is Resolve for routes that take no application credentials
+// at all (POST /auth/console/forgot-password). Any credentials sent are ignored,
+// so every caller is held to the strict per-IP limit: valid client credentials
+// would otherwise buy a higher limit on a route that never checks them.
+func (s *AppS2S) ResolveAnonymous(surface string) echo.MiddlewareFunc {
+	return s.resolve(surface, resolveMode{}, func(echo.Context) (string, string, bool) {
+		return "", "", false
+	})
 }
 
 // ResolveBodyClient is Resolve for routes that name the application by a
@@ -1271,9 +1285,28 @@ func peekBodyString(c echo.Context, field string) string {
 // the decoded prefix followed by whatever was not read — so a larger body is
 // never silently truncated for the handler.
 func peekBodyField(c echo.Context, field string, limit int64) string {
+	holder := reflect.New(bodyFieldType(field))
+	if decodeBodyPrefix(c, holder.Interface(), limit) != nil {
+		return ""
+	}
+	return holder.Elem().Field(0).String()
+}
+
+// DecodeBody decodes the JSON body into v exactly as the limiters read it, and
+// leaves the body in place. A handler on a route limited by a body field must
+// use it: if the handler read a body the limiter could not, that request would
+// be limited as "unknown" while the handler acted on the real value.
+func DecodeBody(c echo.Context, v any) error {
+	return decodeBodyPrefix(c, v, 1<<16)
+}
+
+// errEmptyBody is what decodeBodyPrefix reports for a missing or empty body.
+var errEmptyBody = errors.New("empty request body")
+
+func decodeBodyPrefix(c echo.Context, v any, limit int64) error {
 	req := c.Request()
 	if req.Body == nil {
-		return ""
+		return errEmptyBody
 	}
 	orig := req.Body
 	prefix, err := io.ReadAll(io.LimitReader(orig, limit))
@@ -1281,14 +1314,13 @@ func peekBodyField(c echo.Context, field string, limit int64) string {
 		io.Reader
 		io.Closer
 	}{io.MultiReader(bytes.NewReader(prefix), orig), orig}
-	if err != nil || len(prefix) == 0 {
-		return ""
+	if err != nil {
+		return err
 	}
-	holder := reflect.New(bodyFieldType(field))
-	if json.NewDecoder(bytes.NewReader(prefix)).Decode(holder.Interface()) != nil {
-		return ""
+	if len(prefix) == 0 {
+		return errEmptyBody
 	}
-	return holder.Elem().Field(0).String()
+	return json.NewDecoder(bytes.NewReader(prefix)).Decode(v)
 }
 
 // bodyFieldTypes caches the one-field struct types peekBodyField decodes into,

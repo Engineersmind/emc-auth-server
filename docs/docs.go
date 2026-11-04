@@ -4423,6 +4423,61 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/auth/console/forgot-password": {
+            "post": {
+                "description": "Sends a reset link to every first-party (management-console) account registered to the email, one email per account, naming its tenant, and at most one per account per minute. The emails are sent after the response. No client credentials: this is the browser flow for console administrators; applications use POST /api/v1/auth/forgot-password. ALWAYS returns 200 with the same body whether or not the email is registered (prevents email enumeration). Redeem the emailed token with POST /api/v1/auth/reset-password.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Request a console password reset",
+                "parameters": [
+                    {
+                        "description": "Email address",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ForgotPasswordRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "428": {
+                        "description": "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user = this email, ip = this address); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/forgot-password": {
             "post": {
                 "description": "Sends a reset link to the email address for the authenticated application's user. The application authenticates with Authorization: Basic base64(client_id:client_secret) — this identifies both the tenant and application, scoping the reset to that app's account. ALWAYS returns 200 for a valid client regardless of whether the email is registered (prevents email enumeration).",
