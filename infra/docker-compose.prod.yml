@@ -53,6 +53,16 @@ services:
       # deploy.sh --create-secret generates the token and the matching
       # prometheus.generated.yml (authorization.credentials) automatically.
       METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # ── GHSA-4x5m-3gph-938r (M-02) migration window ──────────────────
+      # The code default is the SECURE one (HS256 verification off) and this
+      # pin defers to it: an unset variable means OFF, including on fresh
+      # deployments. An operator upgrading with live pre-RS256 tokens still
+      # in circulation sets JWT_ALLOW_LEGACY_HS256=true in .env explicitly
+      # for ONE migration window — one agent-token lifetime (1 h; take a
+      # 2 h quiet margin) plus time to confirm
+      #   emc_auth_legacy_hs256_verifications_total is flat at zero —
+      # then removes it. See docs/PHASE4_HS256_CUTOVER.md.
+      JWT_ALLOW_LEGACY_HS256: ${JWT_ALLOW_LEGACY_HS256:-false}
       # ── GHSA-6fcw-g2xw-v42w (L-05) migration window ──────────────────
       # The code defaults are the SECURE ones (legacy issuer rejected,
       # audience required, state required). The pins below preserve the

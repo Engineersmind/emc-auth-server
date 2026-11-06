@@ -670,6 +670,86 @@ func (s *SigningKeyService) BackfillAllTenants(ctx context.Context) (int, error)
 }
 
 // ---------------------------------------------------------------------------
+// Encryption-key rotation
+// ---------------------------------------------------------------------------
+
+// ReencryptPrivateKeys re-seals every live signing_keys.private_key_enc row
+// under the CURRENT JWT_SIGNING_KEY_ENCRYPTION_KEY while a previous key is
+// configured.
+//
+// private_key_enc has no rewrite path of its own — GenerateKey is the only
+// writer and it only runs when a key is created — so without this sweep an
+// old-key ciphertext would become undecryptable the day the previous key is
+// retired, and the tenant could no longer sign at all: load() decrypts the
+// active key's private half on every cache fill (GHSA-4x5m-3gph-938r review).
+// Run at startup while the box carries a previous key: Decrypt falls back to
+// it transparently, and Encrypt always seals under the primary. Together with
+// JWTService.ReencryptTenantSecrets this is what lets a boot log
+// "encryption-key rotation complete" — the signal that
+// JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS can be removed, because both
+// ciphertext families the box protects are covered.
+//
+// Only 'active' and 'next' rows are touched: a retired key's private half is
+// never loaded (load decrypts the active key only) and the row is collected
+// after RetiredKeyGrace, so re-sealing it buys nothing and only adds a decrypt
+// that can fail.
+//
+// The same zero-key guard as JWTService.ReencryptTenantSecrets applies: a box
+// on the development all-zero key must not rewrite rows — re-sealing under it
+// would leave every row unreadable the moment a real primary key is restored.
+//
+// Idempotent and a no-op when no rotation is configured.
+func (s *SigningKeyService) ReencryptPrivateKeys(ctx context.Context) (int, error) {
+	if s.box == nil || !s.box.HasPreviousKey() || s.box.UsesInsecureZeroKey() {
+		return 0, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, private_key_enc FROM signing_keys
+		 WHERE deleted_at IS NULL AND status <> 'retired'`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("list encrypted signing key rows: %w", err)
+	}
+	defer rows.Close()
+
+	type pending struct {
+		id  int64
+		enc string
+	}
+	var todo []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.id, &p.enc); err != nil {
+			return 0, fmt.Errorf("scan signing key enc row: %w", err)
+		}
+		todo = append(todo, p)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate signing key enc rows: %w", err)
+	}
+
+	reencrypted := 0
+	for _, p := range todo {
+		plain, err := s.box.Decrypt(p.enc)
+		if err != nil {
+			return reencrypted, fmt.Errorf("decrypt private_key_enc for signing key %d: %w", p.id, err)
+		}
+		enc, err := s.box.Encrypt(plain)
+		if err != nil {
+			return reencrypted, fmt.Errorf("re-encrypt private key for signing key %d: %w", p.id, err)
+		}
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE signing_keys SET private_key_enc = $1 WHERE id = $2`,
+			enc, p.id,
+		); err != nil {
+			return reencrypted, fmt.Errorf("store re-encrypted private key for signing key %d: %w", p.id, err)
+		}
+		reencrypted++
+	}
+	return reencrypted, nil
+}
+
+// ---------------------------------------------------------------------------
 // JWKS
 // ---------------------------------------------------------------------------
 

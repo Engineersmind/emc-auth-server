@@ -210,6 +210,11 @@ func TestLoad_EnvDefaultsToProduction(t *testing.T) {
 // that a deployment which forgets ENV fails closed rather than silently
 // taking development defaults.
 func TestLoadValidate_UnsetEnvFailsClosed(t *testing.T) {
+	// Pin DATABASE_URL: Load() reads the ambient environment, and since L-06
+	// Validate() refuses an empty DSN in every environment. Without this the
+	// second half below fails on any machine where DATABASE_URL is unset —
+	// the test would be exercising the DSN rule, not the ENV default it names.
+	t.Setenv("DATABASE_URL", "postgres://u:p@localhost/db?sslmode=require")
 	t.Setenv("ENV", "")
 	cfg := Load()
 	if err := cfg.Validate(); err == nil {
