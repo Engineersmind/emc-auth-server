@@ -1806,6 +1806,17 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.POST("/tenants/:tid/applications/:appID/users/import/validate", adminHandler.ValidateUserImport, appUsersWrite, auditMaintLimit)
 	adminGroup.POST("/tenants/:tid/applications/:appID/users/import", adminHandler.CommitUserImport, appUsersWrite, auditMaintLimit)
 
+	// Bulk application RBAC import (#187): permissions and roles, mapped by name,
+	// in one all-or-nothing transaction. Both stages need BOTH write permissions,
+	// the dry run included — its report names which permission and role names
+	// already exist. API-key management tokens work here (appPermsWrite /
+	// appRolesWrite are the same guards as the one-at-a-time routes).
+	adminGroup.POST("/tenants/:tid/applications/:appID/rbac/import/validate", adminHandler.ValidateRBACImport, appPermsWrite, appRolesWrite, auditMaintLimit)
+	adminGroup.POST("/tenants/:tid/applications/:appID/rbac/import", adminHandler.CommitRBACImport, appPermsWrite, appRolesWrite, auditMaintLimit)
+	// Export is the same data the two list endpoints return, so it needs both
+	// read permissions rather than a new one.
+	adminGroup.GET("/tenants/:tid/applications/:appID/rbac/export", adminHandler.ExportRBAC, appPermsRead, appRolesRead, auditMaintLimit)
+
 	// Job progress and the per-row report.
 	//
 	// Reads are on the READ permission and carry no maintenance limit: a client

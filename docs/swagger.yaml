@@ -470,6 +470,83 @@ definitions:
       total_pages:
         type: integer
     type: object
+  admin.RBACImportDocument:
+    properties:
+      mode:
+        description: Mode is "merge" (default) or "replace" — see RBACModeMerge.
+        type: string
+      permissions:
+        items:
+          $ref: '#/definitions/admin.RBACImportPermission'
+        type: array
+      roles:
+        items:
+          $ref: '#/definitions/admin.RBACImportRole'
+        type: array
+    type: object
+  admin.RBACImportPermission:
+    properties:
+      description:
+        type: string
+      name:
+        type: string
+    type: object
+  admin.RBACImportResult:
+    properties:
+      dry_run:
+        type: boolean
+      mode:
+        type: string
+      permissions_created:
+        type: integer
+      permissions_skipped:
+        type: integer
+      rejected:
+        type: integer
+      roles_created:
+        type: integer
+      roles_skipped:
+        type: integer
+      roles_updated:
+        type: integer
+      rows:
+        items:
+          $ref: '#/definitions/admin.RBACImportRowResult'
+        type: array
+    type: object
+  admin.RBACImportRole:
+    properties:
+      name:
+        type: string
+      permissions:
+        items:
+          type: string
+        type: array
+    type: object
+  admin.RBACImportRowResult:
+    properties:
+      added:
+        description: |-
+          Added and Removed list permission names a role gains or loses. Only set
+          for roles with a changing permission list.
+        items:
+          type: string
+        type: array
+      index:
+        type: integer
+      kind:
+        type: string
+      name:
+        type: string
+      outcome:
+        type: string
+      reason:
+        type: string
+      removed:
+        items:
+          type: string
+        type: array
+    type: object
   admin.RoleResult:
     properties:
       application_id:
@@ -10876,6 +10953,156 @@ paths:
       summary: Set an application's rate limit
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/rbac/export:
+    get:
+      description: Returns permissions and roles in the import document shape. format=json
+        (default) or format=csv. Requires permissions:read and roles:read for the
+        application.
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: json (default) or csv
+        in: query
+        name: format
+        type: string
+      produces:
+      - application/json
+      - text/csv
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.RBACImportDocument'
+        "422":
+          description: CSV cannot represent a role name; use JSON
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Export an application's permissions and roles
+      tags:
+      - admin-rbac
+  /api/v1/tenants/{tid}/applications/{appID}/rbac/import:
+    post:
+      consumes:
+      - application/json
+      description: 'Creates permissions and roles and maps them, in one transaction:
+        it fully succeeds or writes nothing. Roles reference permissions by name.
+        mode "merge" (default) adds the listed permissions to each role and keeps
+        existing ones; "replace" makes the list complete. Re-running is a no-op for
+        anything already present. Requires permissions:write and roles:write for the
+        application.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Permissions and roles
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.RBACImportDocument'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.RBACImportResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "409":
+          description: A name was created concurrently; nothing was written, retry
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "413":
+          description: Request Entity Too Large
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "422":
+          description: Rows rejected; nothing was written
+          schema:
+            $ref: '#/definitions/admin.RBACImportResult'
+      security:
+      - BearerAuth: []
+      summary: Import an application's permissions and roles
+      tags:
+      - admin-rbac
+  /api/v1/tenants/{tid}/applications/{appID}/rbac/import/validate:
+    post:
+      consumes:
+      - application/json
+      description: 'Checks a document of permissions and roles against the application''s
+        current state and writes nothing. Returns a per-row report: what would be
+        created, updated or skipped, and every rejected row with its reason. Roles
+        reference permissions by name. Requires permissions:write and roles:write
+        for the application, because the report discloses which names already exist.'
+      parameters:
+      - description: Tenant ID
+        in: path
+        name: tid
+        required: true
+        type: string
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      - description: Permissions and roles
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/admin.RBACImportDocument'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/admin.RBACImportResult'
+        "400":
+          description: Bad Request
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "413":
+          description: Request Entity Too Large
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      security:
+      - BearerAuth: []
+      summary: Validate an application RBAC import (dry run)
+      tags:
+      - admin-rbac
   /api/v1/tenants/{tid}/applications/{appID}/server-trust:
     get:
       description: Returns the application's registered server IPs and whether it
