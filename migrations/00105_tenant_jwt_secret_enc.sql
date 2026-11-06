@@ -11,11 +11,16 @@
 -- signing_keys.private_key_enc, because a leaked symmetric secret IS signing
 -- authority, the same asset class.
 --
--- ADDITIVE and lazily populated: jwt_secret stays populated so a rollback never
--- strands a deployment, and existing rows keep their plaintext until the
--- startup backfill (JWTService.EncryptAllTenantSecrets) encrypts them and
--- blanks the plaintext column. New writes store '' in jwt_secret and the real
--- value in jwt_secret_enc.
+-- ADDITIVE schema — but rollback is NOT free once the backfill has run. The
+-- change itself only adds a column, and jwt_secret stays populated so the
+-- previous binary keeps working through the deploy. The startup backfill
+-- (JWTService.EncryptAllTenantSecrets) then encrypts each plaintext value and
+-- blanks the plaintext column; after that the secret exists only as ciphertext
+-- in jwt_secret_enc, which the previous binary cannot read. Downgrading past
+-- that point therefore requires restoring the original plaintext secrets from
+-- a pre-migration backup — without them the rolled-back binary cannot verify
+-- outstanding HS256 tokens (see Down). New writes store '' in jwt_secret and
+-- the real value in jwt_secret_enc.
 ALTER TABLE tenants
     ADD COLUMN IF NOT EXISTS jwt_secret_enc TEXT;
 
