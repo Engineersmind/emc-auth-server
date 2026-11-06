@@ -297,3 +297,46 @@ func TestRBACImport_DoesNotTouchOtherApplicationsRoles(t *testing.T) {
 		}
 	}
 }
+
+// Two replace imports that read the same role at the same time used to each
+// delete a different mapping and commit an empty role. With the role rows
+// locked before the grants are read they run one after the other, so the role
+// ends with whichever list ran last, never with neither.
+func TestRBACImport_ConcurrentReplaceNeverEmptiesARole(t *testing.T) {
+	f := newAdminFixture(t)
+	ctx := context.Background()
+	if _, err := f.svc.CommitRBACImport(ctx, f.tenantID, f.appID, admin.RBACImportDocument{
+		Permissions: []admin.RBACImportPermission{{Name: "a:read"}, {Name: "b:read"}},
+		Roles:       []admin.RBACImportRole{{Name: "shared", Permissions: []string{"a:read", "b:read"}}},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	for round := 0; round < 5; round++ {
+		// Back to {a,b} each round so every round starts from the racy state.
+		if _, err := f.svc.CommitRBACImport(ctx, f.tenantID, f.appID, admin.RBACImportDocument{
+			Roles: []admin.RBACImportRole{{Name: "shared", Permissions: []string{"a:read", "b:read"}}},
+		}); err != nil {
+			t.Fatalf("reset: %v", err)
+		}
+		errs := make(chan error, 2)
+		for _, only := range []string{"a:read", "b:read"} {
+			go func() {
+				_, err := f.svc.CommitRBACImport(ctx, f.tenantID, f.appID, admin.RBACImportDocument{
+					Mode:  admin.RBACModeReplace,
+					Roles: []admin.RBACImportRole{{Name: "shared", Permissions: []string{only}}},
+				})
+				errs <- err
+			}()
+		}
+		for i := 0; i < 2; i++ {
+			if err := <-errs; err != nil {
+				t.Fatalf("round %d: concurrent replace: %v", round, err)
+			}
+		}
+		_, roles := rbacState(t, f)
+		if got := roles["shared"]; len(got) != 1 {
+			t.Fatalf("round %d: role ended with %v, want exactly one permission (last writer wins, never empty)", round, got)
+		}
+	}
+}

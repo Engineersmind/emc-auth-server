@@ -20,18 +20,36 @@ import (
 // 2MiB holds maxRBACImportRows of realistic names and descriptions.
 const maxRBACImportBodyBytes = 2 << 20
 
+// errRBACBodyTooLarge is returned when an upload exceeds maxRBACImportBodyBytes.
+var errRBACBodyTooLarge = errors.New("import file is larger than 2 MiB")
+
 // bindRBACImportDocument reads and decodes a bounded RBAC import payload.
-// Unknown fields and trailing data are refused for the reasons given on
-// bindImportDocument: a typo'd key ("permisions") must fail the upload, not
-// import a file with its permissions silently dropped.
+//
+// The body is read up to the limit plus one byte, and anything longer is
+// rejected outright. io.LimitReader alone would turn the cut-off into a clean
+// EOF, so a valid document followed by padding and a second document would be
+// accepted with the rest silently dropped.
+//
+// Unknown fields are refused so that a typo'd key ("permisions") fails the
+// upload instead of importing a file with its permissions dropped. Trailing data
+// is refused by requiring end of input after the document: Decoder.More only
+// reports whether an array or object has another element, so it does not see a
+// stray "]" or a second document after a top-level value.
 func bindRBACImportDocument(c echo.Context) (admin.RBACImportDocument, error) {
 	var doc admin.RBACImportDocument
-	dec := json.NewDecoder(io.LimitReader(c.Request().Body, maxRBACImportBodyBytes))
+	body, err := io.ReadAll(io.LimitReader(c.Request().Body, maxRBACImportBodyBytes+1))
+	if err != nil {
+		return doc, err
+	}
+	if len(body) > maxRBACImportBodyBytes {
+		return doc, errRBACBodyTooLarge
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&doc); err != nil {
 		return doc, err
 	}
-	if dec.More() {
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return doc, errors.New("unexpected data after the JSON document")
 	}
 	return doc, nil
@@ -63,6 +81,9 @@ func (h *AdminHandler) ValidateRBACImport(c echo.Context) error {
 	}
 	doc, err := bindRBACImportDocument(c)
 	if err != nil {
+		if errors.Is(err, errRBACBodyTooLarge) {
+			return c.JSON(http.StatusRequestEntityTooLarge, APIError{Error: "import_too_large", Message: err.Error()})
+		}
 		return c.JSON(http.StatusBadRequest, APIError{Error: "import_invalid", Message: "That import file couldn't be read: " + err.Error()})
 	}
 
@@ -114,6 +135,9 @@ func (h *AdminHandler) CommitRBACImport(c echo.Context) error {
 	}
 	doc, err := bindRBACImportDocument(c)
 	if err != nil {
+		if errors.Is(err, errRBACBodyTooLarge) {
+			return c.JSON(http.StatusRequestEntityTooLarge, APIError{Error: "import_too_large", Message: err.Error()})
+		}
 		return c.JSON(http.StatusBadRequest, APIError{Error: "import_invalid", Message: "That import file couldn't be read: " + err.Error()})
 	}
 
@@ -147,8 +171,12 @@ func (h *AdminHandler) CommitRBACImport(c echo.Context) error {
 // is lossless; format=csv gives the permission matrix for a spreadsheet. System
 // roles are omitted because the importer refuses to change them.
 //
+// The export is complete, not truncated. An application with more rows than one
+// import accepts therefore yields a file that must be split before it can be
+// imported; the response says so in X-RBAC-Export-Exceeds-Import-Limit.
+//
 // @Summary      Export an application's permissions and roles
-// @Description  Returns permissions and roles in the import document shape. format=json (default) or format=csv. Requires permissions:read and roles:read for the application.
+// @Description  Returns permissions and roles in the import document shape. format=json (default) or format=csv. The export is complete: if it has more rows than one import accepts (2000 permissions + roles), the response carries X-RBAC-Export-Exceeds-Import-Limit and the file must be split before it is imported. Requires permissions:read and roles:read for the application.
 // @Tags         admin-rbac
 // @Produce      json
 // @Produce      text/csv
@@ -174,6 +202,10 @@ func (h *AdminHandler) ExportRBAC(c echo.Context) error {
 	if err != nil {
 		h.logger.Error().Err(err).Msg("admin: rbac export failed")
 		return fail(c, http.StatusInternalServerError, "export_failed")
+	}
+
+	if doc.ExceedsImportLimit() {
+		c.Response().Header().Set("X-RBAC-Export-Exceeds-Import-Limit", "true")
 	}
 
 	format := strings.ToLower(c.QueryParam("format"))

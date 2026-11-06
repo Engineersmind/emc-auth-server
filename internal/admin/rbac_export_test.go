@@ -58,6 +58,7 @@ func TestWriteRBACCSV(t *testing.T) {
 			{Name: "claims:read", Description: "View, then \"read\""},
 			{Name: "claims:write", Description: "=HYPERLINK(\"x\")"},
 			{Name: "orphan:perm"},
+			{Name: "-1-2"}, // a valid name that a spreadsheet would evaluate
 		},
 		Roles: []admin.RBACImportRole{
 			{Name: "manager", Permissions: []string{"claims:read", "claims:write"}},
@@ -74,6 +75,7 @@ func TestWriteRBACCSV(t *testing.T) {
 		"claims:read,\"View, then \"\"read\"\"\",manager;viewer\n",
 		"claims:write,\"'=HYPERLINK(\"\"x\"\")\",manager\n", // formula neutralised
 		"orphan:perm,,\n", // permission nobody holds still listed
+		"'-1-2,,\n",       // permission names are neutralised too
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("csv missing %q in:\n%s", want, got)
@@ -88,5 +90,19 @@ func TestWriteRBACCSV_RefusesRoleNameWithSemicolon(t *testing.T) {
 	err := admin.WriteRBACCSV(doc, &bytes.Buffer{})
 	if !errors.Is(err, admin.ErrRBACCSVUnsupported) {
 		t.Fatalf("err = %v, want ErrRBACCSVUnsupported", err)
+	}
+}
+
+func TestRBACExport_ExceedsImportLimit(t *testing.T) {
+	doc := &admin.RBACImportDocument{}
+	if doc.ExceedsImportLimit() {
+		t.Fatal("an empty document is within the limit")
+	}
+	for i := 0; i < 1500; i++ {
+		doc.Permissions = append(doc.Permissions, admin.RBACImportPermission{Name: "p"})
+		doc.Roles = append(doc.Roles, admin.RBACImportRole{Name: "r"})
+	}
+	if !doc.ExceedsImportLimit() {
+		t.Fatal("3000 rows is over the 2000-row import limit")
 	}
 }

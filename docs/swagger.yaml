@@ -10955,9 +10955,11 @@ paths:
       - admin-rate-limits
   /api/v1/tenants/{tid}/applications/{appID}/rbac/export:
     get:
-      description: Returns permissions and roles in the import document shape. format=json
-        (default) or format=csv. Requires permissions:read and roles:read for the
-        application.
+      description: 'Returns permissions and roles in the import document shape. format=json
+        (default) or format=csv. The export is complete: if it has more rows than
+        one import accepts (2000 permissions + roles), the response carries X-RBAC-Export-Exceeds-Import-Limit
+        and the file must be split before it is imported. Requires permissions:read
+        and roles:read for the application.'
       parameters:
       - description: Tenant ID
         in: path

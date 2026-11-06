@@ -83,9 +83,11 @@ var ErrRBACCSVUnsupported = fmt.Errorf("a role name contains ';', which the CSV 
 // one row per permission, roles separated by ";". Roles that hold no permission
 // have no row, so the CSV form is for the permission matrix; JSON is lossless.
 //
-// description and roles are passed through csvSafe for the reason given there.
-// Permission names are not: the import's name pattern cannot produce a character
-// that starts a formula call, and prefixing one would break the round trip.
+// Every cell goes through csvSafe for the reason given there, permission names
+// included: the import's name pattern allows a leading '-', so a valid name such
+// as "-1-2" would otherwise be evaluated as arithmetic by a spreadsheet. A
+// prefixed name is not a valid permission name, so a CSV holding one is rejected
+// on re-import with a clear reason; JSON carries every value exactly.
 func WriteRBACCSV(doc *RBACImportDocument, w io.Writer) error {
 	byPerm := map[string][]string{}
 	for _, r := range doc.Roles {
@@ -106,10 +108,18 @@ func WriteRBACCSV(doc *RBACImportDocument, w io.Writer) error {
 		for i, n := range roles {
 			safe[i] = csvSafe(n)
 		}
-		if err := cw.Write([]string{p.Name, csvSafe(p.Description), strings.Join(safe, ";")}); err != nil {
+		if err := cw.Write([]string{csvSafe(p.Name), csvSafe(p.Description), strings.Join(safe, ";")}); err != nil {
 			return err
 		}
 	}
 	cw.Flush()
 	return cw.Error()
+}
+
+// ExceedsImportLimit reports whether the document has more rows than one import
+// accepts. An export is complete rather than truncated, so a large application
+// can produce a file that has to be split before it can be imported; callers
+// surface this instead of presenting the file as restorable in one step.
+func (d *RBACImportDocument) ExceedsImportLimit() bool {
+	return len(d.Permissions)+len(d.Roles) > maxRBACImportRows
 }

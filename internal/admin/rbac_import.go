@@ -161,9 +161,27 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	// Lock the application's roles BEFORE reading their grants. A transaction on
+	// its own does not serialise this read-plan-write: two replace imports that
+	// both read a role holding {a,b}, one asking for {a} and one for {b}, would
+	// each delete a different mapping and commit an empty role. Locking first,
+	// in a statement of its own, means the grants read next are read after any
+	// competing writer has committed (READ COMMITTED takes a fresh snapshot per
+	// statement). Ordered by id so two imports cannot deadlock; the other
+	// writer, UpdateRolePermissions, locks the one role row it changes.
+	if _, err := tx.Exec(ctx, `
+		SELECT 1 FROM (
+			SELECT id FROM roles
+			WHERE tenant_id = $1 AND application_id = $2 AND deleted_at IS NULL
+			ORDER BY id
+			FOR UPDATE
+		) locked`, tenantID, applicationID); err != nil {
+		return nil, fmt.Errorf("lock application roles: %w", err)
+	}
+
 	// Existing state is read inside the transaction the writes will use, so the
 	// plan is computed against the same snapshot it is applied to. A concurrent
-	// writer that sneaks a name in between is caught by the unique index and
+	// writer that sneaks a NEW name in between is caught by the unique index and
 	// aborts the whole import (ErrAlreadyExists) rather than half-applying it.
 	existingPerms, err := loadAppPermissions(ctx, tx, tenantID, applicationID)
 	if err != nil {
