@@ -1363,9 +1363,12 @@ func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID in
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var roleAppID *int64
+	// FOR UPDATE: the bulk RBAC import locks the same row before it reads a
+	// role's grants, so the two cannot interleave their delete-and-insert.
 	err = tx.QueryRow(ctx,
 		`SELECT application_id FROM roles
-		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		 FOR UPDATE`,
 		roleID, tenantID).Scan(&roleAppID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
