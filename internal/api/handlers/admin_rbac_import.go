@@ -30,7 +30,7 @@ var errRBACBodyTooLarge = errors.New("import file is larger than 2 MiB")
 // EOF, so a valid document followed by padding and a second document would be
 // accepted with the rest silently dropped.
 //
-// Unknown fields are refused so that a typo'd key ("permisions") fails the
+// Unknown fields are refused so that a typo'd key ("permissionz") fails the
 // upload instead of importing a file with its permissions dropped. Trailing data
 // is refused by requiring end of input after the document: Decoder.More only
 // reports whether an array or object has another element, so it does not see a

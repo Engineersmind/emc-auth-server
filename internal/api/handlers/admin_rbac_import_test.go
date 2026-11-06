@@ -41,7 +41,7 @@ func TestBindRBACImportDocument_RejectsTrailingData(t *testing.T) {
 }
 
 func TestBindRBACImportDocument_RejectsUnknownField(t *testing.T) {
-	if err := bindRBAC(t, `{"permisions":[]}`); err == nil {
+	if err := bindRBAC(t, `{"permissionz":[]}`); err == nil {
 		t.Fatal("a typo'd key must fail the upload")
 	}
 }
