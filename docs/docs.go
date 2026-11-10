@@ -11009,7 +11009,7 @@ const docTemplate = `{
                         }
                     },
                     "409": {
-                        "description": "A name was created concurrently; nothing was written, retry",
+                        "description": "Permissions or roles changed concurrently; nothing was written, retry",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {

@@ -1363,12 +1363,15 @@ func (s *Service) UpdateRolePermissions(ctx context.Context, tenantID, roleID in
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	var roleAppID *int64
-	// FOR UPDATE: the bulk RBAC import locks the same row before it reads a
-	// role's grants, so the two cannot interleave their delete-and-insert.
+	// FOR NO KEY UPDATE: the bulk RBAC import locks the same row before it reads
+	// a role's grants, so the two cannot interleave their delete-and-insert. It
+	// is the weakest lock that conflicts with itself and, unlike FOR UPDATE, does
+	// not conflict with the FOR KEY SHARE a foreign-key check on user_roles takes,
+	// so assigning the role to a user is not held up.
 	err = tx.QueryRow(ctx,
 		`SELECT application_id FROM roles
 		 WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
-		 FOR UPDATE`,
+		 FOR NO KEY UPDATE`,
 		roleID, tenantID).Scan(&roleAppID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

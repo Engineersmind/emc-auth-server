@@ -238,8 +238,11 @@ func TestRBACImport_FileLevelValidation(t *testing.T) {
 			{Name: "a:b"}, {Name: "a:b"}}},
 		"duplicate role": {Roles: []admin.RBACImportRole{{Name: "r"}, {Name: "r"}}},
 		"empty role":     {Roles: []admin.RBACImportRole{{Name: ""}}},
-		"bad mode":       {Mode: "overwrite", Roles: []admin.RBACImportRole{{Name: "r"}}},
+		"blank role":     {Roles: []admin.RBACImportRole{{Name: "   "}}},
 	}
+	// An unknown mode is wrong about the whole file, not one row, so it is its
+	// own error rather than a rejected row (covered by
+	// TestRBACImport_InvalidModeIsAFileLevelError).
 	for name, doc := range cases {
 		t.Run(name, func(t *testing.T) {
 			res, err := f.svc.CommitRBACImport(ctx, f.tenantID, f.appID, doc)

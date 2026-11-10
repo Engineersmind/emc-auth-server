@@ -267,6 +267,11 @@ var (
 	// thousands of rows or recompute a 100k-row hash chain, so a tenant admin
 	// must not be able to fan out concurrent calls against the DB.
 	auditMaintStore = &limiterStore{}
+	// rbacImportStore buckets the RBAC bulk import, validate and export routes
+	// per tenant and application. Deliberately not auditMaintStore: sharing it
+	// meant a few validate calls used up the tenant's audit-export, user-import
+	// and GDPR-erase allowance, and answered with an audit-specific message.
+	rbacImportStore = &limiterStore{}
 	// appIPStore holds the per-IP buckets for application end-user routes (see
 	// apps2s.go). Separate from ipStore because its legitimate volume — a whole
 	// product's backend — is nothing like one person's login attempts.
@@ -318,6 +323,7 @@ func startCleanup() {
 				tenantStore.cleanup(10 * time.Minute)
 				oauthClientStore.cleanup(10 * time.Minute)
 				auditMaintStore.cleanup(10 * time.Minute)
+				rbacImportStore.cleanup(10 * time.Minute)
 				appIPStore.cleanup(10 * time.Minute)
 				appUserStore.cleanup(10 * time.Minute)
 				jwksStore.cleanup(10 * time.Minute)
@@ -347,7 +353,7 @@ func startCleanup() {
 // MUST NOT be called in production code.
 func ResetStoresForTest() {
 	for _, s := range []*limiterStore{
-		ipStore, tenantStore, oauthClientStore, auditMaintStore, appIPStore, appUserStore,
+		ipStore, tenantStore, oauthClientStore, auditMaintStore, rbacImportStore, appIPStore, appUserStore,
 		jwksStore, signingKeyRotationStore, userInfoStore, authorizeStore, oauthTokenStore,
 		revokeStore, passkeyBeginStore,
 	} {
@@ -389,6 +395,47 @@ func AuditMaintenanceRateLimiter(perMinute int) echo.MiddlewareFunc {
 				c.Response().Header().Set("Retry-After", "60")
 				return c.JSON(http.StatusTooManyRequests, map[string]string{
 					"error":       "too many audit compliance requests — slow down",
+					"retry_after": "60",
+				})
+			}
+			return next(c)
+		}
+	}
+}
+
+// defaultRBACImportRate is the per-application per-minute cap on the RBAC bulk
+// import, validate and export routes. One console import is two calls (check,
+// then apply), so this leaves room for a few attempts at fixing a file.
+const defaultRBACImportRate = 30
+
+// RBACImportRateLimiter bounds the RBAC bulk routes per tenant and application.
+// Each call reads and, for the import, rewrites an application's whole role
+// graph in one transaction, so it is worth a limit — but its own, with its own
+// message, rather than a share of the audit compliance budget.
+// perMinute <= 0 uses defaultRBACImportRate.
+func RBACImportRateLimiter(perMinute int) echo.MiddlewareFunc {
+	startCleanup()
+	if perMinute <= 0 {
+		perMinute = defaultRBACImportRate
+	}
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			key := "rbac-import:"
+			if claims, ok := c.Get("user").(*auth.Claims); ok && claims != nil && claims.TenantID != "" {
+				key += "tenant:" + claims.TenantID
+			} else {
+				ip := c.RealIP()
+				if ip == "" {
+					ip = c.Request().RemoteAddr
+				}
+				key += "ip:" + ip
+			}
+			key += ":app:" + c.Param("appID")
+			if !allowVia(c.Request().Context(), rbacImportStore, "rbac_import", key, perMinute) {
+				metrics.RateLimitHits.WithLabelValues("rbac_import").Inc()
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSON(http.StatusTooManyRequests, map[string]string{
+					"error":       "too many import or export requests for this application — try again in a minute",
 					"retry_after": "60",
 				})
 			}

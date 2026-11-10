@@ -92,6 +92,9 @@ func (h *AdminHandler) ValidateRBACImport(c echo.Context) error {
 		if errors.Is(err, admin.ErrRBACImportTooLarge) {
 			return c.JSON(http.StatusRequestEntityTooLarge, APIError{Error: "import_too_large", Message: err.Error()})
 		}
+		if errors.Is(err, admin.ErrRBACImportInvalid) {
+			return c.JSON(http.StatusBadRequest, APIError{Error: "import_invalid", Message: err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("admin: rbac import validation failed")
 		return fail(c, http.StatusInternalServerError, "import_failed")
 	}
@@ -121,7 +124,7 @@ func (h *AdminHandler) ValidateRBACImport(c echo.Context) error {
 // @Param        body  body      admin.RBACImportDocument true  "Permissions and roles"
 // @Success      200   {object}  admin.RBACImportResult
 // @Failure      400   {object}  map[string]string
-// @Failure      409   {object}  map[string]string  "A name was created concurrently; nothing was written, retry"
+// @Failure      409   {object}  map[string]string  "Permissions or roles changed concurrently; nothing was written, retry"
 // @Failure      413   {object}  map[string]string
 // @Failure      422   {object}  admin.RBACImportResult  "Rows rejected; nothing was written"
 // @Router       /api/v1/tenants/{tid}/applications/{appID}/rbac/import [post]
@@ -146,21 +149,62 @@ func (h *AdminHandler) CommitRBACImport(c echo.Context) error {
 		switch {
 		case errors.Is(err, admin.ErrRBACImportTooLarge):
 			return c.JSON(http.StatusRequestEntityTooLarge, APIError{Error: "import_too_large", Message: err.Error()})
+		case errors.Is(err, admin.ErrRBACImportInvalid):
+			return c.JSON(http.StatusBadRequest, APIError{Error: "import_invalid", Message: err.Error()})
 		case errors.Is(err, admin.ErrRBACImportRejected):
 			return c.JSON(http.StatusUnprocessableEntity, res)
-		case errors.Is(err, admin.ErrAlreadyExists):
+		case errors.Is(err, admin.ErrRBACConflict):
 			return c.JSON(http.StatusConflict, APIError{Error: "import_conflict",
-				Message: "A permission or role with one of these names was created while the import ran. Nothing was written; run it again."})
+				Message: "Permissions or roles in this application changed while the import ran. Nothing was written; run it again."})
 		}
 		h.logger.Error().Err(err).Msg("admin: rbac import failed")
 		return fail(c, http.StatusInternalServerError, "import_failed")
 	}
 
+	changes, truncated := rbacAuditChanges(res.Rows)
 	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminRBACImported, "application", "", appScope,
 		map[string]any{"mode": res.Mode,
 			"permissions_created": res.PermissionsCreated, "roles_created": res.RolesCreated,
-			"roles_updated": res.RolesUpdated, "skipped": res.PermissionsSkipped + res.RolesSkipped})
+			"roles_updated": res.RolesUpdated, "skipped": res.PermissionsSkipped + res.RolesSkipped,
+			"role_changes": changes, "role_changes_truncated": truncated})
 	return c.JSON(http.StatusOK, res)
+}
+
+// Caps on what one audit event carries. A replace import removes grants, so the
+// record must say which roles changed and how; but an event is not a place to
+// store a 2000-row file, so the detail is bounded and says when it was cut.
+const (
+	maxAuditRoleChanges  = 50
+	maxAuditNamesPerRole = 25
+)
+
+// rbacAuditChanges lists the roles an import created or changed with the
+// permission names each gained and lost, bounded by the caps above.
+func rbacAuditChanges(rows []admin.RBACImportRowResult) ([]map[string]any, bool) {
+	changes := []map[string]any{}
+	truncated := false
+	clip := func(in []string) []string {
+		if len(in) > maxAuditNamesPerRole {
+			truncated = true
+			return in[:maxAuditNamesPerRole]
+		}
+		return in
+	}
+	for _, r := range rows {
+		if r.Kind != admin.RBACKindRole || (r.Outcome != admin.RBACOutcomeCreate && r.Outcome != admin.RBACOutcomeUpdate) {
+			continue
+		}
+		if len(changes) >= maxAuditRoleChanges {
+			truncated = true
+			break
+		}
+		changes = append(changes, map[string]any{
+			"role": r.Name, "outcome": r.Outcome,
+			"added": clip(r.Added), "removed": clip(r.Removed),
+			"added_count": len(r.Added), "removed_count": len(r.Removed),
+		})
+	}
+	return changes, truncated
 }
 
 // ExportRBAC handles
@@ -196,6 +240,12 @@ func (h *AdminHandler) ExportRBAC(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "application id is required"})
 	}
 
+	// Checked before any query runs: a bad format should not cost two reads.
+	format := strings.ToLower(c.QueryParam("format"))
+	if format != "" && format != "json" && format != "csv" {
+		return c.JSON(http.StatusBadRequest, APIError{Error: "invalid_format", Message: "format must be json or csv"})
+	}
+
 	// Unlike the user export this is built in memory first, so a failure is still
 	// a status code rather than a truncated download. The row cap makes that safe.
 	doc, err := h.svc.ExportRBAC(c.Request().Context(), tenantID, *appScope)
@@ -208,14 +258,14 @@ func (h *AdminHandler) ExportRBAC(c echo.Context) error {
 		c.Response().Header().Set("X-RBAC-Export-Exceeds-Import-Limit", "true")
 	}
 
-	format := strings.ToLower(c.QueryParam("format"))
-	if format != "" && format != "json" && format != "csv" {
-		return c.JSON(http.StatusBadRequest, APIError{Error: "invalid_format", Message: "format must be json or csv"})
-	}
-
-	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminRBACExported, "application", "", appScope,
-		map[string]any{"format": format, "permissions": len(doc.Permissions), "roles": len(doc.Roles)})
-
+	// The body is fully serialised before anything is sent or audited, so the
+	// event is recorded only for an export that was actually produced; a CSV that
+	// cannot represent the data answers 422 and leaves no "exported" record.
+	var (
+		body        []byte
+		contentType string
+		filename    string
+	)
 	if format == "csv" {
 		var buf bytes.Buffer
 		if err := admin.WriteRBACCSV(doc, &buf); err != nil {
@@ -225,9 +275,19 @@ func (h *AdminHandler) ExportRBAC(c echo.Context) error {
 			h.logger.Error().Err(err).Msg("admin: rbac csv export failed")
 			return fail(c, http.StatusInternalServerError, "export_failed")
 		}
-		c.Response().Header().Set(echo.HeaderContentDisposition, `attachment; filename="rbac.csv"`)
-		return c.Blob(http.StatusOK, "text/csv", buf.Bytes())
+		body, contentType, filename = buf.Bytes(), "text/csv", "rbac.csv"
+	} else {
+		b, err := json.Marshal(doc)
+		if err != nil {
+			h.logger.Error().Err(err).Msg("admin: rbac json export failed")
+			return fail(c, http.StatusInternalServerError, "export_failed")
+		}
+		body, contentType, filename = b, echo.MIMEApplicationJSON, "rbac.json"
 	}
-	c.Response().Header().Set(echo.HeaderContentDisposition, `attachment; filename="rbac.json"`)
-	return c.JSON(http.StatusOK, doc)
+
+	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminRBACExported, "application", "", appScope,
+		map[string]any{"format": format, "permissions": len(doc.Permissions), "roles": len(doc.Roles)})
+
+	c.Response().Header().Set(echo.HeaderContentDisposition, `attachment; filename="`+filename+`"`)
+	return c.Blob(http.StatusOK, contentType, body)
 }

@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
+	"strings"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Bulk RBAC import (#187): create an application's permissions and roles, and
@@ -58,6 +62,14 @@ const (
 var (
 	// ErrRBACImportTooLarge is returned when a document exceeds maxRBACImportRows.
 	ErrRBACImportTooLarge = fmt.Errorf("import exceeds %d rows (permissions + roles)", maxRBACImportRows)
+	// ErrRBACImportInvalid is returned for a document that is wrong as a whole
+	// (an unknown mode), before any transaction starts. It is a 400, not a
+	// rejected row.
+	ErrRBACImportInvalid = errors.New(`mode must be "merge" or "replace"`)
+	// ErrRBACConflict is returned when a concurrent writer changed what the import
+	// depends on after it was read: a name created, or a permission deleted before
+	// its grant was written. Nothing was written; running it again is safe.
+	ErrRBACConflict = errors.New("permissions or roles changed while the import ran")
 	// ErrRBACImportRejected is returned by the commit when validation rejected
 	// any row. The accompanying result lists them; nothing was written.
 	ErrRBACImportRejected = errors.New("import has rejected rows; nothing was written")
@@ -154,6 +166,9 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 	if mode == "" {
 		mode = RBACModeMerge
 	}
+	if mode != RBACModeMerge && mode != RBACModeReplace {
+		return nil, ErrRBACImportInvalid
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -169,20 +184,27 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 	// competing writer has committed (READ COMMITTED takes a fresh snapshot per
 	// statement). Ordered by id so two imports cannot deadlock; the other
 	// writer, UpdateRolePermissions, locks the one role row it changes.
-	if _, err := tx.Exec(ctx, `
-		SELECT 1 FROM (
-			SELECT id FROM roles
-			WHERE tenant_id = $1 AND application_id = $2 AND deleted_at IS NULL
-			ORDER BY id
-			FOR UPDATE
-		) locked`, tenantID, applicationID); err != nil {
-		return nil, fmt.Errorf("lock application roles: %w", err)
+	//
+	// Not taken for a dry run: the report is advisory and writes nothing, so it
+	// must not make a validate call queue behind (or hold up) real writers.
+	// FOR NO KEY UPDATE rather than FOR UPDATE, so the foreign-key checks on
+	// user_roles and users.role_id (FOR KEY SHARE) are not blocked either.
+	if !dryRun {
+		if _, err := tx.Exec(ctx, `
+			SELECT 1 FROM (
+				SELECT id FROM roles
+				WHERE tenant_id = $1 AND application_id = $2 AND deleted_at IS NULL
+				ORDER BY id
+				FOR NO KEY UPDATE
+			) locked`, tenantID, applicationID); err != nil {
+			return nil, fmt.Errorf("lock application roles: %w", err)
+		}
 	}
 
 	// Existing state is read inside the transaction the writes will use, so the
 	// plan is computed against the same snapshot it is applied to. A concurrent
 	// writer that sneaks a NEW name in between is caught by the unique index and
-	// aborts the whole import (ErrAlreadyExists) rather than half-applying it.
+	// aborts the whole import (ErrRBACConflict) rather than half-applying it.
 	existingPerms, err := loadAppPermissions(ctx, tx, tenantID, applicationID)
 	if err != nil {
 		return nil, err
@@ -197,10 +219,6 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 		res.Rejected++
 		res.Rows = append(res.Rows, RBACImportRowResult{
 			Kind: kind, Index: idx, Name: name, Outcome: RBACOutcomeReject, Reason: reason})
-	}
-
-	if mode != RBACModeMerge && mode != RBACModeReplace {
-		reject(RBACKindRole, 0, "", `mode must be "merge" or "replace"`)
 	}
 
 	// --- Permissions ---------------------------------------------------------
@@ -221,6 +239,11 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 		case seenPerm[p.Name] != 0:
 			reject(RBACKindPermission, i, p.Name,
 				fmt.Sprintf("duplicate of permission #%d in this file", seenPerm[p.Name]-1))
+			continue
+		case hasControlChars(p.Description, true):
+			// Postgres refuses a NUL in text, which would otherwise surface as a 500
+			// at commit time after validate had reported the row as fine.
+			reject(RBACKindPermission, i, p.Name, "description contains control characters")
 			continue
 		}
 		seenPerm[p.Name] = i + 1
@@ -243,18 +266,25 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 	var plan []rbacPlanned
 	seenRole := make(map[string]int, len(doc.Roles))
 	for i, r := range doc.Roles {
-		if l := len([]rune(r.Name)); l < 1 || l > 100 {
-			reject(RBACKindRole, i, r.Name, "name must be 1-100 characters")
+		// Surrounding whitespace is dropped: " admin" would otherwise be created
+		// as a separate role that looks exactly like "admin" in the console.
+		name := strings.TrimSpace(r.Name)
+		if l := len([]rune(name)); l < 1 || l > 100 {
+			reject(RBACKindRole, i, name, "name must be 1-100 characters")
 			continue
 		}
-		if seenRole[r.Name] != 0 {
-			reject(RBACKindRole, i, r.Name,
-				fmt.Sprintf("duplicate of role #%d in this file", seenRole[r.Name]-1))
+		if hasControlChars(name, false) {
+			reject(RBACKindRole, i, name, "name must not contain control characters")
 			continue
 		}
-		seenRole[r.Name] = i + 1
+		if seenRole[name] != 0 {
+			reject(RBACKindRole, i, name,
+				fmt.Sprintf("duplicate of role #%d in this file", seenRole[name]-1))
+			continue
+		}
+		seenRole[name] = i + 1
 		if len(r.Permissions) > maxRBACRolePermissions {
-			reject(RBACKindRole, i, r.Name,
+			reject(RBACKindRole, i, name,
 				fmt.Sprintf("more than %d permissions", maxRBACRolePermissions))
 			continue
 		}
@@ -272,14 +302,14 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 		}
 		if len(unknown) > 0 {
 			sort.Strings(unknown)
-			reject(RBACKindRole, i, r.Name, fmt.Sprintf(
-				"unknown permission(s) %v: define them in this file or create them in the application first", dedupeStrings(unknown)))
+			reject(RBACKindRole, i, name, fmt.Sprintf(
+				"unknown permission(s) %v: define them in this file or create them in the application first", slices.Compact(unknown)))
 			continue
 		}
 
-		ex, exists := existingRoles[r.Name]
+		ex, exists := existingRoles[name]
 		if exists && ex.isSystem {
-			reject(RBACKindRole, i, r.Name, "system roles cannot be changed by import")
+			reject(RBACKindRole, i, name, "system roles cannot be changed by import")
 			continue
 		}
 
@@ -299,7 +329,7 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 		sort.Strings(grant)
 		sort.Strings(revoke)
 
-		row := RBACImportRowResult{Kind: RBACKindRole, Index: i, Name: r.Name, Added: grant, Removed: revoke}
+		row := RBACImportRowResult{Kind: RBACKindRole, Index: i, Name: name, Added: grant, Removed: revoke}
 		switch {
 		case !exists:
 			row.Outcome = RBACOutcomeCreate
@@ -315,7 +345,7 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 		res.Rows = append(res.Rows, row)
 		if row.Outcome != RBACOutcomeSkip {
 			plan = append(plan, rbacPlanned{
-				name: r.Name, exists: exists, role: ex, grant: grant, revoke: revoke,
+				name: name, exists: exists, role: ex, grant: grant, revoke: revoke,
 			})
 		}
 	}
@@ -417,7 +447,7 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 			USING unnest($1::bigint[], $2::bigint[]) AS d(role_id, permission_id)
 			WHERE rp.role_id = d.role_id AND rp.permission_id = d.permission_id`,
 			delRole, delPerm); err != nil {
-			return nil, fmt.Errorf("revoke role permissions: %w", err)
+			return nil, rbacWriteErr("revoke role permissions", err)
 		}
 	}
 	if len(addRole) > 0 {
@@ -427,7 +457,7 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 			FROM unnest($1::bigint[], $2::bigint[]) AS a(role_id, permission_id)
 			ON CONFLICT DO NOTHING`,
 			addRole, addPerm, tenantID); err != nil {
-			return nil, fmt.Errorf("grant role permissions: %w", err)
+			return nil, rbacWriteErr("grant role permissions", err)
 		}
 	}
 
@@ -437,26 +467,34 @@ func (s *Service) runRBACImport(ctx context.Context, tenantID, applicationID int
 	return res, nil
 }
 
-// rbacWriteErr maps a unique violation (a name created by a concurrent writer
-// after the snapshot was read) to ErrAlreadyExists so the handler can answer
-// 409, and wraps anything else.
+// rbacWriteErr maps the two ways a concurrent writer can invalidate the plan
+// after its snapshot was read — a unique violation (a name created) and a
+// foreign-key violation (a permission or role deleted before its grant was
+// written) — to ErrRBACConflict so the handler answers 409, and wraps anything
+// else. Nothing was written in either case: the transaction rolls back.
 func rbacWriteErr(op string, err error) error {
-	if isDuplicateErr(err) {
-		return ErrAlreadyExists
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && (pgErr.Code == "23505" || pgErr.Code == "23503") {
+		return ErrRBACConflict
 	}
 	return fmt.Errorf("%s: %w", op, err)
 }
 
-func dedupeStrings(in []string) []string {
-	out := in[:0:0]
-	var prev string
-	for i, s := range in { // callers pass a sorted slice
-		if i == 0 || s != prev {
-			out = append(out, s)
+// hasControlChars reports whether s holds a control character. Postgres refuses
+// NUL in text outright, and other control characters are never intended in a
+// name. allowLayout permits tab, newline and carriage return, which a free-text
+// description can reasonably contain.
+func hasControlChars(s string, allowLayout bool) bool {
+	for _, r := range s {
+		if !unicode.IsControl(r) {
+			continue
 		}
-		prev = s
+		if allowLayout && (r == '\t' || r == '\n' || r == '\r') {
+			continue
+		}
+		return true
 	}
-	return out
+	return false
 }
 
 // loadAppPermissions returns name -> id for the application's live permissions.
@@ -488,6 +526,7 @@ func loadAppRoles(ctx context.Context, tx pgx.Tx, tenantID, applicationID int64)
 		FROM roles r
 		LEFT JOIN role_permissions rp ON rp.role_id = r.id
 		LEFT JOIN permissions p ON p.id = rp.permission_id AND p.deleted_at IS NULL
+		  AND p.application_id IS NOT DISTINCT FROM r.application_id
 		WHERE r.tenant_id = $1 AND r.application_id = $2 AND r.deleted_at IS NULL`,
 		tenantID, applicationID)
 	if err != nil {
