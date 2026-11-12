@@ -59,3 +59,34 @@ func TestRBACImportRateLimiter_OwnBucketAndNeutralMessage(t *testing.T) {
 		t.Errorf("audit bucket = %d, want 204 (separate from RBAC)", rec.Code)
 	}
 }
+
+// /7, /007 and /+7 all resolve to application 7 in authz and the handler, so
+// they must draw from one bucket rather than each getting a fresh allowance.
+func TestRBACImportRateLimiter_CanonicalisesAppID(t *testing.T) {
+	mw.ResetStoresForTest()
+	t.Cleanup(mw.ResetStoresForTest)
+
+	e := echo.New()
+	ok := func(c echo.Context) error { return c.NoContent(http.StatusNoContent) }
+	rbac := mw.RBACImportRateLimiter(2)
+
+	call := func(appID string) int {
+		rec := httptest.NewRecorder()
+		c := e.NewContext(httptest.NewRequest(http.MethodPost, "/", nil), rec)
+		c.SetParamNames("appID")
+		c.SetParamValues(appID)
+		_ = rbac(ok)(c)
+		return rec.Code
+	}
+
+	for _, id := range []string{"7", "007"} {
+		if got := call(id); got != http.StatusNoContent {
+			t.Fatalf("appID %q = %d, want 204", id, got)
+		}
+	}
+	for _, id := range []string{"0007", "+7", "7"} {
+		if got := call(id); got != http.StatusTooManyRequests {
+			t.Errorf("appID %q = %d, want 429 (same application)", id, got)
+		}
+	}
+}

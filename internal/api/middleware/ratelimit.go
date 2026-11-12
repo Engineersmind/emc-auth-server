@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -430,7 +431,13 @@ func RBACImportRateLimiter(perMinute int) echo.MiddlewareFunc {
 				}
 				key += "ip:" + ip
 			}
-			key += ":app:" + c.Param("appID")
+			// Canonicalise: authz and the handler ParseInt this segment, so /7,
+			// /007 and /+7 are the same application and must share one bucket.
+			appKey := c.Param("appID")
+			if id, err := strconv.ParseInt(appKey, 10, 64); err == nil {
+				appKey = strconv.FormatInt(id, 10)
+			}
+			key += ":app:" + appKey
 			if !allowVia(c.Request().Context(), rbacImportStore, "rbac_import", key, perMinute) {
 				metrics.RateLimitHits.WithLabelValues("rbac_import").Inc()
 				c.Response().Header().Set("Retry-After", "60")
