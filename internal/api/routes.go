@@ -141,6 +141,11 @@ type RoutesConfig struct {
 	// organisation routes answer 404 — byte-identical to the behaviour before
 	// the feature existed. See config.Config.OrganizationsEnabled.
 	OrganizationsEnabled bool
+
+	// PasswordlessEnabled and PasswordlessCodeHMACKey configure passwordless
+	// sign-in by emailed code. See config.Config.PasswordlessEnabled.
+	PasswordlessEnabled     bool
+	PasswordlessCodeHMACKey string
 	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
 	// Required when CaptchaEnabled is true.
 	CaptchaHMACKey string
@@ -542,6 +547,19 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithHasher(passwordHasher).
 		WithNotifier(auth.NewEmailNotifier(m, deps.Logger).WithSenders(senderSvc).WithTemplates(tmplSvc))
 	authSvc.WithOrganizations(orgSvc)
+
+	// Passwordless sign-in by emailed code (issue #203). The policy service is
+	// always built (the admin API edits it whether or not the feature is on); the
+	// flow itself is wired into the auth service only when PASSWORDLESS_ENABLED is
+	// set, so with the switch off every application is password only and the
+	// password endpoints never consult the policy.
+	pwlessPolicySvc := auth.NewPasswordlessPolicyService(deps.Pool, deps.Logger).
+		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
+			return totpSvc.GetAppMFAConfig(ctx, appRowID)
+		}).
+		WithTemplateEnabled(func(ctx context.Context, tenantID int64, appRowID *int64) bool {
+			return tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordlessCode)
+		})
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
@@ -575,6 +593,15 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	auditLog := deps.Audit
 	if auditLog == nil {
 		auditLog = audit.New(deps.Pool, deps.Logger)
+	}
+
+	if deps.Config.PasswordlessEnabled {
+		pwlessKey, keyErr := auth.PasswordlessKeyFromConfig(deps.Config.Env, deps.Config.PasswordlessCodeHMACKey)
+		if keyErr != nil {
+			deps.Logger.Fatal().Err(keyErr).Msg("passwordless init failed — check PASSWORDLESS_CODE_HMAC_KEY")
+		}
+		authSvc.WithPasswordless(pwlessPolicySvc, pwlessKey, auditLog)
+		deps.Logger.Info().Msg("passwordless sign-in is ENABLED")
 	}
 
 	// Wire the audit logger into the send services so a template-disabled
@@ -811,6 +838,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// rather than in the authHandler builder chain above.
 	authHandler.WithAuthorization(authzSvc)
 	authHandler.WithCaptcha(captchaSvc)
+	authHandler.WithPasswordless(deps.Config.PasswordlessEnabled)
 	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
 	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
 		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure,
@@ -1083,6 +1111,23 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify,
 		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
 		s2s.GuessLimit("app_magic_link_verify_user", userLimits.MagicLinkVerify))
+
+	// Passwordless sign-in by emailed code (issue #203). Answers 404 while
+	// PASSWORDLESS_ENABLED is false. Start sends mail, so it is limited per
+	// recipient and, via its own bucket, can never spend the quota real password
+	// logins use. Resend and verify redeem or rotate a code, so they are limited
+	// per end-user IP like magic-link verify, because a per-code key would be
+	// useless: every guess is a new code.
+	pwlessClientRateLimit := mw.PasswordlessClientRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
+	authGroup.POST("/apps/passwordless/start", authHandler.PasswordlessStart,
+		s2s.Resolve(mw.SurfaceApp), pwlessClientRateLimit,
+		s2s.UserLimit("app_passwordless_start_user", userLimits.PasswordlessStart, mw.SubjectEmail))
+	authGroup.POST("/apps/passwordless/resend", authHandler.PasswordlessResend,
+		s2s.Resolve(mw.SurfaceApp), pwlessClientRateLimit,
+		s2s.GuessLimit("app_passwordless_verify_user", userLimits.PasswordlessVerify))
+	authGroup.POST("/apps/passwordless/verify", authHandler.PasswordlessVerify,
+		s2s.Resolve(mw.SurfaceApp), pwlessClientRateLimit,
+		s2s.GuessLimit("app_passwordless_verify_user", userLimits.PasswordlessVerify))
 
 	// Organizations — end-user flows. Each answers 404 while
 	// ORGANIZATIONS_ENABLED is false. They carry no client secret (a browser

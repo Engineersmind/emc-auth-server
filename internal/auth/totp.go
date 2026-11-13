@@ -455,6 +455,13 @@ type OTPSession struct {
 	// client asked for. Neither is authority — the mint re-checks membership.
 	OrgRequest       string `json:",omitempty"`
 	SkipOrganization bool   `json:",omitempty"`
+
+	// FirstFactor records which first factor began this sign-in when it was not
+	// the password. Empty means password, which is every session stored before
+	// passwordless existed, so an in-flight challenge across a deploy completes
+	// exactly as it always did. It selects the grant and amr the finished session
+	// carries (see completionSession).
+	FirstFactor string `json:",omitempty"`
 }
 
 // OTPSessionTTL is how long the intermediate TOTP challenge state lives.
@@ -470,3 +477,36 @@ const MFAEnrollmentSessionTTL = 10 * time.Minute
 // from the password step. Hard cap against 6-digit brute force inside the
 // session TTL window.
 const MaxOTPAttempts = 5
+
+// FirstFactorEmailOTP marks a sign-in that began with a passwordless emailed code.
+const FirstFactorEmailOTP = "email_otp"
+
+type firstFactorKey struct{}
+
+// withFirstFactor returns ctx carrying the first factor for the pre-auth session
+// stored under it. The zero value (nothing carried) means password.
+func withFirstFactor(ctx context.Context, f string) context.Context {
+	return context.WithValue(ctx, firstFactorKey{}, f)
+}
+
+func firstFactorFrom(ctx context.Context) string {
+	f, _ := ctx.Value(firstFactorKey{}).(string)
+	return f
+}
+
+// completionAMR is the amr a session carries after its second factor passes.
+func completionAMR(firstFactor string) []string {
+	if firstFactor == FirstFactorEmailOTP {
+		return []string{AMREmailOTP, AMROTP, AMRMFA}
+	}
+	return []string{AMRPassword, AMROTP, AMRMFA}
+}
+
+// completionGrant is the grant a session carries after its second factor passes:
+// the grant that began the flow.
+func completionGrant(firstFactor string) string {
+	if firstFactor == FirstFactorEmailOTP {
+		return GrantEmailOTP
+	}
+	return GrantPassword
+}

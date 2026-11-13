@@ -78,6 +78,10 @@ type AuthService struct {
 	// orgSvc resolves organisation membership at mint time. Nil, or present but
 	// switched off, means every application behaves as organizations_mode 'off'.
 	orgSvc *OrganizationService
+	// pwless is the passwordless email-code flow (issue #203). nil leaves the
+	// service exactly as it was: every passwordless entry point reports
+	// ErrPasswordlessUnavailable and the password endpoints never consult it.
+	pwless *passwordlessRuntime
 	logger zerolog.Logger
 }
 
@@ -1909,6 +1913,13 @@ type mfaGateOptions struct {
 
 // mfaGateWith is mfaGate with options. See mfaGate for the contract.
 func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+	if opts.inboxFirstFactor {
+		// Carried to the stored challenge so the finished session keeps the email-code
+		// grant and amr. A context value rather than a new parameter on every helper
+		// between here and storePreAuthSession keeps those signatures, and so every
+		// existing caller, untouched.
+		ctx = withFirstFactor(ctx, FirstFactorEmailOTP)
+	}
 	// Administrators first: for them MFA is mandatory, so this branch runs even
 	// on a deployment where the per-application gate below would return early.
 	// Only a tenant-level login (appRowID 0) can be an administrator's — an
@@ -2070,11 +2081,11 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 			persistent:  session.Persistent,
 			activeRoles: session.ActiveRoles,
 			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         []string{AMRPassword, AMROTP, AMRMFA},
+			amr:         completionAMR(session.FirstFactor),
 			// The grant is the one that began the flow. MFA is a second factor
-			// on a password login, not a grant of its own — amr already records
+			// on that first factor, not a grant of its own — amr already records
 			// that the OTP step happened.
-			grant: GrantPassword,
+			grant: completionGrant(session.FirstFactor),
 		}, session.AppID)
 }
 
@@ -2205,8 +2216,8 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 			persistent:  session.Persistent,
 			activeRoles: session.ActiveRoles,
 			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         []string{AMRPassword, AMROTP, AMRMFA},
-			grant:       GrantPassword,
+			amr:         completionAMR(session.FirstFactor),
+			grant:       completionGrant(session.FirstFactor),
 		}, session.AppID)
 	if err != nil {
 		return nil, session, err
@@ -2364,6 +2375,9 @@ func (s *AuthService) storePreAuthSession(ctx context.Context, keyFn func(string
 	raw, err := GenerateRefreshToken()
 	if err != nil {
 		return "", err
+	}
+	if sess.FirstFactor == "" {
+		sess.FirstFactor = firstFactorFrom(ctx)
 	}
 	payload, err := json.Marshal(sess)
 	if err != nil {

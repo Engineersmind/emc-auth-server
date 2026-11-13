@@ -45,6 +45,9 @@ type AuthHandler struct {
 	// whose deployment switch is off, makes every gate call a no-op — which is
 	// what keeps this feature invisible until somebody turns it on.
 	captchaSvc *auth.CaptchaService
+	// passwordlessEnabled is the deployment-level switch (PASSWORDLESS_ENABLED).
+	// False makes the three /apps/passwordless routes answer 404.
+	passwordlessEnabled bool
 	// adminSvc backs the end-user session self-service routes (/me/sessions).
 	//
 	// Reuses the admin service's session queries rather than duplicating them:
