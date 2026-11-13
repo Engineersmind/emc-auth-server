@@ -1392,7 +1392,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sets the application's MFA mode and (optionally) its allowed methods. 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login until an admin resets them); 'optional' restores the default opt-in behaviour. allowed_methods omitted keeps the current set (default [\"totp\"]).",
+                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]).",
                 "consumes": [
                     "application/json"
                 ],
@@ -1412,7 +1412,7 @@ const docTemplate = `{
                         "required": true
                     },
                     {
-                        "description": "MFA mode (disabled | optional | required) + optional allowed_methods subset of [totp, email]",
+                        "description": "Optional mfa_enabled switch + MFA mode (disabled | optional | required) + optional allowed_methods subset of [totp, email]",
                         "name": "body",
                         "in": "body",
                         "required": true,
@@ -1438,12 +1438,9 @@ const docTemplate = `{
                         }
                     },
                     "403": {
-                        "description": "Forbidden",
+                        "description": "forbidden | mfa_switch_off_service_token | mfa_switch_off_stale_session",
                         "schema": {
-                            "type": "object",
-                            "additionalProperties": {
-                                "type": "string"
-                            }
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     },
                     "404": {
@@ -5177,7 +5174,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Every MFA method with whether it is allowed for the caller, available on this server, and enrolled. mfa_required is true for administrators, for whom MFA is mandatory.",
+                "description": "Every MFA method with whether it is allowed for the caller, available on this server, and enrolled. mfa_required is true for administrators, for whom MFA is mandatory. For an application user, allowed follows the application's policy: mfa_enabled (the master switch) is true, mode is not \"disabled\", and the method is in the application's allowed_methods. mode is the application's mode (\"required\" for administrators, \"optional\" for tenant-level users).",
                 "produces": [
                     "application/json"
                 ],
@@ -5930,7 +5927,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low.",
+                "description": "Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low. mfa_enabled is the user's application MFA master switch: when false the application runs without MFA (enrolled factors are kept but not challenged, and new enrolment is refused).",
                 "produces": [
                     "application/json"
                 ],
@@ -15405,7 +15402,7 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "allowed": {
-                    "description": "Allowed: the caller's policy accepts this method. Always true for a\nnon-administrator, whose methods are not governed by the admin policy.",
+                    "description": "Allowed: the caller's policy accepts this method — the administrator\npolicy for an administrator; for an application user, the application's\npolicy (switch on, mode not 'disabled', method in allowed_methods);\nalways true for a tenant-level user, who has no application policy.",
                     "type": "boolean"
                 },
                 "available": {
@@ -15447,6 +15444,10 @@ const docTemplate = `{
                 "magic_link_redirect_url": {
                     "type": "string"
                 },
+                "mfa_enabled": {
+                    "description": "MFAEnabled is the master switch. false = the application runs without\nMFA; Mode and AllowedMethods are kept and apply again once it is turned\nback on.",
+                    "type": "boolean"
+                },
                 "mode": {
                     "type": "string"
                 },
@@ -15471,9 +15472,17 @@ const docTemplate = `{
                         "$ref": "#/definitions/auth.MFAMethodStatus"
                     }
                 },
+                "mfa_enabled": {
+                    "description": "MFAEnabled is the caller's application MFA master switch. false means\nthe application runs without MFA: nothing is challenged and nothing can\nbe enrolled. Always true for administrators and tenant-level users.",
+                    "type": "boolean"
+                },
                 "mfa_required": {
                     "description": "MFARequired is true when the caller is an administrator and MFA is\ntherefore mandatory for them.",
                     "type": "boolean"
+                },
+                "mode": {
+                    "description": "Mode is the caller's effective MFA mode: the application's mode for an\napplication user, \"required\" for an administrator, \"optional\" for a\ntenant-level user.",
+                    "type": "string"
                 },
                 "policy_source": {
                     "type": "string"
@@ -16037,6 +16046,10 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "enrolled": {
+                    "type": "boolean"
+                },
+                "mfa_enabled": {
+                    "description": "MFAEnabled is the caller's application MFA master switch, populated by\nthe handler. false = the application runs without MFA: enrolled factors\nare kept but not challenged. Always true for a tenant-level user.",
                     "type": "boolean"
                 }
             }
@@ -17259,6 +17272,9 @@ const docTemplate = `{
                 },
                 "magic_link_redirect_url": {
                     "type": "string"
+                },
+                "mfa_enabled": {
+                    "type": "boolean"
                 },
                 "mode": {
                     "type": "string"
