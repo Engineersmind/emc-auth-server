@@ -1894,6 +1894,21 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
 func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+	return s.mfaGateWith(ctx, mfaGateOptions{}, userID, tenantID, appRowID, appID, email, roleName, perms, persistent, activeRoles, org)
+}
+
+// mfaGateOptions tunes mfaGateWith. The zero value is exactly mfaGate's
+// behaviour, so adding a field here can never change an existing caller.
+type mfaGateOptions struct {
+	// inboxFirstFactor is set when the first factor was itself proof of control
+	// of the user's inbox (the passwordless email code). The email second-factor
+	// method is then neither offered nor emailed: the same inbox twice is
+	// ceremony, not a second factor. TOTP and passkeys are unaffected.
+	inboxFirstFactor bool
+}
+
+// mfaGateWith is mfaGate with options. See mfaGate for the contract.
+func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
 	// Administrators first: for them MFA is mandatory, so this branch runs even
 	// on a deployment where the per-application gate below would return early.
 	// Only a tenant-level login (appRowID 0) can be an administrator's — an
@@ -1946,6 +1961,9 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// users who had already enrolled it. A non-app login (appRowID 0) has no
 	// policy and honours every active factor.
 	permitted := func(method string) bool {
+		if opts.inboxFirstFactor && method == MFAMethodEmail {
+			return false
+		}
 		return appRowID == 0 || methodAllowed(allowedMethods, method)
 	}
 	var methods []string
@@ -1968,7 +1986,11 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// (re)enroll a permitted method before finishing login; otherwise the login
 	// proceeds (the app does not enforce MFA).
 	if appRowID != 0 && mode == MFAModeRequired {
-		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent, activeRoles, org)
+		enrollmentMethods := allowedMethods
+		if opts.inboxFirstFactor {
+			enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
+		}
+		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
 		if err != nil {
 			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
 		}

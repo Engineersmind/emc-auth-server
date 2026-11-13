@@ -65,6 +65,17 @@ func methodAllowed(methods []string, method string) bool {
 	return false
 }
 
+// withoutMethod returns methods minus method, as a new slice.
+func withoutMethod(methods []string, method string) []string {
+	out := make([]string, 0, len(methods))
+	for _, m := range methods {
+		if m != method {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // defaultMFAMethods is the implicit method set when no policy row exists and
 // the pre-00047 default for existing rows.
 func defaultMFAMethods() []string { return []string{MFAMethodTOTP} }
