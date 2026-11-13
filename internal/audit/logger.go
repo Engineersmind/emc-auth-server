@@ -116,6 +116,13 @@ const (
 	ActionAdminUsersImported        = "admin.users_imported"
 	ActionAdminUsersImportCancelled = "admin.users_import_cancelled"
 
+	// Admin — bulk application RBAC import (#187). The validate dry run is audited
+	// for the same reason the user one is: its report discloses which permission
+	// and role names already exist.
+	ActionAdminRBACImportValidated = "admin.rbac_import_validated"
+	ActionAdminRBACImported        = "admin.rbac_imported"
+	ActionAdminRBACExported        = "admin.rbac_exported"
+
 	// Admin — per-app rate limit management (08-02)
 	ActionAdminAppLimitCreated = "admin.app_limit_created"
 	ActionAdminAppLimitUpdated = "admin.app_limit_updated"

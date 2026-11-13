@@ -10892,6 +10892,220 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/rbac/export": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns permissions and roles in the import document shape. format=json (default) or format=csv. The export is complete: if it has more rows than one import accepts (2000 permissions + roles), the response carries X-RBAC-Export-Exceeds-Import-Limit and the file must be split before it is imported. Requires permissions:read and roles:read for the application.",
+                "produces": [
+                    "application/json",
+                    "text/csv"
+                ],
+                "tags": [
+                    "admin-rbac"
+                ],
+                "summary": "Export an application's permissions and roles",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "json (default) or csv",
+                        "name": "format",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.RBACImportDocument"
+                        }
+                    },
+                    "422": {
+                        "description": "CSV cannot represent a role name; use JSON",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/rbac/import": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Creates permissions and roles and maps them, in one transaction: it fully succeeds or writes nothing. Roles reference permissions by name. mode \"merge\" (default) adds the listed permissions to each role and keeps existing ones; \"replace\" makes the list complete. Re-running is a no-op for anything already present. Requires permissions:write and roles:write for the application.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rbac"
+                ],
+                "summary": "Import an application's permissions and roles",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Permissions and roles",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.RBACImportDocument"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.RBACImportResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Permissions or roles changed concurrently; nothing was written, retry",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Rows rejected; nothing was written",
+                        "schema": {
+                            "$ref": "#/definitions/admin.RBACImportResult"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/rbac/import/validate": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Checks a document of permissions and roles against the application's current state and writes nothing. Returns a per-row report: what would be created, updated or skipped, and every rejected row with its reason. Roles reference permissions by name. Requires permissions:write and roles:write for the application, because the report discloses which names already exist.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-rbac"
+                ],
+                "summary": "Validate an application RBAC import (dry run)",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Tenant ID",
+                        "name": "tid",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "Permissions and roles",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/admin.RBACImportDocument"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/admin.RBACImportResult"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/server-trust": {
             "get": {
                 "security": [
@@ -13916,6 +14130,120 @@ const docTemplate = `{
                 },
                 "total_pages": {
                     "type": "integer"
+                }
+            }
+        },
+        "admin.RBACImportDocument": {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "description": "Mode is \"merge\" (default) or \"replace\" — see RBACModeMerge.",
+                    "type": "string"
+                },
+                "permissions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.RBACImportPermission"
+                    }
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.RBACImportRole"
+                    }
+                }
+            }
+        },
+        "admin.RBACImportPermission": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                }
+            }
+        },
+        "admin.RBACImportResult": {
+            "type": "object",
+            "properties": {
+                "dry_run": {
+                    "type": "boolean"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "permissions_created": {
+                    "type": "integer"
+                },
+                "permissions_skipped": {
+                    "type": "integer"
+                },
+                "rejected": {
+                    "type": "integer"
+                },
+                "roles_created": {
+                    "type": "integer"
+                },
+                "roles_skipped": {
+                    "type": "integer"
+                },
+                "roles_updated": {
+                    "type": "integer"
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/admin.RBACImportRowResult"
+                    }
+                }
+            }
+        },
+        "admin.RBACImportRole": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string"
+                },
+                "permissions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "admin.RBACImportRowResult": {
+            "type": "object",
+            "properties": {
+                "added": {
+                    "description": "Added and Removed list permission names a role gains or loses. Only set\nfor roles with a changing permission list.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "index": {
+                    "type": "integer"
+                },
+                "kind": {
+                    "type": "string"
+                },
+                "name": {
+                    "type": "string"
+                },
+                "outcome": {
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "removed": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },
