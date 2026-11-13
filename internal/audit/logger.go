@@ -281,6 +281,10 @@ const (
 	// Admin — per-application MFA policy management (issue #63)
 	ActionAdminMFAPolicyUpdated = "admin.mfa_policy_updated"
 	ActionAdminUserMFAReset     = "admin.user_mfa_reset"
+	// ActionAdminMFASwitchChanged is a real flip of an application's MFA master
+	// switch (#192). Metadata: old_mfa_enabled, new_mfa_enabled. Emitted only
+	// when the value actually changed, and mailed to the app's administrators.
+	ActionAdminMFASwitchChanged = "admin.mfa_switch_changed"
 
 	// Admin — mandatory administrator MFA policy (migration 00094): which
 	// methods satisfy the requirement, per tenant and for the platform.
