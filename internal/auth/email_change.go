@@ -258,3 +258,60 @@ func (s *EmailChangeService) notifyOldAddress(ctx context.Context, tenantID int6
 		s.logger.Warn().Err(err).Msg("email change: could not alert the previous address")
 	}
 }
+
+// AdminChange moves a user's email on an administrator's authority, for the
+// lost-mailbox recovery path (passwordless plan, console action C5). No token is
+// involved: the administrator has already proven who the person is, and the
+// caller records the reason in the audit trail.
+//
+// Everything Confirm does to protect the account is done here too: the new
+// address is marked verified, token_version is bumped, every session is revoked
+// and its access tokens denied, and the PREVIOUS address is told, because an
+// administrator action is exactly what a hijacker with a stolen admin session
+// would use, and without that mail the original owner would have no signal.
+func (s *EmailChangeService) AdminChange(ctx context.Context, tenantID int64, appRowID *int64, userID int64, newEmail string) (*EmailChangeResult, error) {
+	newEmail = emailaddr.Normalize(newEmail)
+	if newEmail == "" || !strings.Contains(newEmail, "@") {
+		return nil, ErrInvalidEmailChange
+	}
+	res := EmailChangeResult{UserID: userID, TenantID: tenantID, NewEmail: newEmail}
+	if err := s.pool.QueryRow(ctx, `
+		SELECT email FROM users WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+		  AND application_id IS NOT DISTINCT FROM $3
+	`, userID, tenantID, appRowID).Scan(&res.OldEmail); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrInvalidEmailChange
+		}
+		return nil, fmt.Errorf("lookup user for email change: %w", err)
+	}
+	if res.OldEmail == newEmail {
+		return nil, ErrInvalidEmailChange
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin admin email change: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// The unique constraint is the authority on whether the address is free.
+	if _, err := tx.Exec(ctx, `
+		UPDATE users SET email = $1, email_verified = true,
+		    token_version = token_version + 1, updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3
+	`, newEmail, userID, tenantID); err != nil {
+		if isUniqueViolation(err) {
+			return nil, ErrEmailTaken
+		}
+		return nil, fmt.Errorf("apply admin email change: %w", err)
+	}
+	if err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
+		return nil, fmt.Errorf("revoke sessions on email change: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit admin email change: %w", err)
+	}
+	DenyAccountSessions(ctx, s.logger, userID, tenantID)
+
+	s.notifyOldAddress(ctx, tenantID, appRowID, res.OldEmail, newEmail)
+	return &res, nil
+}

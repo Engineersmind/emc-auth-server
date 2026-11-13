@@ -33,6 +33,11 @@ func (f *pwFixture) rdb() *redis.Client { return f.rc }
 func newPWFixture(t *testing.T) *pwFixture {
 	t.Helper()
 	f := newMFAFixture(t)
+	// Policy rows are tenant- and platform-wide, so one test's rows would leak into
+	// the next (a tenant row enabling codes would break "disabled by default").
+	if _, err := f.pool.Exec(f.ctx, `TRUNCATE passwordless_policies, passwordless_policy_history`); err != nil {
+		t.Fatalf("clear passwordless policies: %v", err)
+	}
 	policy := auth.NewPasswordlessPolicyService(f.pool, testhelper.TestLogger()).
 		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
 			return f.totpSvc.GetAppMFAConfig(ctx, appRowID)
@@ -769,5 +774,24 @@ func TestNormalizePasswordlessDomains(t *testing.T) {
 		if _, err := auth.NormalizePasswordlessDomains([]string{bad}); !errors.Is(err, auth.ErrPasswordlessInvalid) {
 			t.Errorf("domain %q accepted, want ErrPasswordlessInvalid", bad)
 		}
+	}
+}
+
+// Codes cannot be enabled while the sign-in-code email is switched off for the
+// application: they would be requested and never arrive.
+func TestPasswordlessPolicy_RefusesCodesWhileTheTemplateIsOff(t *testing.T) {
+	f := newPWFixture(t)
+	_, appID := f.createApp(t, "pw-tmpl-off")
+	off := auth.NewPasswordlessPolicyService(f.pool, testhelper.TestLogger()).
+		WithTemplateEnabled(func(context.Context, int64, *int64) bool { return false })
+	sc := auth.PasswordlessScope{TenantID: &f.tenantID, ApplicationID: &appID}
+
+	_, err := off.Put(f.ctx, sc, auth.PasswordlessWriteInput{Row: auth.PasswordlessPolicyRow{EmailOTPEnabled: ref(true)}})
+	if !errors.Is(err, auth.ErrPasswordlessTemplateDisabled) {
+		t.Errorf("enable codes with the template off = %v, want ErrPasswordlessTemplateDisabled", err)
+	}
+	// Turning codes OFF is never blocked by it.
+	if _, err := off.Put(f.ctx, sc, auth.PasswordlessWriteInput{Row: auth.PasswordlessPolicyRow{EmailOTPEnabled: ref(false)}}); err != nil {
+		t.Errorf("disable codes with the template off = %v, want nil", err)
 	}
 }

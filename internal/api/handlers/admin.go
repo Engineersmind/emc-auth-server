@@ -25,7 +25,10 @@ import (
 
 // AdminHandler holds handlers for all Admin API endpoints.
 type AdminHandler struct {
-	svc         *admin.Service
+	svc *admin.Service
+	// pwless backs the passwordless policy and recovery routes. nil makes them
+	// answer 503 rather than panicking.
+	pwless      *PasswordlessAdminDeps
 	appLimitSvc *auth.AppRateLimitService
 	// trustSvc backs the server-trust routes (server IPs, forwarded IP). nil
 	// makes them answer 503.

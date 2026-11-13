@@ -835,6 +835,13 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// after the resolver's cache expires — which matters most in the direction
 	// nobody plans for: turning the feature off because it is blocking people.
 	adminSvc.WithCaptchaPolicy(captchaPolicySvc)
+	adminHandler.WithPasswordlessAdmin(handlers.PasswordlessAdminDeps{
+		Policy:        pwlessPolicySvc,
+		Admin:         auth.NewPasswordlessAdminService(deps.Pool, pwlessPolicySvc),
+		Auth:          authSvc,
+		EmailChange:   emailChangeSvc,
+		ServerEnabled: deps.Config.PasswordlessEnabled,
+	})
 	// The gate itself. Must come after captchaSvc exists, which is why it is here
 	// rather than in the authHandler builder chain above.
 	authHandler.WithAuthorization(authzSvc)
@@ -1553,6 +1560,34 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/captcha-policy", adminHandler.UpdateCaptchaPolicy, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/captcha-policy", adminHandler.DeleteCaptchaPolicy, appAppsWrite)
 
+	// Passwordless sign-in policy and recovery (issue #203). Answers 503 until
+	// the services are attached; the routes work whether or not
+	// PASSWORDLESS_ENABLED is on, so a policy can be prepared before the switch is
+	// turned on. Application administrators edit their own application within the
+	// platform ceilings; tenant defaults and the sensitive transitions (open
+	// sign-up, close the password flow) are checked in the handler against the
+	// caller's scope.
+	adminGroup.GET("/tenants/:tid/passwordless-policy", adminHandler.GetPasswordlessPolicy, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/passwordless-policy", adminHandler.PutPasswordlessPolicy, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/passwordless-policy", adminHandler.DeletePasswordlessPolicy, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/passwordless-policy/history", adminHandler.PasswordlessHistory, tidAppsRead)
+	adminGroup.POST("/tenants/:tid/passwordless-policy/history/:hid/restore", adminHandler.PasswordlessRestore, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/passwordless-policy", adminHandler.GetPasswordlessPolicy, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/passwordless-policy", adminHandler.PutPasswordlessPolicy, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/passwordless-policy", adminHandler.DeletePasswordlessPolicy, appAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/passwordless-policy/impact", adminHandler.PasswordlessImpact, appAppsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/passwordless-policy/history", adminHandler.PasswordlessHistory, appAppsRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/passwordless-policy/history/:hid/restore", adminHandler.PasswordlessRestore, appAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/passwordless/stats", adminHandler.PasswordlessStats, appAppsRead)
+	adminGroup.GET("/tenants/:tid/users/:uid/auth-methods", adminHandler.UserAuthMethods, tidUsersRead)
+	adminGroup.POST("/tenants/:tid/users/:uid/verify-email", adminHandler.VerifyUserEmail, tidUsersWrite)
+	adminGroup.POST("/tenants/:tid/users/:uid/clear-passwordless-throttle", adminHandler.ClearPasswordlessThrottle, tidUsersWrite)
+	adminGroup.PUT("/tenants/:tid/users/:uid/email", adminHandler.ChangeUserEmail, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/auth-methods", adminHandler.UserAuthMethods, appUsersRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/verify-email", adminHandler.VerifyUserEmail, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/clear-passwordless-throttle", adminHandler.ClearPasswordlessThrottle, appUsersWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/email", adminHandler.ChangeUserEmail, appUsersWrite)
+
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
 	adminGroup.PUT("/tenants/:tid/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
@@ -1962,6 +1997,23 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.GET("/applications/:appID/captcha-policy", adminHandler.GetCaptchaPolicy, appsRead)
 	adminGroup.PUT("/applications/:appID/captcha-policy", adminHandler.UpdateCaptchaPolicy, appsWrite)
 	adminGroup.DELETE("/applications/:appID/captcha-policy", adminHandler.DeleteCaptchaPolicy, appsWrite)
+	// Slug-less passwordless variants — the caller's own tenant.
+	adminGroup.GET("/platform/passwordless-policy", adminHandler.GetPlatformPasswordlessPolicy, platformOnly)
+	adminGroup.PUT("/platform/passwordless-policy", adminHandler.PutPlatformPasswordlessPolicy, platformOnly)
+	adminGroup.GET("/passwordless-policy", adminHandler.GetPasswordlessPolicy, appsRead)
+	adminGroup.PUT("/passwordless-policy", adminHandler.PutPasswordlessPolicy, appsWrite)
+	adminGroup.DELETE("/passwordless-policy", adminHandler.DeletePasswordlessPolicy, appsWrite)
+	adminGroup.GET("/applications/:appID/passwordless-policy", adminHandler.GetPasswordlessPolicy, appsRead)
+	adminGroup.PUT("/applications/:appID/passwordless-policy", adminHandler.PutPasswordlessPolicy, appsWrite)
+	adminGroup.DELETE("/applications/:appID/passwordless-policy", adminHandler.DeletePasswordlessPolicy, appsWrite)
+	adminGroup.POST("/applications/:appID/passwordless-policy/impact", adminHandler.PasswordlessImpact, appsRead)
+	adminGroup.GET("/applications/:appID/passwordless-policy/history", adminHandler.PasswordlessHistory, appsRead)
+	adminGroup.POST("/applications/:appID/passwordless-policy/history/:hid/restore", adminHandler.PasswordlessRestore, appsWrite)
+	adminGroup.GET("/applications/:appID/passwordless/stats", adminHandler.PasswordlessStats, appsRead)
+	adminGroup.GET("/applications/:appID/users/:uid/auth-methods", adminHandler.UserAuthMethods, usersRead)
+	adminGroup.POST("/applications/:appID/users/:uid/verify-email", adminHandler.VerifyUserEmail, usersWrite)
+	adminGroup.POST("/applications/:appID/users/:uid/clear-passwordless-throttle", adminHandler.ClearPasswordlessThrottle, usersWrite)
+	adminGroup.PUT("/applications/:appID/users/:uid/email", adminHandler.ChangeUserEmail, usersWrite)
 
 	adminGroup.GET("/users/:uid/passkeys", adminHandler.ListUserPasskeys, usersRead)
 	adminGroup.DELETE("/users/:uid/passkeys/:pid", adminHandler.RevokeUserPasskey, usersWrite)
