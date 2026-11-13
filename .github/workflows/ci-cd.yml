@@ -125,6 +125,8 @@ jobs:
             "aws secretsmanager get-secret-value --secret-id " + secret + " --region " + region + " --query SecretString --output text | python3 -c 'import sys,json; [print(k+chr(61)+str(v)) for k,v in json.load(sys.stdin).items()]' > /tmp/app.env",
             "RPASS=$(grep '^REDIS_PASSWORD=' /tmp/app.env | cut -d= -f2-) && echo \"REDIS_URL=redis://:${RPASS}@emc-auth-redis:6379\" >> /tmp/app.env",
             "echo ENV=production >> /tmp/app.env && echo PORT=8080 >> /tmp/app.env && echo JWT_ISSUER=https://" + domain + " >> /tmp/app.env && echo APP_BASE_URL=https://" + domain + " >> /tmp/app.env",
+            "docker network inspect emc-auth-net >/dev/null 2>&1 || docker network create emc-auth-net",
+            "docker inspect -f '{{.State.Running}}' emc-auth-redis 2>/dev/null | grep -q true || { docker rm -f emc-auth-redis 2>/dev/null || true; RPASS=$(grep '^REDIS_PASSWORD=' /tmp/app.env | cut -d= -f2-); docker run -d --name emc-auth-redis --network emc-auth-net --restart unless-stopped redis:7-alpine redis-server --requirepass \"$RPASS\" --maxmemory 128mb --maxmemory-policy allkeys-lru --save \"\"; }",
             "docker rm -f emc-auth-app 2>/dev/null || true",
             f"docker run -d --name emc-auth-app --network emc-auth-net --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file /tmp/app.env {img}",
             f"echo Deployed: {img}",
