@@ -878,3 +878,17 @@ var (
 		},
 	)
 )
+
+// PasswordAuthDisabledRefusals counts password-flow requests refused because the
+// application closed its password flow (password_enabled=false). It is what an
+// administrator watches fall toward zero before closing the flow for good: a
+// non-zero rate means some integration still sends passwords.
+// route: login, register, forgot_password, reset_password.
+var PasswordAuthDisabledRefusals = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "emc_auth",
+		Name:      "password_auth_disabled_total",
+		Help:      "Password-flow requests refused because the application closed its password flow.",
+	},
+	[]string{"route"},
+)

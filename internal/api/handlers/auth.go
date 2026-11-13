@@ -629,6 +629,9 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 		LastName:     req.LastName,
 	})
 	if err != nil {
+		if errors.Is(err, auth.ErrPasswordAuthDisabled) {
+			return h.refusePasswordAuth(c, "register", clientID)
+		}
 		h.captchaRecordFailure(c, registerScope)
 		h.logger.Error().Err(err).Str("email", req.Email).Msg("app register failed")
 		if errors.Is(err, auth.ErrInvalidClient) {
@@ -714,6 +717,9 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		Organization: req.Organization,
 	})
 	if err != nil {
+		if errors.Is(err, auth.ErrPasswordAuthDisabled) {
+			return h.refusePasswordAuth(c, "login", clientID)
+		}
 		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodPassword, clientID, req.Email); handled {
 			h.captchaClearFailures(c, appLoginScope)
 			return resp
@@ -1641,6 +1647,9 @@ func (h *AuthHandler) ForgotPassword(c echo.Context) error {
 	}
 
 	if err := h.resetSvc.ForgotPassword(c.Request().Context(), tenantID, &appID, req.Email); err != nil {
+		if errors.Is(err, auth.ErrPasswordAuthDisabled) {
+			return h.refusePasswordAuth(c, "forgot_password", id)
+		}
 		h.logger.Error().Err(err).Msg("forgot-password: unexpected service error")
 	}
 
@@ -1788,6 +1797,9 @@ func (h *AuthHandler) ResetPassword(c echo.Context) error {
 	}
 	err := h.resetSvc.ResetPassword(c.Request().Context(), in)
 	if err != nil {
+		if errors.Is(err, auth.ErrPasswordAuthDisabled) {
+			return h.refusePasswordAuth(c, "reset_password", "")
+		}
 		if errors.Is(err, auth.ErrInvalidResetToken) {
 			return fail(c, http.StatusBadRequest, "reset_link_invalid")
 		}

@@ -992,3 +992,27 @@ func (s *AuthService) completePasswordlessLogin(ctx context.Context, tenantID, a
 	}
 	return &LoginResult{Token: tokens}, nil
 }
+
+// ---------------------------------------------------------------------------
+// password_enabled enforcement (plan section 4.9 and 4.11)
+// ---------------------------------------------------------------------------
+
+// ErrPasswordAuthDisabled is returned by the password endpoints (login,
+// register, forgot-password, reset) for an application whose resolved policy has
+// password_enabled=false. It is returned BEFORE any user lookup, hash or
+// comparison, so a refused attempt is not counted toward lockout and costs
+// nothing. It is per-application configuration, so it is safe to reveal.
+//
+// The stored password hashes are never read, changed or deleted by this: the
+// flow is closed, not erased, and re-enabling passwords makes them work again.
+var ErrPasswordAuthDisabled = errors.New("password_auth_disabled")
+
+// PasswordFlowClosed reports whether the password flow is closed for an
+// application. False whenever passwordless is not wired (the feature flag is off)
+// or no policy applies, which is every deployment and application today.
+func (s *AuthService) PasswordFlowClosed(ctx context.Context, tenantID int64, appRowID *int64) bool {
+	if s == nil || s.pwless == nil || appRowID == nil || *appRowID == 0 {
+		return false
+	}
+	return !s.pwless.policy.Resolve(ctx, tenantID, appRowID).PasswordEnabled
+}

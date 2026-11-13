@@ -601,6 +601,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 			deps.Logger.Fatal().Err(keyErr).Msg("passwordless init failed — check PASSWORDLESS_CODE_HMAC_KEY")
 		}
 		authSvc.WithPasswordless(pwlessPolicySvc, pwlessKey, auditLog)
+		resetSvc.WithPasswordless(pwlessPolicySvc)
 		deps.Logger.Info().Msg("passwordless sign-in is ENABLED")
 	}
 

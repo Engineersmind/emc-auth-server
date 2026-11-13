@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // ---------------------------------------------------------------------------
@@ -279,4 +282,32 @@ func clip(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// passwordRefusalAudit rate-limits the audit event for refused password requests
+// to one per application per minute: a client that keeps sending passwords would
+// otherwise write one row per attempt. The metric counts every refusal.
+var passwordRefusalAudit sync.Map // application id -> time of last audit event
+
+// refusePasswordAuth answers a password-flow request for an application that has
+// closed its password flow. Nothing about the user was read: this runs before any
+// lookup, so it cannot be an oracle, and the attempt is not counted toward lockout.
+func (h *AuthHandler) refusePasswordAuth(c echo.Context, route, clientID string) error {
+	metrics.PasswordAuthDisabledRefusals.WithLabelValues(route).Inc()
+
+	ev := audit.Event{
+		Action: audit.ActionAuthLoginFailed, AuthMethod: audit.AuthMethodPassword,
+		ResourceType: "user", IPAddress: clientIP(c), UserAgent: c.Request().UserAgent(),
+		HTTPStatus: http.StatusForbidden,
+		Metadata:   map[string]any{"reason": "password_auth_disabled", "route": route},
+	}
+	attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
+	if ev.ApplicationID != nil {
+		last, seen := passwordRefusalAudit.Load(*ev.ApplicationID)
+		if !seen || time.Since(last.(time.Time)) > time.Minute {
+			passwordRefusalAudit.Store(*ev.ApplicationID, time.Now())
+			h.auditEvent(c, ev)
+		}
+	}
+	return fail(c, http.StatusForbidden, "password_auth_disabled")
 }

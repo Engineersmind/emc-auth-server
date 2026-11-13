@@ -1185,6 +1185,10 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		// arrive alongside app credentials and had to be checked against them.
 		tenantID, appRowID = tid, &aid
 		appID = strconv.FormatInt(aid, 10)
+		// Same closure as Login: refused before any hashing or write.
+		if s.PasswordFlowClosed(ctx, tid, &aid) {
+			return nil, ErrPasswordAuthDisabled
+		}
 	} else {
 		// First-party registration lands in the platform tenant.
 		//
@@ -1580,6 +1584,13 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		}
 		appTenantID, appRowID = tid, aid
 		appID = strconv.FormatInt(aid, 10)
+	}
+
+	// An application that closed its password flow refuses here, before any user
+	// lookup or hash (passwordless plan section 4.9). A no-op unless the feature is
+	// enabled and the application opted in.
+	if appRowID != 0 && s.PasswordFlowClosed(ctx, appTenantID, &appRowID) {
+		return nil, ErrPasswordAuthDisabled
 	}
 
 	// User-base isolation: app-authenticated logins only see that application's
