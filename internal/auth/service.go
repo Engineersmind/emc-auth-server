@@ -1880,6 +1880,9 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // LoginResult carrying a challenge when one is due, or nil when the caller
 // may issue tokens directly:
 //
+//   - application MFA master switch OFF → nil: no challenge, no forced
+//     enrolment, whatever the mode or the user's enrolled factors (#192). The
+//     switch is the one deliberate "run this app without MFA" setting;
 //   - any ACTIVE second factor (TOTP or email) → OTP challenge, even when the
 //     application's policy is 'disabled' (fail-secure: the server never
 //     silently skips a factor the user set up; admins remove enrollments
@@ -1920,11 +1923,19 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	var mode string
 	var allowedMethods []string
 	if appRowID != 0 {
-		var cfgErr error
-		mode, allowedMethods, cfgErr = s.totpSvc.GetAppMFAConfig(ctx, appRowID)
+		cfg, cfgErr := s.totpSvc.GetAppMFAConfig(ctx, appRowID)
 		if cfgErr != nil {
 			return nil, fmt.Errorf("load app MFA policy: %w", cfgErr)
 		}
+		// Master switch off (issue #192): the application runs without MFA —
+		// no challenge for enrolled users and no forced enrolment under
+		// 'required'. Nothing is deleted; turning it back on restores both at
+		// the user's next login. Administrators never reach this line: their
+		// gate ran above and the switch does not govern it.
+		if !cfg.Enabled {
+			return nil, nil
+		}
+		mode, allowedMethods = cfg.Mode, cfg.Methods
 	}
 
 	totpActive, err := s.totpSvc.IsActive(ctx, userID)

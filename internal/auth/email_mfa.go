@@ -205,6 +205,9 @@ func (s *EmailMFAService) BeginEnrollment(ctx context.Context, userID, tenantID 
 	if err != nil {
 		return err
 	}
+	if uc.switchedOff() {
+		return ErrMFASwitchedOff
+	}
 	if uc.appRowID != nil && uc.mode == MFAModeDisabled {
 		return ErrMFAEnrollmentDisabled
 	}
@@ -261,13 +264,14 @@ func (s *EmailMFAService) SendVerificationCode(ctx context.Context, userID, tena
 
 // Disable removes email MFA after verifying an emailed code (requested via
 // SendVerificationCode). Users of a 'required' application may only remove
-// email MFA while another active second factor (TOTP) remains.
+// email MFA while another active second factor (TOTP) remains. While the
+// application's MFA master switch is off there is no mandate to enforce.
 func (s *EmailMFAService) Disable(ctx context.Context, userID, tenantID int64, code string) error {
 	uc, err := loadUserMFAContext(ctx, s.pool, userID, tenantID)
 	if err != nil {
 		return err
 	}
-	if uc.appRowID != nil && uc.mode == MFAModeRequired {
+	if uc.requiredByPolicy() {
 		var totpActive bool
 		err := s.pool.QueryRow(ctx,
 			`SELECT COALESCE((SELECT is_active FROM totp_secrets WHERE user_id = $1), false)`,
