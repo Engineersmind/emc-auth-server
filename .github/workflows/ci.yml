@@ -57,6 +57,24 @@ name: CI
 #          so a local run predicts this job instead of a different linter's
 #          opinion.
 #
+# [CI-13] govulncheck GO-2026-6872, GO-2026-6875 — echo v4, no fixed version (#214)
+#   Cause: 8 echo advisories reached the Go vuln DB; the gate fails from 2026-11-13.
+#          Six are fixed in v4.16.0 (bumped).
+#          The other two have no v4 fix: echo keeps the v4 default for backward
+#          compatibility, and the release notes say to set Echo#IPExtractor instead.
+#          Their v4 OSV records name no symbols, so govulncheck matches every echo
+#          call we make (routes, Context, ServeHTTP) rather than the vulnerable code.
+#   Not exposed: both need Echo#IPExtractor left nil. cmd/server/main.go sets it to
+#          middleware.ClientIPExtractor (ExtractIPFromXFFHeader, trusting loopback +
+#          TRUSTED_PROXIES only; required in production by config.Validate).
+#          6872 also needs echo's RateLimiter and 6875 echo's Proxy middleware; we
+#          register neither (only RequestID, Recover, RequestLoggerWithConfig).
+#   Fix:   scripts/govulncheck-gate.sh fails on any called finding except exactly
+#          these two IDs; any other ID, new or old, still blocks. Remove an ID (and
+#          this note) when its v4 OSV record lists a fixed version we are on, or when
+#          we move to echo v5 (v5.1.0 / v5.4.0 fix them); the gate prints a notice
+#          once an allowlisted ID stops being reported.
+#
 # [CI-CD-01] ci-cd.yml deploy startup failure — missing AWS secrets/variables
 #   Cause: AWS_CICD_ROLE_ARN secret + AWS_REGION/ECR_REPO/EC2_TAG_NAME/SECRET_ID/DOMAIN
 #          vars not configured in this repo
@@ -209,10 +227,12 @@ jobs:
       #         go.mod's `go 1.26.0` directive is itself the floor: with
       #         GOTOOLCHAIN=auto the toolchain under scan cannot silently be an
       #         older patch release.
+      # [CI-13] Hard gate except GO-2026-6872 / GO-2026-6875 (no echo v4 fix;
+      #         not exposed, see the note at the top). Any other finding fails.
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+          bash scripts/govulncheck-gate.sh
 
   # ─── Docker Build Smoke Test ─────────────────────────────────────────────────
   docker:
