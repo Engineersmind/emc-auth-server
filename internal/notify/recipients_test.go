@@ -163,6 +163,21 @@ func TestResolveAudience_SecretRotationReachesTheApplicationsAdministrators(t *t
 	}
 }
 
+// Flipping an application's MFA master switch (#192) reaches the same audience
+// as a secret rotation: the tenant's owners plus the co-owners of that app. No
+// platform oversight — it is the tenant's own security decision.
+func TestResolveAudience_MFASwitchReachesTheApplicationsAdministrators(t *testing.T) {
+	f := newNotifyFixture(t)
+
+	aud, err := f.sink.resolveAudience(f.ctx, f.tenantID, &f.appID, nil, f.owner, audit.ActionAdminMFASwitchChanged)
+	if err != nil {
+		t.Fatalf("resolveAudience: %v", err)
+	}
+	if want := []string{f.owner, f.coOwner}; !equal(aud.to, want) {
+		t.Errorf("recipients = %v, want %v", sorted(aud.to), sorted(want))
+	}
+}
+
 // The actor is not special-cased: a co-owner rotating their own application's
 // secret is one of its administrators and gets the same email — the copy that
 // exposes a stolen session.
