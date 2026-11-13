@@ -71,6 +71,11 @@ const (
 	// the person the action was taken on, who would otherwise discover it only
 	// by being refused something they could do yesterday.
 	TemplateAccessChanged TemplateType = "access_changed"
+	// TemplatePasswordlessCode is the one-time code for passwordless sign-in and
+	// sign-up by email. One template with two wordings chosen by TemplateData.Reason
+	// ("verify" confirms an address, anything else is a sign-in). The code is never
+	// in the subject.
+	TemplatePasswordlessCode TemplateType = "passwordless_code"
 )
 
 // AllTemplateTypes lists every customizable template, for admin listing and
@@ -89,6 +94,7 @@ var AllTemplateTypes = []TemplateType{
 	TemplateTenantLockoutAlert,
 	TemplateAdminActivity,
 	TemplateAccessChanged,
+	TemplatePasswordlessCode,
 }
 
 // ValidTemplateType reports whether t is a known template type.
@@ -120,6 +126,7 @@ type TemplateData struct {
 	Code        string // one-time code (MFA)
 	TTLMinutes  int    // validity window for links/codes
 	Name        string // recipient display name (may be empty)
+	Origin      string // approximate request origin, e.g. "Berlin, Germany" (passwordless_code; may be empty)
 	Email       string // recipient address
 	InviterName string // who sent an invitation (user_invitation; may be empty)
 	// AdminRole is the administrator role an invitation confers, spelled for
@@ -632,6 +639,28 @@ If this change was not expected, review it now.
 {{end}}
 You will see the change the next time you sign in. If you were not expecting
 this, contact whoever administers this tenant.
+
+- {{.ProductName}}`,
+	},
+
+	// The passwordless sign-in / verify-address code. The subject never carries
+	// the code, and the code sits alone on its own line so mail apps can offer to
+	// copy or autofill it. Reason "verify" selects the confirm-your-address
+	// wording; anything else is a sign-in.
+	TemplatePasswordlessCode: {
+		Subject: `{{if eq .Reason "verify"}}Confirm your email address{{else}}Sign in{{if .AppName}} to {{.AppName}}{{end}}{{end}}`,
+		HTML: shell(`<h2>{{if eq .Reason "verify"}}Confirm your email address{{else}}Your sign-in code{{end}}</h2>
+<p>{{if eq .Reason "verify"}}Enter this code to confirm your email address{{else}}Enter this code to sign in{{end}}{{if .AppName}} {{if eq .Reason "verify"}}for{{else}}to{{end}} {{.AppName}}{{end}}:</p>
+<p style="font-size:24px;font-weight:bold;letter-spacing:3px;font-family:monospace">{{.Code}}</p>
+<p>It expires in {{.TTLMinutes}} minutes.{{if .Origin}} This request came from {{.Origin}}.{{end}} Use only the newest code if you asked for more than one.</p>
+<p style="font-size:12px;color:#666">If you did not ask for this code, ignore this email: nothing on your account has changed. Never share this code.</p>`),
+		Text: `{{if eq .Reason "verify"}}Enter this code to confirm your email address{{else}}Enter this code to sign in{{end}}{{if .AppName}} {{if eq .Reason "verify"}}for{{else}}to{{end}} {{.AppName}}{{end}}:
+
+    {{.Code}}
+
+It expires in {{.TTLMinutes}} minutes.{{if .Origin}} This request came from {{.Origin}}.{{end}} Use only the newest code if you asked for more than one.
+
+If you did not ask for this code, ignore this email: nothing on your account has changed. Never share this code.
 
 - {{.ProductName}}`,
 	},

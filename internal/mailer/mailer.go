@@ -94,6 +94,18 @@ type MFACodeEmail struct {
 	TTLMinutes int
 }
 
+// PasswordlessCodeEmail is the one-time code for passwordless sign-in or sign-up.
+// Verify selects the confirm-your-address wording.
+type PasswordlessCodeEmail struct {
+	To         string
+	Code       string
+	AppName    string
+	TTLMinutes int
+	Verify     bool
+	// Origin is the approximate request origin shown in the email; may be empty.
+	Origin string
+}
+
 // MagicLinkEmail is a passwordless sign-in link.
 type MagicLinkEmail struct {
 	To         string
@@ -236,6 +248,7 @@ type Mailer interface {
 	SendReset(ctx context.Context, sender *SMTPConfig, tmpl *Template, email ResetEmail) error
 	SendMFACode(ctx context.Context, sender *SMTPConfig, tmpl *Template, email MFACodeEmail) error
 	SendMagicLink(ctx context.Context, sender *SMTPConfig, tmpl *Template, email MagicLinkEmail) error
+	SendPasswordlessCode(ctx context.Context, sender *SMTPConfig, tmpl *Template, email PasswordlessCodeEmail) error
 	SendVerification(ctx context.Context, sender *SMTPConfig, tmpl *Template, email VerificationEmail) error
 	SendWelcome(ctx context.Context, sender *SMTPConfig, tmpl *Template, email WelcomeEmail) error
 	SendPasswordChanged(ctx context.Context, sender *SMTPConfig, tmpl *Template, email PasswordChangedEmail) error
@@ -677,4 +690,18 @@ func NewMailer(cfg MailerConfig) Mailer {
 func ResolvedBranding(sender *SMTPConfig) (productName, logoURL, subjectPrefix string) {
 	b := brandingFrom(sender)
 	return b.ProductName, b.LogoURL, b.SubjectPrefix
+}
+
+func (m *mailerImpl) SendPasswordlessCode(ctx context.Context, sender *SMTPConfig, tmpl *Template, e PasswordlessCodeEmail) error {
+	reason := ""
+	if e.Verify {
+		reason = "verify"
+	}
+	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordlessCode, e.To,
+		TemplateData{Code: e.Code, AppName: e.AppName, TTLMinutes: e.TTLMinutes, Reason: reason, Origin: e.Origin})
+	if err == nil {
+		// Neither the code nor the address beyond the recipient is logged.
+		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("passwordless code email sent")
+	}
+	return err
 }

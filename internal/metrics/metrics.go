@@ -804,3 +804,77 @@ var OrganizationSwitches = promauto.NewCounterVec(
 	},
 	[]string{"outcome"},
 )
+
+// Passwordless sign-in by emailed code (issue #203). All read zero while the
+// feature is off, which is the first thing to check after deploying it dark.
+//
+// result values are a closed set so cardinality stays flat.
+var (
+	// PasswordlessStarts counts code requests.
+	// result: sent (a real challenge was created), decoy (identical response, no
+	// mail: unknown, blocked or refused address), throttled (a limit was hit,
+	// answered like a decoy), suppressed (template disabled), invalid (bad input).
+	PasswordlessStarts = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "passwordless_start_total",
+			Help:      "Passwordless code requests by result.",
+		},
+		[]string{"result"},
+	)
+
+	// PasswordlessVerifies counts code verifications.
+	// result: success, invalid (wrong, expired or unknown code), blocked (the
+	// per-address failure budget is spent), refused (policy off or user not
+	// allowed), error.
+	PasswordlessVerifies = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "passwordless_verify_total",
+			Help:      "Passwordless code verifications by result.",
+		},
+		[]string{"result"},
+	)
+
+	// PasswordlessCreated counts accounts created by a verified code.
+	PasswordlessCreated = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "passwordless_created_total",
+			Help:      "Accounts created by passwordless sign-up, by result.",
+		},
+		[]string{"result"},
+	)
+
+	// PasswordlessEmailSendFailures counts code emails that could not be handed
+	// to the mailer after retries. Alert on the rate: because sending is
+	// asynchronous, this is the only place a mail outage is visible.
+	PasswordlessEmailSendFailures = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "passwordless_email_send_failures_total",
+			Help:      "Passwordless code emails that failed after retries.",
+		},
+	)
+
+	// PasswordlessThrottled counts requests refused by a passwordless limit.
+	// scope: start_email, start_budget, verify_email.
+	PasswordlessThrottled = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "passwordless_throttled_total",
+			Help:      "Passwordless requests limited, by scope.",
+		},
+		[]string{"scope"},
+	)
+
+	// PasswordlessPreverification counts accounts secured by the pre-hijack
+	// safeguard (an unverified account with a password, then signed in by code).
+	PasswordlessPreverification = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "emc_auth",
+			Name:      "passwordless_preverification_neutralized_total",
+			Help:      "Unverified accounts secured on first proof of inbox control.",
+		},
+	)
+)
