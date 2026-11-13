@@ -242,6 +242,26 @@ type TOTPStatus struct {
 	Active               bool `json:"active"`
 	BackupCodesRemaining int  `json:"backup_codes_remaining"`
 	EmailActive          bool `json:"email_active"`
+	// MFAEnabled is the caller's application MFA master switch, populated by
+	// the handler. false = the application runs without MFA: enrolled factors
+	// are kept but not challenged. Always true for a tenant-level user.
+	MFAEnabled bool `json:"mfa_enabled"`
+}
+
+// AppMFAEnabledForUser reports the MFA master switch of the application the
+// user belongs to — true for a tenant-level user, who has no application.
+func (s *TOTPService) AppMFAEnabledForUser(ctx context.Context, userID, tenantID int64) (bool, error) {
+	uc, err := s.loadUserMFAContext(ctx, userID, tenantID)
+	if err != nil {
+		// A tenant-switched administrator's token names a tenant their user row
+		// does not live in. They are no application's user, so no switch
+		// governs them.
+		if errors.Is(err, ErrUserNotFound) {
+			return true, nil
+		}
+		return false, err
+	}
+	return !uc.switchedOff(), nil
 }
 
 // Status reports the user's TOTP enrollment state and remaining backup codes.

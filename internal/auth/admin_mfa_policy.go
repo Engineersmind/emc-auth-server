@@ -474,8 +474,10 @@ func (s *AuthService) sessionHasMFA(ctx context.Context, sessionID int64, userID
 // MFAMethodStatus is one method's state for the caller's settings page.
 type MFAMethodStatus struct {
 	Method string `json:"method"`
-	// Allowed: the caller's policy accepts this method. Always true for a
-	// non-administrator, whose methods are not governed by the admin policy.
+	// Allowed: the caller's policy accepts this method — the administrator
+	// policy for an administrator; for an application user, the application's
+	// policy (switch on, mode not 'disabled', method in allowed_methods);
+	// always true for a tenant-level user, who has no application policy.
 	Allowed bool `json:"allowed"`
 	// Available: this deployment can run the method at all.
 	Available bool `json:"available"`
@@ -489,14 +491,27 @@ type MFAMethodStatus struct {
 type MFAStatus struct {
 	// MFARequired is true when the caller is an administrator and MFA is
 	// therefore mandatory for them.
-	MFARequired  bool              `json:"mfa_required"`
-	PolicySource string            `json:"policy_source,omitempty"`
-	Methods      []MFAMethodStatus `json:"methods"`
+	MFARequired  bool   `json:"mfa_required"`
+	PolicySource string `json:"policy_source,omitempty"`
+	// MFAEnabled is the caller's application MFA master switch. false means
+	// the application runs without MFA: nothing is challenged and nothing can
+	// be enrolled. Always true for administrators and tenant-level users.
+	MFAEnabled bool `json:"mfa_enabled"`
+	// Mode is the caller's effective MFA mode: the application's mode for an
+	// application user, "required" for an administrator, "optional" for a
+	// tenant-level user.
+	Mode    string            `json:"mode"`
+	Methods []MFAMethodStatus `json:"methods"`
 }
 
 // MyMFAStatus reports the caller's MFA state across every method.
+//
+// Administrators are judged by the administrator MFA policy. Everyone else is
+// judged by their application's policy (issue #189): before this, a
+// non-administrator was reported allowed:true for every method, so portals
+// offered methods the application had disabled and enrolment then failed.
 func (s *AuthService) MyMFAStatus(ctx context.Context, userID, tenantID int64, perms []string) (*MFAStatus, error) {
-	out := &MFAStatus{}
+	out := &MFAStatus{MFAEnabled: true, Mode: MFAModeOptional}
 	var policy *AdminMFAPolicy
 	if s.adminMFA != nil {
 		admin, platform, err := s.administratorKind(ctx, userID, perms)
@@ -508,11 +523,34 @@ func (s *AuthService) MyMFAStatus(ctx context.Context, userID, tenantID int64, p
 			policy = &p
 			out.MFARequired = true
 			out.PolicySource = p.Source
+			out.Mode = MFAModeRequired
+		}
+	}
+
+	allowed := func(string) bool { return true }
+	if policy != nil {
+		allowed = policy.Allows
+	} else {
+		uc, err := loadUserMFAContext(ctx, s.pool, userID, tenantID)
+		switch {
+		case errors.Is(err, ErrUserNotFound):
+			// Token tenant differs from the user's home tenant (a tenant switch):
+			// not an application user here, so no application policy applies.
+			uc = &userMFAContext{enabled: true, mode: MFAModeOptional}
+		case err != nil:
+			return nil, err
+		}
+		if uc.appRowID != nil {
+			out.MFAEnabled = uc.enabled
+			out.Mode = uc.mode
+			allowed = func(m string) bool {
+				return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.allowedMethods, m)
+			}
 		}
 	}
 
 	for _, m := range AdminMFAMethods {
-		st := MFAMethodStatus{Method: m, Allowed: policy == nil || policy.Allows(m)}
+		st := MFAMethodStatus{Method: m, Allowed: allowed(m)}
 		st.Available = s.adminMethodUsable(ctx, tenantID, m)
 		if st.Available {
 			switch m {

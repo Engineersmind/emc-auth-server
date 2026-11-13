@@ -1856,6 +1856,8 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 	result, err := h.totpSvc.EnrollUser(c.Request().Context(), userID, tenantID, claims.Email, req.Code)
 	if err != nil {
 		switch {
+		case errors.Is(err, auth.ErrMFASwitchedOff):
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
 		case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrTOTPReenrollProof):
 			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 		case errors.Is(err, auth.ErrUserNotFound):
@@ -1934,7 +1936,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 // TOTPStatus handles GET /api/v1/auth/otp/status.
 //
 // @Summary      Get own MFA status
-// @Description  Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low.
+// @Description  Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low. mfa_enabled is the user's application MFA master switch: when false the application runs without MFA (enrolled factors are kept but not challenged, and new enrolment is refused).
 // @Tags         AUTH
 // @Produce      json
 // @Security     BearerAuth
@@ -1969,6 +1971,17 @@ func (h *AuthHandler) TOTPStatus(c echo.Context) error {
 		}
 		status.EmailActive = emailActive
 	}
+
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant_id in token"})
+	}
+	enabled, err := h.totpSvc.AppMFAEnabledForUser(c.Request().Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("MFA switch status failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load MFA status"})
+	}
+	status.MFAEnabled = enabled
 	return c.JSON(http.StatusOK, status)
 }
 
@@ -2066,6 +2079,8 @@ func (h *AuthHandler) auditMFA(c echo.Context, tenantID, userID int64, email, ac
 // emailMFAErrorResponse maps EmailMFAService errors onto HTTP responses.
 func emailMFAErrorResponse(c echo.Context, err error) error {
 	switch {
+	case errors.Is(err, auth.ErrMFASwitchedOff):
+		return fail(c, http.StatusForbidden, "mfa_switched_off")
 	case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrMFAMethodNotAllowed), errors.Is(err, auth.ErrMFARequiredByPolicy):
 		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 	case errors.Is(err, auth.ErrTooManyOTPAttempts), errors.Is(err, auth.ErrTooManyResends):
