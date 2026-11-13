@@ -48,6 +48,14 @@ type TenantCORSService struct {
 // only in a browser, only cross-origin, and never in curl or the Go tests.
 const corsAllowedMethods = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
 
+// corsExposedHeaders are the response headers a cross-origin page may read.
+// A browser hides every header outside the CORS-safelisted set unless it is
+// listed here, so without Retry-After a front end calling this API from another
+// origin cannot tell a user how long a 429 lasts. It is set for every allowed
+// cross-origin response, preflights included; browsers only act on it for the
+// actual response and ignore it on a preflight.
+const corsExposedHeaders = "Retry-After"
+
 func NewTenantCORSService(pool *pgxpool.Pool, redisCli *redis.Client, logger zerolog.Logger) *TenantCORSService {
 	return &TenantCORSService{pool: pool, redisCli: redisCli, logger: logger}
 }
@@ -375,6 +383,7 @@ func TenantCORS(svc *TenantCORSService) echo.MiddlewareFunc {
 				h.Set("Access-Control-Allow-Credentials", "true")
 				h.Set("Vary", "Origin")
 			}
+			h.Set("Access-Control-Expose-Headers", corsExposedHeaders)
 
 			// Handle preflight.
 			if c.Request().Method == http.MethodOptions {
