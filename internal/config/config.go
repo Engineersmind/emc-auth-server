@@ -119,23 +119,33 @@ type Config struct {
 
 	// JWTSigningKeyEncryptionKeyPrevious enables zero-downtime rotation of the
 	// key above: set the NEW key as JWT_SIGNING_KEY_ENCRYPTION_KEY and the old
-	// one here. Decryption falls back to it transparently. Note this rotates the
-	// ENCRYPTION key, not the signing keys themselves — signing-key rotation is
-	// a separate operation (see the admin rotate endpoint).
+	// one here. Decryption falls back to it transparently. While it is set, the
+	// startup sweeps re-seal both ciphertext families the box protects that
+	// have no rewrite path of their own: tenants.jwt_secret_enc
+	// (JWTService.ReencryptTenantSecrets) and the live signing_keys.private_key_enc
+	// rows (SigningKeyService.ReencryptPrivateKeys). Remove it only after a
+	// startup log shows "encryption-key rotation complete" — a boot whose
+	// sweeps failed or were cut short leaves old-key ciphertext this key
+	// still decrypts. With more than one app instance, every instance must
+	// first run with the new primary AND the old key as previous before any
+	// instance's sweep result is relied on — the first instance on the new
+	// primary re-seals shared rows an old-primary-only instance can no
+	// longer decrypt; a single instance needs nothing extra. Note this
+	// rotates the
+	// ENCRYPTION key, not the signing keys themselves — signing-key rotation
+	// is a separate operation (see the admin rotate endpoint).
 	JWTSigningKeyEncryptionKeyPrevious string
 
 	// JWTAllowLegacyHS256 keeps symmetric HS256 tokens verifiable during the
-	// migration to RS256. Set JWT_ALLOW_LEGACY_HS256=false to perform the Phase 4
-	// cutover (issue #95).
+	// migration to RS256 (issue #95).
 	//
-	// Defaults to true so upgrading to RS256 signing does not invalidate tokens
-	// minted seconds earlier. Setting it false is what actually removes the forging
-	// risk: while HS256 verifies, any holder of a tenant's jwt_secret can still mint
-	// a token for any user in that tenant.
-	//
-	// Flip it only once emc_auth_legacy_hs256_verifications_total has been flat at
-	// zero — that counter, not a stopwatch, is the evidence. The longest-lived
-	// symmetric token is the 1 h agent token.
+	// Defaults to FALSE (GHSA-4x5m-3gph-938r): while HS256 verifies, any holder
+	// of a tenant's jwt_secret can mint a token for any user in that tenant.
+	// Deployments that still have live HS256 tokens in circulation — minted
+	// before the RS256 switch — must set JWT_ALLOW_LEGACY_HS256=true explicitly
+	// for one token-lifetime window (the longest-lived symmetric token is the
+	// 1 h agent token), then remove it. The evidence for removing it is
+	// emc_auth_legacy_hs256_verifications_total sitting at zero.
 	JWTAllowLegacyHS256 bool
 
 	// OIDCIssuerBaseURL is the public origin used to build each tenant's OIDC
@@ -416,10 +426,10 @@ func Load() *Config {
 		OAuthClientSecretEncryptionKeyPrevious: getEnv("OAUTH_CLIENT_SECRET_ENCRYPTION_KEY_PREVIOUS", ""),
 		JWTSigningKeyEncryptionKey:             getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY", ""),
 		JWTSigningKeyEncryptionKeyPrevious:     getEnv("JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS", ""),
-		// Fails closed towards COMPATIBILITY, not towards strictness: only the
-		// exact string "false" disables legacy verification, so a typo cannot
-		// accidentally reject every live token.
-		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "true") != "false",
+		// Secure by default (GHSA-4x5m-3gph-938r): legacy HS256 verification is
+		// opt-in for the duration of a migration window, not something a
+		// misconfigured deploy gets for free.
+		JWTAllowLegacyHS256: getEnv("JWT_ALLOW_LEGACY_HS256", "false") == "true",
 		// GHSA-6fcw-g2xw-v42w (L-05): the legacy issuer is now opt-IN, not
 		// opt-out — only the exact string "true" re-accepts old global
 		// JWT_ISSUER tokens during a migration window. An unset or mistyped

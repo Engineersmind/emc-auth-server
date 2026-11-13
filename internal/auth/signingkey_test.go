@@ -669,3 +669,154 @@ func TestSigningKeyService_PublishableKeysCarryNoPrivateHalf(t *testing.T) {
 		t.Error("ActiveKey has no private half — the tenant can no longer sign")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Encryption-key rotation sweep (ReencryptPrivateKeys)
+// ---------------------------------------------------------------------------
+
+// storedPrivateKeyEnc reads the ciphertext currently stored for a kid.
+func storedPrivateKeyEnc(t *testing.T, ctx context.Context, pool *pgxpool.Pool, kid string) string {
+	t.Helper()
+	var enc string
+	if err := pool.QueryRow(ctx,
+		`SELECT private_key_enc FROM signing_keys WHERE kid = $1`, kid,
+	).Scan(&enc); err != nil {
+		t.Fatalf("fetch private_key_enc for kid %s: %v", kid, err)
+	}
+	return enc
+}
+
+// TestSigningKeyService_ReencryptPrivateKeys_RotatesEncryptedRows pins the
+// sweep's contract: live private_key_enc rows sealed under the PREVIOUS
+// encryption key must come out sealed under the new primary — otherwise
+// removing JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS orphans the private halves
+// and the tenant can no longer sign (load decrypts the active key's private
+// half on every cache fill).
+// why: private_key_enc has no other rewrite path, so without the sweep the
+// "remove the previous key once the rotation-complete log line appears"
+// guidance breaks RS256 issuance on the boot after the key is dropped.
+func TestSigningKeyService_ReencryptPrivateKeys_RotatesEncryptedRows(t *testing.T) {
+	ctx, _, keys, tenantID, _ := signingFixture(t)
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+
+	// The fixture's box key plays the OLD encryption key.
+	oldKeyHex := strings.Repeat("ab", 32)
+	newKeyHex := strings.Repeat("cd", 32)
+
+	active, err := keys.EnsureTenantKey(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureTenantKey: %v", err)
+	}
+	// Retire the extra key BEFORE PrepareRotation: retireKey inserts it as
+	// 'next' first, and migration 00065's signing_keys_one_next_per_tenant
+	// index allows only one 'next' row per tenant — creating it while the
+	// rotation candidate already exists would violate that index.
+	retiredKID := retireKey(t, ctx, pool, keys, tenantID)
+	next, err := keys.PrepareRotation(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("PrepareRotation: %v", err)
+	}
+
+	activeBefore := storedPrivateKeyEnc(t, ctx, pool, active.KID)
+	nextBefore := storedPrivateKeyEnc(t, ctx, pool, next.KID)
+	retiredBefore := storedPrivateKeyEnc(t, ctx, pool, retiredKID)
+
+	// Rotation posture: new primary, old key still accepted for decrypts.
+	newBox, err := auth.NewSecretBox(newKeyHex, "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(new): %v", err)
+	}
+	if err := newBox.WithPreviousKey(oldKeyHex, "JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS_TEST"); err != nil {
+		t.Fatalf("WithPreviousKey: %v", err)
+	}
+	rotated, err := auth.NewSigningKeyService(pool, newBox, logger)
+	if err != nil {
+		t.Fatalf("NewSigningKeyService(rotated): %v", err)
+	}
+
+	n, err := rotated.ReencryptPrivateKeys(ctx)
+	if err != nil {
+		t.Fatalf("ReencryptPrivateKeys() error = %v", err)
+	}
+	if n != 2 {
+		t.Errorf("ReencryptPrivateKeys re-sealed = %d, want 2 (active + next; retired is left alone)", n)
+	}
+
+	if got := storedPrivateKeyEnc(t, ctx, pool, active.KID); got == activeBefore {
+		t.Error("active key ciphertext unchanged — the row was not re-sealed")
+	}
+	if got := storedPrivateKeyEnc(t, ctx, pool, next.KID); got == nextBefore {
+		t.Error("next key ciphertext unchanged — the pending rotation key must also be re-sealed")
+	}
+	if got := storedPrivateKeyEnc(t, ctx, pool, retiredKID); got != retiredBefore {
+		t.Error("retired key ciphertext was rewritten — its private half is never loaded, so touching it only adds a decrypt that can fail")
+	}
+
+	// The mechanism, not the symptom: with the previous key REMOVED, signing
+	// must still work — the active private key must decrypt under the new
+	// primary alone.
+	soloBox, err := auth.NewSecretBox(newKeyHex, "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(solo): %v", err)
+	}
+	soloSvc, err := auth.NewSigningKeyService(pool, soloBox, logger)
+	if err != nil {
+		t.Fatalf("NewSigningKeyService(solo): %v", err)
+	}
+	soloActive, err := soloSvc.ActiveKey(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("ActiveKey with previous key removed: %v — old-key ciphertext was left behind", err)
+	}
+	if soloActive.Private == nil {
+		t.Error("ActiveKey has no private half after the sweep — the tenant can no longer sign")
+	}
+}
+
+// TestSigningKeyService_ReencryptPrivateKeys_SkipsZeroKeyPrimary pins the same
+// zero-key guard JWTService.ReencryptTenantSecrets carries: with the primary
+// key unset (the development all-zero fallback) and a previous key set, the
+// sweep must write nothing — re-sealing under the publicly known zero key
+// would leave the rows unreadable the moment a real
+// JWT_SIGNING_KEY_ENCRYPTION_KEY is restored.
+// why: a dev/test deploy with PREVIOUS set and primary unset would otherwise
+// decrypt via the previous key and re-seal every row under the zero key.
+func TestSigningKeyService_ReencryptPrivateKeys_SkipsZeroKeyPrimary(t *testing.T) {
+	ctx, _, keys, tenantID, _ := signingFixture(t)
+	pool := testhelper.NewTestDB(t)
+	logger := testhelper.TestLogger()
+
+	oldKeyHex := strings.Repeat("ab", 32)
+
+	active, err := keys.EnsureTenantKey(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("EnsureTenantKey: %v", err)
+	}
+	encBefore := storedPrivateKeyEnc(t, ctx, pool, active.KID)
+
+	// Primary unset → development zero key; previous set → rotation looks
+	// configured, so an unguarded sweep would decrypt via the previous key and
+	// re-seal under the zero key.
+	zeroBox, err := auth.NewSecretBox("", "development", "JWT_SIGNING_KEY_ENCRYPTION_KEY_TEST", logger)
+	if err != nil {
+		t.Fatalf("NewSecretBox(zero): %v", err)
+	}
+	if err := zeroBox.WithPreviousKey(oldKeyHex, "JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS_TEST"); err != nil {
+		t.Fatalf("WithPreviousKey: %v", err)
+	}
+	zeroSvc, err := auth.NewSigningKeyService(pool, zeroBox, logger)
+	if err != nil {
+		t.Fatalf("NewSigningKeyService(zero): %v", err)
+	}
+
+	n, err := zeroSvc.ReencryptPrivateKeys(ctx)
+	if err != nil {
+		t.Fatalf("ReencryptPrivateKeys() error = %v", err)
+	}
+	if n != 0 {
+		t.Errorf("ReencryptPrivateKeys re-sealed = %d, want 0 — a zero-key primary must not write", n)
+	}
+	if got := storedPrivateKeyEnc(t, ctx, pool, active.KID); got != encBefore {
+		t.Error("private_key_enc was rewritten under the zero key — the guard did not hold")
+	}
+}

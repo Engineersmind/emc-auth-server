@@ -730,11 +730,12 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	if skErr != nil {
 		deps.Logger.Fatal().Err(skErr).Msg("JWT signing key service init failed")
 	}
-	// Switch signing to RS256. Verification continues to accept legacy HS256
-	// tokens (no kid) until the Phase 4 cutover, so no live session breaks here.
-	jwtSvc.WithSigningKeys(signingKeySvc).WithLegacyHS256(deps.Config.JWTAllowLegacyHS256)
-	if !deps.Config.JWTAllowLegacyHS256 {
-		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=false — HS256 tokens are REJECTED (issue #95 Phase 4 cutover). Any token minted before RS256 signing went live will fail; tenants.jwt_secret is now unused and can be dropped.")
+	// Switch signing to RS256. Verification rejects legacy HS256 tokens (no kid)
+	// unless JWT_ALLOW_LEGACY_HS256 is explicitly enabled for a migration window.
+	jwtSvc.WithSigningKeys(signingKeySvc).WithLegacyHS256(deps.Config.JWTAllowLegacyHS256).
+		WithSecretBox(signingKeyBox)
+	if deps.Config.JWTAllowLegacyHS256 {
+		deps.Logger.Warn().Msg("JWT_ALLOW_LEGACY_HS256=true — HS256 tokens are still ACCEPTED (issue #95 Phase 4 migration window). Set to false once emc_auth_legacy_hs256_verifications_total has been flat at zero.")
 	}
 
 	// Backfill keys for tenants that predate this feature so their JWKS endpoint is
@@ -746,6 +747,66 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		deps.Logger.Error().Err(err).Msg("signing key backfill failed — keys will be generated lazily")
 	} else if created > 0 {
 		deps.Logger.Info().Int("tenants", created).Msg("backfilled JWT signing keys")
+	}
+
+	// Encrypt plaintext tenants.jwt_secret rows in place (GHSA-4x5m-3gph-938r).
+	// Non-fatal for the same reason as the key backfill: tenantSecret falls back
+	// to the plaintext column until this pass reaches the row. Each encryption
+	// pass runs on its own context and deadline rather than sharing the key
+	// backfill's startupCtx — a slow backfill would otherwise hand a
+	// re-encryption sweep a mostly-spent context, and a sweep cut short
+	// leaves old-key ciphertext behind while the boot reads as healthy.
+	encBackfillCtx, cancelEncBackfill := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelEncBackfill()
+	if encrypted, err := jwtSvc.EncryptAllTenantSecrets(encBackfillCtx); err != nil {
+		deps.Logger.Error().Err(err).Msg("jwt_secret encryption backfill failed — plaintext secrets remain until next startup")
+	} else if encrypted > 0 {
+		deps.Logger.Info().Int("tenants", encrypted).Msg("encrypted tenant jwt_secret values at rest")
+	}
+
+	// Re-seal the two ciphertext families the signing-key box protects that
+	// have no rewrite path of their own — tenants.jwt_secret_enc and the live
+	// signing_keys.private_key_enc rows — under the new
+	// JWT_SIGNING_KEY_ENCRYPTION_KEY while the previous one is still
+	// configured. Without these sweeps retiring the previous key would orphan
+	// old-key ciphertext, and an undecryptable signing key stops a tenant
+	// issuing at all (GHSA-4x5m-3gph-938r review). The previous key is safe to
+	// remove only once the startup log shows the "encryption-key rotation
+	// complete" line below — a failed or unfinished sweep means it must stay.
+	//
+	// Both sweeps refuse to write when the primary key is the development
+	// zero key; surface that skip here, since JWTService carries no logger.
+	previousKeyConfigured := signingKeyBox.HasPreviousKey()
+	zeroKeyPrimary := signingKeyBox.UsesInsecureZeroKey()
+	if previousKeyConfigured && zeroKeyPrimary {
+		deps.Logger.Warn().Msg("re-encryption sweeps skipped — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS is set while the primary key is the development zero key; re-sealing under it would orphan every row once a real key is set — the previous key must be kept")
+	}
+	sweepsOK := true
+	secretsSweepCtx, cancelSecretsSweep := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelSecretsSweep()
+	if reencrypted, err := jwtSvc.ReencryptTenantSecrets(secretsSweepCtx); err != nil {
+		sweepsOK = false
+		deps.Logger.Error().Err(err).Msg("jwt_secret_enc re-encryption sweep failed — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS must be kept: old-key ciphertext remains until next startup")
+	} else if reencrypted > 0 {
+		deps.Logger.Info().Int("tenants", reencrypted).Msg("re-encrypted tenant jwt_secret values under the new key")
+	}
+	keysSweepCtx, cancelKeysSweep := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelKeysSweep()
+	if resealed, err := signingKeySvc.ReencryptPrivateKeys(keysSweepCtx); err != nil {
+		sweepsOK = false
+		deps.Logger.Error().Err(err).Msg("signing_keys.private_key_enc re-encryption sweep failed — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS must be kept: old-key ciphertext remains until next startup")
+	} else if resealed > 0 {
+		deps.Logger.Info().Int("signing_keys", resealed).Msg("re-encrypted signing private keys under the new encryption key")
+	}
+	// The operator-facing signal the rotation guidance keys on. A zero-key
+	// skip is NOT completion: the sweeps refused to write, so the old-key
+	// rows are untouched and the previous key is still needed to read them.
+	if previousKeyConfigured && !zeroKeyPrimary {
+		if sweepsOK {
+			deps.Logger.Info().Msg("encryption-key rotation complete — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS can now be removed")
+		} else {
+			deps.Logger.Warn().Msg("encryption-key rotation incomplete — JWT_SIGNING_KEY_ENCRYPTION_KEY_PREVIOUS must be kept until a startup logs the rotation-complete line")
+		}
 	}
 
 	// Drop retired keys whose grace window has elapsed. Without this every rotation
@@ -770,8 +831,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	signingKeyHandler := handlers.NewSigningKeyHandler(deps.Pool, signingKeySvc, deps.Config.AppBaseURL, auditLog, deps.Logger)
 
 	// Give newly created tenants their key pair up front rather than lazily on
-	// first login.
-	adminSvc.WithSigningKeys(signingKeySvc)
+	// first login. The secret box rides along so their jwt_secret is stored
+	// encrypted from the first write (GHSA-4x5m-3gph-938r).
+	adminSvc.WithSigningKeys(signingKeySvc).WithSecretBox(signingKeyBox)
 
 	idpSvc := auth.NewIdentityProviderService(deps.Pool, secretBox, deps.Config.AppBaseURL, deps.Logger)
 	oauthSvc := auth.NewOAuthLoginService(deps.Pool, deps.Redis, idpSvc, authSvc, deps.Config.AppBaseURL, deps.Logger)

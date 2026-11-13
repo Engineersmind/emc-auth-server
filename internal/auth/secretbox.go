@@ -30,6 +30,11 @@ const secretBoxVersionPrefix = "v1:"
 type SecretBox struct {
 	key     []byte
 	prevKey []byte // optional previous key accepted for decryption during rotation
+	// zeroKey records that the box was built on the development all-zero
+	// fallback. Callers that persist ciphertext must not write under it — the
+	// moment a real key is configured, zero-key ciphertext is unreadable
+	// (GHSA-4x5m-3gph-938r review).
+	zeroKey bool
 }
 
 // ErrEncryptionKeyRequired is returned when a required encryption key is
@@ -68,7 +73,23 @@ func NewSecretBox(keyHex, env, keyName string, logger zerolog.Logger) (*SecretBo
 	if deployed && isZeroKey(key) {
 		return nil, fmt.Errorf("%s (ENV=%q): %w", keyName, env, ErrZeroEncryptionKey)
 	}
-	return &SecretBox{key: key}, nil
+	return &SecretBox{key: key, zeroKey: isZeroKey(key)}, nil
+}
+
+// UsesInsecureZeroKey reports whether the box encrypts under the development
+// all-zero key. Writers of persistent ciphertext should skip writing when this
+// is true — the value would become undecryptable as soon as a real key is set.
+func (b *SecretBox) UsesInsecureZeroKey() bool {
+	return b != nil && b.zeroKey
+}
+
+// HasPreviousKey reports whether a rotation is in progress — a previous key was
+// configured via WithPreviousKey and Decrypt accepts ciphertext under either
+// key. Readers use this to decide whether a re-encryption sweep is needed:
+// ciphertext written under the old key must be re-sealed under the new one
+// before the previous key is retired (GHSA-4x5m-3gph-938r review).
+func (b *SecretBox) HasPreviousKey() bool {
+	return b != nil && b.prevKey != nil
 }
 
 // WithPreviousKey accepts the previous 64-character hex key for decryption
