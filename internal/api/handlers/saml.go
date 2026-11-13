@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/labstack/echo/v4"
 	"github.com/rs/zerolog"
@@ -14,14 +13,15 @@ import (
 // SAMLHandler holds HTTP handlers for SAML 2.0 endpoints.
 type SAMLHandler struct {
 	svc    *samlsvc.Service
-	jwtSvc *auth.JWTService
 	logger zerolog.Logger
 }
 
-// NewSAMLHandler creates a SAMLHandler with the SAML service and JWT service
-// required for metadata, SP-initiated login, ACS, and admin config endpoints.
-func NewSAMLHandler(svc *samlsvc.Service, jwtSvc *auth.JWTService, logger zerolog.Logger) *SAMLHandler {
-	return &SAMLHandler{svc: svc, jwtSvc: jwtSvc, logger: logger}
+// NewSAMLHandler creates a SAMLHandler with the SAML service required for
+// metadata, SP-initiated login, and admin config endpoints. The ACS endpoint
+// stays gated at 501 — no token-minting code exists to wire it to
+// (GHSA-x432-mmvf-jvqf, L-01).
+func NewSAMLHandler(svc *samlsvc.Service, logger zerolog.Logger) *SAMLHandler {
+	return &SAMLHandler{svc: svc, logger: logger}
 }
 
 // GetMetadata handles GET /saml/metadata?tenant=<tenant_id>
@@ -96,73 +96,6 @@ func (h *SAMLHandler) HandleACS(c echo.Context) error {
 		http.StatusNotImplemented,
 		"SAML ACS is not yet available: IdP XML signature verification is pending implementation",
 	)
-}
-
-// handleACSImpl is the deferred full implementation — wired in once crewjam/saml
-// validates the IdP signature on every assertion.
-//
-//nolint:unused
-func (h *SAMLHandler) handleACSImpl(c echo.Context) error {
-	// Tenant comes from RelayState (set in the AuthnRequest redirect) or query param fallback.
-	tenantID := c.FormValue("RelayState")
-	if tenantID == "" {
-		tenantID = c.QueryParam("tenant")
-	}
-	if tenantID == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "tenant not found in RelayState")
-	}
-
-	samlResponse := c.FormValue("SAMLResponse")
-	if samlResponse == "" {
-		return echo.NewHTTPError(http.StatusBadRequest, "SAMLResponse missing")
-	}
-
-	email, _, err := h.svc.ParseACSResponse(samlResponse)
-	if err != nil {
-		h.logger.Error().Err(err).Str("tenant_id", tenantID).Msg("saml: ACS response parse failed")
-		return echo.NewHTTPError(http.StatusBadRequest, "invalid SAML response")
-	}
-
-	// JIT provisioning: find or create the user in this tenant.
-	user, err := h.svc.FindOrCreateUser(c.Request().Context(), tenantID, email)
-	if err != nil {
-		h.logger.Error().Err(err).Str("email", email).Str("tenant_id", tenantID).Msg("saml: JIT provisioning failed")
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to provision user")
-	}
-
-	// Issue JWT using the per-tenant secret.
-	tenantIDInt, err := strconv.ParseInt(user.TenantID, 10, 64)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "invalid tenant_id")
-	}
-
-	claims := &auth.Claims{
-		UserID:      user.ID,
-		TenantID:    user.TenantID,
-		Email:       user.Email,
-		Role:        user.Role,
-		Permissions: []string{},
-	}
-
-	// SAML JIT login produces a real user session — same audience as password,
-	// social, and magic-link login (issue #84), and a grant of its own so the
-	// token records that the credential was asserted by an external IdP rather
-	// than presented to us (issue #130).
-	//
-	// This path mints directly rather than through issueTokenPair, so it is the
-	// one mint site that does not inherit its grant from a sessionContext.
-	accessToken, err := h.jwtSvc.Sign(c.Request().Context(), tenantIDInt, auth.AudienceAPI, auth.GrantSAML, claims)
-	if err != nil {
-		h.logger.Error().Err(err).Str("user_id", user.ID).Msg("saml: JWT sign failed")
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to issue token")
-	}
-
-	return c.JSON(http.StatusOK, map[string]any{
-		"access_token": accessToken,
-		"token_type":   "Bearer",
-		"user_id":      user.ID,
-		"email":        user.Email,
-	})
 }
 
 // GetSAMLConfig handles GET /api/v1/admin/saml-config (tenant-scoped, admin:access required).
