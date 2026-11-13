@@ -70,12 +70,60 @@ PUT /api/v1/applications/{appID}/mfa            Bearer <admin>
   current (default `["totp"]`)
 - Canonical alternative for super_admin cross-tenant:
   `PUT /api/v1/tenants/{tid}/applications/{appID}/mfa`
+- The whole PUT (switch, mode/methods, magic-link fields) is applied in **one
+  transaction**: a 400 on any part leaves every setting as it was.
+
+### 2.3a MFA master switch (`mfa_enabled`)
+```
+PUT /api/v1/applications/{appID}/mfa            Bearer <admin>
+{ "mfa_enabled": false }                         # mode may be omitted
+→ 200 (policy incl. "mfa_enabled": false)
+```
+The switch sits **above** `mode`. It is the one setting that means "run this
+application without MFA".
+
+| | `mfa_enabled: true` (default) | `mfa_enabled: false` |
+|---|---|---|
+| Enrolled user logs in | challenged (per `mode`/`allowed_methods`) | **not challenged** — tokens directly |
+| Unenrolled user, `mode: required` | forced enrolment | **not forced** |
+| New enrolment (TOTP / email) | per `mode`/`allowed_methods` | **403 `mfa_switched_off`** |
+| Removing the last factor under `required` | refused (last-factor guard) | allowed (nothing is required) |
+| Stored mode, methods, factors, backup codes | — | **kept**, all apply again when switched back on |
+
+Compare `mode: "disabled"`, which only blocks *new* enrolment and still
+challenges users who already enrolled.
+
+An application with no settings row is `mfa_enabled: true`. Administrator
+(console) MFA is never affected by any application's switch.
+
+**Turning it OFF is protected** (turning it on is not):
+
+| Caller | Off | On |
+|---|---|---|
+| Management / API-key token, client-credentials token | **403 `mfa_switch_off_service_token`** | allowed |
+| Human session not established with MFA, or MFA sign-in older than **10 minutes** | **403 `mfa_switch_off_stale_session`** — sign in again with MFA and retry | allowed |
+| Human session signed in with MFA in the last 10 minutes | allowed | allowed |
+
+Every real change (old ≠ new) writes an `admin.mfa_switch_changed` audit event
+(`old_mfa_enabled`, `new_mfa_enabled`) and emails the application's
+administrators (tenant owners + co-owners of that app). Re-sending the current
+value is a no-op: no audit, no email.
+
+**Changes apply at the next login.** Existing sessions are not re-checked:
+a session issued while MFA was off stays valid until its refresh token expires
+(up to 30 days), and turning MFA off does not end sessions that did MFA.
+App-wide session revoke is tracked in #196.
+
+**Known gap — social and passkey sign-ins.** Google (and other social) and
+passkey sign-ins do not go through the application MFA gate at all, whatever
+`mfa_enabled` and `mode` say. This predates the switch and is fixed by the
+opt-in `federated_mfa = enforce` setting (#194).
 
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```
 GET /api/v1/applications/{appID}/mfa            Bearer <admin>
 → 200 {
-  "application_id": "149", "mode": "required",
+  "application_id": "149", "mfa_enabled": true, "mode": "required",
   "allowed_methods": ["totp","email"],
   "enrolled_users": 1,          // active TOTP
   "pending_enrollments": 0,     // TOTP enrolled, never activated
@@ -194,17 +242,26 @@ matches your application.
 
 | Purpose | Endpoint | Notes |
 |---|---|---|
-| My MFA state | `GET /api/v1/auth/otp/status` | `{ enrolled, active, backup_codes_remaining, email_active }` — warn user when codes run low |
-| Enroll TOTP | `POST /api/v1/auth/otp/enroll` body `{}` or `{ "code" }` | 403 if app mode `disabled` or `totp` not allowed. **Re-enroll while active (new phone) requires current TOTP/backup code in `code`** |
+| My MFA state | `GET /api/v1/auth/otp/status` | `{ enrolled, active, backup_codes_remaining, email_active, mfa_enabled }` — warn user when codes run low; hide MFA settings when `mfa_enabled` is false |
+| Which methods I may use | `GET /api/v1/auth/me/mfa` | `{ mfa_required, mfa_enabled, mode, methods: [{ method, allowed, available, active }] }`. For an app user `allowed` = `mfa_enabled` **and** `mode != "disabled"` **and** method in the app's `allowed_methods` — only offer methods with `allowed: true` |
+| Enroll TOTP | `POST /api/v1/auth/otp/enroll` body `{}` or `{ "code" }` | 403 `mfa_switched_off` if the app's switch is off; 403 if app mode `disabled` or `totp` not allowed. **Re-enroll while active (new phone) requires current TOTP/backup code in `code`** |
 | Activate TOTP | `POST /api/v1/auth/otp/activate` `{ "code" }` | first authenticator code |
 | Regenerate backup codes | `POST /api/v1/auth/otp/backup-codes` `{ "code" }` | → `{ "backup_codes": [×8] }`; TOTP secret unchanged; all old codes die |
-| Disable TOTP | `DELETE /api/v1/auth/otp` `{ "code" }` | 403 under `required` unless email MFA remains active (last-factor guard) |
-| Enroll email MFA | `POST /api/v1/auth/otp/email/enroll` | sends verification code; 403 if `disabled`/method not allowed |
+| Disable TOTP | `DELETE /api/v1/auth/otp` `{ "code" }` | 403 under `required` unless email MFA remains active (last-factor guard; lifted while the switch is off) |
+| Enroll email MFA | `POST /api/v1/auth/otp/email/enroll` | sends verification code; 403 `mfa_switched_off` if the switch is off; 403 if `disabled`/method not allowed |
 | Activate email MFA | `POST /api/v1/auth/otp/email/activate` `{ "code" }` | inbox proven before it becomes a factor |
 | Send proof code | `POST /api/v1/auth/otp/email/send` | fresh code for the disable action below |
 | Disable email MFA | `DELETE /api/v1/auth/otp/email` `{ "code" }` | same last-factor guard mirrored |
 
 Common error shape everywhere: `{ "error": "human-readable message" }`.
+Newer codes use the coded shape `{ "error": "<stable_code>", "message": "<prose>" }` —
+switch on `error`, never parse `message`. MFA switch codes:
+
+| Code | Status | When |
+|---|---|---|
+| `mfa_switched_off` | 403 | enrolment attempted while the app's MFA switch is off |
+| `mfa_switch_off_service_token` | 403 | a service/API-key token tried to turn MFA off |
+| `mfa_switch_off_stale_session` | 403 | turning MFA off without an MFA sign-in in the last 10 minutes |
 
 ---
 
@@ -235,5 +292,6 @@ Common error shape everywhere: `{ "error": "human-readable message" }`.
 7. **Resend** → 3 ok (each rotates the code), 4th → 429; stale code refused.
 8. **Isolation** → same email registered in a second app logs in without MFA there.
 9. **Policy flips** → `disabled` blocks new enrollments but still challenges enrolled users; `required` blocks disabling the last factor.
+9a. **Master switch** → `mfa_enabled: false`: enrolled user gets tokens with no challenge, `required` stops forcing enrolment, enrolment returns 403 `mfa_switched_off`, `/auth/me/mfa` shows every method `allowed: false`. Switch on → challenge returns at the next login. A management token gets 403 `mfa_switch_off_service_token` turning it off but may turn it on.
 10. **Admin reset** → both factors wiped, next login re-enrolls.
 11. **Sender chain** → configure tenant sender then app override; check `from` in the dev-mailer log; delete each level and watch the fallback.

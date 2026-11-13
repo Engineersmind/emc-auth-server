@@ -1659,8 +1659,10 @@ definitions:
         type: boolean
       allowed:
         description: |-
-          Allowed: the caller's policy accepts this method. Always true for a
-          non-administrator, whose methods are not governed by the admin policy.
+          Allowed: the caller's policy accepts this method — the administrator
+          policy for an administrator; for an application user, the application's
+          policy (switch on, mode not 'disabled', method in allowed_methods);
+          always true for a tenant-level user, who has no application policy.
         type: boolean
       available:
         description: 'Available: this deployment can run the method at all.'
@@ -1694,6 +1696,12 @@ definitions:
         type: boolean
       magic_link_redirect_url:
         type: string
+      mfa_enabled:
+        description: |-
+          MFAEnabled is the master switch. false = the application runs without
+          MFA; Mode and AllowedMethods are kept and apply again once it is turned
+          back on.
+        type: boolean
       mode:
         type: string
       pending_enrollments:
@@ -1711,11 +1719,23 @@ definitions:
         items:
           $ref: '#/definitions/auth.MFAMethodStatus'
         type: array
+      mfa_enabled:
+        description: |-
+          MFAEnabled is the caller's application MFA master switch. false means
+          the application runs without MFA: nothing is challenged and nothing can
+          be enrolled. Always true for administrators and tenant-level users.
+        type: boolean
       mfa_required:
         description: |-
           MFARequired is true when the caller is an administrator and MFA is
           therefore mandatory for them.
         type: boolean
+      mode:
+        description: |-
+          Mode is the caller's effective MFA mode: the application's mode for an
+          application user, "required" for an administrator, "optional" for a
+          tenant-level user.
+        type: string
       policy_source:
         type: string
     type: object
@@ -2136,6 +2156,12 @@ definitions:
       email_active:
         type: boolean
       enrolled:
+        type: boolean
+      mfa_enabled:
+        description: |-
+          MFAEnabled is the caller's application MFA master switch, populated by
+          the handler. false = the application runs without MFA: enrolled factors
+          are kept but not challenged. Always true for a tenant-level user.
         type: boolean
     type: object
   auth.TokenValidationConfig:
@@ -3161,6 +3187,8 @@ definitions:
         type: boolean
       magic_link_redirect_url:
         type: string
+      mfa_enabled:
+        type: boolean
       mode:
         type: string
     type: object
@@ -4374,20 +4402,29 @@ paths:
     put:
       consumes:
       - application/json
-      description: Sets the application's MFA mode and (optionally) its allowed methods.
-        'required' forces enrollment in an allowed method at the next login of every
-        not-yet-enrolled user; 'disabled' rejects new enrollments (already-active
-        enrollments still gate login until an admin resets them); 'optional' restores
-        the default opt-in behaviour. allowed_methods omitted keeps the current set
-        (default ["totp"]).
+      description: 'Sets the application''s MFA master switch, mode and (optionally)
+        allowed methods, in one transaction. mfa_enabled=false runs the application
+        without MFA: nobody is challenged or forced to enrol and new enrolment is
+        refused, but mode, allowed methods and every enrolled factor are kept and
+        apply again when it is turned back on. Changes apply at each user''s NEXT
+        login; existing sessions are not re-checked. Turning MFA on is allowed for
+        any authorised caller; turning it OFF is refused for service/API-key tokens
+        (mfa_switch_off_service_token) and requires a session signed in with MFA in
+        the last 10 minutes (mfa_switch_off_stale_session). mode: ''required'' forces
+        enrollment in an allowed method at the next login of every not-yet-enrolled
+        user; ''disabled'' rejects new enrollments (already-active enrollments still
+        gate login — use mfa_enabled=false to stop that); ''optional'' restores the
+        default opt-in behaviour. mode may be omitted when only mfa_enabled and/or
+        the magic-link fields are sent. allowed_methods omitted keeps the current
+        set (default ["totp"]).'
       parameters:
       - description: Application ID
         in: path
         name: appID
         required: true
         type: string
-      - description: MFA mode (disabled | optional | required) + optional allowed_methods
-          subset of [totp, email]
+      - description: Optional mfa_enabled switch + MFA mode (disabled | optional |
+          required) + optional allowed_methods subset of [totp, email]
         in: body
         name: body
         required: true
@@ -4407,11 +4444,9 @@ paths:
               type: string
             type: object
         "403":
-          description: Forbidden
+          description: forbidden | mfa_switch_off_service_token | mfa_switch_off_stale_session
           schema:
-            additionalProperties:
-              type: string
-            type: object
+            $ref: '#/definitions/handlers.APIError'
         "404":
           description: Application not found
           schema:
@@ -7011,9 +7046,12 @@ paths:
       - AUTH
   /api/v1/auth/me/mfa:
     get:
-      description: Every MFA method with whether it is allowed for the caller, available
+      description: 'Every MFA method with whether it is allowed for the caller, available
         on this server, and enrolled. mfa_required is true for administrators, for
-        whom MFA is mandatory.
+        whom MFA is mandatory. For an application user, allowed follows the application''s
+        policy: mfa_enabled (the master switch) is true, mode is not "disabled", and
+        the method is in the application''s allowed_methods. mode is the application''s
+        mode ("required" for administrators, "optional" for tenant-level users).'
       produces:
       - application/json
       responses:
@@ -7516,9 +7554,11 @@ paths:
       - AUTH
   /api/v1/auth/otp/status:
     get:
-      description: Returns the authenticated user's TOTP enrollment state and how
+      description: 'Returns the authenticated user''s TOTP enrollment state and how
         many single-use backup codes remain — clients should prompt regeneration when
-        the count runs low.
+        the count runs low. mfa_enabled is the user''s application MFA master switch:
+        when false the application runs without MFA (enrolled factors are kept but
+        not challenged, and new enrolment is refused).'
       produces:
       - application/json
       responses:

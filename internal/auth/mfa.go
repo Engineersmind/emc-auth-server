@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -84,6 +86,12 @@ var ErrMFAEnrollmentDisabled = errors.New("MFA is disabled for this application"
 // the application's policy does not permit.
 var ErrMFAMethodNotAllowed = errors.New("this MFA method is not allowed for this application")
 
+// ErrMFASwitchedOff is returned when a user of an application whose MFA master
+// switch is off attempts to enroll a second factor. Distinct from
+// ErrMFAEnrollmentDisabled (mode 'disabled') so a portal can say which one the
+// administrator set.
+var ErrMFASwitchedOff = errors.New("MFA is switched off for this application")
+
 // ErrMFARequiredByPolicy is returned when a user attempts to remove their last
 // active second factor while their application's MFA mode is 'required'.
 var ErrMFARequiredByPolicy = errors.New("MFA is required by this application's policy and cannot be disabled")
@@ -109,7 +117,11 @@ var ErrUserNotFound = errors.New("user not found")
 
 // MFAPolicy is the persisted per-application policy returned by admin reads.
 type MFAPolicy struct {
-	ApplicationID  string   `json:"application_id"`
+	ApplicationID string `json:"application_id"`
+	// MFAEnabled is the master switch. false = the application runs without
+	// MFA; Mode and AllowedMethods are kept and apply again once it is turned
+	// back on.
+	MFAEnabled     bool     `json:"mfa_enabled"`
 	Mode           string   `json:"mode"`
 	AllowedMethods []string `json:"allowed_methods"`
 	// Passwordless magic-link sign-in (opt-in; the redirect URL is the
@@ -126,29 +138,42 @@ type MFAPolicy struct {
 	TotalUsers         int64 `json:"total_users"`
 }
 
-// GetAppMFAConfig returns the effective MFA mode and allowed methods for an
-// application. Absence of a policy row means 'optional' + TOTP-only
-// (pre-feature behaviour). This is the login hot-path read — one PK lookup.
-func (s *TOTPService) GetAppMFAConfig(ctx context.Context, appRowID int64) (mode string, methods []string, err error) {
-	err = s.pool.QueryRow(ctx, `
-		SELECT mode, allowed_methods FROM application_mfa_settings WHERE application_id = $1
-	`, appRowID).Scan(&mode, &methods)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return MFAModeOptional, defaultMFAMethods(), nil
-		}
-		return "", nil, fmt.Errorf("load app MFA config: %w", err)
-	}
-	if len(methods) == 0 {
-		methods = defaultMFAMethods()
-	}
-	return mode, methods, nil
+// AppMFAConfig is the effective login-time MFA configuration of one
+// application.
+type AppMFAConfig struct {
+	// Enabled is the master switch (migration 00105). While false the
+	// application runs without MFA whatever Mode says: no challenge, no forced
+	// enrolment, no new enrolment. Mode and Methods are kept, not cleared.
+	Enabled bool
+	Mode    string
+	Methods []string
 }
 
-// GetAppMFAMode returns just the effective MFA mode for an application.
+// GetAppMFAConfig returns the effective MFA configuration for an application.
+// Absence of a policy row means switch on + 'optional' + TOTP-only
+// (pre-feature behaviour). This is the login hot-path read — one PK lookup.
+func (s *TOTPService) GetAppMFAConfig(ctx context.Context, appRowID int64) (AppMFAConfig, error) {
+	cfg := AppMFAConfig{}
+	err := s.pool.QueryRow(ctx, `
+		SELECT mfa_enabled, mode, allowed_methods FROM application_mfa_settings WHERE application_id = $1
+	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return AppMFAConfig{Enabled: true, Mode: MFAModeOptional, Methods: defaultMFAMethods()}, nil
+		}
+		return AppMFAConfig{}, fmt.Errorf("load app MFA config: %w", err)
+	}
+	if len(cfg.Methods) == 0 {
+		cfg.Methods = defaultMFAMethods()
+	}
+	return cfg, nil
+}
+
+// GetAppMFAMode returns just the effective MFA mode for an application. It does
+// not reflect the master switch; use GetAppMFAConfig when the answer must.
 func (s *TOTPService) GetAppMFAMode(ctx context.Context, appRowID int64) (string, error) {
-	mode, _, err := s.GetAppMFAConfig(ctx, appRowID)
-	return mode, err
+	cfg, err := s.GetAppMFAConfig(ctx, appRowID)
+	return cfg.Mode, err
 }
 
 // GetAppMFAPolicy returns the application's policy plus enrollment stats for
@@ -157,16 +182,17 @@ func (s *TOTPService) GetAppMFAMode(ctx context.Context, appRowID int64) (string
 func (s *TOTPService) GetAppMFAPolicy(ctx context.Context, tenantID, appRowID int64) (*MFAPolicy, error) {
 	p := &MFAPolicy{
 		ApplicationID:  strconv.FormatInt(appRowID, 10),
+		MFAEnabled:     true,
 		Mode:           MFAModeOptional,
 		AllowedMethods: defaultMFAMethods(),
 	}
 
 	var updatedAt time.Time
 	err := s.pool.QueryRow(ctx, `
-		SELECT mode, allowed_methods, magic_link_enabled, magic_link_redirect_url, updated_at
+		SELECT mfa_enabled, mode, allowed_methods, magic_link_enabled, magic_link_redirect_url, updated_at
 		FROM application_mfa_settings
 		WHERE application_id = $1 AND tenant_id = $2
-	`, appRowID, tenantID).Scan(&p.Mode, &p.AllowedMethods, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
+	`, appRowID, tenantID).Scan(&p.MFAEnabled, &p.Mode, &p.AllowedMethods, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("load app MFA policy: %w", err)
 	}
@@ -201,13 +227,25 @@ func (s *TOTPService) GetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 // tenant_id is still pinned in the upsert so a policy row can never point at
 // a foreign tenant.
 func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID int64, mode string, methods []string, updatedBy *int64) error {
+	return setAppMFAPolicy(ctx, s.pool, tenantID, appRowID, mode, methods, updatedBy)
+}
+
+// mfaSettingsQuerier is the subset of *pgxpool.Pool and pgx.Tx the settings
+// writers need, so the same statement runs standalone or inside the admin PUT's
+// transaction.
+type mfaSettingsQuerier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier, tenantID, appRowID int64, mode string, methods []string, updatedBy *int64) error {
 	if !ValidMFAMode(mode) {
 		return ErrInvalidMFAMode
 	}
 	if methods != nil && !ValidMFAMethods(methods) {
 		return ErrInvalidMFAMethods
 	}
-	tag, err := s.pool.Exec(ctx, `
+	tag, err := q.Exec(ctx, `
 		INSERT INTO application_mfa_settings (application_id, tenant_id, mode, allowed_methods, updated_by, updated_at)
 		VALUES ($1, $2, $3, COALESCE($4, '{totp}'::TEXT[]), $5, NOW())
 		ON CONFLICT (application_id) DO UPDATE
@@ -234,6 +272,10 @@ func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 // or provided); the URL must be absolute https (http is allowed for loopback
 // hosts only — sign-in tokens must not transit cleartext).
 func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID int64, enabled *bool, redirectURL *string, updatedBy *int64) error {
+	return setAppMagicLink(ctx, s.pool, tenantID, appRowID, enabled, redirectURL, updatedBy)
+}
+
+func setAppMagicLink(ctx context.Context, q mfaSettingsQuerier, tenantID, appRowID int64, enabled *bool, redirectURL *string, updatedBy *int64) error {
 	if redirectURL != nil && *redirectURL != "" {
 		if !validMagicRedirectURL(*redirectURL) {
 			return ErrMagicLinkNotConfigured
@@ -246,7 +288,7 @@ func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID in
 		incoming := redirectURL != nil && *redirectURL != ""
 		if !incoming {
 			var stored string
-			err := s.pool.QueryRow(ctx,
+			err := q.QueryRow(ctx,
 				`SELECT magic_link_redirect_url FROM application_mfa_settings WHERE application_id = $1`,
 				appRowID,
 			).Scan(&stored)
@@ -256,7 +298,7 @@ func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID in
 		}
 	}
 
-	tag, err := s.pool.Exec(ctx, `
+	tag, err := q.Exec(ctx, `
 		INSERT INTO application_mfa_settings (application_id, tenant_id, magic_link_enabled, magic_link_redirect_url, updated_by, updated_at)
 		VALUES ($1, $2, COALESCE($3, false), COALESCE($4, ''), $5, NOW())
 		ON CONFLICT (application_id) DO UPDATE
@@ -272,6 +314,188 @@ func (s *TOTPService) SetAppMagicLink(ctx context.Context, tenantID, appRowID in
 	// Tenant-pinned DO UPDATE — see SetAppMFAPolicy.
 	if tag.RowsAffected() == 0 {
 		return ErrAppNotFound
+	}
+	return nil
+}
+
+// AppMFAUpdate is one admin PUT .../mfa. Every field is optional: nil / ""
+// leaves that part of the settings unchanged.
+type AppMFAUpdate struct {
+	// Enabled is the master switch.
+	Enabled *bool
+	// Mode, when non-empty, is written together with Methods (nil Methods
+	// keeps the stored set).
+	Mode                 string
+	Methods              []string
+	MagicLinkEnabled     *bool
+	MagicLinkRedirectURL *string
+}
+
+// AppMFAUpdateResult reports what the master switch was before and after the
+// update, so the caller audits and notifies only on a real change.
+type AppMFAUpdateResult struct {
+	PrevEnabled bool
+	NewEnabled  bool
+}
+
+// SwitchChanged reports whether the update flipped the master switch.
+func (r AppMFAUpdateResult) SwitchChanged() bool { return r.PrevEnabled != r.NewEnabled }
+
+// UpdateAppMFASettings applies an admin MFA update — switch, mode/methods and
+// magic-link — in ONE transaction, so a failure part-way (say an invalid
+// magic-link URL after the mode was written) leaves the stored settings exactly
+// as they were instead of half-applied.
+//
+// The application row is locked FOR NO KEY UPDATE first. That does two jobs:
+// it proves the application belongs to tenantID inside the transaction, and it
+// serialises concurrent updates of one application so PrevEnabled is the value
+// this update actually replaced (two racing "turn off" requests audit once,
+// not twice). NO KEY UPDATE rather than UPDATE so logins inserting rows that
+// reference the application (FOR KEY SHARE) are never blocked by it.
+func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRowID int64, u AppMFAUpdate, updatedBy *int64) (AppMFAUpdateResult, error) {
+	var res AppMFAUpdateResult
+	if u.Mode != "" && !ValidMFAMode(u.Mode) {
+		return res, ErrInvalidMFAMode
+	}
+	if u.Methods != nil && !ValidMFAMethods(u.Methods) {
+		return res, ErrInvalidMFAMethods
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return res, fmt.Errorf("begin app MFA update: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var one int
+	if err = tx.QueryRow(ctx, `
+		SELECT 1 FROM oauth_clients WHERE id = $1 AND tenant_id = $2 FOR NO KEY UPDATE
+	`, appRowID, tenantID).Scan(&one); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return res, ErrAppNotFound
+		}
+		return res, fmt.Errorf("lock application for MFA update: %w", err)
+	}
+
+	// No settings row means the switch is on (the column default and the
+	// login-path default agree).
+	res.PrevEnabled = true
+	if err = tx.QueryRow(ctx, `
+		SELECT mfa_enabled FROM application_mfa_settings WHERE application_id = $1 AND tenant_id = $2
+	`, appRowID, tenantID).Scan(&res.PrevEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return res, fmt.Errorf("read app MFA switch: %w", err)
+	}
+	res.NewEnabled = res.PrevEnabled
+
+	if u.Enabled != nil {
+		tag, execErr := tx.Exec(ctx, `
+			INSERT INTO application_mfa_settings (application_id, tenant_id, mfa_enabled, updated_by, updated_at)
+			VALUES ($1, $2, $3, $4, NOW())
+			ON CONFLICT (application_id) DO UPDATE
+			SET mfa_enabled = EXCLUDED.mfa_enabled,
+			    updated_by  = EXCLUDED.updated_by,
+			    updated_at  = NOW()
+			WHERE application_mfa_settings.tenant_id = EXCLUDED.tenant_id
+		`, appRowID, tenantID, *u.Enabled, updatedBy)
+		if execErr != nil {
+			return res, fmt.Errorf("upsert app MFA switch: %w", execErr)
+		}
+		// Tenant-pinned DO UPDATE — see SetAppMFAPolicy.
+		if tag.RowsAffected() == 0 {
+			return res, ErrAppNotFound
+		}
+		res.NewEnabled = *u.Enabled
+	}
+
+	if u.Mode != "" {
+		if err = setAppMFAPolicy(ctx, tx, tenantID, appRowID, u.Mode, u.Methods, updatedBy); err != nil {
+			return res, err
+		}
+	}
+
+	if u.MagicLinkEnabled != nil || u.MagicLinkRedirectURL != nil {
+		if err = setAppMagicLink(ctx, tx, tenantID, appRowID, u.MagicLinkEnabled, u.MagicLinkRedirectURL, updatedBy); err != nil {
+			return res, err
+		}
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return res, fmt.Errorf("commit app MFA update: %w", err)
+	}
+	return res, nil
+}
+
+// SetAppMFAEnabled turns the application's MFA master switch on or off and
+// returns the value it replaced. Tenant-pinned like SetAppMFAPolicy. It does no
+// caller authorisation: AuthorizeMFASwitchOff is the HTTP layer's job.
+func (s *TOTPService) SetAppMFAEnabled(ctx context.Context, tenantID, appRowID int64, enabled bool, updatedBy *int64) (prev bool, err error) {
+	res, err := s.UpdateAppMFASettings(ctx, tenantID, appRowID, AppMFAUpdate{Enabled: &enabled}, updatedBy)
+	return res.PrevEnabled, err
+}
+
+// MFASwitchOffMaxAuthAge is how recently the caller must have signed in WITH
+// MFA to turn an application's MFA off. Turning MFA off lowers security for
+// every user of the application in one call, so a session that is merely still
+// valid is not enough: a laptop left signed in since the morning must not be
+// able to do it. Ten minutes is long enough to sign in and flip the switch.
+// Deliberately a constant, not configuration — a knob here is a knob someone
+// quietly turns up to a day.
+const MFASwitchOffMaxAuthAge = 10 * time.Minute
+
+// ErrMFASwitchOffServiceToken refuses turning MFA off with a token that has no
+// person behind it (management/API-key, client-credentials). Such a token can
+// turn MFA on, never off.
+var ErrMFASwitchOffServiceToken = errors.New("turning MFA off requires a signed-in administrator, not a service token")
+
+// ErrMFASwitchOffStaleSession refuses turning MFA off when the caller's
+// session was not established with MFA within MFASwitchOffMaxAuthAge.
+var ErrMFASwitchOffStaleSession = errors.New("turning MFA off requires signing in again with MFA")
+
+// AuthorizeMFASwitchOff decides whether the caller may turn an application's
+// MFA OFF. gty, sessionID and userID come straight from the verified access
+// token's claims.
+//
+//   - not a human grant → ErrMFASwitchOffServiceToken;
+//   - no session, a revoked session, a session without MFA in its amr, or one
+//     whose auth_time is older than MFASwitchOffMaxAuthAge →
+//     ErrMFASwitchOffStaleSession.
+//
+// The age is compared against the database clock, the same clock that wrote
+// auth_time, so server clock skew cannot widen the window. A token whose grant
+// is a refresh or tenant switch still qualifies: the session row keeps the
+// ORIGINAL auth_time and amr, which is what is checked.
+func (s *TOTPService) AuthorizeMFASwitchOff(ctx context.Context, gty, sessionID, userID string) error {
+	if !slices.Contains(HumanGrants, gty) {
+		if gty == "" {
+			// Pre-gty token: cannot tell what it is. Sign in again mints one that
+			// can be judged.
+			return ErrMFASwitchOffStaleSession
+		}
+		return ErrMFASwitchOffServiceToken
+	}
+	sid, err := strconv.ParseInt(sessionID, 10, 64)
+	if err != nil {
+		return ErrMFASwitchOffStaleSession
+	}
+	uid, err := strconv.ParseInt(userID, 10, 64)
+	if err != nil {
+		return ErrMFASwitchOffServiceToken
+	}
+
+	var ok bool
+	err = s.pool.QueryRow(ctx, `
+		SELECT $3 = ANY (amr) AND auth_time > NOW() - make_interval(secs => $4)
+		FROM user_sessions
+		WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+	`, sid, uid, AMRMFA, MFASwitchOffMaxAuthAge.Seconds()).Scan(&ok)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrMFASwitchOffStaleSession
+		}
+		return fmt.Errorf("read session for MFA switch-off: %w", err)
+	}
+	if !ok {
+		return ErrMFASwitchOffStaleSession
 	}
 	return nil
 }
@@ -362,10 +586,26 @@ func (s *TOTPService) ResetUserMFA(ctx context.Context, tenantID int64, appRowID
 // as the otpauth:// issuer and in code emails), its effective MFA mode, and
 // its allowed method set.
 type userMFAContext struct {
-	appRowID       *int64
-	appName        string
+	appRowID *int64
+	appName  string
+	// enabled is the application's master switch; always true for a
+	// tenant-level user (no application, no switch).
+	enabled        bool
 	mode           string
 	allowedMethods []string
+}
+
+// switchedOff reports whether the user belongs to an application whose MFA
+// master switch is off.
+func (uc *userMFAContext) switchedOff() bool {
+	return uc.appRowID != nil && !uc.enabled
+}
+
+// requiredByPolicy reports whether the application mandates MFA for this
+// user right now: mode 'required' AND the switch on. While the switch is off
+// nothing is required, so the last-factor removal guard stands down.
+func (uc *userMFAContext) requiredByPolicy() bool {
+	return uc.appRowID != nil && uc.enabled && uc.mode == MFAModeRequired
 }
 
 // methodPermitted reports whether the user may use the given MFA method:
@@ -380,17 +620,18 @@ func (uc *userMFAContext) methodPermitted(method string) bool {
 
 // loadUserMFAContext is shared by the TOTP and email MFA services.
 func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantID int64) (*userMFAContext, error) {
-	uc := &userMFAContext{mode: MFAModeOptional, allowedMethods: defaultMFAMethods()}
+	uc := &userMFAContext{enabled: true, mode: MFAModeOptional, allowedMethods: defaultMFAMethods()}
 	var appName *string
+	var enabled *bool
 	var mode *string
 	var methods []string
 	err := pool.QueryRow(ctx, `
-		SELECT u.application_id, oc.name, ams.mode, ams.allowed_methods
+		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods
 		FROM users u
 		LEFT JOIN oauth_clients oc ON oc.id = u.application_id
 		LEFT JOIN application_mfa_settings ams ON ams.application_id = u.application_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&uc.appRowID, &appName, &mode, &methods)
+	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
@@ -399,6 +640,9 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	}
 	if appName != nil {
 		uc.appName = *appName
+	}
+	if enabled != nil {
+		uc.enabled = *enabled
 	}
 	if mode != nil {
 		uc.mode = *mode
@@ -429,6 +673,9 @@ func (s *TOTPService) EnrollUser(ctx context.Context, userID, tenantID int64, em
 	uc, err := s.loadUserMFAContext(ctx, userID, tenantID)
 	if err != nil {
 		return nil, err
+	}
+	if uc.switchedOff() {
+		return nil, ErrMFASwitchedOff
 	}
 	if uc.appRowID != nil && uc.mode == MFAModeDisabled {
 		return nil, ErrMFAEnrollmentDisabled
@@ -478,13 +725,14 @@ func emailMFAActive(ctx context.Context, pool *pgxpool.Pool, userID int64) (bool
 // DisableUser is the user-initiated TOTP disable path: policy-checked, then
 // code-verified via Disable. Users of a 'required' application may only
 // remove TOTP while another active second factor (email MFA) remains — the
-// last factor cannot be removed under a mandate.
+// last factor cannot be removed under a mandate. While the application's MFA
+// master switch is off there is no mandate, so the guard does not apply.
 func (s *TOTPService) DisableUser(ctx context.Context, userID, tenantID int64, code string) error {
 	uc, err := s.loadUserMFAContext(ctx, userID, tenantID)
 	if err != nil {
 		return err
 	}
-	if uc.appRowID != nil && uc.mode == MFAModeRequired {
+	if uc.requiredByPolicy() {
 		emailActive, err := emailMFAActive(ctx, s.pool, userID)
 		if err != nil {
 			return err

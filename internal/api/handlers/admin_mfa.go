@@ -198,7 +198,7 @@ func (h *AuthHandler) SessionMFAEnrollActivate(c echo.Context) error {
 // MyMFA handles GET /api/v1/auth/me/mfa.
 //
 // @Summary      My MFA status
-// @Description  Every MFA method with whether it is allowed for the caller, available on this server, and enrolled. mfa_required is true for administrators, for whom MFA is mandatory.
+// @Description  Every MFA method with whether it is allowed for the caller, available on this server, and enrolled. mfa_required is true for administrators, for whom MFA is mandatory. For an application user, allowed follows the application's policy: mfa_enabled (the master switch) is true, mode is not "disabled", and the method is in the application's allowed_methods. mode is the application's mode ("required" for administrators, "optional" for tenant-level users).
 // @Tags         AUTH
 // @Produce      json
 // @Security     BearerAuth

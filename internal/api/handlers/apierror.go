@@ -131,6 +131,11 @@ var errorMessages = map[string]string{
 	"mfa_required_by_policy": "Two-factor authentication is required for administrators. Add another method before removing this one.",
 	"mfa_reset_forbidden":    "You can't reset two-factor authentication for this administrator. Ask an owner or a platform administrator.",
 
+	// Application MFA master switch (#192).
+	"mfa_switched_off":             "Two-factor authentication is turned off for this application, so it can't be set up right now. Contact the application's administrator.",
+	"mfa_switch_off_service_token": "Turning two-factor authentication off needs a signed-in administrator. Service and API-key tokens can only turn it on.",
+	"mfa_switch_off_stale_session": "To turn two-factor authentication off, sign in again with two-factor authentication and retry within 10 minutes.",
+
 	// --- Passwords -------------------------------------------------------
 	"password_too_short":    "Choose a password of at least 8 characters.",
 	"password_incorrect":    "That isn't your current password.",

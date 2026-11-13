@@ -3371,7 +3371,14 @@ func (h *AdminHandler) DeactivateApplication(c echo.Context) error {
 // must be a non-empty subset of ["totp", "email"]. The magic-link fields
 // omitted (null) keep the stored values; enabling requires a redirect URL
 // (stored or provided).
+//
+// MFAEnabled is the master switch (#192): false runs the application without
+// MFA, keeping mode, methods and every enrolled factor for when it is turned
+// back on. Mode may be omitted when the request only flips the switch and/or
+// the magic-link settings; a body with none of mode, mfa_enabled or the
+// magic-link fields is still rejected as an invalid mode.
 type UpdateApplicationMFARequest struct {
+	MFAEnabled           *bool    `json:"mfa_enabled"`
 	Mode                 string   `json:"mode"`
 	AllowedMethods       []string `json:"allowed_methods"`
 	MagicLinkEnabled     *bool    `json:"magic_link_enabled"`
@@ -3413,16 +3420,16 @@ func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
 // PUT /api/v1/tenants/:tid/applications/:appID/mfa.
 //
 // @Summary      Set application MFA policy
-// @Description  Sets the application's MFA mode and (optionally) its allowed methods. 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login until an admin resets them); 'optional' restores the default opt-in behaviour. allowed_methods omitted keeps the current set (default ["totp"]).
+// @Description  Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default ["totp"]).
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
 // @Security     BearerAuth
 // @Param        appID  path      string                       true  "Application ID"
-// @Param        body   body      UpdateApplicationMFARequest  true  "MFA mode (disabled | optional | required) + optional allowed_methods subset of [totp, email]"
+// @Param        body   body      UpdateApplicationMFARequest  true  "Optional mfa_enabled switch + MFA mode (disabled | optional | required) + optional allowed_methods subset of [totp, email]"
 // @Success      200    {object}  auth.MFAPolicy
 // @Failure      400    {object}  map[string]string  "Invalid mode"
-// @Failure      403    {object}  map[string]string
+// @Failure      403    {object}  APIError           "forbidden | mfa_switch_off_service_token | mfa_switch_off_stale_session"
 // @Failure      404    {object}  map[string]string  "Application not found"
 // @Router       /api/v1/applications/{appID}/mfa [put]
 func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
@@ -3439,6 +3446,35 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
+	// mode stays mandatory unless the body carries something else to change,
+	// so an empty body is still the 400 it always was.
+	magicLink := req.MagicLinkEnabled != nil || req.MagicLinkRedirectURL != nil
+	if req.Mode == "" && req.MFAEnabled == nil && !magicLink {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": auth.ErrInvalidMFAMode.Error()})
+	}
+
+	// Turning MFA OFF removes it for every user of the application in one
+	// call, so it needs a person who has just proved themselves with MFA — not
+	// a stored service token, not a session left open since the morning.
+	// Checked on the REQUESTED value, before any write: refusing a redundant
+	// "off" on an app that is already off is harmless, and checking first
+	// leaves no window between check and write.
+	if req.MFAEnabled != nil && !*req.MFAEnabled {
+		var gty, sid, uid string
+		if claims != nil {
+			gty, sid, uid = claims.Gty, claims.SessionID, claims.UserID
+		}
+		if err := h.totpSvc.AuthorizeMFASwitchOff(c.Request().Context(), gty, sid, uid); err != nil {
+			switch {
+			case errors.Is(err, auth.ErrMFASwitchOffServiceToken):
+				return fail(c, http.StatusForbidden, "mfa_switch_off_service_token")
+			case errors.Is(err, auth.ErrMFASwitchOffStaleSession):
+				return fail(c, http.StatusForbidden, "mfa_switch_off_stale_session")
+			}
+			h.logger.Error().Err(err).Msg("admin: MFA switch-off authorisation failed")
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})
+		}
+	}
 
 	// Service tokens carry the public client_id in UserID — record no updater
 	// rather than a garbage id (same convention as auditAdmin).
@@ -3449,31 +3485,39 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		}
 	}
 
-	if err := h.totpSvc.SetAppMFAPolicy(c.Request().Context(), tenantID, appID, req.Mode, req.AllowedMethods, updatedBy); err != nil {
-		if errors.Is(err, auth.ErrInvalidMFAMode) || errors.Is(err, auth.ErrInvalidMFAMethods) {
+	// Switch, mode/methods and magic link in ONE transaction: before #192
+	// these were separate writes, so a bad magic-link URL returned 400 after
+	// the mode had already been changed.
+	res, err := h.totpSvc.UpdateAppMFASettings(c.Request().Context(), tenantID, appID, auth.AppMFAUpdate{
+		Enabled:              req.MFAEnabled,
+		Mode:                 req.Mode,
+		Methods:              req.AllowedMethods,
+		MagicLinkEnabled:     req.MagicLinkEnabled,
+		MagicLinkRedirectURL: req.MagicLinkRedirectURL,
+	}, updatedBy)
+	if err != nil {
+		switch {
+		case errors.Is(err, auth.ErrInvalidMFAMode), errors.Is(err, auth.ErrInvalidMFAMethods), errors.Is(err, auth.ErrMagicLinkNotConfigured):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
-		}
-		if errors.Is(err, auth.ErrAppNotFound) {
+		case errors.Is(err, auth.ErrAppNotFound):
 			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("admin: set application MFA policy failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})
 	}
 
-	if req.MagicLinkEnabled != nil || req.MagicLinkRedirectURL != nil {
-		if err := h.totpSvc.SetAppMagicLink(c.Request().Context(), tenantID, appID, req.MagicLinkEnabled, req.MagicLinkRedirectURL, updatedBy); err != nil {
-			if errors.Is(err, auth.ErrMagicLinkNotConfigured) {
-				return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
-			}
-			if errors.Is(err, auth.ErrAppNotFound) {
-				return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
-			}
-			h.logger.Error().Err(err).Msg("admin: set application magic link failed")
-			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set magic link settings"})
-		}
+	appIDStr := strconv.FormatInt(appID, 10)
+	if req.Mode != "" || magicLink {
+		h.auditAdminApp(c, claims, audit.ActionAdminMFAPolicyUpdated, "application", appIDStr, &appID)
 	}
-
-	h.auditAdminApp(c, claims, audit.ActionAdminMFAPolicyUpdated, "application", strconv.FormatInt(appID, 10), &appID)
+	// Only a real flip is audited (and so mailed): re-sending the current
+	// value is a no-op and must not page every administrator of the app.
+	// Filed under the tenant that was acted on, not the caller's own, so a
+	// platform operator's change lands in — and notifies — the right tenant.
+	if res.SwitchChanged() {
+		h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminMFASwitchChanged, "application", appIDStr, &appID,
+			map[string]any{"old_mfa_enabled": res.PrevEnabled, "new_mfa_enabled": res.NewEnabled})
+	}
 
 	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
 	if err != nil {
