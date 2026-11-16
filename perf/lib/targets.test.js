@@ -103,6 +103,9 @@ test('exact threshold strings for one flow', () => {
   assert.deepEqual(o.thresholds['http_req_failed{flow:auth_login}'], ['rate<=0.001']);
   // why: #218 a zero-sample flow must not pass — count>=1 pins that (F12)
   assert.deepEqual(o.thresholds['http_reqs{flow:auth_login}'], ['count>=1']);
+  // why: #218 a 200 OTP challenge without access_token passes http_req_failed;
+  //      only the body check catches it, so checks must carry the error budget
+  assert.deepEqual(o.thresholds['checks{flow:auth_login}'], ['rate>=0.999']);
   // why: #218 the RPS half of "VUs/RPS" is dropped_iterations on arrival-rate
   //      executors (F12)
   assert.deepEqual(o.thresholds['dropped_iterations{scenario:auth_login}'], ['count==0']);
@@ -181,4 +184,19 @@ test('poolFloors and appQuotas scale with the peak multiplier', () => {
   assert.equal(q.web.requests_per_minute, Math.ceil((2 + 2 + 2 + 2) * 4 * 60 * 1.2));
   assert.equal(q.web.burst, q.web.requests_per_minute);
   assert.equal(q.m2m.requests_per_minute, Math.ceil(2 * 4 * 60 * 1.2));
+});
+
+// why: #218 an error_rate of 0 must demand every check pass (rate>=1), and the
+//      floor must not carry float noise k6 would parse verbatim
+test('checks threshold tracks error_rate exactly', () => {
+  const o = buildOptions(base(), 'smoke');
+  for (const f of FLOWS) {
+    const e = base().flows[f].error_rate;
+    assert.deepEqual(o.thresholds[`checks{flow:${f}}`], [`rate>=${Number((1 - e).toFixed(6))}`]);
+  }
+  const t = base();
+  t.flows.jwks.error_rate = 0;
+  assert.deepEqual(buildOptions(t, 'load').thresholds['checks{flow:jwks}'], ['rate>=1']);
+  t.flows.jwks.error_rate = 0.003;
+  assert.deepEqual(buildOptions(t, 'load').thresholds['checks{flow:jwks}'], ['rate>=0.997']);
 });

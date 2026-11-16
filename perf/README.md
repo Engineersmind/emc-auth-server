@@ -113,6 +113,12 @@ and error-rate values under each scenario key. Placeholder flows
 they belong to and the HTML report banners them. `targets.fail-demo.json`
 exists to prove the wiring: running with it must fail the k6 run.
 
+Per flow, the run fails on: p95 or p99 over target; `http_req_failed` above
+`error_rate`; a `checks` pass rate below `1 - error_rate` (a 200 without the
+expected body, such as an OTP challenge with no `access_token`, or a token
+holder that could not log in); zero requests; and, on arrival-rate scenarios,
+any dropped iteration.
+
 ## What "green" means on a laptop
 
 `targets.local.json` is sized so **smoke, ratelimit and load** run green on a

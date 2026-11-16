@@ -340,7 +340,13 @@ export function oauth_refresh() {
     holder.oauth_refresh = loginAppUser(tokenUser());
   }
   const h = holder.oauth_refresh;
-  if (!h) return; // setup failed — try again next iteration
+  if (!h) {
+    // Setup failed, so no measured request goes out. Record it as a failed
+    // check: checks{flow:oauth_refresh} is thresholded, so lost iterations
+    // cannot quietly thin the flow while its other gates stay green.
+    check(null, { 'oauth_refresh: holder login': () => false });
+    return;
+  }
   const res = http.post(
     `${ORIGIN}/oauth/token`,
     formBody({ grant_type: 'refresh_token', refresh_token: h.refresh }),
@@ -371,7 +377,11 @@ export function apps_me() {
     h = loginAppUser(tokenUser());
   }
   holder.apps_me = h;
-  if (!h) return;
+  if (!h) {
+    // Same as oauth_refresh: a holder that cannot log in is a failed check.
+    check(null, { 'apps_me: holder login': () => false });
+    return;
+  }
   const res = http.get(
     `${ORIGIN}/api/v1/auth/apps/me`,
     reqParams('apps_me', 200, {

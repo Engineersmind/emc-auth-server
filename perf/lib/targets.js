@@ -7,7 +7,8 @@
 // Every flow declares its own thresholds (rps/max_vus, p95, p99, error rate);
 // a breached threshold fails the run. Because a threshold on a metric with
 // zero samples silently passes in k6, every flow also carries
-// http_reqs{flow}:count>=1, and every arrival-rate scenario carries
+// http_reqs{flow}:count>=1, a checks{flow} rate floor of 1 - error_rate (a 200
+// without the expected body is a failure too), and every arrival-rate scenario carries
 // dropped_iterations{scenario}:count==0 — the "VUs/RPS" half of the target.
 
 export const FLOWS = Object.freeze([
@@ -207,6 +208,12 @@ function flowThresholds(flow, f) {
   th[`http_req_failed{flow:${f}}`] = [`rate<=${flow.error_rate}`];
   // A zero-sample flow must never read as a pass.
   th[`http_reqs{flow:${f}}`] = ['count>=1'];
+  // http_req_failed only sees the status code. A 200 that is not a real
+  // success (an OTP challenge with no access_token, a holder that could not
+  // log in) fails the flow's check instead, so the same error budget applies
+  // to checks. The scenario tag puts every check in that scenario under
+  // {flow:<f>}.
+  th[`checks{flow:${f}}`] = [`rate>=${Number((1 - flow.error_rate).toFixed(6))}`];
   return th;
 }
 
