@@ -1,0 +1,33 @@
+# perf/docker-compose.perf.yml — issue #218 (FR4)
+#
+# Perf overlay for the local stack:
+#   docker compose -f docker-compose.yml -f perf/docker-compose.perf.yml up -d
+#
+# Compose merges `environment` by key, so this file adds exactly two variables
+# to the stock emc-auth-server service and changes nothing else.
+#
+#   TRUSTED_PROXIES   — required. The suite sends a unique X-Forwarded-For per
+#                       iteration so the per-IP limiters measure the scenario
+#                       rate instead of one runner IP. c.RealIP() only believes
+#                       XFF from a trusted peer, and each CIDR must be /16 or
+#                       narrower (internal/config/config.go). Find the address
+#                       k6's traffic arrives from — usually the compose
+#                       network's gateway:
+#                         docker network inspect <project>_default
+#                       then export PERF_TRUSTED_PROXIES=<that subnet>,
+#                       e.g. 172.18.0.0/16.
+#   RATE_LIMIT_APP_PER_IP — the app_ip limiter (default 600/min per connIP)
+#                       would trip under any real scenario rate; the perf run
+#                       raises it. Per-user and per-app-quota limits are set by
+#                       the seed instead, and the measured ones (login_ip,
+#                       login_account, JWKS, the defaults app) keep their real
+#                       values — that is what the ratelimit scenario checks.
+#
+# The ratelimit scenario does NOT need this overlay: it measures the compiled-in
+# defaults from one real IP, no X-Forwarded-For.
+
+services:
+  emc-auth-server:
+    environment:
+      TRUSTED_PROXIES: ${PERF_TRUSTED_PROXIES:?set the /16-or-narrower CIDR the k6 traffic arrives from — see the comment at the top of this file}
+      RATE_LIMIT_APP_PER_IP: ${PERF_RATE_LIMIT_APP_PER_IP:-60000}
