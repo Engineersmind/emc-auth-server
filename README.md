@@ -611,59 +611,89 @@ jobs:
 | Audit trail | `audit_logs` table — 21 event types with tenant_id, user_id, IP | PostgreSQL / API |
 | Error logging | Zerolog `Error()` on all DB/Redis failures with context fields | stdout |
 
-### Observability Metrics (Implemented — Phase 7)
+### Observability Metrics
 
-`GET /metrics` — Prometheus-compatible endpoint (live, no auth required):
+`GET /metrics` — Prometheus-compatible endpoint. It is registered openly when
+`ENV=development` or `ENV=test`; in every other environment the route exists
+only when `METRICS_TOKEN` is set, and scrapes must then send
+`Authorization: Bearer <METRICS_TOKEN>`
+(`internal/api/middleware/metricsauth.go`).
 
+All metrics carry the `emc_auth` namespace; the full inventory with label
+documentation is the package comment of `internal/metrics/metrics.go`. Groups:
+
+- **HTTP** — `emc_auth_http_request_duration_seconds{method,path,status}` histogram, `emc_auth_http_requests_in_flight` gauge
+- **Password hashing** — `emc_auth_password_hash_duration_seconds{algorithm,operation}`, `emc_auth_password_hash_in_flight`, `emc_auth_password_hash_queue_wait_seconds`, `emc_auth_password_rehash_total{from}`
+- **Rate limiting** — `emc_auth_rate_limit_hits_total{limiter}`, `emc_auth_rate_limit_fail_open_total{limiter,reason}`, `emc_auth_rate_limit_store_overflow_total{store}`
+- **Audit pipeline** — `emc_auth_audit_queue_depth`, `emc_auth_audit_events_dropped_total{reason}`, `emc_auth_audit_events_written_total`, `emc_auth_audit_flush_duration_seconds`, `emc_auth_audit_enrichment_errors_total{stage}`
+- **Tokens / OAuth / MFA / sessions** — `emc_auth_tokens_issued_total{grant_type}`, `emc_auth_tokens_revoked_total{reason}`, `emc_auth_oauth_grants_total{grant,outcome}`, `emc_auth_oauth_authorize_requests_total{outcome}`, `emc_auth_mfa_challenges_total{factor,outcome}`, `emc_auth_mfa_lockouts_total`, `emc_auth_session_revocations_total{reason}`, `emc_auth_sessions_reaped_total`, `emc_auth_session_reaper_runs_total{outcome}`, `emc_auth_session_denylist_errors_total{op}`
+- **Postgres pool** — `emc_auth_db_pool_*` gauges and counters exported from `pgxpool.Stat` by `internal/metrics/pool.go`; absent until `store.NewDB` has connected
+- **Auth activity** — `emc_auth_operations_total{operation,outcome}` plus security counters (API-key auth, social login, risk signals, scope/audience rejections)
+
+### Grafana Dashboards
+
+Provisioned JSON in `infra/grafana/dashboards/`, auto-loaded through the file
+provider in `infra/grafana/provisioning/dashboards/dashboards.yml` (folder
+"EMC Auth Server"):
+
+| File | Panels |
+|------|--------|
+| `emc-auth-red.json` | RED per route — request rate, 5xx errors, p50/p95/p99 from `emc_auth_http_request_duration_seconds` |
+| `emc-auth-saturation.json` | In-flight requests, Argon2id hash latency/concurrency/queue wait, rate-limit hits/fail-open/store overflow, pgx pool stats |
+| `emc-auth-audit.json` | Audit queue depth, dropped/written events, flush latency, enrichment errors |
+| `emc-auth-identity.json` | Tokens issued/revoked, OAuth grants, MFA challenges/lockouts, session lifecycle |
+
+Every dashboard carries a stat panel on `up{job="emc-auth-server"}` so a dead
+scrape is distinguishable from a quiet system, and every panel targets the
+provisioned `Prometheus` datasource (`uid: prometheus`).
+
+### Alerting Rules
+
+Two rule files under `infra/prometheus/`:
+
+- `audit_alerts.yml` — audit-pipeline health (dropped events, queue backlog, flush latency, enrichment errors) and security anomalies (failed-login rate, MFA lockouts, risk signals).
+- `service_alerts.yml` — service level (issue #217): per-route p99 above SLO for 5m (the Argon2id-bearing routes listed in the file header carry their own budget; both thresholds are placeholders pending the #170 NFR table), 5xx ratio above 1%, any rate-limit fail-open, host CPU above 80% (node_exporter names), and scrape-down. Promtool unit tests: `infra/prometheus/tests/service_alerts_test.yml`.
+
+Continuous validation: `bash scripts/check-observability.sh` runs
+`promtool check config`, `promtool check rules`, the promtool unit tests,
+`amtool check-config`, and the Go drift tests that pin every referenced
+series name against `internal/metrics`. `.github/workflows/observability-config.yml`
+runs the same script on PRs that touch these paths.
+
+### Local monitoring
+
+```bash
+docker compose --profile monitoring up -d
 ```
-# HTTP layer
-emc_auth_http_request_duration_seconds{method, path, status}   histogram
-emc_auth_http_requests_in_flight                               gauge
 
-# Business operations
-emc_auth_operations_total{operation, outcome}                  counter
+starts Prometheus, Grafana, Alertmanager, node-exporter and a dummy alert
+receiver (`alert-sink`) alongside the normal app stack. All host ports bind
+to 127.0.0.1:
 
-# Rate limiting
-emc_auth_rate_limit_hits_total{limiter}                        counter
+| UI | URL |
+|----|-----|
+| Grafana | http://localhost:3001 — admin / `local-dev-only` (override with `GRAFANA_ADMIN_PASSWORD`) |
+| Prometheus | http://localhost:9091 |
+| Alertmanager | http://localhost:9093 |
+
+Fire a test alert end-to-end (runs inside the container, so amtool's default
+`http://localhost:9093` target is right):
+
+```bash
+docker compose exec alertmanager amtool alert add test-alert severity=critical
+docker compose logs alert-sink
 ```
 
-### Grafana Dashboard (Implemented — Phase 7)
+The webhook receiver URL is read from a file (`url_file`), mounted from
+`./infra/alertmanager/webhook_url.local` — the committed default points at
+the `alert-sink` echo service. For a real endpoint, put the URL in a
+gitignored `infra/alertmanager/*.secret` file (no trailing newline) and set
+`ALERTMANAGER_WEBHOOK_URL_FILE` to its path.
 
-Provisioned JSON at `infra/grafana/dashboards/emc-auth.json` — auto-loaded by the production compose stack.
-
-```
-Row 1 — Traffic Overview
-  ├── Requests/sec (by endpoint)
-  ├── Login success rate (success / total)
-  └── Rate limit hit rate
-
-Row 2 — Auth Health
-  ├── Failed logins by tenant (bar chart — spike = brute-force attempt)
-  ├── Token refresh volume
-  └── Password reset requests
-
-Row 3 — Performance
-  ├── p50/p95/p99 request latency (heatmap)
-  ├── DB query latency
-  └── Redis operation latency
-
-Row 4 — Infrastructure
-  ├── DB connection pool utilization
-  ├── Go runtime memory (heap in use)
-  └── Goroutine count
-```
-
-### Alerting Rules (Implemented — Phase 7)
-
-Rules file: `infra/prometheus/rules.yml`
-
-| Alert | Condition | Severity |
-|-------|-----------|----------|
-| Auth spike | Login failures > 50/min/tenant | Warning |
-| Brute-force | Rate limit hits > 100/min/IP | Critical |
-| DB saturation | Pool acquired > 90% for 5 min | Warning |
-| High latency | p99 login > 500ms for 2 min | Warning |
-| Server down | `/health` fails 3 consecutive checks | Critical |
+Note on `METRICS_TOKEN`: locally `ENV=development` serves `/metrics` openly.
+Setting `METRICS_TOKEN` on the app without also giving it to Prometheus makes
+the scrape 404 — `up` drops to 0 and `EmcAuthScrapeDown` fires. That is the
+alarm working, not a bug.
 
 ---
 
