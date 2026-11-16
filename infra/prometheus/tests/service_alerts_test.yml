@@ -179,12 +179,45 @@ tests:
               summary: 'Rate limiter is failing open'
               description: 'Requests bypassed a rate limiter because the limiter could not evaluate them — quotas are currently unenforced. Check Redis health.'
 
-  # Counter exists but never incremented → increase = 0 → silent.
+  # First-ever fail-open for a limiter/reason pair: the lazy counter appears
+  # already at 1 and never moves, so increase() is 0 — the new-series branch
+  # must fire.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_rate_limit_fail_open_total{limiter="app", reason="redis_error", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '_x4 1x40'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: EmcAuthRateLimitFailOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: rate_limit
+            exp_annotations:
+              summary: 'Rate limiter is failing open'
+              description: 'Requests bypassed a rate limiter because the limiter could not evaluate them — quotas are currently unenforced. Check Redis health.'
+
+  # The same series 5m+ later, with no further failures → silent.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_rate_limit_fail_open_total{limiter="app", reason="redis_error", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '_x4 1x80'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthRateLimitFailOpen
+        exp_alerts: []
+
+  # Counter exists but never incremented → increase = 0 and the value is 0,
+  # so the new-series branch does not count it either → silent, even while
+  # the series is younger than 5m.
   - interval: 15s
     input_series:
       - series: 'emc_auth_rate_limit_fail_open_total{limiter="app", reason="redis_error", instance="emc-auth-server:9090", job="emc-auth-server"}'
         values: '0x119'
     alert_rule_test:
+      - eval_time: 3m
+        alertname: EmcAuthRateLimitFailOpen
+        exp_alerts: []
       - eval_time: 10m
         alertname: EmcAuthRateLimitFailOpen
         exp_alerts: []

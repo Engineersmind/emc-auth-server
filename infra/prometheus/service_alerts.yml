@@ -74,8 +74,14 @@ groups:
       # Any fail-open in 5m: a rate limiter could not decide and let traffic
       # through, meaning configured quotas are silently unenforced (usually a
       # Redis outage).
+      # The counter is created lazily on the first failure, so a limiter/reason
+      # pair's first fail-open shows up as a NEW series already at 1 —
+      # increase() sees 1, 1, ... and stays 0. The `or` branch catches that: a
+      # positive series that did not exist 5m ago. Side effect: after a
+      # Prometheus restart without its TSDB (the stateless local profile),
+      # counters that are already positive look new and fire once.
       - alert: EmcAuthRateLimitFailOpen
-        expr: 'sum(increase(emc_auth_rate_limit_fail_open_total[5m])) > 0'
+        expr: 'sum(increase(emc_auth_rate_limit_fail_open_total[5m])) > 0 or count((emc_auth_rate_limit_fail_open_total > 0) unless emc_auth_rate_limit_fail_open_total offset 5m) > 0'
         for: 1m
         labels: { severity: critical, component: rate_limit }
         annotations:
