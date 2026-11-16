@@ -175,11 +175,12 @@ func TestPoolCollector_DescribeMatchesCollect(t *testing.T) {
 	}
 }
 
-// why: #217 — ClearDBPool must only clear the registration for THE pool it is
-// given. Tests (and any future secondary pool) call CloseDB on their own
-// pools; an unconditional clear would let a short-lived test pool unregister
-// the server's live one and make the whole emc_auth_db_pool_* family
-// disappear mid-scrape.
+// why: #217 — SetDBPool must not let a second pool take over the
+// registration, and ClearDBPool must only clear it for THE pool that holds it.
+// Tests (and any future secondary pool) open and close pools of their own; a
+// plain Store in SetDBPool would hand the registration to the secondary pool,
+// and closing that pool would then leave the server's live pool unreported —
+// the whole emc_auth_db_pool_* family gone while the server keeps running.
 func TestPoolCollector_ClearOnlyCurrent(t *testing.T) {
 	newPool := func(t *testing.T) *pgxpool.Pool {
 		t.Helper()
@@ -199,11 +200,16 @@ func TestPoolCollector_ClearOnlyCurrent(t *testing.T) {
 	}
 
 	prev := currentPool.Load()
+	currentPool.Store(nil)
 	t.Cleanup(func() { currentPool.Store(prev) })
 
 	a, b := newPool(t), newPool(t)
 
 	SetDBPool(a)
+	SetDBPool(b)
+	if got := currentPool.Load(); got != a {
+		t.Fatalf("SetDBPool(b) replaced the registered pool: got %p, want %p (a)", got, a)
+	}
 	ClearDBPool(b)
 	if got := currentPool.Load(); got != a {
 		t.Fatalf("ClearDBPool(b) cleared current pool: got %p, want %p (a)", got, a)

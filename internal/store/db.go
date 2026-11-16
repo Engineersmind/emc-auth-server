@@ -48,6 +48,7 @@ func NewDB(ctx context.Context, databaseURL string, logger zerolog.Logger) (*pgx
 
 		// Advertise the pool to the emc_auth_db_pool_* collector only once it
 		// has actually pinged — a pool that never connected is never exported.
+		// The first pool claims the registration; later pools do not replace it.
 		metrics.SetDBPool(pool)
 		logger.Info().
 			Int32("max_conns", config.MaxConns).

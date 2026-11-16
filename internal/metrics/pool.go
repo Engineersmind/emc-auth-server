@@ -13,15 +13,16 @@ import (
 // pgxpool.Stat answers on demand but is a snapshot struct of unexported
 // fields — it cannot be handed to a GaugeFunc per method, and the package has
 // no exported way to ask "which pool belongs to this process". The bridge is a
-// pull collector: store.NewDB registers the live pool once it has pinged, and
-// every scrape reads a fresh Stat off it. Before NewDB succeeds, and after
+// pull collector: store.NewDB registers the first live pool once it has
+// pinged, and every scrape reads a fresh Stat off it. Before NewDB succeeds, and after
 // CloseDB clears it, the emc_auth_db_pool_* families are ABSENT from /metrics
 // rather than frozen at their last reading — a closed pool's Stat still
 // answers, and stale numbers that look alive are worse than no series.
 //
-// Set/Clear go through a compare-and-swap so that closing a secondary pool —
-// a test's throwaway NewDB, say — can never blank the server's registered
-// pool out from under the scrape path.
+// Set and Clear both go through compare-and-swap: Set claims the registration
+// only while it is empty, and Clear releases it only for the pool that holds
+// it. Creating or closing a secondary pool — a test's throwaway NewDB, say —
+// therefore never replaces or blanks the server's registered pool.
 
 // PoolStats is one scrape's worth of pgxpool.Stat readings — one field per
 // Stat method, so a new upstream reading is a one-line addition here and in
@@ -162,15 +163,17 @@ func (c *poolCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-// currentPool is the pool the registered collector reports on. It is set
-// once by store.NewDB on the success path and cleared by store.CloseDB.
+// currentPool is the pool the registered collector reports on. The first
+// pool store.NewDB opens claims it; store.CloseDB on that pool releases it.
 var currentPool atomic.Pointer[pgxpool.Pool]
 
-// SetDBPool makes p the pool reported by the emc_auth_db_pool_* series.
+// SetDBPool makes p the pool reported by the emc_auth_db_pool_* series, but
+// only if no pool is registered yet: a second live pool must not take over
+// the registration, or closing it would leave the first pool unreported.
 // Called by store.NewDB only after the pool has pinged — a pool that never
 // connected is never advertised.
 func SetDBPool(p *pgxpool.Pool) {
-	currentPool.Store(p)
+	currentPool.CompareAndSwap(nil, p)
 }
 
 // ClearDBPool unregisters p ONLY if p is the pool currently being reported.
