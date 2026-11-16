@@ -652,7 +652,7 @@ provisioned `Prometheus` datasource (`uid: prometheus`).
 Two rule files under `infra/prometheus/`:
 
 - `audit_alerts.yml` — audit-pipeline health (dropped events, queue backlog, flush latency, enrichment errors) and security anomalies (failed-login rate, MFA lockouts, risk signals).
-- `service_alerts.yml` — service level (issue #217): per-route p99 above SLO for 5m (the Argon2id-bearing routes listed in the file header carry their own budget; both thresholds are placeholders pending the #170 NFR table), 5xx ratio above 1%, any rate-limit fail-open, host CPU above 80% (node_exporter names), and scrape-down. Promtool unit tests: `infra/prometheus/tests/service_alerts_test.yml`.
+- `service_alerts.yml` — service level (issue #217): p99 above SLO for 5m per method and route (the POST Argon2id-bearing routes listed in the file header carry their own budget; both thresholds are placeholders pending the #170 NFR table), 5xx ratio above 1%, any rate-limit fail-open, host CPU above 80% (node_exporter names), and scrape-down. Promtool unit tests: `infra/prometheus/tests/service_alerts_test.yml`.
 
 Continuous validation: `bash scripts/check-observability.sh` runs
 `promtool check config`, `promtool check rules`, the promtool unit tests,
