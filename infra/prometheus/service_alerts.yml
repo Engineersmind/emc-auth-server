@@ -29,6 +29,9 @@
 #   /api/v1/applications/:appID/users/import                 routes.go:1805  (CommitUserImport)
 #   /api/v1/tenants/:tid/applications/:appID/users/import    routes.go:1807  (CommitUserImport)
 #   /oauth/authorize/login                                   routes.go:2117  (LoginSubmit → AuthService.Login)
+# Every entry is a POST handler, and both rules key on (method, path): a GET
+# on the same template (e.g. listing GET /api/v1/users) is NOT a password
+# route and stays under the normal SLO.
 # Client-secret checks (/api/v1/auth/token, app basic-auth) use HashToken
 # (SHA-256), not Argon2id — deliberately not in this list.
 # The PASSWORD_ROUTES regex literal in the two rules below must stay in sync
@@ -36,28 +39,29 @@
 groups:
   - name: emc_auth_service
     rules:
-      # p99 above SLO for 5m, per route, on non-password routes.
+      # p99 above SLO for 5m, per (method, path), on everything except the
+      # POST password routes (removed by the `unless` clause).
       # 0.5 = SLO placeholder — set from the #170 NFR table.
       # The `and` clause is a minimum-traffic guard: one slow request on an
       # idle route cannot page.
       - alert: EmcAuthLatencyP99AboveSLO
-        expr: 'histogram_quantile(0.99, sum by (le, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~"/metrics|/health|unknown",path!~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m]))) > 0.5 and sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path!~"/metrics|/health|unknown",path!~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m])) > 0.1'
+        expr: '(histogram_quantile(0.99, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~"/metrics|/health|unknown"}[5m]))) > 0.5 and sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{path!~"/metrics|/health|unknown"}[5m])) > 0.1) unless on (method, path) count by (method, path) (emc_auth_http_request_duration_seconds_count{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"})'
         for: 5m
         labels: { severity: warning, component: http }
         annotations:
-          summary: 'Route {{ $labels.path }} p99 latency above SLO for 5m'
-          description: 'The p99 of {{ $labels.path }} exceeded the service SLO (placeholder 0.5s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+          summary: 'Route {{ $labels.method }} {{ $labels.path }} p99 latency above SLO for 5m'
+          description: 'The p99 of {{ $labels.method }} {{ $labels.path }} exceeded the service SLO (placeholder 0.5s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
 
       # Same shape for the Argon2id-bearing routes listed at the top of this
       # file — deliberately-slow endpoints get their own budget.
       # 2.0 = SLO placeholder — set from the #170 NFR table.
       - alert: EmcAuthPasswordRouteLatencyP99AboveSLO
-        expr: 'histogram_quantile(0.99, sum by (le, path) (rate(emc_auth_http_request_duration_seconds_bucket{path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m]))) > 2 and sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m])) > 0.1'
+        expr: 'histogram_quantile(0.99, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m]))) > 2 and sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m])) > 0.1'
         for: 5m
         labels: { severity: warning, component: http }
         annotations:
-          summary: 'Password route {{ $labels.path }} p99 above SLO for 5m'
-          description: 'The p99 of Argon2id-bearing route {{ $labels.path }} exceeded the password-route SLO (placeholder 2s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+          summary: 'Password route {{ $labels.method }} {{ $labels.path }} p99 above SLO for 5m'
+          description: 'The p99 of Argon2id-bearing route {{ $labels.method }} {{ $labels.path }} exceeded the password-route SLO (placeholder 2s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
 
       # 5xx above 1% of all requests for 5m. /metrics and /health are excluded
       # from BOTH sides — Prometheus's own scrapes would otherwise dilute the

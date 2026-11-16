@@ -99,10 +99,11 @@ tests:
           - exp_labels:
               severity: warning
               component: http
+              method: GET
               path: /api/v1/auth/me
             exp_annotations:
-              summary: 'Route /api/v1/auth/me p99 latency above SLO for 5m'
-              description: 'The p99 of /api/v1/auth/me exceeded the service SLO (placeholder 0.5s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+              summary: 'Route GET /api/v1/auth/me p99 latency above SLO for 5m'
+              description: 'The p99 of GET /api/v1/auth/me exceeded the service SLO (placeholder 0.5s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
 
   # Same shape but count rate 0.0033/s — below the 0.1/s traffic guard. The p99
   # side is true yet the alert stays silent: one slow request on an idle route
@@ -120,6 +121,44 @@ tests:
     alert_rule_test:
       - eval_time: 15m
         alertname: EmcAuthLatencyP99AboveSLO
+        exp_alerts: []
+
+  # Shared template: GET and POST /api/v1/users (routes.go:1743-1744). Only
+  # POST hashes a password. Both run at p99 ≈ 0.995s above the guard: the GET
+  # must page under the normal 0.5s SLO, the POST must not (its budget is the
+  # password one, which 0.995s does not exceed).
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/users", status="200", le="0.5", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/users", status="200", le="1", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/users", status="200", le="+Inf", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="GET", path="/api/v1/users", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/users", status="200", le="0.5", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/users", status="200", le="1", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/users", status="200", le="+Inf", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="POST", path="/api/v1/users", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthLatencyP99AboveSLO
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: http
+              method: GET
+              path: /api/v1/users
+            exp_annotations:
+              summary: 'Route GET /api/v1/users p99 latency above SLO for 5m'
+              description: 'The p99 of GET /api/v1/users exceeded the service SLO (placeholder 0.5s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+      - eval_time: 15m
+        alertname: EmcAuthPasswordRouteLatencyP99AboveSLO
         exp_alerts: []
 
   # ── EmcAuthPasswordRouteLatencyP99AboveSLO ────────────────────────────────
@@ -142,10 +181,11 @@ tests:
           - exp_labels:
               severity: warning
               component: http
+              method: POST
               path: /api/v1/auth/login
             exp_annotations:
-              summary: 'Password route /api/v1/auth/login p99 above SLO for 5m'
-              description: 'The p99 of Argon2id-bearing route /api/v1/auth/login exceeded the password-route SLO (placeholder 2s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+              summary: 'Password route POST /api/v1/auth/login p99 above SLO for 5m'
+              description: 'The p99 of Argon2id-bearing route POST /api/v1/auth/login exceeded the password-route SLO (placeholder 2s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
 
   # Password route below the traffic guard → silent.
   - interval: 15s
