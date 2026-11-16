@@ -74,6 +74,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Tokens revoked/sec by reason",
+      "description": "emc_auth_tokens_revoked_total is declared in internal/metrics but nothing increments it yet, so this panel shows No data until revocation paths are instrumented. The session revocations panel covers revocation activity today.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 10, "x": 14, "y": 0 },
       "targets": [
@@ -98,38 +99,11 @@
       }
     },
     {
-      "id": 4,
-      "type": "timeseries",
-      "title": "Auth operations/sec by operation, outcome",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (operation, outcome) (rate(emc_auth_operations_total[5m]))",
-          "legendFormat": "{{operation}} / {{outcome}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "spanNulls": false },
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
-      }
-    },
-    {
       "id": 5,
       "type": "timeseries",
       "title": "OAuth grants/sec by grant, outcome",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
           "refId": "A",
@@ -156,7 +130,7 @@
       "type": "timeseries",
       "title": "OAuth authorize requests/sec by outcome",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
       "targets": [
         {
           "refId": "A",
@@ -183,7 +157,7 @@
       "type": "timeseries",
       "title": "MFA challenges/sec by factor, outcome",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
       "targets": [
         {
           "refId": "A",
