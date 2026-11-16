@@ -33,12 +33,24 @@ type OIDCHandler struct {
 	// different values. UserInfo does not use it.
 	issuers *auth.TenantIssuerResolver
 
+	// introspection advertises introspection_endpoint in discovery. It mirrors
+	// whether routes.go registered POST /oauth/introspect, which it does only
+	// with Organizations enabled (#180).
+	introspection bool
+
 	logger zerolog.Logger
 }
 
 // NewOIDCHandler builds the handler.
 func NewOIDCHandler(pool *pgxpool.Pool, issuers *auth.TenantIssuerResolver, logger zerolog.Logger) *OIDCHandler {
 	return &OIDCHandler{pool: pool, issuers: issuers, logger: logger}
+}
+
+// WithIntrospection sets whether discovery advertises introspection_endpoint.
+// Pass the same value that decides whether the route is registered.
+func (h *OIDCHandler) WithIntrospection(enabled bool) *OIDCHandler {
+	h.introspection = enabled
+	return h
 }
 
 // UserInfoResponse is the OIDC UserInfo claim set (OIDC Core 1.0 §5.3).

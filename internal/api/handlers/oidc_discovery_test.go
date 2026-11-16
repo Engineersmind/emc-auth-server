@@ -58,6 +58,14 @@ type discoveryEnv struct {
 // testing a fiction.
 func newDiscoveryEnv(t *testing.T) *discoveryEnv {
 	t.Helper()
+	return newDiscoveryEnvWith(t, false)
+}
+
+// newDiscoveryEnvWith is newDiscoveryEnv with the Organizations switch
+// (ORGANIZATIONS_ENABLED) set as given; it decides whether introspection is
+// advertised.
+func newDiscoveryEnvWith(t *testing.T, organizationsEnabled bool) *discoveryEnv {
+	t.Helper()
 
 	pool := testhelper.NewTestDB(t)
 	testhelper.CleanupTables(t, pool)
@@ -110,7 +118,7 @@ func newDiscoveryEnv(t *testing.T) *discoveryEnv {
 	env.jwtSvc = jwtSvc.WithSigningKeys(keys).WithTenantIssuers(resolver)
 
 	e := echo.New()
-	oidcHandler := NewOIDCHandler(pool, resolver, logger)
+	oidcHandler := NewOIDCHandler(pool, resolver, logger).WithIntrospection(organizationsEnabled)
 	jwksHandler := NewJWKSHandler(pool, keys, logger)
 	// Registered from the same constants routes.go uses. If those change, this
 	// test server changes with them — which is the point of the constants.
@@ -457,6 +465,9 @@ func TestDiscovery_AdvertisesOnlyS256(t *testing.T) {
 // document to "look complete". Every field asserted absent here names a feature
 // that does not exist; advertising one sends a conformant client to a 404 inside
 // its own SDK, far from the cause.
+//
+// The fixture runs with Organizations off, so introspection is one of them: the
+// route is not registered, and advertising it would be a false claim (#180).
 func TestDiscovery_OmitsUnimplementedEndpoints(t *testing.T) {
 	env := newDiscoveryEnv(t)
 
@@ -474,16 +485,12 @@ func TestDiscovery_OmitsUnimplementedEndpoints(t *testing.T) {
 		"check_session_iframe",
 		"registration_endpoint",
 		"acr_values_supported",
+		// why: #180 — /oauth/introspect is registered only with Organizations on.
+		"introspection_endpoint",
 	} {
 		if _, present := raw[field]; present {
 			t.Errorf("document advertises %q, which this server does not implement", field)
 		}
-	}
-
-	// RFC 7662 introspection is implemented (Organizations), so it must now be
-	// advertised — and at the route the server actually registers.
-	if got, want := raw["introspection_endpoint"], env.base+PathOAuthIntrospect; got != want {
-		t.Errorf("introspection_endpoint = %v, want %q", got, want)
 	}
 
 	// The negative capability flags are the opposite case: present, and false.
@@ -501,6 +508,68 @@ func TestDiscovery_OmitsUnimplementedEndpoints(t *testing.T) {
 		if value != false {
 			t.Errorf("%q = %v, want false", field, value)
 		}
+	}
+}
+
+// TestDiscovery_IntrospectionFollowsOrganizationsSwitch pins both arms of the
+// switch. Off, the document is byte-for-byte what it was before Organizations
+// existed, so no integrator's cached discovery ETag changes on deploy; on, it
+// advertises the route the server then registers.
+//
+// why: #180
+func TestDiscovery_IntrospectionFollowsOrganizationsSwitch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+	}{
+		{"organizations off", false},
+		{"organizations on", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newDiscoveryEnvWith(t, tc.enabled)
+
+			res := env.get(env.base+tenantPath(PathTenantDiscovery, env.slug), "")
+			if res.status != http.StatusOK {
+				t.Fatalf("status = %d, want 200", res.status)
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(res.body, &raw); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+
+			got, present := raw["introspection_endpoint"]
+			if !tc.enabled {
+				if present {
+					t.Errorf("introspection_endpoint = %v with Organizations off; the route "+
+						"is not registered, so this sends a client to a 404", got)
+				}
+				return
+			}
+			if want := env.base + PathOAuthIntrospect; got != want {
+				t.Errorf("introspection_endpoint = %v, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestBuildDiscoveryDocument_IntrospectionOmittedWhenOff needs no database, so
+// the switch is pinned even where the integration tests above are skipped.
+//
+// why: #180
+func TestBuildDiscoveryDocument_IntrospectionOmittedWhenOff(t *testing.T) {
+	const base = "https://auth.example.test"
+
+	off, err := json.Marshal(buildDiscoveryDocument(base, "emc", false))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(off), "introspection_endpoint") {
+		t.Errorf("Organizations off: document contains introspection_endpoint: %s", off)
+	}
+
+	on := buildDiscoveryDocument(base, "emc", true)
+	if want := base + PathOAuthIntrospect; on.IntrospectionEndpoint != want {
+		t.Errorf("Organizations on: introspection_endpoint = %q, want %q", on.IntrospectionEndpoint, want)
 	}
 }
 

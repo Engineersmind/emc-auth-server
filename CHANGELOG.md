@@ -28,6 +28,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     membership and fails closed.
   - RFC 7662 token introspection at `/oauth/introspect` (confidential clients,
     own application's tokens), advertised in discovery.
+  - Introspection ships with the Organizations switch: with `ORGANIZATIONS_ENABLED=false`
+    `/oauth/introspect` is not registered and discovery omits `introspection_endpoint` (#180).
   - Database-enforced isolation: members and organisation roles cannot cross
     applications. Migrations `00100`–`00104`, all additive.
   - Audit events `organization.*`, `audit_logs.organization_id`, and metrics
