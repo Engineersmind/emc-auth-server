@@ -363,7 +363,9 @@ export function oauth_refresh() {
     // resending a used refresh token revokes the session family.
     holder.oauth_refresh = null;
   }
-  check(res, { 'oauth_refresh: rotated pair': (r) => r.status === 200 && !!j && !!j.access_token });
+  // Same condition as keeping the pair above: a 200 without a new refresh
+  // token means rotation is broken, not a pass.
+  check(res, { 'oauth_refresh: rotated pair': (r) => r.status === 200 && !!j && !!j.access_token && !!j.refresh_token });
 }
 
 export function apps_me() {
