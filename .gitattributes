@@ -16,3 +16,8 @@ docker-compose.yml text eol=lf
 *.html text eol=lf
 *.part text eol=lf
 *.md   text eol=lf
+
+# Perf suite (issue #218): k6 and node run the same files on Linux runners and
+# Windows checkouts — pin them to LF so a CRLF checkout cannot change behaviour.
+*.js   text eol=lf
+*.json text eol=lf
