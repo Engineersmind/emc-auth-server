@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net"
+	"net/http"
 
 	"github.com/labstack/echo/v4"
 )
@@ -28,4 +29,31 @@ func ClientIPExtractor(trusted []*net.IPNet) echo.IPExtractor {
 		opts = append(opts, echo.TrustIPRange(n))
 	}
 	return echo.ExtractIPFromXFFHeader(opts...)
+}
+
+// TrustedPeer reports whether a request's direct peer is a trusted proxy,
+// using the same rule as ClientIPExtractor: loopback plus the TRUSTED_PROXIES
+// ranges, nothing else. Headers a proxy sets (X-Forwarded-Proto, for one) are
+// only believed when this returns true; from any other peer they are
+// client-written (issue #216).
+func TrustedPeer(trusted []*net.IPNet) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return false
+		}
+		if ip.IsLoopback() {
+			return true
+		}
+		for _, n := range trusted {
+			if n.Contains(ip) {
+				return true
+			}
+		}
+		return false
+	}
 }

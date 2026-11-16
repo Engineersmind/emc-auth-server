@@ -332,6 +332,7 @@ func main() {
 		Config: api.RoutesConfig{
 			JWTIssuer:                 cfg.JWTIssuer,
 			Env:                       cfg.Env,
+			TrustedProxies:            trustedProxies,
 			MetricsToken:              cfg.MetricsToken,
 			PasswordHashMaxConcurrent: cfg.PasswordHashMaxConcurrent,
 			AppRateLimits: middleware.AppS2SConfig{
