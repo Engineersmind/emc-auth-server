@@ -197,6 +197,18 @@ export function appQuotas(targets) {
   };
 }
 
+// k6's arrival-rate executors take an integer `rate` per `timeUnit`. A whole
+// number of requests per second keeps timeUnit '1s'; anything else (rps 0.5, a
+// 1.5x stress multiplier on an odd rps) is expressed per minute, rounded to the
+// nearest whole request and never below one. k6 spaces arrivals evenly within
+// the timeUnit either way.
+function perUnit(ratesPerSecond) {
+  if (ratesPerSecond.every((r) => Number.isInteger(r))) {
+    return { timeUnit: '1s', rates: ratesPerSecond.map((r) => Math.max(1, r)) };
+  }
+  return { timeUnit: '1m', rates: ratesPerSecond.map((r) => Math.max(1, Math.round(r * 60))) };
+}
+
 function allocVUs(rate, p99ms, maxVUs) {
   // Steady-state VUs ~= arrivals/sec * worst expected seconds-per-iteration.
   return Math.min(maxVUs, Math.max(1, Math.ceil((rate * p99ms) / 1000)));
@@ -243,14 +255,15 @@ export function buildOptions(targets, scenario) {
     } else if (scenario === 'spike') {
       const rate = flow.rps;
       const maxVUs = Math.max(1, Math.ceil(flow.max_vus * sc.multiplier));
+      const u = perUnit([rate, ...sc.stages.map((s) => rate * s.target)]);
       k6scenarios[f] = {
         ...base,
         executor: 'ramping-arrival-rate',
-        startRate: Math.max(1, Math.round(rate)),
-        timeUnit: '1s',
-        stages: sc.stages.map((s) => ({
+        startRate: u.rates[0],
+        timeUnit: u.timeUnit,
+        stages: sc.stages.map((s, i) => ({
           duration: s.duration,
-          target: Math.max(1, Math.round(rate * s.target)),
+          target: u.rates[i + 1],
         })),
         preAllocatedVUs: allocVUs(rate * sc.multiplier, flow.p99_ms, maxVUs),
         maxVUs,
@@ -259,11 +272,12 @@ export function buildOptions(targets, scenario) {
       const mult = scenario === 'stress' ? sc.multiplier ?? 2 : 1;
       const rate = flow.rps * mult;
       const maxVUs = Math.max(1, Math.ceil(flow.max_vus * mult));
+      const u = perUnit([rate]);
       k6scenarios[f] = {
         ...base,
         executor: 'constant-arrival-rate',
-        rate,
-        timeUnit: '1s',
+        rate: u.rates[0],
+        timeUnit: u.timeUnit,
         duration: sc.duration,
         preAllocatedVUs: allocVUs(rate, flow.p99_ms, maxVUs),
         maxVUs,

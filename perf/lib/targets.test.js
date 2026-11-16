@@ -200,3 +200,32 @@ test('checks threshold tracks error_rate exactly', () => {
   t.flows.jwks.error_rate = 0.003;
   assert.deepEqual(buildOptions(t, 'load').thresholds['checks{flow:jwks}'], ['rate>=0.997']);
 });
+
+// why: #218 k6 arrival-rate executors need an integer rate per timeUnit — a
+//      fractional rps (0.5) or multiplier (1.5x on an odd rps) must become a
+//      whole per-minute rate, not a fractional per-second one k6 rejects
+test('fractional arrival rates are expressed per minute', () => {
+  const t = base();
+  t.flows.jwks.rps = 0.5;
+  let o = buildOptions(loadTargets(t), 'load');
+  assert.equal(o.scenarios.jwks.rate, 30);
+  assert.equal(o.scenarios.jwks.timeUnit, '1m');
+  // whole rates keep per-second units
+  assert.equal(o.scenarios.auth_login.rate, 2);
+  assert.equal(o.scenarios.auth_login.timeUnit, '1s');
+  const u = base();
+  u.flows.jwks.rps = 1;
+  u.scenarios.stress.multiplier = 1.5;
+  o = buildOptions(loadTargets(u), 'stress');
+  assert.equal(o.scenarios.jwks.rate, 90);
+  assert.equal(o.scenarios.jwks.timeUnit, '1m');
+  const v = base();
+  v.flows.jwks.rps = 0.5;
+  o = buildOptions(loadTargets(v), 'spike');
+  assert.equal(o.scenarios.jwks.timeUnit, '1m');
+  assert.equal(o.scenarios.jwks.startRate, 30);
+  for (const st of o.scenarios.jwks.stages) assert.ok(Number.isInteger(st.target) && st.target >= 1);
+  for (const sc of Object.values(o.scenarios)) {
+    for (const k of ['rate', 'startRate']) if (sc[k] !== undefined) assert.ok(Number.isInteger(sc[k]));
+  }
+});
