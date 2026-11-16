@@ -138,16 +138,25 @@ export async function main({ env, fetch, fs, log, now }) {
     }
   }
   if (removalFailed) return 1;
-  // Drop latest.json only when it still points at this run; it may simply not
-  // exist, which is not an error.
+  // Drop latest.json only when it still points at this run. A missing or
+  // unparseable pointer is not an error, but failing to delete one that does
+  // point here leaves this run's secrets on disk, so that fails the teardown.
+  const latestPath = path.join(path.dirname(statePath), 'latest.json');
+  let latest = null;
   try {
-    const latestPath = path.join(path.dirname(statePath), 'latest.json');
-    const latest = JSON.parse(fs.readFileSync(latestPath, 'utf8'));
-    if (latest && latest.runid === state.runid) {
-      fs.unlinkSync(latestPath);
-    }
+    latest = JSON.parse(fs.readFileSync(latestPath, 'utf8'));
   } catch {
     /* no usable latest.json — nothing to clean */
+  }
+  if (latest && latest.runid === state.runid) {
+    try {
+      fs.unlinkSync(latestPath);
+    } catch (e) {
+      if (!(e && e.code === 'ENOENT')) {
+        log(`teardown: deactivated, but removing ${latestPath} failed: ${e instanceof Error ? e.message : e}`);
+        return 1;
+      }
+    }
   }
   log('teardown: done — apps and tenant deactivated (deactivation only; rows remain, nothing is hard-deleted)');
   return 0;

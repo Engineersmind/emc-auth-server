@@ -324,6 +324,36 @@ test('teardown via latest.json removes pointer and run file', async () => {
   assert.equal(fs.existsSync(sp), false, 'run file removed');
 });
 
+// why: #218 when teardown is pointed at the run file, a latest.json that
+//      still names this run holds the same secrets — failing to delete it must
+//      fail the teardown, not report success
+test('teardown: latest.json delete failure exits 1', async () => {
+  const dir = tmpdir();
+  const { state, sp } = writeState(dir);
+  const latest = path.join(dir, 'latest.json');
+  fs.writeFileSync(latest, JSON.stringify(state));
+  const { fetch } = makeFetch(() => okRes(204));
+  const logs = [];
+  const deps = teardownDeps(dir, sp, fetch, logs);
+  deps.fs = {
+    ...fs,
+    readFileSync: fs.readFileSync,
+    unlinkSync: (p) => {
+      if (p === latest) {
+        const e = new Error('EACCES: permission denied');
+        e.code = 'EACCES';
+        throw e;
+      }
+      return fs.unlinkSync(p);
+    },
+  };
+  const code = await teardownMain(deps);
+  assert.equal(code, 1);
+  assert.equal(fs.existsSync(sp), false, 'run file removed');
+  assert.equal(fs.existsSync(latest), true, 'pointer kept, and reported');
+  assert.ok(logs.some((m) => m.includes('latest.json') && m.includes('failed')));
+});
+
 // why: #218 a 401/403 means the admin token died — keep the state file so a
 //      retry with a fresh token can finish, and say exactly that
 test('teardown: 401 keeps state file and exits 1', async () => {
