@@ -147,6 +147,96 @@ services:
     # liveness/readiness, ECS, or a compose file that adds a dependency on this
     # service. Re-add a `healthcheck:` block here if that day comes.
 
+  # ─── Local monitoring profile (issue #217) ────────────────────────────────
+  # Everything below sits behind `profiles: ["monitoring"]`:
+  #   docker compose --profile monitoring up -d
+  # Nothing here starts under a plain `docker compose up`, and none of these
+  # services use a named volume — the stack is stateless.
+  #
+  # Host ports bind to 127.0.0.1 only: these UIs have no auth beyond Grafana's
+  # admin password and must never leave the loopback interface.
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    ports:
+      # Host 9091 → container 9090 (9090 is the auth server's own port).
+      - "127.0.0.1:9091:9090"
+    volumes:
+      - ./infra/prometheus:/etc/prometheus:ro
+    command:
+      # prometheus.local.yml targets the local service names — the prod
+      # config's `app:9090` does not exist in this stack.
+      - "--config.file=/etc/prometheus/prometheus.local.yml"
+    depends_on:
+      emc-auth-server:
+        condition: service_started
+      alertmanager:
+        condition: service_started
+      node-exporter:
+        condition: service_started
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local-dev-only}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # Same container paths as infra/docker-compose.prod.yml so the
+      # provisioning files and dashboards resolve identically in both.
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      # Host 3000 is the console's Vite dev server — Grafana takes 3001.
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    volumes:
+      - ./infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # The receiver webhook URL lives in a file read via url_file (added in
+      # Alertmanager v0.26 — hence the pinned ≥v0.26 image) so no real URL is
+      # ever committed. The default file routes to the alert-sink service
+      # below; point ALERTMANAGER_WEBHOOK_URL_FILE at a gitignored *.secret
+      # file containing a real endpoint instead.
+      - ${ALERTMANAGER_WEBHOOK_URL_FILE:-./infra/alertmanager/webhook_url.local}:/etc/alertmanager/secrets/webhook_url:ro
+    ports:
+      - "127.0.0.1:9093:9093"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+
+  # Dummy alert receiver — an echo server that logs every request body, which
+  # is how a local test alert is verified end-to-end. No host port: only the
+  # compose network needs to reach it. See deliveries with:
+  #   docker compose logs alert-sink
+  alert-sink:
+    image: mendhak/http-https-echo:35
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+
+  # Host-level CPU for the HostCPUHigh rule. On Docker Desktop the /host
+  # mount is the Docker VM's rootfs, so this measures the VM, not the Windows
+  # host — the alert still exercises the full pipeline. No rslave
+  # propagation: Docker Desktop rejects it.
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    volumes:
+      - /:/host:ro
+    command:
+      - "--path.rootfs=/host"
+
 volumes:
   postgres_data:
   redis_data:
