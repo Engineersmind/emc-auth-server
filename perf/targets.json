@@ -1,0 +1,26 @@
+{
+  "comment": "NFR targets for the k6 suite (issue #218, FR2). Every flow is still placeholder: true — real values land when the NFR table is agreed in #170. Thresholds that breach fail the run; a placeholder flow only means the NUMBER is unagreed, not that the check is off.",
+  "flows": {
+    "auth_login": { "rps": 10, "max_vus": 20, "p95_ms": 300, "p99_ms": 800, "error_rate": 0.001, "placeholder": true },
+    "apps_login": { "rps": 10, "max_vus": 20, "p95_ms": 300, "p99_ms": 800, "error_rate": 0.001, "placeholder": true },
+    "apps_register": { "rps": 2, "max_vus": 5, "p95_ms": 500, "p99_ms": 1200, "error_rate": 0.001, "placeholder": true },
+    "oauth_client_credentials": { "rps": 20, "max_vus": 30, "p95_ms": 200, "p99_ms": 500, "error_rate": 0.001, "placeholder": true },
+    "oauth_refresh": { "rps": 10, "max_vus": 20, "p95_ms": 250, "p99_ms": 600, "error_rate": 0.001, "placeholder": true },
+    "jwks": { "rps": 50, "max_vus": 60, "p95_ms": 100, "p99_ms": 300, "error_rate": 0, "placeholder": true },
+    "apps_me": { "rps": 20, "max_vus": 30, "p95_ms": 200, "p99_ms": 500, "error_rate": 0.001, "placeholder": true }
+  },
+  "scenarios": {
+    "smoke": { "iterations": 3 },
+    "load": { "duration": "5m" },
+    "stress": { "multiplier": 2, "duration": "5m" },
+    "soak": { "duration": "30m" },
+    "spike": {
+      "multiplier": 8,
+      "stages": [
+        { "duration": "30s", "target": 1 },
+        { "duration": "2m", "target": 8 },
+        { "duration": "30s", "target": 1 }
+      ]
+    }
+  }
+}
