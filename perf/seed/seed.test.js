@@ -68,7 +68,7 @@ function makeFetch(responder) {
 // Default happy-path responder for a full seed.
 let appCounter = 0;
 function seedResponder(url) {
-  if (url.endsWith('/api/v1/tenants')) return okRes(201, { id: '42' });
+  if (url.endsWith('/api/v1/tenants')) return okRes(201, { tenant: { id: '42' }, owner: { id: '9' } });
   if (url.includes('/applications') && url.endsWith('/applications')) {
     appCounter += 1;
     return okRes(201, { id: String(100 + appCounter), client_id: 'cid', client_secret: 'cs' });
@@ -306,6 +306,22 @@ test('teardown: deletes recorded app ids then tenant, in order', async () => {
   ]);
   for (const c of calls) assert.equal(c.init.redirect, 'manual');
   assert.equal(fs.existsSync(sp), false, 'state file removed after full teardown');
+});
+
+// why: #218 PERF_STATE_FILE is usually latest.json — teardown must remove the
+//      run file the runid resolves to as well as the pointer, or the seeded
+//      secrets stay on disk after a "successful" teardown
+test('teardown via latest.json removes pointer and run file', async () => {
+  const dir = tmpdir();
+  const { state, sp } = writeState(dir);
+  const latest = path.join(dir, 'latest.json');
+  fs.writeFileSync(latest, JSON.stringify(state));
+  const { fetch } = makeFetch(() => okRes(204));
+  const logs = [];
+  const code = await teardownMain(teardownDeps(dir, latest, fetch, logs));
+  assert.equal(code, 0);
+  assert.equal(fs.existsSync(latest), false, 'pointer removed');
+  assert.equal(fs.existsSync(sp), false, 'run file removed');
 });
 
 // why: #218 a 401/403 means the admin token died — keep the state file so a

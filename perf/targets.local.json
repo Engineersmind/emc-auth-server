@@ -1,13 +1,13 @@
 {
-  "comment": "Laptop-sized targets for running the suite against the local docker compose stack (issue #218). Real numbers, not placeholders — short durations, small rates, lenient latencies.",
+  "comment": "Laptop-sized targets for running the suite against the local docker compose stack (issue #218). Real numbers, not placeholders — short durations, small rates, latencies sized for bcrypt logins on a dev box (login/register paths measured ~2.4s p95 / ~4.3s p99 under concurrency; non-credential paths are ~10x faster). max_vus carries the arrival-rate headroom (needed VUs ~= rps * p99_seconds) so dropped_iterations stays at zero.",
   "flows": {
-    "auth_login": { "rps": 2, "max_vus": 4, "p95_ms": 2000, "p99_ms": 5000, "error_rate": 0.001, "placeholder": false },
-    "apps_login": { "rps": 2, "max_vus": 4, "p95_ms": 2000, "p99_ms": 5000, "error_rate": 0.001, "placeholder": false },
-    "apps_register": { "rps": 1, "max_vus": 2, "p95_ms": 3000, "p99_ms": 6000, "error_rate": 0.001, "placeholder": false },
+    "auth_login": { "rps": 2, "max_vus": 12, "p95_ms": 6000, "p99_ms": 10000, "error_rate": 0.001, "placeholder": false },
+    "apps_login": { "rps": 2, "max_vus": 12, "p95_ms": 6000, "p99_ms": 10000, "error_rate": 0.001, "placeholder": false },
+    "apps_register": { "rps": 1, "max_vus": 8, "p95_ms": 7000, "p99_ms": 11000, "error_rate": 0.001, "placeholder": false },
     "oauth_client_credentials": { "rps": 4, "max_vus": 6, "p95_ms": 2000, "p99_ms": 5000, "error_rate": 0.001, "placeholder": false },
-    "oauth_refresh": { "rps": 2, "max_vus": 4, "p95_ms": 2000, "p99_ms": 5000, "error_rate": 0.001, "placeholder": false },
+    "oauth_refresh": { "rps": 2, "max_vus": 8, "p95_ms": 4000, "p99_ms": 8000, "error_rate": 0.001, "placeholder": false },
     "jwks": { "rps": 10, "max_vus": 10, "p95_ms": 1000, "p99_ms": 3000, "error_rate": 0, "placeholder": false },
-    "apps_me": { "rps": 4, "max_vus": 6, "p95_ms": 2000, "p99_ms": 5000, "error_rate": 0.001, "placeholder": false }
+    "apps_me": { "rps": 4, "max_vus": 8, "p95_ms": 1500, "p99_ms": 4000, "error_rate": 0.001, "placeholder": false }
   },
   "scenarios": {
     "smoke": { "iterations": 1 },

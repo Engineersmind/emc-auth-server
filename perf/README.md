@@ -12,6 +12,7 @@ perf/
   lib/                      targets/guard/results helpers + node:test tests
   scripts/check-target.js   standalone production-host refusal (CLI)
   scripts/results-dir.js    prints docs/perf/<date>/<scenario>-<sha>-<ts>/
+  scripts/mint-admin-token.js  mints an admin JWT through the forced-MFA path
   targets.json              canonical NFR numbers (placeholders until #170 lands)
   targets.local.json        gentle numbers for the docker compose smoke
   targets.fail-demo.json    deliberately impossible — proves thresholds fail runs
@@ -63,14 +64,20 @@ production hosts to `refused-hosts.json`.
   # find the subnet: docker network inspect <project>_default
   ```
 
-- An admin JWT for the seed (15-minute life — mint one per run):
+- An admin JWT for the seed (15-minute life — mint one per run). The seeded
+  `admin@emc.local` is under the forced administrator-MFA policy, so a plain
+  password login returns an enrollment/OTP challenge, not a token.
+  `perf/scripts/mint-admin-token.js` walks that for you — enrolls TOTP once
+  (secret kept at `perf/.state/admin-totp.json`, 0600) and completes the OTP
+  challenge on later mints:
 
   ```bash
-  curl -s http://localhost:9090/api/v1/auth/login \
-    -H 'Content-Type: application/json' \
-    -d '{"email":"admin@emc.local","password":"<SEED_ADMIN_PASSWORD>"}' \
-    | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).access_token))"
-  export PERF_ADMIN_TOKEN=<token from above>
+  export PERF_ADMIN_TOKEN=$(BASE_URL=http://localhost:9090 \
+    PERF_ADMIN_PASSWORD="$SEED_ADMIN_PASSWORD" \
+    node perf/scripts/mint-admin-token.js)
+  # prints ONLY the token on stdout; a second run reuses the stored secret.
+  # On a foreign stack: PERF_ADMIN_TOTP_SECRET=<base32> overrides it, or mint
+  # however you normally get admin JWTs and export PERF_ADMIN_TOKEN directly.
   ```
 
 ## Run loop

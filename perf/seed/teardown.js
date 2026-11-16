@@ -117,13 +117,27 @@ export async function main({ env, fetch, fs, log, now }) {
   if (notFound.length > 0) {
     log(`teardown: not found, not counted as deleted: ${notFound.join(', ')}`);
   }
-  // Every recorded id answered 2xx or 404 — the file has done its job.
-  try {
-    fs.unlinkSync(statePath);
-  } catch (e) {
-    log(`teardown: deactivated, but removing the state file failed: ${e instanceof Error ? e.message : e}`);
-    return 1;
+  // Every recorded id answered 2xx or 404 — the file has done its job. The
+  // secrets can sit under two names: statePath itself and, when the caller
+  // pointed at latest.json, the run file the runid resolves to. Remove both;
+  // ENOENT is fine (already gone), anything else leaves credentials behind so
+  // it fails loudly.
+  const removals = [statePath];
+  if (typeof state.runid === 'string' && /^[0-9A-Za-z-]+$/.test(state.runid)) {
+    const runPath = path.join(path.dirname(statePath), `${state.runid}.json`);
+    if (runPath !== statePath) removals.push(runPath);
   }
+  let removalFailed = false;
+  for (const p of removals) {
+    try {
+      fs.unlinkSync(p);
+    } catch (e) {
+      if (e && e.code === 'ENOENT') continue;
+      log(`teardown: deactivated, but removing ${p} failed: ${e instanceof Error ? e.message : e}`);
+      removalFailed = true;
+    }
+  }
+  if (removalFailed) return 1;
   // Drop latest.json only when it still points at this run; it may simply not
   // exist, which is not an error.
   try {

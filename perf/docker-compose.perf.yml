@@ -25,9 +25,27 @@
 #
 # The ratelimit scenario does NOT need this overlay: it measures the compiled-in
 # defaults from one real IP, no X-Forwarded-For.
+#
+# The PERF_PUBLISH_* ports defaults are byte-identical to the base file, so a
+# single stack sees no change; they exist so a second project can coexist with
+# an already-running one:
+#   PERF_PUBLISH_APP=19090 PERF_PUBLISH_REDIS=16379 \
+#     docker compose -p emcperf -f docker-compose.yml -f perf/docker-compose.perf.yml up -d
 
 services:
+  postgres:
+    ports: !override
+      - "${PERF_PUBLISH_POSTGRES:-5433}:5432"
+  redis:
+    ports: !override
+      - "${PERF_PUBLISH_REDIS:-6379}:6379"
+  mailpit:
+    ports: !override
+      - "${PERF_PUBLISH_SMTP:-1025}:1025"
+      - "${PERF_PUBLISH_MAILPIT_UI:-8025}:8025"
   emc-auth-server:
+    ports: !override
+      - "${PERF_PUBLISH_APP:-9090}:9090"
     environment:
       TRUSTED_PROXIES: ${PERF_TRUSTED_PROXIES:?set the /16-or-narrower CIDR the k6 traffic arrives from — see the comment at the top of this file}
       RATE_LIMIT_APP_PER_IP: ${PERF_RATE_LIMIT_APP_PER_IP:-60000}

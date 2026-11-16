@@ -204,8 +204,12 @@ export async function main({ env, fetch, fs, log, now, random, sleep }) {
       body: { name: `perf-${runid}`, slug: `perf-${runid}`, owner_email: `perf-${runid}-owner@perf.invalid` },
     });
     if (res.status !== 201) return fail(`create tenant: HTTP ${res.status}`);
-    const tenant = await res.json();
-    state.tenant = { id: String(tenant.id), slug: `perf-${runid}`, name: `perf-${runid}` };
+    const created = await res.json();
+    // CreateTenantResult is {tenant:{id,...}, owner:{...}} — not a flat row.
+    if (!created || !created.tenant || created.tenant.id === undefined || created.tenant.id === null) {
+      return fail('create tenant: 201 but response carried no tenant.id');
+    }
+    state.tenant = { id: String(created.tenant.id), slug: `perf-${runid}`, name: `perf-${runid}` };
     persist();
     const tid = state.tenant.id;
 
@@ -218,6 +222,10 @@ export async function main({ env, fetch, fs, log, now, random, sleep }) {
       });
       if (res.status !== 201) return fail(`create app ${key}: HTTP ${res.status}`);
       const app = await res.json();
+      // AppResult is flat {id, client_id, client_secret(one-time)}.
+      if (!app || app.id === undefined || !app.client_id || !app.client_secret) {
+        return fail(`create app ${key}: 201 but response carried no id/client credentials`);
+      }
       state.apps[key] = { id: String(app.id), client_id: app.client_id, client_secret: app.client_secret };
       persist();
     }
