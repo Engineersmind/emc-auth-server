@@ -430,6 +430,15 @@ function probeAuthLoginIP() {
   return fired;
 }
 
+function limiterOf(res) {
+  const j = safeJson(res);
+  return j && typeof j.limiter === 'string' ? j.limiter : '';
+}
+
+// Probes (ii) and (iii) share one source IP. Each must show its own limiter:
+// the first request has to reach authentication (401), and the 429 that counts
+// has to name the limiter under test in its body. Otherwise an IP bucket left
+// empty by the other probe would pass this one with the limiter switched off.
 function probeAppUnverifiedIP() {
   const params = {
     headers: {
@@ -446,7 +455,14 @@ function probeAppUnverifiedIP() {
   let fired = false;
   for (let i = 0; i < 6; i++) {
     const res = http.post(`${ORIGIN}/api/v1/auth/apps/login`, body, params);
-    if (res.status === 429 && hasRetryAfter(res)) fired = true;
+    if (i === 0) {
+      if (res.status !== 401) {
+        console.error(`ratelimit: first wrong-secret request was ${res.status}, not 401 — IP bucket not fresh: wait 60 s`);
+        return false;
+      }
+    } else if (res.status === 429 && hasRetryAfter(res) && limiterOf(res) === 'ip') {
+      fired = true;
+    }
   }
   return fired;
 }
@@ -466,13 +482,23 @@ function probeAppUserLogin() {
   let fired = false;
   for (let i = 0; i < 6; i++) {
     const res = http.post(`${ORIGIN}/api/v1/auth/apps/login`, body, params);
-    if (res.status === 429 && hasRetryAfter(res)) fired = true;
+    if (i === 0) {
+      if (res.status !== 401) {
+        console.error(`ratelimit: first wrong-password request was ${res.status}, not 401 — user bucket not fresh: wait 60 s`);
+        return false;
+      }
+    } else if (res.status === 429 && hasRetryAfter(res) && limiterOf(res) === 'user') {
+      fired = true;
+    }
   }
   return fired;
 }
 
 export function ratelimit() {
-  const probes = [probeAuthLoginIP(), probeAppUnverifiedIP(), probeAppUserLogin()];
+  // The per-user probe runs before the wrong-secret probe: the wrong secrets
+  // fill this IP's bad-credential bucket, which would answer the user probe
+  // with an IP 429 before the user limiter is reached.
+  const probes = [probeAuthLoginIP(), probeAppUserLogin(), probeAppUnverifiedIP()];
   for (const fired of probes) {
     limiterFired.add(fired ? 1 : 0);
     check(null, { limiter_fired: () => fired });

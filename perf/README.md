@@ -37,8 +37,11 @@ docs/perf/<date>/           run output: summary.json + meta.json + report.html
 `SCENARIO` env picks one of `smoke|load|stress|soak|spike|ratelimit`. Stress is
 sized at 2x the load target; soak holds the load rate for the soak duration;
 spike jumps to the spike rate and back. `ratelimit` is separate and short: it
-probes the compiled-in default limiters (per-IP login, per-IP app-login,
-per-user app-login) and fails unless each returns 429 with a `Retry-After`.
+probes the compiled-in default limiters (per-IP login, per-user app-login,
+per-IP app-login, in that order) and fails unless each returns 429 with a
+`Retry-After`. Each probe's first request must reach authentication, and the
+app-login 429s must name the expected limiter (`user`, then `ip`) in the body,
+so one probe's spent bucket cannot pass the other.
 
 ## Never production
 
