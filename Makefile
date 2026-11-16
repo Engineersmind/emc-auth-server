@@ -148,10 +148,18 @@ check: lint gosec vuln test
 ci-local: lint gosec test
 	@echo "ci-local: lint + gosec + tests passed"
 
-## Run k6 load test (requires k6 installed and server running on localhost:9090)
+## Run the k6 perf smoke scenario (requires k6, the stack on localhost:9090 and
+## seeded fixtures — `node perf/seed/seed.js`; see perf/README.md)
 .PHONY: load-test
 load-test:
-	k6 run scripts/load-test.js
+	@RESULTS_DIR="$$(GIT_SHA="$$(git rev-parse --short HEAD)" node perf/scripts/results-dir.js smoke)"; \
+	mkdir -p "$$RESULTS_DIR"; \
+	BASE_URL="$${BASE_URL:-http://localhost:9090}" SCENARIO=smoke \
+		TARGETS_FILE="$(CURDIR)/perf/targets.local.json" \
+		PERF_STATE_FILE="$(CURDIR)/perf/.state/latest.json" \
+		GIT_SHA="$$(git rev-parse --short HEAD)" \
+		RESULTS_DIR="$$RESULTS_DIR" \
+		k6 run perf/k6/main.js
 
 # ─── Database ───────────────────────────────────────────────────────────────
 
