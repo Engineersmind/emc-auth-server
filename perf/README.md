@@ -113,6 +113,17 @@ and error-rate values under each scenario key. Placeholder flows
 they belong to and the HTML report banners them. `targets.fail-demo.json`
 exists to prove the wiring: running with it must fail the k6 run.
 
+## What "green" means on a laptop
+
+`targets.local.json` is sized so **smoke, ratelimit and load** run green on a
+local Docker Desktop stack. The credential flows are bcrypt-bound and the
+server holds a DB connection for the whole login; its pool is 25. On a
+constrained box, `stress` (2x), `spike` and `soak` legitimately breach — the
+suite correctly reports p95 blow-out, dropped iterations and context-deadline
+500s. That is the suite measuring capacity, not a suite bug: real NFR numbers
+land in `targets.json` when #170 agrees them, and they are meant to be run
+against a realistically provisioned test deployment — never a laptop.
+
 ## Workflow
 
 `.github/workflows/perf-smoke.yml` — `workflow_dispatch` with a required
