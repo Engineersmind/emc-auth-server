@@ -24,14 +24,15 @@
 #   /api/v1/tenants/:tid/applications/:appID/users           routes.go:1673  (CreateAdminUser → Hash)
 #   /api/v1/users                                            routes.go:1744  (CreateAdminUser → Hash)
 #   /api/v1/applications/:appID/users                        routes.go:1948  (CreateAdminUser → Hash)
-#   /api/v1/users/import                                     routes.go:1801  (CommitUserImport → Hash per plaintext row)
-#   /api/v1/tenants/:tid/users/import                        routes.go:1803  (CommitUserImport)
-#   /api/v1/applications/:appID/users/import                 routes.go:1805  (CommitUserImport)
-#   /api/v1/tenants/:tid/applications/:appID/users/import    routes.go:1807  (CommitUserImport)
 #   /oauth/authorize/login                                   routes.go:2117  (LoginSubmit → AuthService.Login)
 # Every entry is a POST handler, and both rules key on (method, path): a GET
 # on the same template (e.g. listing GET /api/v1/users) is NOT a password
 # route and stays under the normal SLO.
+# The four .../users/import routes (routes.go:1801-1807) are NOT listed:
+# CommitUserImport only enqueues the job and returns 202
+# (handlers/admin.go:4537-4548); the background worker does the hashing, which
+# shows up in emc_auth_password_hash_* rather than in request latency. They
+# stay under the normal SLO.
 # Client-secret checks (/api/v1/auth/token, app basic-auth) use HashToken
 # (SHA-256), not Argon2id — deliberately not in this list.
 # The PASSWORD_ROUTES regex literal in the two rules below must stay in sync
@@ -45,7 +46,7 @@ groups:
       # The `and` clause is a minimum-traffic guard: one slow request on an
       # idle route cannot page.
       - alert: EmcAuthLatencyP99AboveSLO
-        expr: '(histogram_quantile(0.99, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~"/metrics|/health|unknown"}[5m]))) > 0.5 and sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{path!~"/metrics|/health|unknown"}[5m])) > 0.1) unless on (method, path) count by (method, path) (emc_auth_http_request_duration_seconds_count{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"})'
+        expr: '(histogram_quantile(0.99, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~"/metrics|/health|unknown"}[5m]))) > 0.5 and sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{path!~"/metrics|/health|unknown"}[5m])) > 0.1) unless on (method, path) count by (method, path) (emc_auth_http_request_duration_seconds_count{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/oauth/authorize/login"})'
         for: 5m
         labels: { severity: warning, component: http }
         annotations:
@@ -56,7 +57,7 @@ groups:
       # file — deliberately-slow endpoints get their own budget.
       # 2.0 = SLO placeholder — set from the #170 NFR table.
       - alert: EmcAuthPasswordRouteLatencyP99AboveSLO
-        expr: 'histogram_quantile(0.99, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m]))) > 2 and sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m])) > 0.1'
+        expr: 'histogram_quantile(0.99, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/oauth/authorize/login"}[5m]))) > 2 and sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{method="POST",path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/oauth/authorize/login"}[5m])) > 0.1'
         for: 5m
         labels: { severity: warning, component: http }
         annotations:
