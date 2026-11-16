@@ -1,0 +1,104 @@
+# Service-level alerting rules for emc-auth-server (issue #217), complementing
+# audit_alerts.yml (audit pipeline + security anomaly rules).
+#
+# Loaded by infra/prometheus/prometheus.local.yml in the local monitoring
+# profile. The prod compose does not load this file today — its Prometheus
+# mount carries only prometheus.yml (see PR notes / follow-ups).
+#
+# Every expr is intentionally one line: the observability drift test scans
+# expr: values for metric names.
+#
+# ── Password-bearing routes ─────────────────────────────────────────────────
+# These Echo route templates run Argon2id hashing or verification (shared
+# password.Hasher, deliberately ~1s per derivation), so they get their own
+# higher p99 SLO. Template = the `path` label value, from routes.go:
+#   /api/v1/auth/register                                    routes.go:894   (AuthService.Register → Hash)
+#   /api/v1/auth/login                                       routes.go:896   (AuthService.Login → Verify, incl. dummy-hash path)
+#   /api/v1/auth/reset-password                              routes.go:986   (ResetService.ResetPassword → Hash)
+#   /api/v1/auth/accept-invitation                           routes.go:1005  (InvitationService.Accept → Verify+Hash)
+#   /api/v1/auth/session                                     routes.go:1027  (SessionLogin → AuthService.Login)
+#   /api/v1/auth/apps/register                               routes.go:1051  (AppRegister → AuthService.Register)
+#   /api/v1/auth/apps/login                                  routes.go:1054  (AppLogin → AuthService.Login)
+#   /api/v1/auth/apps/organizations/invitations/accept       routes.go:1097  (OrganizationService.AcceptInvitation → Hash)
+#   /api/v1/tenants/:tid/users                               routes.go:1519  (CreateAdminUser → Hash)
+#   /api/v1/tenants/:tid/applications/:appID/users           routes.go:1673  (CreateAdminUser → Hash)
+#   /api/v1/users                                            routes.go:1744  (CreateAdminUser → Hash)
+#   /api/v1/applications/:appID/users                        routes.go:1948  (CreateAdminUser → Hash)
+#   /api/v1/users/import                                     routes.go:1801  (CommitUserImport → Hash per plaintext row)
+#   /api/v1/tenants/:tid/users/import                        routes.go:1803  (CommitUserImport)
+#   /api/v1/applications/:appID/users/import                 routes.go:1805  (CommitUserImport)
+#   /api/v1/tenants/:tid/applications/:appID/users/import    routes.go:1807  (CommitUserImport)
+#   /oauth/authorize/login                                   routes.go:2117  (LoginSubmit → AuthService.Login)
+# Client-secret checks (/api/v1/auth/token, app basic-auth) use HashToken
+# (SHA-256), not Argon2id — deliberately not in this list.
+# The PASSWORD_ROUTES regex literal in the two rules below must stay in sync
+# with this table.
+groups:
+  - name: emc_auth_service
+    rules:
+      # p99 above SLO for 5m, per route, on non-password routes.
+      # 0.5 = SLO placeholder — set from the #170 NFR table.
+      # The `and` clause is a minimum-traffic guard: one slow request on an
+      # idle route cannot page.
+      - alert: EmcAuthLatencyP99AboveSLO
+        expr: 'histogram_quantile(0.99, sum by (le, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~"/metrics|/health|unknown",path!~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m]))) > 0.5 and sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path!~"/metrics|/health|unknown",path!~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m])) > 0.1'
+        for: 5m
+        labels: { severity: warning, component: http }
+        annotations:
+          summary: 'Route {{ $labels.path }} p99 latency above SLO for 5m'
+          description: 'The p99 of {{ $labels.path }} exceeded the service SLO (placeholder 0.5s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+
+      # Same shape for the Argon2id-bearing routes listed at the top of this
+      # file — deliberately-slow endpoints get their own budget.
+      # 2.0 = SLO placeholder — set from the #170 NFR table.
+      - alert: EmcAuthPasswordRouteLatencyP99AboveSLO
+        expr: 'histogram_quantile(0.99, sum by (le, path) (rate(emc_auth_http_request_duration_seconds_bucket{path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m]))) > 2 and sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path=~"/api/v1/auth/register|/api/v1/auth/login|/api/v1/auth/reset-password|/api/v1/auth/accept-invitation|/api/v1/auth/session|/api/v1/auth/apps/register|/api/v1/auth/apps/login|/api/v1/auth/apps/organizations/invitations/accept|/api/v1/tenants/:tid/users|/api/v1/tenants/:tid/applications/:appID/users|/api/v1/users|/api/v1/applications/:appID/users|/api/v1/users/import|/api/v1/tenants/:tid/users/import|/api/v1/applications/:appID/users/import|/api/v1/tenants/:tid/applications/:appID/users/import|/oauth/authorize/login"}[5m])) > 0.1'
+        for: 5m
+        labels: { severity: warning, component: http }
+        annotations:
+          summary: 'Password route {{ $labels.path }} p99 above SLO for 5m'
+          description: 'The p99 of Argon2id-bearing route {{ $labels.path }} exceeded the password-route SLO (placeholder 2s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+
+      # 5xx above 1% of all requests for 5m. /metrics and /health are excluded
+      # from BOTH sides — Prometheus's own scrapes would otherwise dilute the
+      # ratio. Zero traffic yields NaN (silent); a fleet with no 5xx series at
+      # all has an empty numerator (silent — correct: there are no errors).
+      - alert: EmcAuthHTTP5xxRatioHigh
+        expr: 'sum(rate(emc_auth_http_request_duration_seconds_count{path!~"/metrics|/health",status=~"5.."}[5m])) / sum(rate(emc_auth_http_request_duration_seconds_count{path!~"/metrics|/health"}[5m])) > 0.01'
+        for: 5m
+        labels: { severity: warning, component: http }
+        annotations:
+          summary: '5xx responses exceed 1% of traffic for 5m'
+          description: 'The share of 5xx responses across all routes is above 1%. Check server logs and downstream dependencies.'
+
+      # Any fail-open in 5m: a rate limiter could not decide and let traffic
+      # through, meaning configured quotas are silently unenforced (usually a
+      # Redis outage).
+      - alert: EmcAuthRateLimitFailOpen
+        expr: 'sum(increase(emc_auth_rate_limit_fail_open_total[5m])) > 0'
+        for: 1m
+        labels: { severity: critical, component: rate_limit }
+        annotations:
+          summary: 'Rate limiter is failing open'
+          description: 'Requests bypassed a rate limiter because the limiter could not evaluate them — quotas are currently unenforced. Check Redis health.'
+
+      # Host CPU above 80% for 10m (node_exporter metric names — emitted by
+      # the node-exporter service in the monitoring profile, and by any real
+      # node_exporter in a deployed environment).
+      - alert: HostCPUHigh
+        expr: '100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m]))) > 80'
+        for: 10m
+        labels: { severity: warning, component: host }
+        annotations:
+          summary: 'Host CPU above 80% on {{ $labels.instance }} for 10m'
+          description: 'Sustained high CPU on {{ $labels.instance }}. On Docker Desktop this measures the Docker VM, not the Windows host.'
+
+      # The scrape itself is down — every other emc_auth_* rule goes silent at
+      # the same time, so this is the alert that must still fire.
+      - alert: EmcAuthScrapeDown
+        expr: 'up{job="emc-auth-server"} == 0'
+        for: 2m
+        labels: { severity: critical, component: scrape }
+        annotations:
+          summary: 'emc-auth-server metrics target down on {{ $labels.instance }}'
+          description: 'The /metrics scrape of {{ $labels.instance }} has failed for 2m. All emc_auth_* series are stale — including the data every other alert reads.'

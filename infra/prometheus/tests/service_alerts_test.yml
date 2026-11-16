@@ -1,0 +1,218 @@
+# promtool unit tests for service_alerts.yml (issue #217).
+# Run via scripts/check-observability.sh:
+#   promtool test rules /etc/prometheus/tests/service_alerts_test.yml
+#
+# Each rule gets one firing and one silent scenario. All series names are real
+# series the app (or node_exporter) exports — the Go drift test T5 scans these
+# series: lines for emc_auth_* names.
+rule_files:
+  - ../service_alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── EmcAuthScrapeDown ──────────────────────────────────────────────────────
+  - interval: 15s
+    input_series:
+      - series: 'up{job="emc-auth-server", instance="emc-auth-server:9090"}'
+        values: '0x119'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: EmcAuthScrapeDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: scrape
+              job: emc-auth-server
+              instance: emc-auth-server:9090
+            exp_annotations:
+              summary: 'emc-auth-server metrics target down on emc-auth-server:9090'
+              description: 'The /metrics scrape of emc-auth-server:9090 has failed for 2m. All emc_auth_* series are stale — including the data every other alert reads.'
+
+  - interval: 15s
+    input_series:
+      - series: 'up{job="emc-auth-server", instance="emc-auth-server:9090"}'
+        values: '1x119'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: EmcAuthScrapeDown
+        exp_alerts: []
+
+  # ── EmcAuthHTTP5xxRatioHigh ───────────────────────────────────────────────
+  # 200-rate 0.1333/s + 500-rate 0.0033/s → ~2.4% 5xx → fires.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_http_request_duration_seconds_count{method="GET", path="/api/v1/auth/me", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="GET", path="/api/v1/auth/me", status="500", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.05x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthHTTP5xxRatioHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: http
+            exp_annotations:
+              summary: '5xx responses exceed 1% of traffic for 5m'
+              description: 'The share of 5xx responses across all routes is above 1%. Check server logs and downstream dependencies.'
+
+  # 0.5% 5xx — below the threshold → silent.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_http_request_duration_seconds_count{method="GET", path="/api/v1/auth/me", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="GET", path="/api/v1/auth/me", status="500", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.01x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthHTTP5xxRatioHigh
+        exp_alerts: []
+
+  # Zero traffic → 0/0 = NaN → silent.
+  - interval: 15s
+    input_series:
+      - series: 'up{job="emc-auth-server", instance="emc-auth-server:9090"}'
+        values: '1x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthHTTP5xxRatioHigh
+        exp_alerts: []
+
+  # ── EmcAuthLatencyP99AboveSLO ─────────────────────────────────────────────
+  # Non-password route, all mass in the (0.5, 1] bucket → p99 ≈ 0.995 > 0.5,
+  # count rate 0.1333/s > 0.1 guard → fires.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/auth/me", status="200", le="0.5", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/auth/me", status="200", le="1", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/auth/me", status="200", le="+Inf", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="GET", path="/api/v1/auth/me", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthLatencyP99AboveSLO
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: http
+              path: /api/v1/auth/me
+            exp_annotations:
+              summary: 'Route /api/v1/auth/me p99 latency above SLO for 5m'
+              description: 'The p99 of /api/v1/auth/me exceeded the service SLO (placeholder 0.5s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+
+  # Same shape but count rate 0.0033/s — below the 0.1/s traffic guard. The p99
+  # side is true yet the alert stays silent: one slow request on an idle route
+  # must not page.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/auth/me", status="200", le="0.5", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/auth/me", status="200", le="1", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.05x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="GET", path="/api/v1/auth/me", status="200", le="+Inf", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.05x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="GET", path="/api/v1/auth/me", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.05x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthLatencyP99AboveSLO
+        exp_alerts: []
+
+  # ── EmcAuthPasswordRouteLatencyP99AboveSLO ────────────────────────────────
+  # /api/v1/auth/login runs Argon2id; all mass in (2, 3] → p99 ≈ 2.99 > 2,
+  # count rate above the guard → fires.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/auth/login", status="200", le="2", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/auth/login", status="200", le="3", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/auth/login", status="200", le="+Inf", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="POST", path="/api/v1/auth/login", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+2x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthPasswordRouteLatencyP99AboveSLO
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: http
+              path: /api/v1/auth/login
+            exp_annotations:
+              summary: 'Password route /api/v1/auth/login p99 above SLO for 5m'
+              description: 'The p99 of Argon2id-bearing route /api/v1/auth/login exceeded the password-route SLO (placeholder 2s — set from the #170 NFR table) with at least 0.1 req/s of traffic.'
+
+  # Password route below the traffic guard → silent.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/auth/login", status="200", le="2", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/auth/login", status="200", le="3", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.05x119'
+      - series: 'emc_auth_http_request_duration_seconds_bucket{method="POST", path="/api/v1/auth/login", status="200", le="+Inf", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.05x119'
+      - series: 'emc_auth_http_request_duration_seconds_count{method="POST", path="/api/v1/auth/login", status="200", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+0.05x119'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: EmcAuthPasswordRouteLatencyP99AboveSLO
+        exp_alerts: []
+
+  # ── EmcAuthRateLimitFailOpen ──────────────────────────────────────────────
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_rate_limit_fail_open_total{limiter="app", reason="redis_error", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0+1x119'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: EmcAuthRateLimitFailOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: rate_limit
+            exp_annotations:
+              summary: 'Rate limiter is failing open'
+              description: 'Requests bypassed a rate limiter because the limiter could not evaluate them — quotas are currently unenforced. Check Redis health.'
+
+  # Counter exists but never incremented → increase = 0 → silent.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_rate_limit_fail_open_total{limiter="app", reason="redis_error", instance="emc-auth-server:9090", job="emc-auth-server"}'
+        values: '0x119'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: EmcAuthRateLimitFailOpen
+        exp_alerts: []
+
+  # ── HostCPUHigh ───────────────────────────────────────────────────────────
+  # idle rate 0.0033/s per cpu → ~99.7% busy → fires (for 10m, eval at 20m).
+  - interval: 15s
+    input_series:
+      - series: 'node_cpu_seconds_total{cpu="0", mode="idle", instance="node-exporter:9100", job="node-exporter"}'
+        values: '0+0.05x119'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HostCPUHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: host
+              instance: node-exporter:9100
+            exp_annotations:
+              summary: 'Host CPU above 80% on node-exporter:9100 for 10m'
+              description: 'Sustained high CPU on node-exporter:9100. On Docker Desktop this measures the Docker VM, not the Windows host.'
+
+  # idle rate 0.333/s → ~67% busy → silent.
+  - interval: 15s
+    input_series:
+      - series: 'node_cpu_seconds_total{cpu="0", mode="idle", instance="node-exporter:9100", job="node-exporter"}'
+        values: '0+5x119'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HostCPUHigh
+        exp_alerts: []
