@@ -2,7 +2,7 @@
   "id": null,
   "uid": "emc-auth-red",
   "title": "EMC Auth — RED per route",
-  "description": "Rate, errors and duration for every HTTP route, from emc_auth_http_request_duration_seconds. /metrics, /health and unmatched (unknown) paths are excluded so Prometheus's own scrapes do not dilute the numbers.",
+  "description": "Rate, errors and duration for every HTTP route (method + path template, so GET and POST on one path stay separate), from emc_auth_http_request_duration_seconds. /metrics, /health and unmatched (unknown) paths are excluded so Prometheus's own scrapes do not dilute the numbers.",
   "tags": ["emc-auth", "red"],
   "timezone": "browser",
   "editable": true,
@@ -53,8 +53,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\"}[5m]))",
-          "legendFormat": "{{path}}",
+          "expr": "sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\"}[5m]))",
+          "legendFormat": "{{method}} {{path}}",
           "range": true
         }
       ],
@@ -80,8 +80,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\",status=~\"5..\"}[5m]))",
-          "legendFormat": "{{path}}",
+          "expr": "sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\",status=~\"5..\"}[5m]))",
+          "legendFormat": "{{method}} {{path}}",
           "range": true
         }
       ],
@@ -107,8 +107,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\",status=~\"5..\"}[5m])) / sum by (path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\"}[5m]))",
-          "legendFormat": "{{path}}",
+          "expr": "sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\",status=~\"5..\"}[5m])) / sum by (method, path) (rate(emc_auth_http_request_duration_seconds_count{path!~\"/metrics|/health|unknown\"}[5m]))",
+          "legendFormat": "{{method}} {{path}}",
           "range": true
         }
       ],
@@ -136,8 +136,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.50, sum by (le, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~\"/metrics|/health|unknown\"}[5m])))",
-          "legendFormat": "{{path}}",
+          "expr": "histogram_quantile(0.50, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~\"/metrics|/health|unknown\"}[5m])))",
+          "legendFormat": "{{method}} {{path}}",
           "range": true
         }
       ],
@@ -163,8 +163,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.95, sum by (le, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~\"/metrics|/health|unknown\"}[5m])))",
-          "legendFormat": "{{path}}",
+          "expr": "histogram_quantile(0.95, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~\"/metrics|/health|unknown\"}[5m])))",
+          "legendFormat": "{{method}} {{path}}",
           "range": true
         }
       ],
@@ -190,8 +190,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "prometheus" },
-          "expr": "histogram_quantile(0.99, sum by (le, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~\"/metrics|/health|unknown\"}[5m])))",
-          "legendFormat": "{{path}}",
+          "expr": "histogram_quantile(0.99, sum by (le, method, path) (rate(emc_auth_http_request_duration_seconds_bucket{path!~\"/metrics|/health|unknown\"}[5m])))",
+          "legendFormat": "{{method}} {{path}}",
           "range": true
         }
       ],
