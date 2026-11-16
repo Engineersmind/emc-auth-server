@@ -236,10 +236,17 @@ export function apps_login() {
   check(res, { 'apps_login: access_token': (r) => { const j = safeJson(r); return !!j && !!j.access_token; } });
 }
 
+// The seed's runid is shared by every k6 run against that seed, and
+// iterationInTest/idInTest restart at 0/1 each run — so a second run would
+// re-register the same addresses and take 409s. A per-VU stamp from init time
+// keeps addresses unique across runs; iterationInTest keeps them unique
+// within one.
+const REGISTER_STAMP = `${Date.now().toString(36)}${Math.floor(Math.random() * 1679616).toString(36)}`;
+
 export function apps_register() {
   const iter = exec.scenario.iterationInTest;
   const vu = exec.vu.idInTest;
-  const email = `perf-${STATE.runid}-r${vu}-${iter}@perf.invalid`;
+  const email = `perf-${STATE.runid}-r${REGISTER_STAMP}-${vu}-${iter}@perf.invalid`;
   const password = `P3rf${iter.toString(36)}x${vu.toString(36)}yZ9`;
   const res = http.post(
     `${ORIGIN}/api/v1/auth/apps/register`,
