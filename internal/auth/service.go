@@ -78,6 +78,10 @@ type AuthService struct {
 	// orgSvc resolves organisation membership at mint time. Nil, or present but
 	// switched off, means every application behaves as organizations_mode 'off'.
 	orgSvc *OrganizationService
+	// pwless is the passwordless email-code flow (issue #203). nil leaves the
+	// service exactly as it was: every passwordless entry point reports
+	// ErrPasswordlessUnavailable and the password endpoints never consult it.
+	pwless *passwordlessRuntime
 	logger zerolog.Logger
 }
 
@@ -1181,6 +1185,10 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		// arrive alongside app credentials and had to be checked against them.
 		tenantID, appRowID = tid, &aid
 		appID = strconv.FormatInt(aid, 10)
+		// Same closure as Login: refused before any hashing or write.
+		if s.PasswordFlowClosed(ctx, tid, &aid) {
+			return nil, ErrPasswordAuthDisabled
+		}
 	} else {
 		// First-party registration lands in the platform tenant.
 		//
@@ -1578,6 +1586,13 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		appID = strconv.FormatInt(aid, 10)
 	}
 
+	// An application that closed its password flow refuses here, before any user
+	// lookup or hash (passwordless plan section 4.9). A no-op unless the feature is
+	// enabled and the application opted in.
+	if appRowID != 0 && s.PasswordFlowClosed(ctx, appTenantID, &appRowID) {
+		return nil, ErrPasswordAuthDisabled
+	}
+
 	// User-base isolation: app-authenticated logins only see that application's
 	// own users; generic logins only see tenant-level users (application_id IS
 	// NULL) — an app-scoped account can never authenticate outside its app.
@@ -1894,6 +1909,28 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
 func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+	return s.mfaGateWith(ctx, mfaGateOptions{}, userID, tenantID, appRowID, appID, email, roleName, perms, persistent, activeRoles, org)
+}
+
+// mfaGateOptions tunes mfaGateWith. The zero value is exactly mfaGate's
+// behaviour, so adding a field here can never change an existing caller.
+type mfaGateOptions struct {
+	// inboxFirstFactor is set when the first factor was itself proof of control
+	// of the user's inbox (the passwordless email code). The email second-factor
+	// method is then neither offered nor emailed: the same inbox twice is
+	// ceremony, not a second factor. TOTP and passkeys are unaffected.
+	inboxFirstFactor bool
+}
+
+// mfaGateWith is mfaGate with options. See mfaGate for the contract.
+func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+	if opts.inboxFirstFactor {
+		// Carried to the stored challenge so the finished session keeps the email-code
+		// grant and amr. A context value rather than a new parameter on every helper
+		// between here and storePreAuthSession keeps those signatures, and so every
+		// existing caller, untouched.
+		ctx = withFirstFactor(ctx, FirstFactorEmailOTP)
+	}
 	// Administrators first: for them MFA is mandatory, so this branch runs even
 	// on a deployment where the per-application gate below would return early.
 	// Only a tenant-level login (appRowID 0) can be an administrator's — an
@@ -1946,6 +1983,9 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// users who had already enrolled it. A non-app login (appRowID 0) has no
 	// policy and honours every active factor.
 	permitted := func(method string) bool {
+		if opts.inboxFirstFactor && method == MFAMethodEmail {
+			return false
+		}
 		return appRowID == 0 || methodAllowed(allowedMethods, method)
 	}
 	var methods []string
@@ -1968,7 +2008,16 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// (re)enroll a permitted method before finishing login; otherwise the login
 	// proceeds (the app does not enforce MFA).
 	if appRowID != 0 && mode == MFAModeRequired {
-		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent, activeRoles, org)
+		enrollmentMethods := allowedMethods
+		if opts.inboxFirstFactor {
+			enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
+		}
+		if opts.inboxFirstFactor && len(enrollmentMethods) == 0 {
+			// Fail loudly rather than hand the user an enrollment challenge they
+			// cannot complete: the policy needs a non-email method to be allowed.
+			return nil, ErrPasswordlessMFAConflict
+		}
+		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
 		if err != nil {
 			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
 		}
@@ -2044,16 +2093,9 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 	// session.AppID carries the application context through the challenge so
 	// an app-authenticated login keeps its app_id claim after the OTP step.
 	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
-		sessionContext{
-			persistent:  session.Persistent,
-			activeRoles: session.ActiveRoles,
-			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         []string{AMRPassword, AMROTP, AMRMFA},
-			// The grant is the one that began the flow. MFA is a second factor
-			// on a password login, not a grant of its own — amr already records
-			// that the OTP step happened.
-			grant: GrantPassword,
-		}, session.AppID)
+		// The grant is the one that began the flow. MFA is a second factor on that
+		// first factor, not a grant of its own: amr already records the OTP step.
+		completionSessionContext(session), session.AppID)
 }
 
 // EnrollPending generates the TOTP secret for a forced-enrollment login
@@ -2179,13 +2221,7 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 	s.clearOTPSession(ctx, key)
 
 	tokens, err := s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
-		sessionContext{
-			persistent:  session.Persistent,
-			activeRoles: session.ActiveRoles,
-			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         []string{AMRPassword, AMROTP, AMRMFA},
-			grant:       GrantPassword,
-		}, session.AppID)
+		completionSessionContext(session), session.AppID)
 	if err != nil {
 		return nil, session, err
 	}
@@ -2342,6 +2378,9 @@ func (s *AuthService) storePreAuthSession(ctx context.Context, keyFn func(string
 	raw, err := GenerateRefreshToken()
 	if err != nil {
 		return "", err
+	}
+	if sess.FirstFactor == "" {
+		sess.FirstFactor = firstFactorFrom(ctx)
 	}
 	payload, err := json.Marshal(sess)
 	if err != nil {

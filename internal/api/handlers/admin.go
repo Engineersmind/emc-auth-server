@@ -25,7 +25,10 @@ import (
 
 // AdminHandler holds handlers for all Admin API endpoints.
 type AdminHandler struct {
-	svc         *admin.Service
+	svc *admin.Service
+	// pwless backs the passwordless policy and recovery routes. nil makes them
+	// answer 503 rather than panicking.
+	pwless      *PasswordlessAdminDeps
 	appLimitSvc *auth.AppRateLimitService
 	// trustSvc backs the server-trust routes (server IPs, forwarded IP). nil
 	// makes them answer 503.
@@ -3455,6 +3458,9 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		}
 		if errors.Is(err, auth.ErrAppNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+		}
+		if errors.Is(err, auth.ErrPasswordlessMFAConflict) {
+			return c.JSON(http.StatusUnprocessableEntity, map[string]string{"error": "passwordless_mfa_conflict", "message": err.Error()})
 		}
 		h.logger.Error().Err(err).Msg("admin: set application MFA policy failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})

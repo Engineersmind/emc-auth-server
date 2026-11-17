@@ -40,6 +40,9 @@ type ResetService struct {
 	// constructor so a caller that forgets WithHasher still writes a correctly
 	// hashed password.
 	hasher *password.Hasher
+	// pwless closes the flow for applications that set password_enabled=false
+	// (issue #203). nil, the default, leaves reset exactly as it was.
+	pwless *PasswordlessPolicyService
 	logger zerolog.Logger
 }
 
@@ -52,6 +55,12 @@ func NewResetService(pool *pgxpool.Pool, m mailer.Mailer, appBaseURL string, log
 		hasher:     password.NewHasher(password.DefaultParams()),
 		logger:     logger,
 	}
+}
+
+// WithPasswordless lets reset honour an application's password_enabled=false.
+func (s *ResetService) WithPasswordless(p *PasswordlessPolicyService) *ResetService {
+	s.pwless = p
+	return s
 }
 
 // WithHasher shares the process-wide hasher so a reset writes the credential
@@ -221,6 +230,13 @@ func (s *ResetService) ForgotPasswordFirstParty(ctx context.Context, email strin
 func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string, honorSuppression bool) error {
 	email = emailaddr.Normalize(email)
 
+	// A user-initiated reset is closed for an application without passwords. An
+	// administrator-forced reset (honorSuppression false) still goes out; its link
+	// cannot be redeemed while the flow is closed.
+	if honorSuppression && s.passwordClosed(ctx, tenantID, appRowID) {
+		return ErrPasswordAuthDisabled
+	}
+
 	// Suppression: if the reset template is disabled at this scope, don't send —
 	// unless this is an admin-forced reset (honorSuppression=false).
 	if honorSuppression && !s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordReset) {
@@ -375,6 +391,12 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 		return fmt.Errorf("lookup reset token: %w", err)
 	}
 
+	// Links issued before an application closed its password flow stop working.
+	// Refused before hashing, and the token is left unspent.
+	if s.passwordClosed(ctx, tenantID, appRowID) {
+		return ErrPasswordAuthDisabled
+	}
+
 	newHash, err := s.hasher.Hash(ctx, in.NewPassword)
 	if err != nil {
 		return fmt.Errorf("hash new password: %w", err)
@@ -451,4 +473,12 @@ func (s *ResetService) NotifyPasswordChanged(ctx context.Context, tenantID int64
 	if err != nil {
 		s.logger.Warn().Err(err).Str("email", email).Msg("password-changed confirmation could not be delivered")
 	}
+}
+
+// passwordClosed reports whether the application has closed its password flow.
+func (s *ResetService) passwordClosed(ctx context.Context, tenantID int64, appRowID *int64) bool {
+	if s == nil || s.pwless == nil || appRowID == nil || *appRowID == 0 {
+		return false
+	}
+	return !s.pwless.Resolve(ctx, tenantID, appRowID).PasswordEnabled
 }

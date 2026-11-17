@@ -4055,6 +4055,207 @@
                 }
             }
         },
+        "/api/v1/auth/apps/passwordless/resend": {
+            "post": {
+                "description": "Rotates the code on the same challenge: the previous code stops working. Subject to a cooldown and a resend budget set by the application's policy. Failed attempts are not reset, so resending cannot multiply guesses.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Send a fresh code for an open challenge",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Challenge",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessResendRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasswordlessResendResult"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid_or_expired_code",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "429": {
+                        "description": "resend_cooldown or too_many_resends",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/passwordless/start": {
+            "post": {
+                "description": "Emails a 6-digit one-time code for the address, or, for an address that must not receive one (unknown with sign-up off, blocked, domain refused, throttled), stores a decoy and sends nothing. The response is identical in every case, so it cannot be used to find out which addresses are registered. Sending is asynchronous.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Request a sign-in or sign-up code",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Address and optional profile hints",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessStartRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasswordlessStartResult"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid_email",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "passwordless_disabled",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "404": {
+                        "description": "not_found, the feature is not enabled on this server",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "428": {
+                        "description": "captcha_required",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/auth/apps/passwordless/verify": {
+            "post": {
+                "description": "Proves the code, then signs the user in, or creates the account (when the application allows sign-up) and signs in. The application's MFA policy still applies, and the email method is not offered as a second factor after an emailed first factor: the response is a token pair, an OTP challenge (requires_otp), a forced-enrollment challenge (403 mfa_enrollment_required) or 409 organization_selection_required. Every refusal is the single error invalid_or_expired_code.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "AUTH"
+                ],
+                "summary": "Verify a code to sign in or sign up",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Basic base64(client_id:client_secret)",
+                        "name": "Authorization",
+                        "in": "header",
+                        "required": true
+                    },
+                    {
+                        "description": "Challenge and code",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessVerifyRequest"
+                        }
+                    },
+                    {
+                        "type": "string",
+                        "description": "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits",
+                        "name": "X-EMC-Forwarded-For",
+                        "in": "header"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.AuthResult"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid_or_expired_code",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "MFA enrollment required",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "409": {
+                        "description": "organization_selection_required",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "429": {
+                        "description": "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/auth/apps/register": {
             "post": {
                 "description": "Creates a user account owned by the authenticated application — the same email may hold independent accounts in different applications. Application credentials via Authorization: Basic header only; no tenant slug needed. Does NOT sign the user in — no session is created and no tokens are returned; call /auth/apps/login afterwards.",
@@ -8035,6 +8236,68 @@
                 }
             }
         },
+        "/api/v1/platform/passwordless-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Platform values are defaults for every tenant and ceilings no tenant or application may exceed. Requires tenant:manage.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Get the platform passwordless defaults and ceilings",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessPolicyResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Requires tenant:manage. Same body and checks as the tenant route.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Set the platform passwordless defaults and ceilings",
+                "parameters": [
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PutPasswordlessPolicyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessPolicyResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/roles": {
             "get": {
                 "security": [
@@ -10728,6 +10991,240 @@
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/passwordless-policy": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the overrides stored at this scope (null when none), the effective values after inheritance, which level supplied each value, and the resulting mode (password_only, both, passwordless_only). server_enabled reports whether PASSWORDLESS_ENABLED is on for this deployment.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Get the passwordless sign-in policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessPolicyResponse"
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the overrides at this scope. Checked against the resolved policy: at least one first factor must remain, email codes cannot be enabled where required MFA allows only email, values may not exceed platform limits, and the sign-in-code template must be enabled. Optimistic concurrency: send the version you read; a mismatch is 409. Enabling sign-up, closing the password flow and editing tenant defaults need a tenant owner. Switching to password only while active users have no password needs override_no_password_users.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Set the passwordless sign-in policy",
+                "parameters": [
+                    {
+                        "description": "Overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PutPasswordlessPolicyRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessPolicyResponse"
+                        }
+                    },
+                    "409": {
+                        "description": "Conflict",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Removes this scope's overrides so it inherits again. Refused when the inherited result would leave no first factor.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Reset the passwordless sign-in policy",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/passwordless-policy/history": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Append-only list of changes at this scope, newest first, with the field-level before and after of each.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Passwordless policy history",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/auth.PasswordlessHistoryEntry"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/passwordless-policy/history/{hid}/restore": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Writes a NEW version from the old snapshot; history is never rewritten. Send the current version as version. Restoring is checked and permissioned exactly like a PUT.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Restore an earlier passwordless policy version",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessPolicyResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/passwordless-policy/impact": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Dry run, writes nothing. Reports the mode before and after, active users with and without a stored password, users whose address is unverified, password sign-ins in the last 7 and 30 days, users who would be asked to enrol an authenticator app, whether self-registration remains possible, and warnings. risky means the console should ask for the application name to be typed; requires_override means the change would strand users without a password.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Preview what a policy change would do",
+                "parameters": [
+                    {
+                        "description": "Proposed overrides",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.PasswordlessImpactRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasswordlessImpact"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/passwordless/stats": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Counts over 24h, 7d or 30d from the audit log: codes requested and throttled, sign-ins by code, failed verifications and the success rate, accounts created and secured, and password requests refused because the flow is closed.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-security"
+                ],
+                "summary": "Passwordless usage statistics",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "24h, 7d or 30d (default 24h)",
+                        "name": "window",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasswordlessStats"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/rate-limit": {
             "get": {
                 "security": [
@@ -11383,6 +11880,110 @@
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/auth-methods": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Password, email code, passkeys, social providers and MFA factors, each with when it was added and last used.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "A user's sign-in methods",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/auth.PasswordlessUserMethods"
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/clear-passwordless-throttle": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Clears the 15-minute block that follows too many failed code attempts for the address, and its failure count.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Lift a user's passwordless verify block",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/email": {
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Requires a reason. Marks the new address verified, revokes every session of the user and tells the previous address what happened. Audited with the reason.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Change a user's email on their behalf (lost-mailbox recovery)",
+                "parameters": [
+                    {
+                        "description": "New address and reason",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.ChangeUserEmailRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "The address is taken",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/organizations": {
             "get": {
                 "produces": [
@@ -11409,6 +12010,31 @@
                             "items": {
                                 "$ref": "#/definitions/auth.OrganizationMembership"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/users/{uid}/verify-email": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-users"
+                ],
+                "summary": "Mark a user's email address as verified",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
                         }
                     }
                 }
@@ -15608,6 +16234,13 @@
                 }
             }
         },
+        "auth.FieldChange": {
+            "type": "object",
+            "properties": {
+                "after": {},
+                "before": {}
+            }
+        },
         "auth.IntrospectionResult": {
             "type": "object",
             "properties": {
@@ -16179,6 +16812,305 @@
                 }
             }
         },
+        "auth.PasswordlessHistoryEntry": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string"
+                },
+                "change": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/auth.FieldChange"
+                    }
+                },
+                "changed_by": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "integer"
+                },
+                "snapshot": {
+                    "$ref": "#/definitions/auth.PasswordlessPolicyRow"
+                },
+                "version": {
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.PasswordlessImpact": {
+            "type": "object",
+            "properties": {
+                "active_users": {
+                    "description": "ActiveUsers is the number of active users in the application.",
+                    "type": "integer"
+                },
+                "mode_after": {
+                    "type": "string"
+                },
+                "mode_before": {
+                    "type": "string"
+                },
+                "password_sign_in_users_30d": {
+                    "type": "integer"
+                },
+                "password_sign_in_users_7d": {
+                    "type": "integer"
+                },
+                "password_sign_ins_30d": {
+                    "type": "integer"
+                },
+                "password_sign_ins_7d": {
+                    "description": "PasswordSignIns are successful password sign-ins in the window, with the\nnumber of distinct users: the figure that should fall toward zero before the\npassword flow is closed.",
+                    "type": "integer"
+                },
+                "requires_override": {
+                    "description": "RequiresOverride is true when the change would strand active users that\nhave no stored password (a switch to password only).",
+                    "type": "boolean"
+                },
+                "risky": {
+                    "description": "Risky is true when the change needs the application name typed to confirm:\npassword flow closed, or sign-up opened with no domain list.",
+                    "type": "boolean"
+                },
+                "self_registration_remains": {
+                    "description": "SelfRegistrationRemains reports whether new accounts can still appear\nwithout an administrator: by password sign-up or by code sign-up.",
+                    "type": "boolean"
+                },
+                "users_needing_totp_enrolment": {
+                    "description": "UsersNeedingTOTPEnrolment have email as their only second factor while the\napplication requires MFA: after an emailed first factor they would be asked\nto enrol an authenticator app.",
+                    "type": "integer"
+                },
+                "users_unverified_email": {
+                    "description": "UsersUnverifiedEmail will have their address verified by their first code.",
+                    "type": "integer"
+                },
+                "users_with_password": {
+                    "description": "UsersWithPassword keep their stored password whatever the mode: it is never\ndeleted, only closed in passwordless-only mode.",
+                    "type": "integer"
+                },
+                "users_without_password": {
+                    "type": "integer"
+                },
+                "warnings": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "auth.PasswordlessPolicyRow": {
+            "type": "object",
+            "properties": {
+                "allow_persistent": {
+                    "type": "boolean"
+                },
+                "allowed_email_domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "application_id": {
+                    "type": "integer"
+                },
+                "blocked_email_domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "code_ttl_seconds": {
+                    "type": "integer"
+                },
+                "created_at": {
+                    "type": "string"
+                },
+                "daily_email_budget": {
+                    "type": "integer"
+                },
+                "email_otp_enabled": {
+                    "type": "boolean"
+                },
+                "max_attempts": {
+                    "type": "integer"
+                },
+                "max_resends": {
+                    "type": "integer"
+                },
+                "password_enabled": {
+                    "type": "boolean"
+                },
+                "resend_cooldown_secs": {
+                    "type": "integer"
+                },
+                "signup_enabled": {
+                    "type": "boolean"
+                },
+                "starts_per_hour": {
+                    "type": "integer"
+                },
+                "tenant_id": {
+                    "type": "integer"
+                },
+                "updated_at": {
+                    "type": "string"
+                },
+                "updated_by": {
+                    "type": "integer"
+                },
+                "version": {
+                    "type": "integer"
+                },
+                "welcome_email_enabled": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "auth.PasswordlessResendResult": {
+            "type": "object",
+            "properties": {
+                "resend_after": {
+                    "type": "integer"
+                },
+                "resends_left": {
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.PasswordlessSettings": {
+            "type": "object",
+            "properties": {
+                "allow_persistent": {
+                    "type": "boolean"
+                },
+                "allowed_email_domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "blocked_email_domains": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "code_ttl_seconds": {
+                    "type": "integer"
+                },
+                "daily_email_budget": {
+                    "type": "integer"
+                },
+                "email_otp_enabled": {
+                    "type": "boolean"
+                },
+                "max_attempts": {
+                    "type": "integer"
+                },
+                "max_resends": {
+                    "type": "integer"
+                },
+                "password_enabled": {
+                    "type": "boolean"
+                },
+                "resend_cooldown_secs": {
+                    "type": "integer"
+                },
+                "signup_enabled": {
+                    "type": "boolean"
+                },
+                "sources": {
+                    "description": "Sources names, per field, which level supplied the value: \"application\",\n\"tenant\", \"platform\" or \"default\". Shown first by the console.",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "starts_per_hour": {
+                    "type": "integer"
+                },
+                "welcome_email_enabled": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "auth.PasswordlessStartResult": {
+            "type": "object",
+            "properties": {
+                "challenge_id": {
+                    "type": "string"
+                },
+                "code_length": {
+                    "type": "integer"
+                },
+                "expires_in": {
+                    "type": "integer"
+                },
+                "resend_after": {
+                    "type": "integer"
+                }
+            }
+        },
+        "auth.PasswordlessStats": {
+            "type": "object",
+            "properties": {
+                "accounts_created": {
+                    "type": "integer"
+                },
+                "accounts_secured": {
+                    "type": "integer"
+                },
+                "codes_requested": {
+                    "type": "integer"
+                },
+                "codes_throttled": {
+                    "type": "integer"
+                },
+                "failed_verifies": {
+                    "type": "integer"
+                },
+                "password_refusals": {
+                    "type": "integer"
+                },
+                "sign_ins_by_code": {
+                    "type": "integer"
+                },
+                "verify_success_rate": {
+                    "type": "string"
+                },
+                "window": {
+                    "type": "string"
+                }
+            }
+        },
+        "auth.PasswordlessUserMethods": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "email_verified": {
+                    "type": "boolean"
+                },
+                "methods": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.UserAuthMethod"
+                    }
+                },
+                "mode": {
+                    "description": "ThrottleBlocked reports the per-address verify block, if one is active.",
+                    "type": "string"
+                },
+                "user_id": {
+                    "type": "integer"
+                }
+            }
+        },
         "auth.ProviderConfigDetail": {
             "type": "object",
             "properties": {
@@ -16380,6 +17312,26 @@
                 },
                 "jwks_uri": {
                     "description": "JWKSURI is the tenant's public key set. Per-tenant because the signing\nkeys are: a single shared key set would defeat that isolation.",
+                    "type": "string"
+                }
+            }
+        },
+        "auth.UserAuthMethod": {
+            "type": "object",
+            "properties": {
+                "added_at": {
+                    "type": "string"
+                },
+                "detail": {
+                    "type": "string"
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "last_used": {
+                    "type": "string"
+                },
+                "method": {
                     "type": "string"
                 }
             }
@@ -16625,6 +17577,17 @@
             ],
             "properties": {
                 "new_email": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.ChangeUserEmailRequest": {
+            "type": "object",
+            "properties": {
+                "email": {
+                    "type": "string"
+                },
+                "reason": {
                     "type": "string"
                 }
             }
@@ -17144,6 +18107,101 @@
                 "organizations_mode": {
                     "description": "Mode is \"off\", \"optional\" or \"required\".",
                     "type": "string"
+                }
+            }
+        },
+        "handlers.PasswordlessImpactRequest": {
+            "type": "object",
+            "properties": {
+                "policy": {
+                    "$ref": "#/definitions/auth.PasswordlessPolicyRow"
+                }
+            }
+        },
+        "handlers.PasswordlessPolicyResponse": {
+            "type": "object",
+            "properties": {
+                "effective": {
+                    "$ref": "#/definitions/auth.PasswordlessSettings"
+                },
+                "mode": {
+                    "type": "string"
+                },
+                "row": {
+                    "$ref": "#/definitions/auth.PasswordlessPolicyRow"
+                },
+                "scope": {
+                    "type": "string"
+                },
+                "server_enabled": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "handlers.PasswordlessResendRequest": {
+            "type": "object",
+            "properties": {
+                "challenge_id": {
+                    "type": "string"
+                }
+            }
+        },
+        "handlers.PasswordlessStartRequest": {
+            "type": "object",
+            "properties": {
+                "captcha_answer": {
+                    "type": "string"
+                },
+                "captcha_id": {
+                    "description": "CaptchaID and CaptchaAnswer carry a solved challenge. Optional, and ignored\nunless the scope's captcha policy protects the \"passwordless\" flow.",
+                    "type": "string"
+                },
+                "email": {
+                    "type": "string"
+                },
+                "first_name": {
+                    "type": "string"
+                },
+                "last_name": {
+                    "type": "string"
+                },
+                "persistent": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "handlers.PasswordlessVerifyRequest": {
+            "type": "object",
+            "properties": {
+                "challenge_id": {
+                    "type": "string"
+                },
+                "code": {
+                    "type": "string"
+                },
+                "organization": {
+                    "type": "string"
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "handlers.PutPasswordlessPolicyRequest": {
+            "type": "object",
+            "properties": {
+                "override_no_password_users": {
+                    "description": "OverrideNoPasswordUsers confirms a switch to password only while active\nusers have no stored password.",
+                    "type": "boolean"
+                },
+                "policy": {
+                    "$ref": "#/definitions/auth.PasswordlessPolicyRow"
+                },
+                "version": {
+                    "type": "integer"
                 }
             }
         },

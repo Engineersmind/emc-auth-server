@@ -379,6 +379,8 @@ func (s *AuthService) CompleteOrganizationSelection(ctx context.Context, selecti
 		sess.grant = GrantPassword
 	case GrantMagicLink:
 		sess.grant = GrantMagicLink
+	case GrantEmailOTP:
+		sess.grant = GrantEmailOTP
 	case GrantSocial:
 		sess.grant = GrantSocial
 	case GrantPasskey:
