@@ -1195,7 +1195,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	appOrgs.GET("/:org/invitations", orgHandler.ListInvitations(appOrgScope))
 	appOrgs.DELETE("/:org/invitations/:inv", orgHandler.RevokeInvitation(appOrgScope))
 	authGroup.GET("/apps/users/:uid/organizations", orgHandler.ListUserOrganizations(appOrgScope),
-		s2s.Resolve(mw.SurfaceApp), appClientRateLimit)
+		mw.AppOrgManagementChain(s2s, appClientRateLimit)...)
 
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates

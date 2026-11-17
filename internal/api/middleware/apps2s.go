@@ -480,8 +480,6 @@ const (
 	// SurfaceOrg: /auth/apps/login/organization, /apps/switch-organization and
 	// the organisation invitation preview/accept routes.
 	SurfaceOrg = "org"
-	// SurfaceSession: /auth/refresh and /auth/logout.
-	SurfaceSession = "session"
 )
 
 func headerCredentials(c echo.Context) (string, string, bool) {
