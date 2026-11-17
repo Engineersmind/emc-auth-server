@@ -2088,16 +2088,9 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 	// session.AppID carries the application context through the challenge so
 	// an app-authenticated login keeps its app_id claim after the OTP step.
 	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
-		sessionContext{
-			persistent:  session.Persistent,
-			activeRoles: session.ActiveRoles,
-			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         completionAMR(session.FirstFactor),
-			// The grant is the one that began the flow. MFA is a second factor
-			// on that first factor, not a grant of its own — amr already records
-			// that the OTP step happened.
-			grant: completionGrant(session.FirstFactor),
-		}, session.AppID)
+		// The grant is the one that began the flow. MFA is a second factor on that
+		// first factor, not a grant of its own: amr already records the OTP step.
+		completionSessionContext(session), session.AppID)
 }
 
 // EnrollPending generates the TOTP secret for a forced-enrollment login
@@ -2223,13 +2216,7 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 	s.clearOTPSession(ctx, key)
 
 	tokens, err := s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
-		sessionContext{
-			persistent:  session.Persistent,
-			activeRoles: session.ActiveRoles,
-			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         completionAMR(session.FirstFactor),
-			grant:       completionGrant(session.FirstFactor),
-		}, session.AppID)
+		completionSessionContext(session), session.AppID)
 	if err != nil {
 		return nil, session, err
 	}

@@ -494,19 +494,22 @@ func firstFactorFrom(ctx context.Context) string {
 	return f
 }
 
-// completionAMR is the amr a session carries after its second factor passes.
-func completionAMR(firstFactor string) []string {
-	if firstFactor == FirstFactorEmailOTP {
-		return []string{AMREmailOTP, AMROTP, AMRMFA}
+// completionSessionContext is the session a sign-in carries once its second factor
+// has passed. The grant is the one that began the flow, spelled as a Grant*
+// constant at each assignment (TestEveryMintSitePassesAGrantConstant requires it):
+// the password grant by default, which is every session stored before passwordless
+// existed, and the email-code grant when the first factor was an emailed code.
+func completionSessionContext(session *OTPSession) sessionContext {
+	sc := sessionContext{
+		persistent:  session.Persistent,
+		activeRoles: session.ActiveRoles,
+		org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
+		amr:         []string{AMRPassword, AMROTP, AMRMFA},
+		grant:       GrantPassword,
 	}
-	return []string{AMRPassword, AMROTP, AMRMFA}
-}
-
-// completionGrant is the grant a session carries after its second factor passes:
-// the grant that began the flow.
-func completionGrant(firstFactor string) string {
-	if firstFactor == FirstFactorEmailOTP {
-		return GrantEmailOTP
+	if session.FirstFactor == FirstFactorEmailOTP {
+		sc.amr = []string{AMREmailOTP, AMROTP, AMRMFA}
+		sc.grant = GrantEmailOTP
 	}
-	return GrantPassword
+	return sc
 }
