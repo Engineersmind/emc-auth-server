@@ -46,7 +46,7 @@ func TestInvitationScope_NamesTheOwningApplicationAndStopsAfterAcceptance(t *tes
 }
 
 func TestOrganizationSelectionScope_NamesTheOwningApplicationAndDoesNotConsume(t *testing.T) {
-	f := newOrgFixture(t, "org-scope-select", auth.OrganizationsModeOptional)
+	f := newOrgFixture(t, "org-scope-select", auth.OrganizationsModeRequired)
 	rdb := testhelper.NewTestRedis(t) // skips without REDIS_URL
 	f.svc.WithTOTP(nil, rdb)
 	acme, globex := f.createOrg(t, "acme"), f.createOrg(t, "globex")
