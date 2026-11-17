@@ -463,6 +463,24 @@ func liveRoleNames(ctx context.Context, q pgx.Tx, p *pendingInvitation) ([]strin
 	return names, nil
 }
 
+// InvitationScope reports the tenant and application a pending invitation token
+// belongs to. Read only. ok is false for an unknown, used, revoked or expired
+// token (or while organisations are off).
+//
+// For the rate limiter, which charges a backend's invitation preview and accept
+// calls to its own application's quota only for its own invitations (see
+// middleware.ScopeToCaller).
+func (s *OrganizationService) InvitationScope(ctx context.Context, token string) (tenantID, appID int64, ok bool) {
+	if s.guard() != nil {
+		return 0, 0, false
+	}
+	p, err := loadPendingInvitation(ctx, s.pool, token, false)
+	if err != nil {
+		return 0, 0, false
+	}
+	return p.tenant, p.appRowID, true
+}
+
 // PreviewInvitation describes a pending invitation to the holder of its token.
 func (s *OrganizationService) PreviewInvitation(ctx context.Context, token string) (*OrganizationInvitationPreview, error) {
 	if err := s.guard(); err != nil {

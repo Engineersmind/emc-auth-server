@@ -928,8 +928,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, enrollChain...)     // forced enrollment, TOTP path: get QR + backup codes
 	authGroup.POST("/login/mfa/email", authHandler.MFAEmailPending, enrollChain...)       // forced enrollment, email path: send code to inbox
 	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, enrollChain...) // forced enrollment: first code → tokens
-	authGroup.POST("/refresh", authHandler.Refresh)
-	authGroup.POST("/logout", authHandler.Logout)
+	// Refresh and logout had no limiter. A backend that sends its client
+	// credentials is charged to its application's shared quota, for its own
+	// users' sessions only; callers without credentials are unchanged.
+	sessionChain := []echo.MiddlewareFunc{
+		s2s.ResolveOptional(mw.SurfaceSession),
+		mw.ScopeToCaller(mw.ScopeByBodyToken("refresh_token", authSvc.RefreshTokenScope)),
+		mw.BackendsOnly(appCallerRateLimit),
+	}
+	authGroup.POST("/refresh", authHandler.Refresh, sessionChain...)
+	authGroup.POST("/logout", authHandler.Logout, sessionChain...)
 
 	// Change the active tenant for a multi-tenant administrator (plan step 4).
 	//
@@ -1091,17 +1099,43 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	//
 	// The static invitation paths are registered alongside /:org below; Echo
 	// prefers a static segment over a parameter, so they never collide.
-	authGroup.POST("/apps/login/organization", orgHandler.SelectOrganization, mw.TokenRateLimiter(rlCfg))
-	authGroup.POST("/apps/switch-organization", orgHandler.SwitchOrganization, mw.TokenRateLimiter(rlCfg))
-	authGroup.GET("/apps/organizations/invitations/preview", orgHandler.PreviewInvitation, mw.TokenRateLimiter(rlCfg))
-	authGroup.POST("/apps/organizations/invitations/accept", orgHandler.AcceptInvitation, mw.TokenRateLimiter(rlCfg))
+	//
+	// A product backend calling them for its users can send its client
+	// credentials (Authorization: Basic, or X-Client-Authorization beside the
+	// user's Bearer token on accept). It is then limited by the application's
+	// shared quota like every other backend route, and TokenRateLimiter steps
+	// aside for it. ScopeToCaller trusts it only for its own application's
+	// tokens; a token from another tenant or application keeps the per-IP limit.
+	// Callers without credentials keep TokenRateLimiter exactly as before.
+	orgFlowChain := func(scope mw.SubjectScopeFunc) []echo.MiddlewareFunc {
+		return []echo.MiddlewareFunc{
+			s2s.ResolveOptional(mw.SurfaceOrg),
+			mw.ScopeToCaller(scope),
+			mw.BackendsOnly(appCallerRateLimit),
+			mw.TokenRateLimiter(rlCfg),
+		}
+	}
+	authGroup.POST("/apps/login/organization", orgHandler.SelectOrganization,
+		orgFlowChain(mw.ScopeByBodyToken("selection_token", authSvc.OrganizationSelectionScope))...)
+	authGroup.POST("/apps/switch-organization", orgHandler.SwitchOrganization,
+		orgFlowChain(mw.ScopeByBodyToken("refresh_token", authSvc.RefreshTokenScope))...)
+	authGroup.GET("/apps/organizations/invitations/preview", orgHandler.PreviewInvitation,
+		orgFlowChain(mw.ScopeByQueryToken("token", orgSvc.InvitationScope))...)
+	authGroup.POST("/apps/organizations/invitations/accept", orgHandler.AcceptInvitation,
+		orgFlowChain(mw.ScopeByBodyToken("token", orgSvc.InvitationScope))...)
 
 	// Organizations — management by an application's own backend, with its
 	// client credentials in Authorization: Basic, exactly like
 	// /apps/users/roles. The scope is the authenticated application, so a
 	// leaked secret reaches only that application's organisations.
 	appOrgScope := orgHandler.AppScope
-	appOrgs := authGroup.Group("/apps/organizations", mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+	//
+	// Limited like /apps/login and /token, not per IP: a product backend calls
+	// these for every one of its users from one egress IP with one client_id
+	// (pdffillr checks membership on every organisation request), so a per-IP
+	// TokenRateLimiter throttled the whole product at 5/min. Resolve still holds
+	// callers whose secret does not verify to the strict per-IP bucket.
+	appOrgs := authGroup.Group("/apps/organizations", s2s.Resolve(mw.SurfaceApp), appClientRateLimit)
 	appOrgs.POST("", orgHandler.CreateOrganization(appOrgScope))
 	appOrgs.GET("", orgHandler.ListOrganizations(appOrgScope))
 	appOrgs.GET("/:org", orgHandler.GetOrganization(appOrgScope))
@@ -1118,7 +1152,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	appOrgs.GET("/:org/invitations", orgHandler.ListInvitations(appOrgScope))
 	appOrgs.DELETE("/:org/invitations/:inv", orgHandler.RevokeInvitation(appOrgScope))
 	authGroup.GET("/apps/users/:uid/organizations", orgHandler.ListUserOrganizations(appOrgScope),
-		mw.TokenRateLimiter(rlCfg), appClientRateLimit)
+		s2s.Resolve(mw.SurfaceApp), appClientRateLimit)
 
 	// jwtRenew is used on all cookie-aware protected routes.
 	// It validates the access token and, when expired, transparently rotates

@@ -304,6 +304,31 @@ func (s *AuthService) storeOrganizationSelection(ctx context.Context, userID, te
 	}, nil
 }
 
+// OrganizationSelectionScope reports the tenant and application (0 for a
+// tenant-level sign-in) a pending organisation selection belongs to. Read only:
+// it neither consumes the token nor counts as a use. ok is false when the token
+// names no live selection.
+//
+// For the rate limiter, which charges a backend's request to its own
+// application's quota only for its own users (see middleware.ScopeToCaller).
+func (s *AuthService) OrganizationSelectionScope(ctx context.Context, selectionToken string) (tenantID, appID int64, ok bool) {
+	if s.redisCli == nil || selectionToken == "" {
+		return 0, 0, false
+	}
+	blob, err := s.redisCli.Get(ctx, orgSelectionKeyPrefix+HashToken(selectionToken)).Bytes()
+	if err != nil {
+		return 0, 0, false
+	}
+	var st orgSelectionState
+	if json.Unmarshal(blob, &st) != nil {
+		return 0, 0, false
+	}
+	if id := appRowIDFromClaim(st.AppID); id != nil {
+		appID = *id
+	}
+	return st.TenantID, appID, true
+}
+
 // CompleteOrganizationSelection finishes a sign-in that stopped at an
 // organisation choice. The token is single-use: it is deleted before the mint,
 // so a replay fails whether or not the first attempt succeeded.

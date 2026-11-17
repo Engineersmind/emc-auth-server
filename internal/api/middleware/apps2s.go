@@ -465,6 +465,11 @@ const (
 	SurfaceOAuth   = "oauth"   // /auth/oauth/exchange, /oauth/token, /oauth/revoke
 	SurfacePasskey = "passkey" // /auth/passkey/login/complete
 	SurfaceAccount = "account" // /auth/resend-verification
+	// SurfaceOrg: /auth/apps/login/organization, /apps/switch-organization and
+	// the organisation invitation preview/accept routes.
+	SurfaceOrg = "org"
+	// SurfaceSession: /auth/refresh and /auth/logout.
+	SurfaceSession = "session"
 )
 
 func headerCredentials(c echo.Context) (string, string, bool) {
@@ -666,6 +671,18 @@ func ScopeSignedInUser(c echo.Context) (tenantID, appID int64, ok bool) {
 func ScopeByBodyToken(field string, lookup func(ctx context.Context, token string) (tenantID, appID int64, ok bool)) SubjectScopeFunc {
 	return func(c echo.Context) (int64, int64, bool) {
 		token := peekBodyString(c, field)
+		if token == "" {
+			return 0, 0, false
+		}
+		return lookup(c.Request().Context(), token)
+	}
+}
+
+// ScopeByQueryToken is ScopeByBodyToken for a route whose subject is a token in
+// the URL query (GET .../invitations/preview?token=).
+func ScopeByQueryToken(param string, lookup func(ctx context.Context, token string) (tenantID, appID int64, ok bool)) SubjectScopeFunc {
+	return func(c echo.Context) (int64, int64, bool) {
+		token := c.QueryParam(param)
 		if token == "" {
 			return 0, 0, false
 		}
