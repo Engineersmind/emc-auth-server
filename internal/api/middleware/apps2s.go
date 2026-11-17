@@ -146,6 +146,10 @@ type AppUserLimits struct {
 	OAuthExchange      int // /auth/oauth/exchange
 	PasskeyLogin       int // /auth/passkey/login/complete
 	ResendVerification int // /auth/resend-verification
+	// Passwordless email-code sign-in. Start sends mail, so it is per recipient;
+	// verify and resend redeem or rotate a code, so they are per end-user IP.
+	PasswordlessStart  int
+	PasswordlessVerify int
 }
 
 // AppS2SConfig sizes the limits. Zero values take the defaults, never "unlimited".
@@ -198,6 +202,8 @@ func DefaultAppUserLimits() AppUserLimits {
 		OAuthExchange:      5,
 		PasskeyLogin:       5,
 		ResendVerification: 5,
+		PasswordlessStart:  5,
+		PasswordlessVerify: 10,
 	}
 }
 
@@ -226,6 +232,8 @@ func (cfg AppS2SConfig) withDefaults() AppS2SConfig {
 		OAuthExchange:      pick(cfg.Users.OAuthExchange, def.OAuthExchange),
 		PasskeyLogin:       pick(cfg.Users.PasskeyLogin, def.PasskeyLogin),
 		ResendVerification: pick(cfg.Users.ResendVerification, def.ResendVerification),
+		PasswordlessStart:  pick(cfg.Users.PasswordlessStart, def.PasswordlessStart),
+		PasswordlessVerify: pick(cfg.Users.PasswordlessVerify, def.PasswordlessVerify),
 	}
 	return cfg
 }
@@ -294,6 +302,8 @@ var userLimitKeys = map[string]string{
 	"app_oauth_exchange_user":      auth.UserLimitOAuthExchange,
 	"app_passkey_login_user":       auth.UserLimitPasskeyLogin,
 	"app_resend_verification_user": auth.UserLimitResendVerification,
+	"app_passwordless_start_user":  auth.UserLimitPasswordlessStart,
+	"app_passwordless_verify_user": auth.UserLimitPasswordlessVerify,
 }
 
 // ByKey returns the limits keyed like auth.UserLimitDefs, for the admin API to
@@ -312,6 +322,8 @@ func (u AppUserLimits) ByKey() map[string]int {
 		auth.UserLimitOAuthExchange:      u.OAuthExchange,
 		auth.UserLimitPasskeyLogin:       u.PasskeyLogin,
 		auth.UserLimitResendVerification: u.ResendVerification,
+		auth.UserLimitPasswordlessStart:  u.PasswordlessStart,
+		auth.UserLimitPasswordlessVerify: u.PasswordlessVerify,
 	}
 }
 

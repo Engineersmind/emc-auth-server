@@ -24,6 +24,7 @@ type captureMailer struct {
 	mu            sync.Mutex
 	sent          []mailer.MFACodeEmail
 	links         []mailer.MagicLinkEmail
+	pwless        []mailer.PasswordlessCodeEmail
 	resets        []mailer.ResetEmail
 	verifications []mailer.VerificationEmail
 	welcomes      []mailer.WelcomeEmail
@@ -793,4 +794,38 @@ func TestResetUserMFA_ScopedAndIdempotent(t *testing.T) {
 	if err := f.totpSvc.ResetUserMFA(f.ctx, f.tenantID, &appAID, userA); err != nil {
 		t.Errorf("second ResetUserMFA error = %v, want nil (idempotent)", err)
 	}
+}
+
+func (m *captureMailer) SendPasswordlessCode(ctx context.Context, sender *mailer.SMTPConfig, _ *mailer.Template, e mailer.PasswordlessCodeEmail) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pwless = append(m.pwless, e)
+	m.senders = append(m.senders, sender)
+	return nil
+}
+
+// passwordlessCount returns how many passwordless code emails were sent.
+func (m *captureMailer) passwordlessCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pwless)
+}
+
+// lastPasswordless waits briefly for an (asynchronously sent) passwordless code
+// email beyond the first `after` and returns the latest one.
+func (m *captureMailer) lastPasswordless(t *testing.T, after int) mailer.PasswordlessCodeEmail {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		m.mu.Lock()
+		if len(m.pwless) > after {
+			e := m.pwless[len(m.pwless)-1]
+			m.mu.Unlock()
+			return e
+		}
+		m.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no passwordless code email was sent (had %d, want > %d)", m.passwordlessCount(), after)
+	return mailer.PasswordlessCodeEmail{}
 }

@@ -141,6 +141,11 @@ type RoutesConfig struct {
 	// organisation routes answer 404 — byte-identical to the behaviour before
 	// the feature existed. See config.Config.OrganizationsEnabled.
 	OrganizationsEnabled bool
+
+	// PasswordlessEnabled and PasswordlessCodeHMACKey configure passwordless
+	// sign-in by emailed code. See config.Config.PasswordlessEnabled.
+	PasswordlessEnabled     bool
+	PasswordlessCodeHMACKey string
 	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
 	// Required when CaptchaEnabled is true.
 	CaptchaHMACKey string
@@ -542,6 +547,22 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithHasher(passwordHasher).
 		WithNotifier(auth.NewEmailNotifier(m, deps.Logger).WithSenders(senderSvc).WithTemplates(tmplSvc))
 	authSvc.WithOrganizations(orgSvc)
+
+	// Passwordless sign-in by emailed code (issue #203). The policy service is
+	// always built (the admin API edits it whether or not the feature is on); the
+	// flow itself is wired into the auth service only when PASSWORDLESS_ENABLED is
+	// set, so with the switch off every application is password only and the
+	// password endpoints never consult the policy.
+	pwlessPolicySvc := auth.NewPasswordlessPolicyService(deps.Pool, deps.Logger).
+		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
+			return totpSvc.GetAppMFAConfig(ctx, appRowID)
+		}).
+		WithTemplateEnabled(func(ctx context.Context, tenantID int64, appRowID *int64) bool {
+			return tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordlessCode)
+		})
+	totpSvc.WithEmailCodeCheck(func(ctx context.Context, tenantID, appRowID int64) bool {
+		return pwlessPolicySvc.Resolve(ctx, tenantID, &appRowID).EmailOTPEnabled
+	})
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)
@@ -575,6 +596,16 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	auditLog := deps.Audit
 	if auditLog == nil {
 		auditLog = audit.New(deps.Pool, deps.Logger)
+	}
+
+	if deps.Config.PasswordlessEnabled {
+		pwlessKey, keyErr := auth.PasswordlessKeyFromConfig(deps.Config.Env, deps.Config.PasswordlessCodeHMACKey)
+		if keyErr != nil {
+			deps.Logger.Fatal().Err(keyErr).Msg("passwordless init failed — check PASSWORDLESS_CODE_HMAC_KEY")
+		}
+		authSvc.WithPasswordless(pwlessPolicySvc, pwlessKey, auditLog)
+		resetSvc.WithPasswordless(pwlessPolicySvc)
+		deps.Logger.Info().Msg("passwordless sign-in is ENABLED")
 	}
 
 	// Wire the audit logger into the send services so a template-disabled
@@ -807,10 +838,18 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// after the resolver's cache expires — which matters most in the direction
 	// nobody plans for: turning the feature off because it is blocking people.
 	adminSvc.WithCaptchaPolicy(captchaPolicySvc)
+	adminHandler.WithPasswordlessAdmin(handlers.PasswordlessAdminDeps{
+		Policy:        pwlessPolicySvc,
+		Admin:         auth.NewPasswordlessAdminService(deps.Pool, pwlessPolicySvc),
+		Auth:          authSvc,
+		EmailChange:   emailChangeSvc,
+		ServerEnabled: deps.Config.PasswordlessEnabled,
+	})
 	// The gate itself. Must come after captchaSvc exists, which is why it is here
 	// rather than in the authHandler builder chain above.
 	authHandler.WithAuthorization(authzSvc)
 	authHandler.WithCaptcha(captchaSvc)
+	authHandler.WithPasswordless(deps.Config.PasswordlessEnabled)
 	authzSessions := auth.NewAuthzSessionStore(deps.Redis)
 	authorizeHandler := handlers.NewOAuthAuthorizeHandler(
 		authzSvc, authzSessions, authSvc, auditLog, deps.Logger, cookieCfg.Secure,
@@ -1083,6 +1122,23 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/apps/login/magic/verify", authHandler.AppMagicLinkVerify,
 		s2s.Resolve(mw.SurfaceApp), appClientRateLimit,
 		s2s.GuessLimit("app_magic_link_verify_user", userLimits.MagicLinkVerify))
+
+	// Passwordless sign-in by emailed code (issue #203). Answers 404 while
+	// PASSWORDLESS_ENABLED is false. Start sends mail, so it is limited per
+	// recipient and, via its own bucket, can never spend the quota real password
+	// logins use. Resend and verify redeem or rotate a code, so they are limited
+	// per end-user IP like magic-link verify, because a per-code key would be
+	// useless: every guess is a new code.
+	pwlessClientRateLimit := mw.PasswordlessClientRateLimiter(appLimitSvc, deps.Redis, deps.Logger)
+	authGroup.POST("/apps/passwordless/start", authHandler.PasswordlessStart,
+		s2s.Resolve(mw.SurfaceApp), pwlessClientRateLimit,
+		s2s.UserLimit("app_passwordless_start_user", userLimits.PasswordlessStart, mw.SubjectEmail))
+	authGroup.POST("/apps/passwordless/resend", authHandler.PasswordlessResend,
+		s2s.Resolve(mw.SurfaceApp), pwlessClientRateLimit,
+		s2s.GuessLimit("app_passwordless_verify_user", userLimits.PasswordlessVerify))
+	authGroup.POST("/apps/passwordless/verify", authHandler.PasswordlessVerify,
+		s2s.Resolve(mw.SurfaceApp), pwlessClientRateLimit,
+		s2s.GuessLimit("app_passwordless_verify_user", userLimits.PasswordlessVerify))
 
 	// Organizations — end-user flows. Each answers 404 while
 	// ORGANIZATIONS_ENABLED is false. They carry no client secret (a browser
@@ -1507,6 +1563,34 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/captcha-policy", adminHandler.UpdateCaptchaPolicy, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/captcha-policy", adminHandler.DeleteCaptchaPolicy, appAppsWrite)
 
+	// Passwordless sign-in policy and recovery (issue #203). Answers 503 until
+	// the services are attached; the routes work whether or not
+	// PASSWORDLESS_ENABLED is on, so a policy can be prepared before the switch is
+	// turned on. Application administrators edit their own application within the
+	// platform ceilings; tenant defaults and the sensitive transitions (open
+	// sign-up, close the password flow) are checked in the handler against the
+	// caller's scope.
+	adminGroup.GET("/tenants/:tid/passwordless-policy", adminHandler.GetPasswordlessPolicy, tidAppsRead)
+	adminGroup.PUT("/tenants/:tid/passwordless-policy", adminHandler.PutPasswordlessPolicy, tidAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/passwordless-policy", adminHandler.DeletePasswordlessPolicy, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/passwordless-policy/history", adminHandler.PasswordlessHistory, tidAppsRead)
+	adminGroup.POST("/tenants/:tid/passwordless-policy/history/:hid/restore", adminHandler.PasswordlessRestore, tidAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/passwordless-policy", adminHandler.GetPasswordlessPolicy, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/passwordless-policy", adminHandler.PutPasswordlessPolicy, appAppsWrite)
+	adminGroup.DELETE("/tenants/:tid/applications/:appID/passwordless-policy", adminHandler.DeletePasswordlessPolicy, appAppsWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/passwordless-policy/impact", adminHandler.PasswordlessImpact, appAppsRead)
+	adminGroup.GET("/tenants/:tid/applications/:appID/passwordless-policy/history", adminHandler.PasswordlessHistory, appAppsRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/passwordless-policy/history/:hid/restore", adminHandler.PasswordlessRestore, appAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/passwordless/stats", adminHandler.PasswordlessStats, appAppsRead)
+	adminGroup.GET("/tenants/:tid/users/:uid/auth-methods", adminHandler.UserAuthMethods, tidUsersRead)
+	adminGroup.POST("/tenants/:tid/users/:uid/verify-email", adminHandler.VerifyUserEmail, tidUsersWrite)
+	adminGroup.POST("/tenants/:tid/users/:uid/clear-passwordless-throttle", adminHandler.ClearPasswordlessThrottle, tidUsersWrite)
+	adminGroup.PUT("/tenants/:tid/users/:uid/email", adminHandler.ChangeUserEmail, tidUsersWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/users/:uid/auth-methods", adminHandler.UserAuthMethods, appUsersRead)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/verify-email", adminHandler.VerifyUserEmail, appUsersWrite)
+	adminGroup.POST("/tenants/:tid/applications/:appID/users/:uid/clear-passwordless-throttle", adminHandler.ClearPasswordlessThrottle, appUsersWrite)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/users/:uid/email", adminHandler.ChangeUserEmail, appUsersWrite)
+
 	adminGroup.GET("/tenants/:tid/permissions", adminHandler.ListPermissions, tidPermsRead)
 	adminGroup.POST("/tenants/:tid/permissions", adminHandler.CreatePermission, tidPermsWrite)
 	adminGroup.PUT("/tenants/:tid/permissions/:pid", adminHandler.UpdatePermission, tidPermsWrite)
@@ -1916,6 +2000,23 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.GET("/applications/:appID/captcha-policy", adminHandler.GetCaptchaPolicy, appsRead)
 	adminGroup.PUT("/applications/:appID/captcha-policy", adminHandler.UpdateCaptchaPolicy, appsWrite)
 	adminGroup.DELETE("/applications/:appID/captcha-policy", adminHandler.DeleteCaptchaPolicy, appsWrite)
+	// Slug-less passwordless variants — the caller's own tenant.
+	adminGroup.GET("/platform/passwordless-policy", adminHandler.GetPlatformPasswordlessPolicy, platformOnly)
+	adminGroup.PUT("/platform/passwordless-policy", adminHandler.PutPlatformPasswordlessPolicy, platformOnly)
+	adminGroup.GET("/passwordless-policy", adminHandler.GetPasswordlessPolicy, appsRead)
+	adminGroup.PUT("/passwordless-policy", adminHandler.PutPasswordlessPolicy, appsWrite)
+	adminGroup.DELETE("/passwordless-policy", adminHandler.DeletePasswordlessPolicy, appsWrite)
+	adminGroup.GET("/applications/:appID/passwordless-policy", adminHandler.GetPasswordlessPolicy, appsRead)
+	adminGroup.PUT("/applications/:appID/passwordless-policy", adminHandler.PutPasswordlessPolicy, appsWrite)
+	adminGroup.DELETE("/applications/:appID/passwordless-policy", adminHandler.DeletePasswordlessPolicy, appsWrite)
+	adminGroup.POST("/applications/:appID/passwordless-policy/impact", adminHandler.PasswordlessImpact, appsRead)
+	adminGroup.GET("/applications/:appID/passwordless-policy/history", adminHandler.PasswordlessHistory, appsRead)
+	adminGroup.POST("/applications/:appID/passwordless-policy/history/:hid/restore", adminHandler.PasswordlessRestore, appsWrite)
+	adminGroup.GET("/applications/:appID/passwordless/stats", adminHandler.PasswordlessStats, appsRead)
+	adminGroup.GET("/applications/:appID/users/:uid/auth-methods", adminHandler.UserAuthMethods, usersRead)
+	adminGroup.POST("/applications/:appID/users/:uid/verify-email", adminHandler.VerifyUserEmail, usersWrite)
+	adminGroup.POST("/applications/:appID/users/:uid/clear-passwordless-throttle", adminHandler.ClearPasswordlessThrottle, usersWrite)
+	adminGroup.PUT("/applications/:appID/users/:uid/email", adminHandler.ChangeUserEmail, usersWrite)
 
 	adminGroup.GET("/users/:uid/passkeys", adminHandler.ListUserPasskeys, usersRead)
 	adminGroup.DELETE("/users/:uid/passkeys/:pid", adminHandler.RevokeUserPasskey, usersWrite)
