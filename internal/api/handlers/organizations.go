@@ -974,7 +974,9 @@ func (h *OrganizationHandler) SelectOrganization(c echo.Context) error {
 		return fail(c, http.StatusNotFound, "not_found")
 	}
 	var req SelectOrganizationRequest
-	if err := c.Bind(&req); err != nil {
+	// DecodeBody, not Bind: the rate limiter reads selection_token with the same
+	// decoder, so both see one subject (a padded body cannot hide it from the limiter).
+	if err := mw.DecodeBody(c, &req); err != nil {
 		return orgFail(c, http.StatusBadRequest, "invalid_request", "Invalid request body.")
 	}
 	tokens, err := h.authSvc.CompleteOrganizationSelection(c.Request().Context(), req.SelectionToken, req.Organization)
@@ -1022,7 +1024,8 @@ func (h *OrganizationHandler) SwitchOrganization(c echo.Context) error {
 		return fail(c, http.StatusNotFound, "not_found")
 	}
 	var req SwitchOrganizationRequest
-	if err := c.Bind(&req); err != nil {
+	// DecodeBody, not Bind: see SelectOrganization.
+	if err := mw.DecodeBody(c, &req); err != nil {
 		return orgFail(c, http.StatusBadRequest, "invalid_request", "Invalid request body.")
 	}
 	// The refresh token is accepted from the body ONLY. Falling back to the
@@ -1164,7 +1167,8 @@ func (h *OrganizationHandler) AcceptInvitation(c echo.Context) error {
 		return fail(c, http.StatusNotFound, "not_found")
 	}
 	var req AcceptOrganizationInvitationRequest
-	if err := c.Bind(&req); err != nil {
+	// DecodeBody, not Bind: see SelectOrganization.
+	if err := mw.DecodeBody(c, &req); err != nil {
 		return orgFail(c, http.StatusBadRequest, "invalid_request", "Invalid request body.")
 	}
 	ctx := c.Request().Context()

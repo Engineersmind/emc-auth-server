@@ -2527,6 +2527,36 @@ type GraceResult struct {
 	OrgPermissions []string
 }
 
+// RefreshTokenScope reports the tenant and application (0 for a tenant-level
+// session) a live refresh token belongs to. Read only: it neither rotates nor
+// revokes. ok is false when the token names no live session, an expired or
+// made-up token.
+//
+// For the rate limiter, which charges a backend's refresh, logout and
+// switch-organization calls to its own application's quota only for its own
+// users (see middleware.ScopeToCaller).
+func (s *AuthService) RefreshTokenScope(ctx context.Context, rawRefreshToken string) (tenantID, appID int64, ok bool) {
+	if rawRefreshToken == "" {
+		return 0, 0, false
+	}
+	var appRowID *int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT s.tenant_id, s.application_id
+		FROM refresh_tokens rt
+		JOIN user_sessions s ON s.id = rt.session_id
+		WHERE rt.token_hash = $1
+		  AND `+LiveTokenWhere("rt.")+`
+		  AND `+LiveSessionWhere("s."),
+		HashToken(rawRefreshToken)).Scan(&tenantID, &appRowID)
+	if err != nil {
+		return 0, 0, false
+	}
+	if appRowID != nil {
+		appID = *appRowID
+	}
+	return tenantID, appID, true
+}
+
 // Refresh rotates a refresh token pair (AUTH-03).
 func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*AuthResult, error) {
 	hash := HashToken(rawRefreshToken)
