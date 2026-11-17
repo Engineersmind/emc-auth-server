@@ -251,3 +251,38 @@ func TestPasswordlessAdmin_UnconfiguredAnswers503(t *testing.T) {
 		t.Errorf("unconfigured GET = %d, want 503", code)
 	}
 }
+
+// Deleting an override is a write whose result the parent chooses: an application
+// administrator must not reach, by deleting, a state PUT refuses.
+func TestPasswordlessAdmin_DeleteNeedsTenantOwnerForSensitiveResult(t *testing.T) {
+	e := newPWAdminEnv(t)
+	// Tenant defaults: codes on, password off. The application keeps passwords with an override.
+	if code, out := e.call(e.h.PutPasswordlessPolicy, e.owner(), http.MethodPut,
+		`{"policy":{"email_otp_enabled":true,"password_enabled":false},"version":0}`, e.tenantParams()); code != http.StatusOK {
+		t.Fatalf("tenant PUT = %d %v", code, out)
+	}
+	if code, out := e.call(e.h.PutPasswordlessPolicy, e.owner(), http.MethodPut,
+		`{"policy":{"password_enabled":true},"version":0}`, e.appParams()); code != http.StatusOK {
+		t.Fatalf("app PUT = %d %v", code, out)
+	}
+	if code, out := e.call(e.h.DeletePasswordlessPolicy, e.appAdmin(), http.MethodDelete, "", e.appParams()); code != http.StatusForbidden || out["error"] != "tenant_owner_required" {
+		t.Errorf("app admin DELETE closing the password flow = %d %v, want 403 tenant_owner_required", code, out)
+	}
+	if code, _ := e.call(e.h.DeletePasswordlessPolicy, e.owner(), http.MethodDelete, "", e.appParams()); code != http.StatusOK {
+		t.Errorf("owner DELETE = %d, want 200", code)
+	}
+}
+
+// A parent write is validated against the overrides beneath it.
+func TestPasswordlessAdmin_ParentWriteValidatedAgainstChildren(t *testing.T) {
+	e := newPWAdminEnv(t)
+	if code, out := e.call(e.h.PutPasswordlessPolicy, e.owner(), http.MethodPut,
+		`{"policy":{"email_otp_enabled":false},"version":0}`, e.appParams()); code != http.StatusOK {
+		t.Fatalf("app PUT = %d %v", code, out)
+	}
+	code, out := e.call(e.h.PutPasswordlessPolicy, e.owner(), http.MethodPut,
+		`{"policy":{"email_otp_enabled":true,"password_enabled":false},"version":0}`, e.tenantParams())
+	if code != http.StatusUnprocessableEntity || out["error"] != "no_first_factor" {
+		t.Errorf("tenant PUT stranding a child = %d %v, want 422 no_first_factor", code, out)
+	}
+}

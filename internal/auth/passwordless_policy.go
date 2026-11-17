@@ -603,6 +603,11 @@ func (s *PasswordlessPolicyService) Validate(ctx context.Context, sc Passwordles
 	if !eff.EmailOTPEnabled && !eff.PasswordEnabled {
 		return eff, ErrPasswordlessNoFirstFactor
 	}
+	if sc.Level() != "application" {
+		if err := s.validateDescendants(ctx, sc, platform, tenant); err != nil {
+			return eff, err
+		}
+	}
 	if eff.EmailOTPEnabled && sc.ApplicationID != nil {
 		if s.mfaConfig != nil {
 			mode, methods, mErr := s.mfaConfig(ctx, *sc.ApplicationID)
@@ -618,6 +623,105 @@ func (s *PasswordlessPolicyService) Validate(ctx context.Context, sc Passwordles
 		}
 	}
 	return eff, nil
+}
+
+// validateDescendants checks that a proposed platform or tenant row leaves every
+// override beneath it with a first factor. platform and tenant are the rows as
+// they would be after the write. An application that overrode
+// email_otp_enabled=false must not be left with no password either.
+func (s *PasswordlessPolicyService) validateDescendants(ctx context.Context, sc PasswordlessScope, platform, tenant *PasswordlessPolicyRow) error {
+	rows, err := s.pool.Query(ctx, `SELECT `+passwordlessRowColumns+` FROM passwordless_policies
+		WHERE tenant_id IS NOT NULL AND ($1::BIGINT IS NULL OR tenant_id = $1)`, sc.TenantID)
+	if err != nil {
+		return fmt.Errorf("read descendant policies: %w", err)
+	}
+	defer rows.Close()
+	var tenantRows = map[int64]*PasswordlessPolicyRow{}
+	var appRows []PasswordlessPolicyRow
+	for rows.Next() {
+		r, err := scanPasswordlessRow(rows)
+		if err != nil {
+			return err
+		}
+		if r.ApplicationID == nil {
+			rr := r
+			tenantRows[*r.TenantID] = &rr
+		} else {
+			appRows = append(appRows, r)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	noFactor := func(e PasswordlessSettings) bool { return !e.EmailOTPEnabled && !e.PasswordEnabled }
+	if sc.Level() == "platform" {
+		for _, tr := range tenantRows {
+			if noFactor(MergePasswordlessPolicy(platform, tr, nil)) {
+				return ErrPasswordlessNoFirstFactor
+			}
+		}
+	}
+	for i := range appRows {
+		ar := &appRows[i]
+		t := tenant
+		if sc.Level() == "platform" {
+			t = tenantRows[*ar.TenantID]
+		}
+		eff := MergePasswordlessPolicy(platform, t, ar)
+		if noFactor(eff) {
+			return ErrPasswordlessNoFirstFactor
+		}
+		if eff.EmailOTPEnabled && s.mfaConfig != nil {
+			mode, methods, mErr := s.mfaConfig(ctx, *ar.ApplicationID)
+			if mErr != nil {
+				return fmt.Errorf("read application MFA policy: %w", mErr)
+			}
+			if mode == MFAModeRequired && len(methods) == 1 && methods[0] == MFAMethodEmail {
+				return ErrPasswordlessMFAConflict
+			}
+		}
+	}
+	return nil
+}
+
+// ProjectApp returns an application's effective policy before and after in
+// replaces the row at sc (nil in removes it, i.e. a delete). sc may be the
+// application, its tenant or the platform.
+func (s *PasswordlessPolicyService) ProjectApp(ctx context.Context, sc PasswordlessScope, in *PasswordlessPolicyRow, tenantID, appID int64) (before, after PasswordlessSettings, err error) {
+	platform, tenant, app, err := s.chain(ctx, s.pool, tenantID, &appID)
+	if err != nil {
+		return before, after, err
+	}
+	before = MergePasswordlessPolicy(platform, tenant, app)
+	switch sc.Level() {
+	case "platform":
+		platform = in
+	case "tenant":
+		tenant = in
+	default:
+		app = in
+	}
+	return before, MergePasswordlessPolicy(platform, tenant, app), nil
+}
+
+// AppsInScope lists the applications a policy write at sc can change.
+func (s *PasswordlessPolicyService) AppsInScope(ctx context.Context, sc PasswordlessScope) (map[int64]int64, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, tenant_id FROM oauth_clients
+		WHERE deleted_at IS NULL AND ($1::BIGINT IS NULL OR tenant_id = $1) AND ($2::BIGINT IS NULL OR id = $2)`,
+		sc.TenantID, sc.ApplicationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]int64{}
+	for rows.Next() {
+		var id, tid int64
+		if err := rows.Scan(&id, &tid); err != nil {
+			return nil, err
+		}
+		out[id] = tid
+	}
+	return out, rows.Err()
 }
 
 // Put creates or replaces the overrides at a scope, writing a history entry in
@@ -851,6 +955,15 @@ func (s *PasswordlessPolicyService) History(ctx context.Context, sc Passwordless
 // Restore writes a NEW version from an old history snapshot. History is never
 // rewritten. currentVersion is the version the caller last saw.
 func (s *PasswordlessPolicyService) Restore(ctx context.Context, sc PasswordlessScope, historyID int64, currentVersion int, actor *int64) (*PasswordlessPolicyRow, error) {
+	row, err := s.Snapshot(ctx, sc, historyID)
+	if err != nil {
+		return nil, err
+	}
+	return s.Put(ctx, sc, PasswordlessWriteInput{Row: *row, Version: currentVersion, Actor: actor, Action: "restore"})
+}
+
+// Snapshot returns the policy row stored in a history entry at sc.
+func (s *PasswordlessPolicyService) Snapshot(ctx context.Context, sc PasswordlessScope, historyID int64) (*PasswordlessPolicyRow, error) {
 	var snap []byte
 	err := s.pool.QueryRow(ctx, `
 		SELECT snapshot FROM passwordless_policy_history
@@ -866,5 +979,5 @@ func (s *PasswordlessPolicyService) Restore(ctx context.Context, sc Passwordless
 	if err := json.Unmarshal(snap, &row); err != nil {
 		return nil, err
 	}
-	return s.Put(ctx, sc, PasswordlessWriteInput{Row: row, Version: currentVersion, Actor: actor, Action: "restore"})
+	return &row, nil
 }

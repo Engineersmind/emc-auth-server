@@ -3459,6 +3459,9 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		if errors.Is(err, auth.ErrAppNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 		}
+		if errors.Is(err, auth.ErrPasswordlessMFAConflict) {
+			return c.JSON(http.StatusUnprocessableEntity, map[string]string{"error": "passwordless_mfa_conflict", "message": err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("admin: set application MFA policy failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})
 	}

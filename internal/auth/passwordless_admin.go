@@ -172,6 +172,42 @@ func (s *PasswordlessAdminService) SwitchGuard(ctx context.Context, tenantID, ap
 	return nil
 }
 
+// SwitchGuardScope applies SwitchGuard to every application a write at sc would
+// change, using each one's resolved policy: an application, a tenant default, the
+// platform default, a delete (in == nil) or a restore. Without override it
+// refuses when any application would become password only while it has active
+// users with no stored password.
+func (s *PasswordlessAdminService) SwitchGuardScope(ctx context.Context, sc PasswordlessScope, in *PasswordlessPolicyRow, override bool) error {
+	if override {
+		return nil
+	}
+	apps, err := s.policy.AppsInScope(ctx, sc)
+	if err != nil {
+		return err
+	}
+	for appID, tenantID := range apps {
+		before, after, err := s.policy.ProjectApp(ctx, sc, in, tenantID, appID)
+		if err != nil {
+			return err
+		}
+		if after.Mode() != PasswordlessModePasswordOnly || !before.EmailOTPEnabled {
+			continue
+		}
+		var n int
+		if err := s.pool.QueryRow(ctx, `
+			SELECT count(*) FROM users u
+			WHERE u.tenant_id = $1 AND u.application_id = $2 AND u.is_active AND u.deleted_at IS NULL
+			  AND NOT EXISTS (SELECT 1 FROM user_credentials c WHERE c.user_id = u.id)`,
+			tenantID, appID).Scan(&n); err != nil {
+			return fmt.Errorf("count users without a password: %w", err)
+		}
+		if n > 0 {
+			return ErrPasswordlessNoPasswordUsers
+		}
+	}
+	return nil
+}
+
 // PasswordlessStats are usage counters over a window, read from the audit log.
 type PasswordlessStats struct {
 	Window            string `json:"window"`
@@ -339,8 +375,13 @@ func (s *PasswordlessAdminService) UserApplication(ctx context.Context, tenantID
 	var app *int64
 	err := s.pool.QueryRow(ctx, `SELECT application_id FROM users WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
 		userID, tenantID).Scan(&app)
-	if errors.Is(err, pgx.ErrNoRows) || (err == nil && app == nil) {
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return 0, ErrPasswordlessPolicyNotFound
+	case err != nil:
+		return 0, err
+	case app == nil:
 		return 0, ErrPasswordlessPolicyNotFound
 	}
-	return *app, err
+	return *app, nil
 }

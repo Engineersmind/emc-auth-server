@@ -218,6 +218,19 @@ func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 	if methods != nil && !ValidMFAMethods(methods) {
 		return ErrInvalidMFAMethods
 	}
+	// Required MFA with email as the only method cannot be satisfied by a user who
+	// signed in with an emailed code, so refuse it while email codes are on.
+	if mode == MFAModeRequired && s.emailCodeEnabled != nil {
+		eff := methods
+		if eff == nil {
+			if _, cur, cErr := s.GetAppMFAConfig(ctx, appRowID); cErr == nil {
+				eff = cur
+			}
+		}
+		if len(eff) == 1 && eff[0] == MFAMethodEmail && s.emailCodeEnabled(ctx, tenantID, appRowID) {
+			return ErrPasswordlessMFAConflict
+		}
+	}
 	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO application_mfa_settings (application_id, tenant_id, mode, allowed_methods, updated_by, updated_at)
 		VALUES ($1, $2, $3, COALESCE($4, '{totp}'::TEXT[]), $5, NOW())

@@ -28,9 +28,12 @@ const (
 
 // TOTPService handles TOTP enrollment, verification, and management.
 type TOTPService struct {
-	pool   *pgxpool.Pool
-	encKey []byte
-	logger zerolog.Logger
+	// emailCodeEnabled reports whether email-code sign-in is on for an application
+	// (nil = never). Used to refuse an MFA policy that email-code users could not satisfy.
+	emailCodeEnabled func(ctx context.Context, tenantID, appRowID int64) bool
+	pool             *pgxpool.Pool
+	encKey           []byte
+	logger           zerolog.Logger
 }
 
 // ErrTOTPZeroKey is returned when TOTP_ENCRYPTION_KEY is the all-zero dev key
@@ -512,4 +515,11 @@ func completionSessionContext(session *OTPSession) sessionContext {
 		sc.grant = GrantEmailOTP
 	}
 	return sc
+}
+
+// WithEmailCodeCheck supplies the email-code policy reader that SetAppMFAPolicy
+// uses to refuse required MFA with email as the only method.
+func (s *TOTPService) WithEmailCodeCheck(f func(ctx context.Context, tenantID, appRowID int64) bool) *TOTPService {
+	s.emailCodeEnabled = f
+	return s
 }

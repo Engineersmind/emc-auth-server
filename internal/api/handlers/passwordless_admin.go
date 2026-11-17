@@ -204,12 +204,8 @@ func (h *AdminHandler) PutPasswordlessPolicy(c echo.Context) error {
 				"message": "Only a tenant owner can turn on sign-up by code or close the password flow."})
 		}
 	}
-	if p.appID != nil && h.pwless.Admin != nil {
-		if err := h.pwless.Admin.SwitchGuard(ctx, p.tenantID, *p.appID, req.Policy, req.OverrideNoPasswordUsers); err != nil {
-			if handled, resp := pwlessErr(c, err); handled {
-				return resp
-			}
-		}
+	if handled, resp := h.pwlessSwitchGuard(c, p.scope, &req.Policy, req.OverrideNoPasswordUsers); handled {
+		return resp
 	}
 
 	saved, err := h.pwless.Policy.Put(ctx, p.scope, auth.PasswordlessWriteInput{
@@ -232,6 +228,25 @@ func (h *AdminHandler) PutPasswordlessPolicy(c echo.Context) error {
 	h.auditPasswordlessChange(c, p, "set", saved)
 	view, _ := h.pwless.Policy.View(ctx, p.scope)
 	return c.JSON(http.StatusOK, PasswordlessPolicyResponse{view, h.pwless.ServerEnabled})
+}
+
+// pwlessSwitchGuard refuses a change (PUT, DELETE with in == nil, restore) that
+// would leave an application password only while active users have no password,
+// unless the administrator confirmed it. It covers every application the write
+// reaches, so tenant and platform defaults are guarded like an application's own.
+func (h *AdminHandler) pwlessSwitchGuard(c echo.Context, sc auth.PasswordlessScope, in *auth.PasswordlessPolicyRow, override bool) (bool, error) {
+	if h.pwless.Admin == nil {
+		return false, nil
+	}
+	err := h.pwless.Admin.SwitchGuardScope(c.Request().Context(), sc, in, override)
+	if err == nil {
+		return false, nil
+	}
+	if handled, resp := pwlessErr(c, err); handled {
+		return true, resp
+	}
+	h.logger.Error().Err(err).Msg("admin: passwordless switch guard failed")
+	return true, c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to check the effect of this change"})
 }
 
 func (h *AdminHandler) auditPasswordlessChange(c echo.Context, p *pwlessCtx, how string, saved *auth.PasswordlessPolicyRow) {
@@ -263,7 +278,27 @@ func (h *AdminHandler) DeletePasswordlessPolicy(c echo.Context) error {
 	if p.appID == nil && !tenantWide(p.claims) {
 		return c.JSON(http.StatusForbidden, map[string]string{"error": "tenant_owner_required"})
 	}
-	if err := h.pwless.Policy.Delete(c.Request().Context(), p.scope, actorID(p.claims)); err != nil {
+	var body struct {
+		OverrideNoPasswordUsers bool `json:"override_no_password_users"`
+	}
+	_ = c.Bind(&body)
+	ctx := c.Request().Context()
+	// Deleting an override is a write whose result the parent chooses, so apply
+	// the checks PUT applies to the inherited result.
+	if p.appID != nil && !tenantWide(p.claims) {
+		before, after, err := h.pwless.Policy.ProjectApp(ctx, p.scope, nil, p.tenantID, *p.appID)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load the passwordless policy"})
+		}
+		if (after.SignupEnabled && !before.SignupEnabled) || (!after.PasswordEnabled && before.PasswordEnabled) {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "tenant_owner_required",
+				"message": "Resetting to the inherited policy would turn on sign-up by code or close the password flow, which needs a tenant owner."})
+		}
+	}
+	if handled, resp := h.pwlessSwitchGuard(c, p.scope, nil, body.OverrideNoPasswordUsers); handled {
+		return resp
+	}
+	if err := h.pwless.Policy.Delete(ctx, p.scope, actorID(p.claims)); err != nil {
 		if handled, resp := pwlessErr(c, err); handled {
 			return resp
 		}
@@ -315,6 +350,9 @@ func (h *AdminHandler) PutPlatformPasswordlessPolicy(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 	sc := auth.PasswordlessScope{}
+	if handled, resp := h.pwlessSwitchGuard(c, sc, &req.Policy, req.OverrideNoPasswordUsers); handled {
+		return resp
+	}
 	saved, err := h.pwless.Policy.Put(c.Request().Context(), sc, auth.PasswordlessWriteInput{
 		Row: req.Policy, Version: req.Version, Actor: actorID(claims),
 	})
@@ -415,7 +453,8 @@ func (h *AdminHandler) PasswordlessRestore(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid history id"})
 	}
 	var body struct {
-		Version int `json:"version"`
+		Version                 int  `json:"version"`
+		OverrideNoPasswordUsers bool `json:"override_no_password_users"`
 	}
 	_ = c.Bind(&body)
 	// A restore is a write: an application administrator may not use it to open
@@ -423,6 +462,16 @@ func (h *AdminHandler) PasswordlessRestore(c echo.Context) error {
 	if p.appID != nil && !tenantWide(p.claims) {
 		return c.JSON(http.StatusForbidden, map[string]string{"error": "tenant_owner_required",
 			"message": "Restoring an earlier version can reopen sign-up or close the password flow, so it needs a tenant owner."})
+	}
+	snap, err := h.pwless.Policy.Snapshot(c.Request().Context(), p.scope, hid)
+	if err != nil {
+		if handled, resp := pwlessErr(c, err); handled {
+			return resp
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to restore the policy"})
+	}
+	if handled, resp := h.pwlessSwitchGuard(c, p.scope, snap, body.OverrideNoPasswordUsers); handled {
+		return resp
 	}
 	saved, err := h.pwless.Policy.Restore(c.Request().Context(), p.scope, hid, body.Version, actorID(p.claims))
 	if err != nil {

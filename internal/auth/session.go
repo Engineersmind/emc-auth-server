@@ -414,7 +414,7 @@ func DenyAccountSessions(ctx context.Context, logger zerolog.Logger, userID, ten
 	if pkgDenier == nil {
 		return
 	}
-	if err := pkgDenier.Set(ctx, userDenyKey(userID, tenantID), "1", AccessTokenTTL).Err(); err != nil {
+	if err := pkgDenier.Set(ctx, userDenyKey(userID, tenantID), revocationStamp(), AccessTokenTTL).Err(); err != nil {
 		metrics.SessionDenylistErrors.WithLabelValues("write_user").Inc()
 		logger.Warn().Err(err).Int64("user_id", userID).Int64("tenant_id", tenantID).
 			Msg("session denylist: account-wide write failed; revocation only enforced at refresh")

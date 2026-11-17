@@ -560,6 +560,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		WithTemplateEnabled(func(ctx context.Context, tenantID int64, appRowID *int64) bool {
 			return tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordlessCode)
 		})
+	totpSvc.WithEmailCodeCheck(func(ctx context.Context, tenantID, appRowID int64) bool {
+		return pwlessPolicySvc.Resolve(ctx, tenantID, &appRowID).EmailOTPEnabled
+	})
 	emailChangeSvc := auth.NewEmailChangeService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).
 		WithSenders(senderSvc).
 		WithTemplates(tmplSvc)

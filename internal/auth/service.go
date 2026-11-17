@@ -2012,6 +2012,11 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		if opts.inboxFirstFactor {
 			enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
 		}
+		if opts.inboxFirstFactor && len(enrollmentMethods) == 0 {
+			// Fail loudly rather than hand the user an enrollment challenge they
+			// cannot complete: the policy needs a non-email method to be allowed.
+			return nil, ErrPasswordlessMFAConflict
+		}
 		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
 		if err != nil {
 			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
