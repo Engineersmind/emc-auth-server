@@ -304,7 +304,8 @@ func (h *AuthHandler) refusePasswordAuth(c echo.Context, route, clientID string)
 	attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
 	if ev.ApplicationID != nil {
 		last, seen := passwordRefusalAudit.Load(*ev.ApplicationID)
-		if !seen || time.Since(last.(time.Time)) > time.Minute {
+		lastAt, _ := last.(time.Time) // zero (long ago) if the stored value is not a time
+		if !seen || time.Since(lastAt) > time.Minute {
 			passwordRefusalAudit.Store(*ev.ApplicationID, time.Now())
 			h.auditEvent(c, ev)
 		}

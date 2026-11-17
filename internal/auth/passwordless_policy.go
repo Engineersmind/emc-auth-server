@@ -580,7 +580,7 @@ func (s *PasswordlessPolicyService) Validate(ctx context.Context, sc Passwordles
 	if sc.TenantID != nil {
 		tenantID = *sc.TenantID
 	}
-	platform, tenant, app, err := s.chain(ctx, s.pool, tenantID, sc.ApplicationID)
+	platform, tenant, _, err := s.chain(ctx, s.pool, tenantID, sc.ApplicationID)
 	if err != nil {
 		return PasswordlessSettings{}, err
 	}
@@ -590,6 +590,7 @@ func (s *PasswordlessPolicyService) Validate(ctx context.Context, sc Passwordles
 		}
 	}
 	// Substitute the proposed row for the one at this scope, then resolve.
+	var app *PasswordlessPolicyRow
 	switch sc.Level() {
 	case "platform":
 		platform, tenant, app = in, nil, nil
