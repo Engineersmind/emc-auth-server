@@ -967,16 +967,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	authGroup.POST("/login/mfa/enroll", authHandler.MFAEnrollPending, enrollChain...)     // forced enrollment, TOTP path: get QR + backup codes
 	authGroup.POST("/login/mfa/email", authHandler.MFAEmailPending, enrollChain...)       // forced enrollment, email path: send code to inbox
 	authGroup.POST("/login/mfa/activate", authHandler.MFAActivatePending, enrollChain...) // forced enrollment: first code → tokens
-	// Refresh and logout had no limiter. A backend that sends its client
-	// credentials is charged to its application's shared quota, for its own
-	// users' sessions only; callers without credentials are unchanged.
-	sessionChain := []echo.MiddlewareFunc{
-		s2s.ResolveOptional(mw.SurfaceSession),
-		mw.ScopeToCaller(mw.ScopeByBodyToken("refresh_token", authSvc.RefreshTokenScope)),
-		mw.BackendsOnly(appCallerRateLimit),
-	}
-	authGroup.POST("/refresh", authHandler.Refresh, sessionChain...)
-	authGroup.POST("/logout", authHandler.Logout, sessionChain...)
+	authGroup.POST("/refresh", authHandler.Refresh)
+	authGroup.POST("/logout", authHandler.Logout) // never throttled: revocation must not be rate limited for the token holder
 
 	// Change the active tenant for a multi-tenant administrator (plan step 4).
 	//

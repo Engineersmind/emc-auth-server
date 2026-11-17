@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -193,7 +194,10 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 
 	if res.Allowed == 0 {
 		metrics.RateLimitHits.WithLabelValues(limiterLabel).Inc()
-		retryAfter := int(res.RetryAfter.Seconds())
+		retryAfter := int(math.Ceil(res.RetryAfter.Seconds()))
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
 		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		return c.JSON(http.StatusTooManyRequests, map[string]string{
 			"error": "rate limit exceeded for application " + strconv.FormatInt(appID, 10),
