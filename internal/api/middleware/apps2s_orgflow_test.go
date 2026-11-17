@@ -153,3 +153,27 @@ func TestScopeByQueryToken(t *testing.T) {
 		}
 	}
 }
+
+// The limiter reads the first 64 KiB of the body. A handler that bound the whole
+// body would see a token the limiter could not, so padding in front of a foreign
+// token kept the backend trusted. Handlers on these routes use DecodeBody, which
+// reads the same prefix and fails on a padded body instead of acting on it.
+func TestDecodeBody_PaddedBodyFailsInsteadOfHidingTheSubject(t *testing.T) {
+	e := echo.New()
+	decode := func(body string) (string, error) {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		var in struct {
+			RefreshToken string `json:"refresh_token"`
+		}
+		err := middleware.DecodeBody(e.NewContext(req, httptest.NewRecorder()), &in)
+		return in.RefreshToken, err
+	}
+	if tok, err := decode(`{"refresh_token":"foreign-1"}`); err != nil || tok != "foreign-1" {
+		t.Fatalf("plain body: got %q, %v", tok, err)
+	}
+	padded := `{"pad":"` + strings.Repeat("a", 70_000) + `","refresh_token":"foreign-1"}`
+	if tok, err := decode(padded); err == nil {
+		t.Fatalf("a body padded past the limiter's window decoded to %q; it must fail so the handler refuses it", tok)
+	}
+}
