@@ -1156,12 +1156,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// tokens; a token from another tenant or application keeps the per-IP limit.
 	// Callers without credentials keep TokenRateLimiter exactly as before.
 	orgFlowChain := func(scope mw.SubjectScopeFunc) []echo.MiddlewareFunc {
-		return []echo.MiddlewareFunc{
-			s2s.ResolveOptional(mw.SurfaceOrg),
-			mw.ScopeToCaller(scope),
-			mw.BackendsOnly(appCallerRateLimit),
-			mw.TokenRateLimiter(rlCfg),
-		}
+		return mw.OrgFlowChain(s2s, scope, appCallerRateLimit, rlCfg)
 	}
 	authGroup.POST("/apps/login/organization", orgHandler.SelectOrganization,
 		orgFlowChain(mw.ScopeByBodyToken("selection_token", authSvc.OrganizationSelectionScope))...)
@@ -1183,7 +1178,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// (pdffillr checks membership on every organisation request), so a per-IP
 	// TokenRateLimiter throttled the whole product at 5/min. Resolve still holds
 	// callers whose secret does not verify to the strict per-IP bucket.
-	appOrgs := authGroup.Group("/apps/organizations", s2s.Resolve(mw.SurfaceApp), appClientRateLimit)
+	appOrgs := authGroup.Group("/apps/organizations", mw.AppOrgManagementChain(s2s, appClientRateLimit)...)
 	appOrgs.POST("", orgHandler.CreateOrganization(appOrgScope))
 	appOrgs.GET("", orgHandler.ListOrganizations(appOrgScope))
 	appOrgs.GET("/:org", orgHandler.GetOrganization(appOrgScope))

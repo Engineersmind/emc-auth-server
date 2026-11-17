@@ -26,24 +26,21 @@ func scopeOf(_ context.Context, token string) (tenantID, appID int64, ok bool) {
 	switch {
 	case strings.HasPrefix(token, "own-"):
 		return appTenantID, appRowID, true
+	case strings.HasPrefix(token, "sibling-"):
+		return appTenantID, otherRowID, true
 	case strings.HasPrefix(token, "foreign-"):
 		return appTenantID + 1, 99, true
 	}
 	return 0, 0, false
 }
 
-// orgFlowTestChain mirrors orgFlowChain in routes.go, with a counting stand-in
+// orgFlowTestChain is the chain routes.go registers (middleware.OrgFlowChain), with a counting stand-in
 // for the application quota.
 func orgFlowTestChain(s *middleware.AppS2S, charged *int) []echo.MiddlewareFunc {
 	quota := func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error { *charged++; return next(c) }
 	}
-	return []echo.MiddlewareFunc{
-		s.ResolveOptional(middleware.SurfaceOrg),
-		middleware.ScopeToCaller(middleware.ScopeByBodyToken("refresh_token", scopeOf)),
-		middleware.BackendsOnly(quota),
-		middleware.TokenRateLimiter(middleware.DefaultRateLimitConfig()),
-	}
+	return middleware.OrgFlowChain(s, middleware.ScopeByBodyToken("refresh_token", scopeOf), quota, middleware.DefaultRateLimitConfig())
 }
 
 func refreshBody(token string, i int) string {
@@ -176,4 +173,68 @@ func TestDecodeBody_PaddedBodyFailsInsteadOfHidingTheSubject(t *testing.T) {
 	if tok, err := decode(padded); err == nil {
 		t.Fatalf("a body padded past the limiter's window decoded to %q; it must fail so the handler refuses it", tok)
 	}
+}
+
+// Another application in the SAME tenant is a different subject.
+func TestOrgFlow_BackendIsNotTrustedForASiblingApplicationsTokens(t *testing.T) {
+	s, _ := newS2S(middleware.AppS2SConfig{}, nil)
+	var charged int
+	chain := orgFlowTestChain(s, &charged)
+	for i := 0; i < 5; i++ {
+		runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, body: refreshBody("sibling", i)})
+	}
+	if res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret, body: refreshBody("sibling", 9)}); res.code != http.StatusTooManyRequests {
+		t.Fatalf("6th request on a sibling application's token: got %d, want 429", res.code)
+	}
+	if charged != 0 {
+		t.Fatalf("a sibling application's token was charged to this application's quota %d times", charged)
+	}
+}
+
+// /apps/organizations/*: the chain routes.go registers for the management routes.
+func TestAppOrgManagementChain(t *testing.T) {
+	newChain := func(charged *int) (*middleware.AppS2S, []echo.MiddlewareFunc) {
+		s, _ := newS2S(middleware.AppS2SConfig{}, nil)
+		quota := func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c echo.Context) error { *charged++; return next(c) }
+		}
+		return s, middleware.AppOrgManagementChain(s, quota)
+	}
+	t.Run("verified backend is limited by the application quota, not per IP", func(t *testing.T) {
+		var charged int
+		_, chain := newChain(&charged)
+		for i := 0; i < 100; i++ {
+			if res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret}); res.code != http.StatusOK {
+				t.Fatalf("request %d: got %d, want 200", i+1, res.code)
+			}
+		}
+		if charged != 100 {
+			t.Fatalf("charged %d times, want 100", charged)
+		}
+	})
+	// Unverified callers stay on Resolve's strict per-IP bucket. (The real
+	// application limiter ignores them; the counting stand-in cannot tell, so
+	// these assert the limit, not the charge.)
+	t.Run("anonymous caller is held to the strict per-IP limit", func(t *testing.T) {
+		var charged int
+		_, chain := newChain(&charged)
+		var last int
+		for i := 0; i < middleware.DefaultAppUnverifiedPerIPRate+1; i++ {
+			last = runS2S(t, chain, s2sReq{remote: strangerIP}).code
+		}
+		if last != http.StatusTooManyRequests {
+			t.Fatalf("anonymous past the strict limit: got %d, want 429", last)
+		}
+	})
+	t.Run("wrong secret is held to the strict per-IP limit", func(t *testing.T) {
+		var charged int
+		_, chain := newChain(&charged)
+		var last int
+		for i := 0; i < middleware.DefaultAppUnverifiedPerIPRate+1; i++ {
+			last = runS2S(t, chain, s2sReq{remote: strangerIP, clientID: appClient, secret: "guess"}).code
+		}
+		if last != http.StatusTooManyRequests {
+			t.Fatalf("wrong secret past the strict limit: got %d, want 429", last)
+		}
+	})
 }
