@@ -29,7 +29,7 @@ func NewDB(ctx context.Context, databaseURL string, logger zerolog.Logger) (*pgx
 
 	// Trace every query as a span (no-op until the OTel tracer provider is set). Statement text is
 	// kept out of spans so values and PII never reach the APM store.
-	config.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithTrimSQLInSpanName(), otelpgx.WithDisableSQLStatementInAttributes())
+	config.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithDisableSQLStatementInAttributes())
 
 	var pool *pgxpool.Pool
 
