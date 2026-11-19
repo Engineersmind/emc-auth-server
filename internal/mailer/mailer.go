@@ -84,6 +84,11 @@ type ResetEmail struct {
 	// TTLMinutes is the link's validity window as stated in the body. Zero falls
 	// back to defaultResetTTLMinutes so an unset value never renders "0 minutes".
 	TTLMinutes int
+	// Token is the raw single-use token inside ResetLink, exposed so an
+	// integrator can build a link to its own reset page. Optional.
+	Token string
+	// Name is the recipient's first name, when known. Optional.
+	Name string
 }
 
 // MFACodeEmail is a one-time MFA code email.
@@ -92,6 +97,12 @@ type MFACodeEmail struct {
 	Code       string
 	AppName    string
 	TTLMinutes int
+	// Purpose finishes "use the code below to …", e.g. "finish signing in". The
+	// code is not always a sign-in challenge (enrolment, proof to disable email
+	// MFA), so the originating flow says what it is for.
+	Purpose string
+	// Name is the recipient's first name, when known. Optional.
+	Name string
 }
 
 // PasswordlessCodeEmail is the one-time code for passwordless sign-in or sign-up.
@@ -104,6 +115,8 @@ type PasswordlessCodeEmail struct {
 	Verify     bool
 	// Origin is the approximate request origin shown in the email; may be empty.
 	Origin string
+	// Name is the recipient's first name, when known. Optional.
+	Name string
 }
 
 // MagicLinkEmail is a passwordless sign-in link.
@@ -112,6 +125,11 @@ type MagicLinkEmail struct {
 	Link       string
 	AppName    string
 	TTLMinutes int
+	// Token is the raw one-time token inside Link, exposed for integrators that
+	// build their own link. Optional.
+	Token string
+	// Name is the recipient's first name, when known. Optional.
+	Name string
 }
 
 // VerificationEmail confirms ownership of an email address.
@@ -120,6 +138,11 @@ type VerificationEmail struct {
 	Link       string
 	AppName    string
 	TTLMinutes int
+	// Token is the raw verification token only (Link carries the full URL),
+	// so an integrator can build a link to its own frontend. Optional.
+	Token string
+	// Name is the recipient's first name, when known. Optional.
+	Name string
 }
 
 // WelcomeEmail greets a user after verification.
@@ -127,6 +150,8 @@ type WelcomeEmail struct {
 	To      string
 	Name    string
 	AppName string
+	// LoginURL is where the recipient signs in, when the flow knows it. Optional.
+	LoginURL string
 }
 
 // PasswordChangedEmail confirms a password change.
@@ -147,6 +172,9 @@ type InvitationEmail struct {
 	// say what they are being invited to be. Both empty for a user invitation.
 	AdminRole  string
 	TenantName string
+	// Token is the raw invitation token inside Link, exposed for integrators that
+	// build their own accept page. Optional.
+	Token string
 }
 
 // ChangeEmailEmail carries either half of the email-change flow, selected by
@@ -181,6 +209,13 @@ type BlockedAccountEmail struct {
 	// #72). Zero when the lock does not expire, which suppresses the "or just
 	// wait" wording rather than promising a release that never comes.
 	RetryMinutes int
+	// Attempts is the number of failed sign-ins that caused the lock. Zero when
+	// not applicable. Optional.
+	Attempts int
+	// ResetLink is a password-reset link offered beside Link. Optional.
+	ResetLink string
+	// Name is the recipient's first name, when known. Optional.
+	Name string
 }
 
 // TenantLockoutAlertEmail warns a tenant's administrators that many accounts
@@ -326,6 +361,7 @@ type mailerImpl struct {
 	global   SMTPConfig // global sender (From/branding/provider/creds)
 	globalTr transport  // transport for the global sender (smtp/sendgrid/dev)
 	logger   zerolog.Logger
+	geo      GeoLookup // nil when no GeoIP database is configured
 }
 
 // dispatch renders one email and sends it via the resolved transport.
@@ -350,6 +386,9 @@ func (m *mailerImpl) dispatchMarked(ctx context.Context, sender *SMTPConfig, tmp
 	if data.Year == 0 {
 		data.Year = time.Now().Year()
 	}
+	// Device, place, local time, expiry clock time, masked and support address.
+	// Additive: built-in templates do not reference these fields.
+	m.applyCentralFields(ctx, sender, tt, to, &data)
 
 	// Resolve the template: custom override → built-in default. A custom
 	// template that fails to render falls back to the built-in default.
@@ -409,15 +448,23 @@ func (m *mailerImpl) SendReset(ctx context.Context, sender *SMTPConfig, tmpl *Te
 	if ttl <= 0 {
 		ttl = defaultResetTTLMinutes
 	}
-	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordReset, e.To, TemplateData{Link: e.ResetLink, TenantName: e.TenantName, TTLMinutes: ttl})
+	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordReset, e.To, TemplateData{Link: e.ResetLink, TenantName: e.TenantName, TTLMinutes: ttl, Token: e.Token, Name: e.Name})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Msg("password reset email sent")
 	}
 	return err
 }
 
+// mfaPurpose falls back to wording that is true for every use of the code.
+func mfaPurpose(p string) string {
+	if strings.TrimSpace(p) == "" {
+		return "verify it's you"
+	}
+	return p
+}
+
 func (m *mailerImpl) SendMFACode(ctx context.Context, sender *SMTPConfig, tmpl *Template, e MFACodeEmail) error {
-	err := m.dispatch(ctx, sender, tmpl, TemplateMFACode, e.To, TemplateData{Code: e.Code, AppName: e.AppName, TTLMinutes: e.TTLMinutes})
+	err := m.dispatch(ctx, sender, tmpl, TemplateMFACode, e.To, TemplateData{Code: e.Code, AppName: e.AppName, TTLMinutes: e.TTLMinutes, Name: e.Name, Purpose: mfaPurpose(e.Purpose)})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("MFA code email sent")
 	}
@@ -425,7 +472,7 @@ func (m *mailerImpl) SendMFACode(ctx context.Context, sender *SMTPConfig, tmpl *
 }
 
 func (m *mailerImpl) SendMagicLink(ctx context.Context, sender *SMTPConfig, tmpl *Template, e MagicLinkEmail) error {
-	err := m.dispatch(ctx, sender, tmpl, TemplateMagicLink, e.To, TemplateData{Link: e.Link, AppName: e.AppName, TTLMinutes: e.TTLMinutes})
+	err := m.dispatch(ctx, sender, tmpl, TemplateMagicLink, e.To, TemplateData{Link: e.Link, AppName: e.AppName, TTLMinutes: e.TTLMinutes, Token: e.Token, Name: e.Name})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("magic link email sent")
 	}
@@ -433,7 +480,7 @@ func (m *mailerImpl) SendMagicLink(ctx context.Context, sender *SMTPConfig, tmpl
 }
 
 func (m *mailerImpl) SendVerification(ctx context.Context, sender *SMTPConfig, tmpl *Template, e VerificationEmail) error {
-	err := m.dispatch(ctx, sender, tmpl, TemplateEmailVerification, e.To, TemplateData{Link: e.Link, AppName: e.AppName, TTLMinutes: e.TTLMinutes})
+	err := m.dispatch(ctx, sender, tmpl, TemplateEmailVerification, e.To, TemplateData{Link: e.Link, AppName: e.AppName, TTLMinutes: e.TTLMinutes, Token: e.Token, Name: e.Name})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("verification email sent")
 	}
@@ -441,7 +488,7 @@ func (m *mailerImpl) SendVerification(ctx context.Context, sender *SMTPConfig, t
 }
 
 func (m *mailerImpl) SendWelcome(ctx context.Context, sender *SMTPConfig, tmpl *Template, e WelcomeEmail) error {
-	err := m.dispatch(ctx, sender, tmpl, TemplateWelcome, e.To, TemplateData{Name: e.Name, AppName: e.AppName})
+	err := m.dispatch(ctx, sender, tmpl, TemplateWelcome, e.To, TemplateData{Name: e.Name, AppName: e.AppName, LoginURL: e.LoginURL})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Msg("welcome email sent")
 	}
@@ -459,7 +506,7 @@ func (m *mailerImpl) SendPasswordChanged(ctx context.Context, sender *SMTPConfig
 func (m *mailerImpl) SendInvitation(ctx context.Context, sender *SMTPConfig, tmpl *Template, e InvitationEmail) error {
 	err := m.dispatch(ctx, sender, tmpl, TemplateUserInvitation, e.To, TemplateData{
 		Link: e.Link, AppName: e.AppName, InviterName: e.InviterName, Name: e.Name, TTLMinutes: e.TTLMinutes,
-		AdminRole: e.AdminRole, TenantName: e.TenantName,
+		AdminRole: e.AdminRole, TenantName: e.TenantName, Token: e.Token,
 	})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("invitation email sent")
@@ -481,7 +528,7 @@ func (m *mailerImpl) SendChangeEmail(ctx context.Context, sender *SMTPConfig, tm
 func (m *mailerImpl) SendBlockedAccount(ctx context.Context, sender *SMTPConfig, tmpl *Template, e BlockedAccountEmail) error {
 	err := m.dispatch(ctx, sender, tmpl, TemplateBlockedAccount, e.To, TemplateData{
 		Link: e.Link, AppName: e.AppName, Reason: e.Reason, TTLMinutes: e.TTLMinutes,
-		RetryMinutes: e.RetryMinutes,
+		RetryMinutes: e.RetryMinutes, Count: e.Attempts, ResetLink: e.ResetLink, Name: e.Name,
 	})
 	if err == nil {
 		m.logger.Info().Str("to", e.To).Str("reason", e.Reason).Msg("blocked-account email sent")
@@ -549,14 +596,27 @@ func (m *mailerImpl) SendAccessChanged(ctx context.Context, sender *SMTPConfig, 
 // realistic regardless of the chosen template type.
 func sampleTestData() TemplateData {
 	return TemplateData{
-		AppName:     "Example App",
-		Link:        "https://example.com/action?token=SAMPLE_TOKEN",
-		Code:        "123456",
-		TTLMinutes:  15,
-		Name:        "Alex Doe",
-		InviterName: "Jordan Smith",
-		AdminRole:   "co-owner",
-		Reason:      BlockReasonFailedAttempts,
+		AppName:      "Example App",
+		Link:         "https://example.com/action?token=SAMPLE_TOKEN",
+		Token:        "SAMPLE_TOKEN", // obviously fake: a test email must not be able to act on a real account
+		ResetLink:    "https://example.com/forgot-password",
+		LoginURL:     "https://example.com/login",
+		Purpose:      "finish signing in",
+		Timezone:     "UTC",
+		ExpiryTime:   "14:47",
+		SupportEmail: "support@example.com",
+		MaskedEmail:  "a***@example.com",
+		Browser:      "Chrome",
+		OS:           "Windows 10",
+		City:         "Pune",
+		Country:      "India",
+		Location:     "Pune, India",
+		Code:         "123456",
+		TTLMinutes:   15,
+		Name:         "Alex Doe",
+		InviterName:  "Jordan Smith",
+		AdminRole:    "co-owner",
+		Reason:       BlockReasonFailedAttempts,
 		// admin_activity fields — without these the test send for that type
 		// renders a message with no subject content and empty rows.
 		ActorEmail:   "jordan.smith@example.com",
@@ -624,6 +684,10 @@ type MailerConfig struct {
 	EmailFrom string
 	FromName  string
 
+	// Geo resolves a request IP to a city and country for the device/location
+	// rows of security emails. Nil leaves those rows empty.
+	Geo GeoLookup
+
 	Logger zerolog.Logger
 }
 
@@ -651,6 +715,7 @@ func NewMailer(cfg MailerConfig) Mailer {
 	m := &mailerImpl{
 		logger: cfg.Logger,
 		global: SMTPConfig{From: cfg.EmailFrom, FromName: cfg.FromName},
+		geo:    cfg.Geo,
 	}
 	// Same trimming rationale as pickTransport: a trailing newline on an env
 	// var is invisible in a 401 and costs hours to find.
@@ -693,12 +758,12 @@ func ResolvedBranding(sender *SMTPConfig) (productName, logoURL, subjectPrefix s
 }
 
 func (m *mailerImpl) SendPasswordlessCode(ctx context.Context, sender *SMTPConfig, tmpl *Template, e PasswordlessCodeEmail) error {
-	reason := ""
+	reason, purpose := "", "sign in"
 	if e.Verify {
-		reason = "verify"
+		reason, purpose = "verify", "confirm your email address"
 	}
 	err := m.dispatch(ctx, sender, tmpl, TemplatePasswordlessCode, e.To,
-		TemplateData{Code: e.Code, AppName: e.AppName, TTLMinutes: e.TTLMinutes, Reason: reason, Origin: e.Origin})
+		TemplateData{Code: e.Code, AppName: e.AppName, TTLMinutes: e.TTLMinutes, Reason: reason, Origin: e.Origin, Name: e.Name, Purpose: purpose})
 	if err == nil {
 		// Neither the code nor the address beyond the recipient is logged.
 		m.logger.Info().Str("to", e.To).Str("app", e.AppName).Msg("passwordless code email sent")

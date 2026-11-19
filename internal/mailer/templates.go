@@ -190,6 +190,52 @@ type TemplateData struct {
 	// Filled centrally in dispatch, so every send path and the built-ins get it
 	// without each caller remembering.
 	Year int
+
+	// ---- Fields below are for custom templates (the console editor). ----
+	//
+	// html/template fails the WHOLE render on an unknown field, which silently
+	// sends the built-in instead — so every variable a template might reasonably
+	// use is declared here for every template type, populated or not. Wrap the
+	// optional ones in {{if .Field}}…{{end}}.
+
+	// Token is the raw single-use token embedded in Link — the token ONLY, not a
+	// URL — so an integrator can build a link to its own frontend
+	// ("https://app.example/verify?token={{.Token}}"). Set for email_verification,
+	// password_reset, magic_link and user_invitation; empty elsewhere. Link is
+	// unaffected and still carries the full URL.
+	Token string
+
+	// Timezone labels OccurredAt and ExpiryTime ("UTC", "IST"). Filled centrally.
+	Timezone string
+	// ExpiryTime is the clock time a link or code stops working, derived from
+	// TTLMinutes and shown in Timezone. Filled centrally; empty when TTLMinutes
+	// is zero.
+	ExpiryTime string
+	// SupportEmail is the sender's reply-to address, else its From address.
+	// Filled centrally.
+	SupportEmail string
+	// MaskedEmail is Email with the local part hidden ("a***@acme.com"). Filled
+	// centrally.
+	MaskedEmail string
+	// Purpose finishes "use the code below to …" in a code email. Set by the
+	// code-sending paths; empty elsewhere.
+	Purpose string
+	// ResetLink is a second action link: a password reset offered beside the
+	// unlock link in blocked_account. Empty elsewhere.
+	ResetLink string
+	// LoginURL is where the recipient signs in. Empty unless a flow supplies it.
+	LoginURL string
+
+	// Browser, OS, City, Country and Location describe the END USER's device and
+	// approximate place, for security emails. Populated only when the request's
+	// identity is trusted (see requestctx.RequestInfo.Trusted) and the template is
+	// one that describes the recipient's own request; empty otherwise, which is
+	// the template's cue to drop the row. Location is "City, Country".
+	Browser  string
+	OS       string
+	City     string
+	Country  string
+	Location string
 }
 
 // EmailChangeApplied is the TemplateData.Reason value that turns the
@@ -770,6 +816,11 @@ func bodyOpenIndex(html string) int {
 func ValidateTemplate(tmpl *Template, tt TemplateType) error {
 	if tmpl == nil {
 		return nil // no override: the built-in default always renders
+	}
+	// Structural check first: it covers every branch, including ones the sample data
+	// below would not execute.
+	if err := tmpl.checkFields(); err != nil {
+		return err
 	}
 	data := sampleTestData()
 	data.ProductName = defaultProductName
