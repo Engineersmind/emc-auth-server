@@ -1,0 +1,36 @@
+name: Observability Config
+
+# Validates the monitoring stack added in #217: Prometheus config + rules
+# (promtool check), promtool unit tests, Alertmanager config (amtool), and the
+# Go drift tests that pin metric names against dashboards/rules. Kept out of
+# ci.yml so the signal stays scoped to observability changes.
+on:
+  pull_request:
+    branches: ["master"]
+    paths:
+      - "infra/**"
+      - "internal/metrics/**"
+      - "internal/store/db.go"
+      - "docker-compose.yml"
+      - "scripts/check-observability.sh"
+      - ".github/workflows/observability-config.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Observability checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # promtool/amtool run inside the same pinned images the monitoring
+      # profile uses; ubuntu-latest runners ship Docker.
+      - name: promtool, amtool and Go drift tests
+        run: bash scripts/check-observability.sh

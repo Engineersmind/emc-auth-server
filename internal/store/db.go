@@ -7,6 +7,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 // NewDB creates a pgxpool.Pool configured for the auth server workload.
@@ -44,6 +46,10 @@ func NewDB(ctx context.Context, databaseURL string, logger zerolog.Logger) (*pgx
 			continue
 		}
 
+		// Advertise the pool to the emc_auth_db_pool_* collector only once it
+		// has actually pinged — a pool that never connected is never exported.
+		// The first pool claims the registration; later pools do not replace it.
+		metrics.SetDBPool(pool)
 		logger.Info().
 			Int32("max_conns", config.MaxConns).
 			Int32("min_conns", config.MinConns).
@@ -57,6 +63,11 @@ func NewDB(ctx context.Context, databaseURL string, logger zerolog.Logger) (*pgx
 // CloseDB closes the pgxpool.Pool.
 func CloseDB(pool *pgxpool.Pool) {
 	if pool != nil {
+		// Clear BEFORE Close: a closed pool's Stat still answers, and the
+		// emc_auth_db_pool_* series would keep reporting its final snapshot
+		// forever. CompareAndSwap inside ClearDBPool means this only clears
+		// the registration when this pool is the one being served.
+		metrics.ClearDBPool(pool)
 		pool.Close()
 	}
 }
