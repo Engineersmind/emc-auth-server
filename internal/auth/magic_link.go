@@ -146,6 +146,9 @@ func (s *AuthService) RequestMagicLink(ctx context.Context, clientID, clientSecr
 		Link:       link,
 		AppName:    s.appNameByID(ctx, strconv.FormatInt(appRowID, 10)),
 		TTLMinutes: int(MagicLinkTTL.Minutes()),
+		// Raw token only (Link carries the full URL).
+		Token: raw,
+		Name:  firstNameByID(ctx, s.pool, userID),
 	}
 	sender := s.resolveEmailSender(ctx, tenantID, &appRowID)
 	tmpl := s.emailSvc.tmplSvc.ResolveTemplate(ctx, tenantID, &appRowID, mailer.TemplateMagicLink)

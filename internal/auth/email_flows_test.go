@@ -721,6 +721,14 @@ func TestLockout_BlocksAfterThresholdAndUnblocks(t *testing.T) {
 	if len(blocks) != 1 || blocks[0].Reason != mailer.BlockReasonFailedAttempts {
 		t.Fatalf("blocked-account emails = %+v, want 1 with the failed-attempts reason", blocks)
 	}
+	// The unlock email carries the lock's trigger count and a reset link to offer
+	// beside the unlock link, for templates that use them.
+	if blocks[0].Attempts <= 0 {
+		t.Errorf("Attempts = %d, want the hard-lock threshold", blocks[0].Attempts)
+	}
+	if !strings.HasSuffix(blocks[0].ResetLink, "/forgot-password") {
+		t.Errorf("ResetLink = %q, want the forgot-password URL", blocks[0].ResetLink)
+	}
 
 	raw := tokenFromLink(t, blocks[0].Link)
 	if err := blockSvc.Unblock(e.ctx, raw); err != nil {

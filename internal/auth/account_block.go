@@ -468,6 +468,11 @@ func (s *AccountBlockService) blockForFailedAttempts(ctx context.Context, tenant
 		Reason:       mailer.BlockReasonFailedAttempts,
 		TTLMinutes:   int(UnblockTokenTTL.Minutes()),
 		RetryMinutes: retryMins,
+		// The count that crossed the hard threshold, and a reset link to offer
+		// beside the unlock link. Optional: a built-in template ignores both.
+		Attempts:  policy.HardLockThreshold,
+		ResetLink: fmt.Sprintf("%s/forgot-password", s.appBaseURL),
+		Name:      firstNameByID(ctx, s.pool, userID),
 	})
 	return true
 }

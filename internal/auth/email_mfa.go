@@ -139,6 +139,7 @@ func (s *EmailMFAService) mintAndSend(ctx context.Context, key, email, appName s
 		Code:       code,
 		AppName:    appName,
 		TTLMinutes: int(ttl.Minutes()),
+		Name:       firstNameByEmail(ctx, s.pool, tenantID, appRowID, email),
 	}
 
 	var sender *mailer.SMTPConfig
