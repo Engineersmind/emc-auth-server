@@ -1,0 +1,25 @@
+{
+  "comment": "Deliberately impossible thresholds (issue #218 acceptance): p95_ms of 0.001 cannot be met by any real request, so a run with this file MUST exit non-zero. Used to prove a breached threshold fails the run.",
+  "flows": {
+    "auth_login": { "rps": 1, "max_vus": 2, "p95_ms": 0.001, "p99_ms": 0.001, "error_rate": 0.001, "placeholder": false },
+    "apps_login": { "rps": 1, "max_vus": 2, "p95_ms": 0.001, "p99_ms": 0.001, "error_rate": 0.001, "placeholder": false },
+    "apps_register": { "rps": 1, "max_vus": 2, "p95_ms": 0.001, "p99_ms": 0.001, "error_rate": 0.001, "placeholder": false },
+    "oauth_client_credentials": { "rps": 1, "max_vus": 2, "p95_ms": 0.001, "p99_ms": 0.001, "error_rate": 0.001, "placeholder": false },
+    "oauth_refresh": { "rps": 1, "max_vus": 2, "p95_ms": 0.001, "p99_ms": 0.001, "error_rate": 0.001, "placeholder": false },
+    "jwks": { "rps": 1, "max_vus": 2, "p95_ms": 0.001, "p99_ms": 0.001, "error_rate": 0, "placeholder": false },
+    "apps_me": { "rps": 1, "max_vus": 2, "p95_ms": 0.001, "p99_ms": 0.001, "error_rate": 0.001, "placeholder": false }
+  },
+  "scenarios": {
+    "smoke": { "iterations": 1 },
+    "load": { "duration": "10s" },
+    "stress": { "multiplier": 2, "duration": "10s" },
+    "soak": { "duration": "10s" },
+    "spike": {
+      "multiplier": 2,
+      "stages": [
+        { "duration": "5s", "target": 1 },
+        { "duration": "5s", "target": 2 }
+      ]
+    }
+  }
+}

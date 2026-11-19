@@ -1,0 +1,108 @@
+name: perf-smoke
+
+# Issue #218 (FR7): manually dispatched k6 smoke run against a caller-supplied
+# target URL. The allowlist guard in perf/scripts/check-target.js refuses
+# production hosts (senie.ai, engineersmind.com, pollenx.ai and anything else
+# outside localhost/loopback/private-LAN/::1/docker service names) before the
+# first request. There is deliberately no schedule — the suite runs on demand
+# only.
+#
+# Target URL handling: every step that needs the URL sets TARGET_URL in its
+# own env: and quotes "$TARGET_URL" inside run:. Nothing interpolates a
+# workflow expression into a run: block (script injection). The guard step
+# carries no secrets.
+#
+# Requirements on the repo: secrets.PERF_ADMIN_TOKEN — a currently valid admin
+# JWT (15-minute life; mint it fresh per run — see perf/README.md). With it
+# missing, the seed step fails before k6 ever runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: "Base URL to smoke (local/CI targets only — production hosts are refused)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-smoke-${{ github.workflow }}-${{ inputs.target_url }}
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: k6 smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Refuse non-test targets
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+        run: node perf/scripts/check-target.js "$TARGET_URL"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      # k6 has no action on the allowed-actions list; install it through Go
+      # like golangci-lint/gosec in ci.yml, pinned to a tag.
+      - name: Install k6
+        run: go install go.k6.io/k6@v0.55.0
+
+      - name: Resolve and create results dir
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          RESULTS_DIR="$(node perf/scripts/results-dir.js smoke)"
+          echo "RESULTS_DIR=${RESULTS_DIR}" >> "$GITHUB_ENV"
+          mkdir -p "$RESULTS_DIR"
+
+      - name: Seed perf fixtures
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          PERF_ADMIN_TOKEN: ${{ secrets.PERF_ADMIN_TOKEN }}
+        run: BASE_URL="$TARGET_URL" TARGETS_FILE="$GITHUB_WORKSPACE/perf/targets.local.json" PERF_STATE_DIR="$GITHUB_WORKSPACE/perf/.state" node perf/seed/seed.js
+
+      - name: k6 smoke
+        env:
+          TARGET_URL: ${{ inputs.target_url }}
+          GIT_SHA: ${{ github.sha }}
+        run: BASE_URL="$TARGET_URL" SCENARIO=smoke TARGETS_FILE="$GITHUB_WORKSPACE/perf/targets.local.json" PERF_STATE_FILE="$GITHUB_WORKSPACE/perf/.state/latest.json" RESULTS_DIR="$RESULTS_DIR" k6 run perf/k6/main.js
+
+      - name: Teardown perf fixtures
+        if: always() && hashFiles('perf/.state/*.json') != ''
+        env:
+          PERF_ADMIN_TOKEN: ${{ secrets.PERF_ADMIN_TOKEN }}
+        run: PERF_STATE_FILE="$GITHUB_WORKSPACE/perf/.state/latest.json" node perf/seed/teardown.js
+
+      - name: Append run summary
+        if: always()
+        run: |
+          if [ -n "$RESULTS_DIR" ] && [ -f "$RESULTS_DIR/meta.json" ]; then
+            cat "$RESULTS_DIR/meta.json" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -n "$RESULTS_DIR" ] && [ -f "$RESULTS_DIR/summary.json" ]; then
+            printf '\n```json\n' >> "$GITHUB_STEP_SUMMARY"
+            head -c 20000 "$RESULTS_DIR/summary.json" >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Only the results tree is uploaded — perf/.state holds seeded secrets
+      # and is gitignored, never uploaded.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-smoke-results
+          path: docs/perf/
+          if-no-files-found: ignore
