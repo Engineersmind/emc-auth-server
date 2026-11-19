@@ -17,79 +17,124 @@ import (
 // send then silently falls back to the built-in. Checking the tree covers every
 // branch, whatever data the sample holds.
 //
-// A `range` or `with` rebinds the dot, so field references inside one are not
-// checked: the check never reports a false unknown.
+// Scoping: `range` and `with` rebind the dot inside their body, so references in
+// the body are not checked (the check never reports a false unknown). Their
+// pipeline and their `else` branch still use the enclosing dot, and ARE checked.
+// A named template invoked as `{{template "x" .}}` is checked with the invoker's
+// dot; one invoked with any other argument is not, for the same reason.
 func unknownFields(src string, html bool) ([]string, error) {
-	var tree *parse.Tree
+	var (
+		tree  *parse.Tree
+		defs  map[string]*parse.Tree
+		known = map[string]bool{}
+	)
 	if html {
 		t, err := template.New("t").Parse(src)
 		if err != nil {
 			return nil, err
 		}
 		tree = t.Tree
+		defs = map[string]*parse.Tree{}
+		for _, d := range t.Templates() {
+			if d.Tree != nil {
+				defs[d.Name()] = d.Tree
+			}
+		}
 	} else {
 		t, err := tmpltext.New("t").Parse(src)
 		if err != nil {
 			return nil, err
 		}
 		tree = t.Tree
+		defs = map[string]*parse.Tree{}
+		for _, d := range t.Templates() {
+			if d.Tree != nil {
+				defs[d.Name()] = d.Tree
+			}
+		}
 	}
 	if tree == nil || tree.Root == nil {
 		return nil, nil
 	}
-	known := map[string]bool{}
 	rt := reflect.TypeOf(TemplateData{})
 	for i := 0; i < rt.NumField(); i++ {
 		known[rt.Field(i).Name] = true
 	}
+
 	var out []string
-	seen := map[string]bool{}
-	var walk func(n parse.Node, topLevelDot bool)
-	walk = func(n parse.Node, topLevelDot bool) {
+	seenField := map[string]bool{}
+	visited := map[string]bool{} // named templates already checked: stops recursion
+	var walk func(n parse.Node, dotIsData bool)
+	walk = func(n parse.Node, dotIsData bool) {
 		switch n := n.(type) {
 		case *parse.ListNode:
 			if n == nil {
 				return
 			}
 			for _, c := range n.Nodes {
-				walk(c, topLevelDot)
+				walk(c, dotIsData)
 			}
 		case *parse.ActionNode:
-			walk(n.Pipe, topLevelDot)
+			walk(n.Pipe, dotIsData)
 		case *parse.IfNode:
-			walk(n.Pipe, topLevelDot)
-			walk(n.List, topLevelDot)
+			walk(n.Pipe, dotIsData)
+			walk(n.List, dotIsData)
 			if n.ElseList != nil {
-				walk(n.ElseList, topLevelDot)
+				walk(n.ElseList, dotIsData)
 			}
-		case *parse.RangeNode, *parse.WithNode:
-			// The dot is rebound inside: skip rather than risk a false unknown.
+		case *parse.RangeNode:
+			walk(n.Pipe, dotIsData)
+			// n.List rebinds the dot; n.ElseList does not.
+			if n.ElseList != nil {
+				walk(n.ElseList, dotIsData)
+			}
+		case *parse.WithNode:
+			walk(n.Pipe, dotIsData)
+			if n.ElseList != nil {
+				walk(n.ElseList, dotIsData)
+			}
 		case *parse.TemplateNode:
 			if n.Pipe != nil {
-				walk(n.Pipe, topLevelDot)
+				walk(n.Pipe, dotIsData)
+				if dotIsData && isBareDot(n.Pipe) && !visited[n.Name] {
+					visited[n.Name] = true
+					if d, ok := defs[n.Name]; ok && d.Root != nil {
+						walk(d.Root, true)
+					}
+				}
 			}
 		case *parse.PipeNode:
 			if n == nil {
 				return
 			}
 			for _, c := range n.Cmds {
-				walk(c, topLevelDot)
+				walk(c, dotIsData)
 			}
 		case *parse.CommandNode:
 			for _, a := range n.Args {
-				walk(a, topLevelDot)
+				walk(a, dotIsData)
 			}
 		case *parse.FieldNode:
-			if topLevelDot && len(n.Ident) > 0 && !known[n.Ident[0]] && !seen[n.Ident[0]] {
-				seen[n.Ident[0]] = true
+			if dotIsData && len(n.Ident) > 0 && !known[n.Ident[0]] && !seenField[n.Ident[0]] {
+				seenField[n.Ident[0]] = true
 				out = append(out, n.Ident[0])
 			}
 		case *parse.ChainNode:
-			walk(n.Node, topLevelDot)
+			walk(n.Node, dotIsData)
 		}
 	}
 	walk(tree.Root, true)
 	return out, nil
+}
+
+// isBareDot reports whether a pipeline is exactly `.`, i.e. the template is invoked
+// with the same dot as its caller.
+func isBareDot(p *parse.PipeNode) bool {
+	if p == nil || len(p.Cmds) != 1 || len(p.Cmds[0].Args) != 1 {
+		return false
+	}
+	_, ok := p.Cmds[0].Args[0].(*parse.DotNode)
+	return ok
 }
 
 // checkFields applies unknownFields to a template's three parts and reports the

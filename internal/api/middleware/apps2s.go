@@ -687,6 +687,13 @@ func ScopeToCaller(scope SubjectScopeFunc) echo.MiddlewareFunc {
 			tenantID, appID, known := scope(c)
 			if known && (tenantID != caller.TenantID || (appID != 0 && appID != caller.AppID)) {
 				caller.OutOfScope = true
+				// The forwarded identity was vouched for by a DIFFERENT application
+				// than the one this request is about, so it must not describe the
+				// user in an email either: keep the address and User-Agent for
+				// session attribution, withdraw the claim that they are the user's.
+				req := c.Request()
+				prev := requestctx.FromContext(req.Context())
+				c.SetRequest(req.WithContext(requestctx.WithClientIdentity(req.Context(), prev.IPAddress, prev.UserAgent, "", false, false)))
 			}
 			return next(c)
 		}

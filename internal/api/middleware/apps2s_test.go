@@ -587,3 +587,28 @@ func TestAppS2S_ForwardedIdentityTrust(t *testing.T) {
 		})
 	}
 }
+
+// A forwarded identity is vouched for by ONE application. If the request turns out
+// to be about another application's user, the identity must not describe that user
+// in an email either.
+func TestAppS2S_OutOfScopeWithdrawsForwardedIdentity(t *testing.T) {
+	s, _ := newS2S(middleware.AppS2SConfig{}, trustWith([]string{backendIP + "/32"}, true))
+	otherApp := func(echo.Context) (int64, int64, bool) { return appTenantID, appRowID + 1000, true }
+	chain := []echo.MiddlewareFunc{s.Resolve(middleware.SurfaceApp), middleware.ScopeToCaller(otherApp)}
+
+	res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret,
+		forwarded: endUserIPOne, fwdUA: "Mozilla/5.0 Chrome/120", fwdTZ: "Asia/Kolkata", body: emailBody("bob@x.com")})
+	if res.code != http.StatusOK {
+		t.Fatalf("got %d %v, want 200", res.code, res.body)
+	}
+	if !res.caller.OutOfScope {
+		t.Fatal("setup: caller should be out of scope")
+	}
+	if res.ctxInfo.Trusted || res.ctxInfo.UserAgentTrusted || res.ctxInfo.Timezone != "" {
+		t.Errorf("out-of-scope request kept the forwarded identity: %+v", res.ctxInfo)
+	}
+	// Still recorded for session attribution.
+	if res.ctxInfo.IPAddress != endUserIPOne {
+		t.Errorf("IPAddress = %q, want it kept for attribution", res.ctxInfo.IPAddress)
+	}
+}

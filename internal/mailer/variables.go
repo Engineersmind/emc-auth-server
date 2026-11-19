@@ -110,7 +110,9 @@ var typeVariables = map[TemplateType][]TemplateVariable{
 		v("Reason", "failed_attempts, failed_attempts_warning, soft_locked, admin or suspicious_login", VarAlways),
 		v("Count", "Number of failed sign-ins that caused the lock", VarOptional),
 		v("AppName", "The application name", VarOptional),
-		v("TTLMinutes", "Minutes the link stays valid", VarAlways),
+		// Not always set: the early-warning and suspicious-login alerts leave it 0, and
+		// for soft_locked it is how long the lock lasts, not how long a link is valid.
+		v("TTLMinutes", "Minutes the unlock link stays valid (failed_attempts); the lock duration for soft_locked; empty for the alerts", VarOptional),
 		v("RetryMinutes", "Minutes until an automatic lock lifts on its own", VarOptional),
 		v("Name", "The recipient's first name", VarOptional),
 	},

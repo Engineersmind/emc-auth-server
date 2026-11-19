@@ -382,3 +382,31 @@ func TestMFAPurpose_FallsBackToWordingTrueForEveryUse(t *testing.T) {
 		t.Errorf("explicit purpose not kept: %q", got)
 	}
 }
+
+// with/range rebind the dot in their body only: the pipeline and the else branch
+// still use the enclosing dot, and a named template invoked with `.` shares it.
+func TestValidateTemplate_ScopesWithRangeAndNamedTemplates(t *testing.T) {
+	bad := map[string]string{
+		"else branch of with":   `{{with .Location}}{{.}}{{else}}{{.Locaton}}{{end}}`,
+		"pipeline of with":      `{{with .Nope}}x{{end}}`,
+		"else branch of range":  `{{range .Browser}}{{.}}{{else}}{{.Typo}}{{end}}`,
+		"named template, dot":   `{{define "d"}}{{if .NewEmail}}{{.Timezne}}{{end}}{{end}}{{template "d" .}}`,
+		"nested named template": `{{define "a"}}{{template "b" .}}{{end}}{{define "b"}}{{.Typo}}{{end}}{{template "a" .}}`,
+	}
+	for name, html := range bad {
+		if err := ValidateTemplate(&Template{Subject: "s", HTML: html}, TemplateChangeEmail); err == nil {
+			t.Errorf("%s: want an unknown-variable error, got none", name)
+		}
+	}
+	good := map[string]string{
+		"with body rebinds dot":    `{{with .Location}}{{.}}{{end}}`,
+		"template with other dot":  `{{define "d"}}{{.}}{{end}}{{template "d" .Location}}`,
+		"recursive named template": `{{define "r"}}{{template "r" .}}{{end}}{{.Token}}`,
+		"valid named template":     `{{define "d"}}{{.Timezone}}{{end}}{{template "d" .}}`,
+	}
+	for name, html := range good {
+		if err := ValidateTemplate(&Template{Subject: "s", HTML: html}, TemplateChangeEmail); err != nil {
+			t.Errorf("%s: wrongly rejected: %v", name, err)
+		}
+	}
+}
