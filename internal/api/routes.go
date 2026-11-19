@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -53,6 +54,10 @@ type RoutesConfig struct {
 	JWTIssuer string
 	// Env is "development" or "production" — controls HTTPS enforcement behaviour.
 	Env string
+	// TrustedProxies are the parsed TRUSTED_PROXIES ranges — the same ones
+	// e.IPExtractor trusts. httpsRedirect believes X-Forwarded-Proto only from
+	// these peers (and loopback); see middleware.TrustedPeer.
+	TrustedProxies []*net.IPNet
 	// MetricsToken gates GET /metrics behind a bearer token. In
 	// production/staging the endpoint is not registered at all when this is
 	// empty (GHSA-4r4c-348x-w452); in development/test it is served open for
@@ -217,14 +222,18 @@ func securityHeaders() echo.MiddlewareFunc {
 // httpsRedirect returns middleware that issues a 301 redirect to HTTPS when the
 // request arrives over plain HTTP. Only active when Env == "production".
 // In development, requests pass through unchanged so localhost HTTP works.
-func httpsRedirect(env string) echo.MiddlewareFunc {
+//
+// X-Forwarded-Proto is believed only when the direct peer is a trusted proxy
+// (the TRUSTED_PROXIES ranges ClientIPExtractor uses); from anyone else it is
+// client-written, so the real connection scheme decides (issue #216).
+func httpsRedirect(env string, trustedProxies []*net.IPNet) echo.MiddlewareFunc {
+	fromProxy := mw.TrustedPeer(trustedProxies)
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
-			if env == "production" && c.Request().TLS == nil {
-				// Check X-Forwarded-Proto in case a TLS-terminating proxy is in front.
-				proto := c.Request().Header.Get("X-Forwarded-Proto")
-				if proto != "https" {
-					target := "https://" + c.Request().Host + c.Request().RequestURI
+			req := c.Request()
+			if env == "production" && req.TLS == nil {
+				if !fromProxy(req) || req.Header.Get(echo.HeaderXForwardedProto) != "https" {
+					target := "https://" + req.Host + req.RequestURI
 					return c.Redirect(http.StatusMovedPermanently, target)
 				}
 			}
@@ -320,7 +329,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// Sentry: before Recover so panics reach Sentry first; re-panics so Recover returns 500.
 	e.Use(sentryMiddleware())
 	e.Use(securityHeaders())
-	e.Use(httpsRedirect(deps.Config.Env))
+	e.Use(httpsRedirect(deps.Config.Env, deps.Config.TrustedProxies))
 	e.Use(mw.RequestLogger(deps.Logger))
 	e.Use(mw.PrometheusMetrics())
 	// RequestInfo: carries client IP + User-Agent into the request context so
