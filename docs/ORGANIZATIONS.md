@@ -198,6 +198,8 @@ token=<access or refresh token>
 `{"active": false}` for anything revoked, expired, issued to another
 application, or whose user or membership is no longer active. Confidential
 clients only. Advertised as `introspection_endpoint` in discovery.
+Introspection ships with the Organizations switch: with `ORGANIZATIONS_ENABLED=false`
+the route is not registered (404) and discovery does not advertise it.
 
 ---
 

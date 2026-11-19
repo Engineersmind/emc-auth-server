@@ -93,7 +93,7 @@ type OIDCDiscoveryDocument struct {
 	JWKSURI               string `json:"jwks_uri"`
 	RevocationEndpoint    string `json:"revocation_endpoint"`
 	// IntrospectionEndpoint is RFC 7662 / RFC 8414 introspection_endpoint.
-	IntrospectionEndpoint string `json:"introspection_endpoint"`
+	IntrospectionEndpoint string `json:"introspection_endpoint,omitempty"`
 
 	ScopesSupported        []string `json:"scopes_supported"`
 	ResponseTypesSupported []string `json:"response_types_supported"`
@@ -128,7 +128,10 @@ type OIDCDiscoveryDocument struct {
 // buildDiscoveryDocument assembles one tenant's metadata.
 //
 // base is the public origin without a trailing slash; slug is a tenant slug
-// already proven to exist.
+// already proven to exist. introspection is true only when POST
+// /oauth/introspect is registered, i.e. with Organizations enabled (#180);
+// otherwise introspection_endpoint is absent and the document is unchanged from
+// before the feature existed.
 //
 // Deliberately absent, each because advertising it would be a false claim that
 // sends a conformant client to a 404:
@@ -140,8 +143,8 @@ type OIDCDiscoveryDocument struct {
 //	                                            admin-managed client API, which
 //	                                            is a different thing
 //	acr_values_supported                        no ACR concept
-func buildDiscoveryDocument(base, slug string) OIDCDiscoveryDocument {
-	return OIDCDiscoveryDocument{
+func buildDiscoveryDocument(base, slug string, introspection bool) OIDCDiscoveryDocument {
+	doc := OIDCDiscoveryDocument{
 		Issuer: base + tenantPath("/tenants/:slug", slug),
 
 		AuthorizationEndpoint: base + PathOAuthAuthorize,
@@ -149,7 +152,6 @@ func buildDiscoveryDocument(base, slug string) OIDCDiscoveryDocument {
 		UserInfoEndpoint:      base + PathOAuthUserInfo,
 		JWKSURI:               base + tenantPath(PathTenantJWKS, slug),
 		RevocationEndpoint:    base + PathOAuthRevoke,
-		IntrospectionEndpoint: base + PathOAuthIntrospect,
 
 		// The four reserved OIDC scopes from application.go. Permission scopes
 		// (resource:action) share that column but are not advertised here: they
@@ -201,6 +203,10 @@ func buildDiscoveryDocument(base, slug string) OIDCDiscoveryDocument {
 		RequestParameterSupported:    false,
 		RequestURIParameterSupported: false,
 	}
+	if introspection {
+		doc.IntrospectionEndpoint = base + PathOAuthIntrospect
+	}
+	return doc
 }
 
 // Discovery serves GET /tenants/:slug/.well-known/openid-configuration.
@@ -276,7 +282,7 @@ func (h *OIDCHandler) Discovery(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "internal error"})
 	}
 
-	doc := buildDiscoveryDocument(h.issuers.BaseURL(), slug)
+	doc := buildDiscoveryDocument(h.issuers.BaseURL(), slug, h.introspection)
 
 	body, err := json.Marshal(doc)
 	if err != nil {

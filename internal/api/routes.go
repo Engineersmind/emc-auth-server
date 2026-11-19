@@ -801,7 +801,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 
 	// JWKS publication + signing-key rotation handlers (issue #95).
 	jwksHandler := handlers.NewJWKSHandler(deps.Pool, signingKeySvc, deps.Logger)
-	oidcHandler := handlers.NewOIDCHandler(deps.Pool, issuerResolver, deps.Logger)
+	oidcHandler := handlers.NewOIDCHandler(deps.Pool, issuerResolver, deps.Logger).
+		WithIntrospection(deps.Config.OrganizationsEnabled)
 	signingKeyHandler := handlers.NewSigningKeyHandler(deps.Pool, signingKeySvc, deps.Config.AppBaseURL, auditLog, deps.Logger)
 
 	// Give newly created tenants their key pair up front rather than lazily on
@@ -2266,8 +2267,11 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// RFC 7662 introspection — the live check behind a locally verified JWT.
 	// Confidential clients only, for their own application's tokens. Uses the
 	// revocation route's per-IP limiter (RevokeRateLimiter): both are
-	// client-authenticated token lookups.
-	e.POST(handlers.PathOAuthIntrospect, oauthTokenHandler.Introspect, mw.RevokeRateLimiter())
+	// client-authenticated token lookups. Ships with Organizations (#180): with
+	// the switch off it is not registered and discovery does not advertise it.
+	if deps.Config.OrganizationsEnabled {
+		e.POST(handlers.PathOAuthIntrospect, oauthTokenHandler.Introspect, mw.RevokeRateLimiter())
+	}
 
 	// Social login browser endpoints — public, top-level like SAML, but with
 	// the dedicated rate limiting SAML's routes lack (issue #64).
