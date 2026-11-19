@@ -37,6 +37,20 @@ type RequestInfo struct {
 	IPAddress string
 	// UserAgent is the raw User-Agent header, truncated to maxUserAgentLen.
 	UserAgent string
+	// Timezone is the end user's IANA timezone ("Asia/Kolkata") when a trusted
+	// backend forwarded it. Empty otherwise. Validated by the caller that sets it.
+	Timezone string
+	// Trusted reports that IPAddress and UserAgent describe the END USER's
+	// device: either a trusted backend forwarded them, or the request came
+	// straight from the user's own client.
+	//
+	// It is false for a request an application's backend made on its own behalf
+	// without forwarding the user's identity. In that case IPAddress and
+	// UserAgent are the BACKEND's, and anything that would present them to a
+	// person as "your device" or "your location" — the security emails — must
+	// not. It is zero-valued (false) outside HTTP, so a background job never
+	// claims an identity.
+	Trusted bool
 }
 
 // ctxKey is the private context key type. Unexported so no other package can
@@ -49,10 +63,33 @@ type ctxKey struct{}
 // of a RequestInfo — including future ones that do not write to refresh_tokens —
 // sees the same bounded value.
 func WithRequestInfo(ctx context.Context, ip, userAgent string) context.Context {
+	return WithClientIdentity(ctx, ip, userAgent, "", false)
+}
+
+// WithClientIdentity is WithRequestInfo plus the end user's timezone and whether
+// the identity may be shown to that user. See RequestInfo.Trusted.
+func WithClientIdentity(ctx context.Context, ip, userAgent, timezone string, trusted bool) context.Context {
 	if len(userAgent) > maxUserAgentLen {
 		userAgent = userAgent[:maxUserAgentLen]
 	}
-	return context.WithValue(ctx, ctxKey{}, RequestInfo{IPAddress: ip, UserAgent: userAgent})
+	return context.WithValue(ctx, ctxKey{}, RequestInfo{
+		IPAddress: ip, UserAgent: userAgent, Timezone: timezone, Trusted: trusted,
+	})
+}
+
+type noClientContextKey struct{}
+
+// WithoutClientContext marks ctx so that emails sent under it do not describe
+// the requester's device or location. Use it where the person making the request
+// is not the person receiving the email — an administrator acting on a user.
+func WithoutClientContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noClientContextKey{}, true)
+}
+
+// ClientContextSuppressed reports whether WithoutClientContext was applied.
+func ClientContextSuppressed(ctx context.Context) bool {
+	v, _ := ctx.Value(noClientContextKey{}).(bool)
+	return v
 }
 
 // FromContext returns the client identity carried by ctx, or the zero

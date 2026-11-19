@@ -23,7 +23,10 @@ func RequestInfo() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			req := c.Request()
-			ctx := requestctx.WithRequestInfo(req.Context(), c.RealIP(), req.UserAgent())
+			// Trusted by default: with no application backend in front, RealIP and the
+			// User-Agent are the person's own. AppS2S.Resolve revokes this for a
+			// request an application's backend made without forwarding the user.
+			ctx := requestctx.WithClientIdentity(req.Context(), c.RealIP(), req.UserAgent(), "", true)
 			c.SetRequest(req.WithContext(ctx))
 			return next(c)
 		}
