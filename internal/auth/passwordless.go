@@ -492,6 +492,7 @@ func (s *AuthService) pwlessSend(ctx context.Context, tenantID, appRowID int64, 
 		TTLMinutes: s.pwlessTTLMinutes(ctx, tenantID, appRowID),
 		Verify:     verify,
 		Origin:     ip,
+		Name:       firstNameByEmail(ctx, s.pool, tenantID, &appRowID, email),
 	}
 	sender := s.resolveEmailSender(ctx, tenantID, &appRowID)
 	tmpl := s.emailSvc.tmplSvc.ResolveTemplate(ctx, tenantID, &appRowID, mailer.TemplatePasswordlessCode)
@@ -906,7 +907,10 @@ func (s *AuthService) pwlessWelcome(ctx context.Context, tenantID, appRowID int6
 		}
 		sender := s.resolveEmailSender(ctx, tenantID, &appRowID)
 		tmpl := s.emailSvc.tmplSvc.ResolveTemplate(ctx, tenantID, &appRowID, mailer.TemplateWelcome)
-		msg := mailer.WelcomeEmail{To: email, AppName: s.appNameByID(ctx, strconv.FormatInt(appRowID, 10))}
+		msg := mailer.WelcomeEmail{
+			To: email, AppName: s.appNameByID(ctx, strconv.FormatInt(appRowID, 10)),
+			Name: firstNameByEmail(ctx, s.pool, tenantID, &appRowID, email),
+		}
 		if err := s.emailSvc.mailer.SendWelcome(ctx, sender, tmpl, msg); err != nil && sender != nil {
 			_ = s.emailSvc.mailer.SendWelcome(ctx, nil, tmpl, msg)
 		}

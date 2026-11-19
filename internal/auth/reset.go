@@ -16,6 +16,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
 	"github.com/engineersmind/emc-auth-server/internal/password"
+	"github.com/engineersmind/emc-auth-server/internal/requestctx"
 )
 
 // ResetTokenTTL is the expiry window for password reset tokens (RESET-01: 15 minutes).
@@ -230,6 +231,13 @@ func (s *ResetService) ForgotPasswordFirstParty(ctx context.Context, email strin
 func (s *ResetService) forgotPassword(ctx context.Context, tenantID int64, appRowID *int64, email string, honorSuppression bool) error {
 	email = emailaddr.Normalize(email)
 
+	// An administrator-forced reset is made by the admin, not the account holder:
+	// the request's device and location are the admin's, so the email must not
+	// present them as the recipient's own.
+	if !honorSuppression {
+		ctx = requestctx.WithoutClientContext(ctx)
+	}
+
 	// A user-initiated reset is closed for an application without passwords. An
 	// administrator-forced reset (honorSuppression false) still goes out; its link
 	// cannot be redeemed while the flow is closed.
@@ -306,6 +314,10 @@ func (s *ResetService) issueReset(ctx context.Context, userID, tenantID int64, a
 		To:         email,
 		ResetLink:  resetLink,
 		TenantName: how.tenantName,
+		// Raw token only (ResetLink carries the full URL), for integrators that
+		// host their own reset page. Name greets the recipient when known.
+		Token: rawToken,
+		Name:  firstNameByID(ctx, s.pool, userID),
 		// State the real window so the body can never contradict the token's
 		// actual expiry if ResetTokenTTL changes.
 		TTLMinutes: int(ResetTokenTTL.Minutes()),

@@ -40,7 +40,10 @@ type Deps struct {
 	// Audit is the async audit logger. main.go owns its lifecycle (Close on
 	// shutdown drains buffered events). When nil, RegisterRoutes creates one
 	// internally — convenient for tests, but its buffer is not drained on exit.
-	Audit  *audit.Logger
+	Audit *audit.Logger
+	// Geo resolves a request IP to a city/country for the device and location rows
+	// of security emails. Nil leaves those rows out; nothing else changes.
+	Geo    mailer.GeoLookup
 	Config RoutesConfig
 }
 
@@ -473,6 +476,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 		SendGridAPIKey: deps.Config.SendGridAPIKey,
 		EmailFrom:      deps.Config.SMTPFrom,
 		FromName:       deps.Config.EmailFromName,
+		Geo:            deps.Geo,
 		Logger:         deps.Logger,
 	})
 	resetSvc := auth.NewResetService(deps.Pool, m, deps.Config.AppBaseURL, deps.Logger).

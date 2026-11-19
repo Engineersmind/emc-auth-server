@@ -4169,6 +4169,13 @@ func (h *AdminHandler) UpsertEmailTemplate(c echo.Context) error {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save email template"})
 	}
 
+	// Warn, do not reject: a template saved with an unknown variable already
+	// falls back to the built-in at send time, so refusing the save now would only
+	// start failing edits that have always worked. The editor shows the warning.
+	if verr := mailer.ValidateTemplate(&mailer.Template{Subject: req.Subject, HTML: req.HTMLBody, Text: req.TextBody}, tt); verr != nil {
+		tmpl.Warnings = []string{"this template will not be used until it is fixed — every send falls back to the built-in: " + renderErrorHint(verr)}
+	}
+
 	rt, rid := senderResource(tenantID, appRowID)
 	h.auditAdmin(c, claims, audit.ActionAdminEmailTemplateUpdated, rt, rid)
 	return c.JSON(http.StatusOK, tmpl)

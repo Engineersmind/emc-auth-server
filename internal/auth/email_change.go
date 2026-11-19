@@ -14,6 +14,7 @@ import (
 	"github.com/engineersmind/emc-auth-server/internal/audit"
 	"github.com/engineersmind/emc-auth-server/internal/emailaddr"
 	"github.com/engineersmind/emc-auth-server/internal/mailer"
+	"github.com/engineersmind/emc-auth-server/internal/requestctx"
 )
 
 // ---------------------------------------------------------------------------
@@ -270,6 +271,10 @@ func (s *EmailChangeService) notifyOldAddress(ctx context.Context, tenantID int6
 // administrator action is exactly what a hijacker with a stolen admin session
 // would use, and without that mail the original owner would have no signal.
 func (s *EmailChangeService) AdminChange(ctx context.Context, tenantID int64, appRowID *int64, userID int64, newEmail string) (*EmailChangeResult, error) {
+	// The old-address notice is sent on the administrator's request, so the
+	// request's device and location are the administrator's, not the account
+	// holder's, and must not be presented as theirs.
+	ctx = requestctx.WithoutClientContext(ctx)
 	newEmail = emailaddr.Normalize(newEmail)
 	if newEmail == "" || !strings.Contains(newEmail, "@") {
 		return nil, ErrInvalidEmailChange

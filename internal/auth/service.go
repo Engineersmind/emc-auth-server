@@ -2170,7 +2170,7 @@ func (s *AuthService) SendPendingEnrollmentCode(ctx context.Context, enrollmentT
 	}
 
 	appName := s.appNameByID(ctx, session.AppID)
-	if err := s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), MFAEnrollmentSessionTTL); err != nil {
+	if err := s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), MFAEnrollmentSessionTTL, "set up email two-factor authentication"); err != nil {
 		return session, err
 	}
 	return session, nil
@@ -2261,7 +2261,7 @@ func (s *AuthService) createOTPSessionWith(ctx context.Context, userID, tenantID
 	emailSent := false
 	if sendEmailNow && methodAllowed(methods, MFAMethodEmail) && s.emailSvc != nil {
 		appName := s.appNameByID(ctx, appID)
-		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(sessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL); err != nil {
+		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(sessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL, "finish signing in"); err != nil {
 			// If email is the ONLY method the challenge would be uncompletable —
 			// fail the login rather than strand the user. With TOTP also active
 			// the challenge still works, so log and continue.
@@ -2311,7 +2311,7 @@ func (s *AuthService) ResendLoginOTP(ctx context.Context, otpSessionToken string
 	}
 
 	appName := s.appNameByID(ctx, session.AppID)
-	return s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), OTPSessionTTL)
+	return s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), OTPSessionTTL, "finish signing in")
 }
 
 // createMFAEnrollmentSession stores pre-auth state for a forced enrollment and
