@@ -61,6 +61,44 @@ import (
 // AppS2S.resolveEndUserIP for when it is believed.
 const ForwardedForHeader = "X-EMC-Forwarded-For"
 
+// ForwardedUserAgentHeader carries the end user's browser User-Agent from a
+// trusted backend, under exactly the checks that govern ForwardedForHeader.
+const ForwardedUserAgentHeader = "X-EMC-Forwarded-User-Agent"
+
+// ForwardedTimezoneHeader carries the end user's IANA timezone
+// ("Asia/Kolkata"), under the same checks. Used only to render times in emails.
+const ForwardedTimezoneHeader = "X-EMC-Forwarded-Timezone"
+
+// maxForwardedTimezoneLen bounds the header before it reaches the tz database.
+const maxForwardedTimezoneLen = 64
+
+// forwardedUserAgent returns the end user's User-Agent as forwarded by a trusted
+// backend, or "". Control characters are rejected rather than stripped: a header
+// that was not what it claimed is better ignored than repaired.
+func forwardedUserAgent(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get(ForwardedUserAgentHeader))
+	for _, c := range v {
+		if c < 0x20 || c == 0x7f {
+			return ""
+		}
+	}
+	return v
+}
+
+// forwardedTimezone returns the forwarded timezone if it is a real IANA name the
+// server's tz database knows, or "". Anything else is dropped: the value is only
+// ever used to pick a display zone, and an unknown one must not fail a request.
+func forwardedTimezone(r *http.Request) string {
+	v := strings.TrimSpace(r.Header.Get(ForwardedTimezoneHeader))
+	if v == "" || len(v) > maxForwardedTimezoneLen {
+		return ""
+	}
+	if _, err := time.LoadLocation(v); err != nil {
+		return ""
+	}
+	return v
+}
+
 // appCallerKey is the echo context key for the resolved *AppCaller.
 const appCallerKey = "emc.app_caller"
 
@@ -839,9 +877,27 @@ func (s *AppS2S) resolve(surface string, mode resolveMode, creds func(echo.Conte
 				caller.EndUserIP = ip
 				caller.Forwarded = true
 				// Sessions record their device from requestctx; give them the
-				// user's address rather than the backend's.
+				// user's address rather than the backend's. The User-Agent and
+				// timezone ride the same trust: a backend vouched for enough to
+				// report the user's IP may report the rest of their identity.
 				req := c.Request()
-				c.SetRequest(req.WithContext(requestctx.WithRequestInfo(req.Context(), ip, req.UserAgent())))
+				ua, tz := forwardedUserAgent(req), forwardedTimezone(req)
+				// Only a forwarded (and valid) User-Agent is the user's browser.
+				// Without one the request's own User-Agent — the backend's HTTP
+				// client — is kept for session attribution but not shown as a device.
+				uaTrusted := ua != ""
+				if !uaTrusted {
+					ua = req.UserAgent()
+				}
+				c.SetRequest(req.WithContext(requestctx.WithClientIdentity(req.Context(), ip, ua, tz, true, uaTrusted)))
+			} else if caller.Verified || caller.ServerIP {
+				// An application's backend, speaking for itself: RealIP and the
+				// User-Agent are the BACKEND's. Keep them for session attribution,
+				// as before, but withdraw the claim that they describe the user so
+				// no email presents the backend's address as "your location".
+				req := c.Request()
+				prev := requestctx.FromContext(req.Context())
+				c.SetRequest(req.WithContext(requestctx.WithClientIdentity(req.Context(), prev.IPAddress, prev.UserAgent, "", false, false)))
 			}
 
 			c.Set(appCallerKey, caller)

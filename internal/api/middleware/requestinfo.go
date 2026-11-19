@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"strings"
+
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/requestctx"
@@ -23,7 +25,14 @@ func RequestInfo() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			req := c.Request()
-			ctx := requestctx.WithRequestInfo(req.Context(), c.RealIP(), req.UserAgent())
+			// Trusted by default: with no application backend in front, RealIP and the
+			// User-Agent are the person's own. AppS2S.Resolve refines this for routes
+			// it guards. Routes it does not guard (verify-email, email-change
+			// confirmation, MFA enrolment) cannot be classified there, so a request
+			// that presents application credentials is treated as the BACKEND here,
+			// rather than letting its address and HTTP client pass as the user's.
+			fromBackend := strings.HasPrefix(strings.ToLower(req.Header.Get(echo.HeaderAuthorization)), "basic ")
+			ctx := requestctx.WithClientIdentity(req.Context(), c.RealIP(), req.UserAgent(), "", !fromBackend, !fromBackend)
 			c.SetRequest(req.WithContext(ctx))
 			return next(c)
 		}
