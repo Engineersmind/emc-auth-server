@@ -687,6 +687,7 @@ func TestEmailChange_RejectsTakenAndSame(t *testing.T) {
 func TestLockout_BlocksAfterThresholdAndUnblocks(t *testing.T) {
 	e := newFlowEnv(t)
 	blockSvc := auth.NewAccountBlockService(e.pool, e.mail, "http://localhost:9090", testhelper.TestLogger()).
+		WithDashboardURL("https://console.test").
 		WithTemplates(e.tmplSvc)
 
 	email := uniqueEmail("lockout")
@@ -720,6 +721,15 @@ func TestLockout_BlocksAfterThresholdAndUnblocks(t *testing.T) {
 	blocks := e.mail.awaitBlocks(t, 1)
 	if len(blocks) != 1 || blocks[0].Reason != mailer.BlockReasonFailedAttempts {
 		t.Fatalf("blocked-account emails = %+v, want 1 with the failed-attempts reason", blocks)
+	}
+	// The unlock email carries the lock's trigger count and a reset link to offer
+	// beside the unlock link, for templates that use them.
+	if blocks[0].Attempts <= 0 {
+		t.Errorf("Attempts = %d, want the hard-lock threshold", blocks[0].Attempts)
+	}
+	// The console's recovery page, never the API origin (which has none).
+	if blocks[0].ResetLink != "https://console.test/forgot-password" {
+		t.Errorf("ResetLink = %q, want the console forgot-password URL", blocks[0].ResetLink)
 	}
 
 	raw := tokenFromLink(t, blocks[0].Link)

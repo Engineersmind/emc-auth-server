@@ -320,7 +320,7 @@ func (s *OrganizationService) CreateInvitation(ctx context.Context, sc Organizat
 	}
 
 	if in.SendEmail {
-		out.EmailSent = s.sendInvitationEmail(ctx, sc, org.DisplayName, email, link, in.InviterName, ttl)
+		out.EmailSent = s.sendInvitationEmail(ctx, sc, org.DisplayName, email, link, token, in.InviterName, ttl)
 	}
 	return out, nil
 }
@@ -329,11 +329,11 @@ func (s *OrganizationService) CreateInvitation(ctx context.Context, sc Organizat
 // branded user_invitation template. Delivery failure does not undo the
 // invitation — the caller still holds the token and the response says the
 // mail was not sent.
-func (s *OrganizationService) sendInvitationEmail(ctx context.Context, sc OrganizationScope, orgName, email, link, inviter string, ttl time.Duration) bool {
+func (s *OrganizationService) sendInvitationEmail(ctx context.Context, sc OrganizationScope, orgName, email, link, token, inviter string, ttl time.Duration) bool {
 	appRowID := sc.AppRowID
 	msg := mailer.InvitationEmail{
 		To: email, Link: link, AppName: orgName, InviterName: inviter,
-		TTLMinutes: int(ttl.Minutes()),
+		TTLMinutes: int(ttl.Minutes()), Token: token,
 	}
 	sent, err := s.notify.Send(ctx, sc.TenantID, &appRowID, mailer.TemplateUserInvitation,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {

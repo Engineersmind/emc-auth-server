@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -324,6 +325,9 @@ func (s *AccountBlockService) sendBlockedAccountAsync(ctx context.Context, tenan
 		// Resolved in here rather than by the caller: it is a database round trip,
 		// and the whole point of this function is that the caller waits for nothing.
 		msg.AppName = appNameByRowID(ctx, s.pool, appRowID)
+		if msg.Name == "" {
+			msg.Name = firstNameByID(ctx, s.pool, userID)
+		}
 
 		if _, err := s.notify.Send(ctx, tenantID, appRowID, mailer.TemplateBlockedAccount,
 			func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
@@ -334,6 +338,16 @@ func (s *AccountBlockService) sendBlockedAccountAsync(ctx context.Context, tenan
 				Msg("lockout: notification could not be delivered")
 		}
 	}()
+}
+
+// consoleRecoveryURL is the console's password-recovery page, or "" when no
+// console is configured. appBaseURL is the API origin, which has no such page, so
+// it is deliberately not used here: a link to it would 404.
+func (s *AccountBlockService) consoleRecoveryURL() string {
+	if s.dashboardURL == "" {
+		return ""
+	}
+	return strings.TrimRight(s.dashboardURL, "/") + "/forgot-password"
 }
 
 // notifyFailureWarning tells the account owner that somebody has been failing to
@@ -468,6 +482,12 @@ func (s *AccountBlockService) blockForFailedAttempts(ctx context.Context, tenant
 		Reason:       mailer.BlockReasonFailedAttempts,
 		TTLMinutes:   int(UnblockTokenTTL.Minutes()),
 		RetryMinutes: retryMins,
+		// The count that crossed the hard threshold, and a reset link to offer
+		// beside the unlock link. Optional: a built-in template ignores both.
+		// The first name is resolved inside the detached worker, not here, so
+		// the request that crosses the threshold waits for nothing.
+		Attempts:  policy.HardLockThreshold,
+		ResetLink: s.consoleRecoveryURL(),
 	})
 	return true
 }
