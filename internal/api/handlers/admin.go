@@ -3420,7 +3420,7 @@ func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
 // PUT /api/v1/tenants/:tid/applications/:appID/mfa.
 //
 // @Summary      Set application MFA policy
-// @Description  Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default ["totp"]).
+// @Description  Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default ["totp"]); allowed_methods sent without mode is a 400.
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
@@ -3497,7 +3497,8 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 	}, updatedBy)
 	if err != nil {
 		switch {
-		case errors.Is(err, auth.ErrInvalidMFAMode), errors.Is(err, auth.ErrInvalidMFAMethods), errors.Is(err, auth.ErrMagicLinkNotConfigured):
+		case errors.Is(err, auth.ErrInvalidMFAMode), errors.Is(err, auth.ErrInvalidMFAMethods),
+			errors.Is(err, auth.ErrMFAMethodsNeedMode), errors.Is(err, auth.ErrMagicLinkNotConfigured):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case errors.Is(err, auth.ErrAppNotFound):
 			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})

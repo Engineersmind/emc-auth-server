@@ -4416,7 +4416,7 @@ paths:
         gate login — use mfa_enabled=false to stop that); ''optional'' restores the
         default opt-in behaviour. mode may be omitted when only mfa_enabled and/or
         the magic-link fields are sent. allowed_methods omitted keeps the current
-        set (default ["totp"]).'
+        set (default ["totp"]); allowed_methods sent without mode is a 400.'
       parameters:
       - description: Application ID
         in: path

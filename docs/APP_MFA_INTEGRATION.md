@@ -67,7 +67,8 @@ PUT /api/v1/applications/{appID}/mfa            Bearer <admin>
 ```
 - `mode`: `disabled` | `optional` (default) | `required`
 - `allowed_methods`: non-empty subset of `["totp","email"]`; omit to keep
-  current (default `["totp"]`)
+  current (default `["totp"]`). Only accepted together with `mode`; sent
+  without it → 400 `allowed_methods requires mode`
 - Canonical alternative for super_admin cross-tenant:
   `PUT /api/v1/tenants/{tid}/applications/{appID}/mfa`
 - The whole PUT (switch, mode/methods, magic-link fields) is applied in **one

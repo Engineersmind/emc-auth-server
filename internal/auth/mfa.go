@@ -78,6 +78,11 @@ var ErrInvalidMFAMode = errors.New("mode must be one of: disabled, optional, req
 // empty method set.
 var ErrInvalidMFAMethods = errors.New("allowed_methods must be a non-empty subset of: totp, email")
 
+// ErrMFAMethodsNeedMode is returned when an update carries allowed_methods
+// without a mode. Methods are only ever written together with the mode, so
+// accepting them alone would return success while silently dropping them.
+var ErrMFAMethodsNeedMode = errors.New("allowed_methods requires mode")
+
 // ErrMFAEnrollmentDisabled is returned when a user of an application whose MFA
 // mode is 'disabled' attempts to enroll.
 var ErrMFAEnrollmentDisabled = errors.New("MFA is disabled for this application")
@@ -356,6 +361,9 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 	var res AppMFAUpdateResult
 	if u.Mode != "" && !ValidMFAMode(u.Mode) {
 		return res, ErrInvalidMFAMode
+	}
+	if u.Mode == "" && u.Methods != nil {
+		return res, ErrMFAMethodsNeedMode
 	}
 	if u.Methods != nil && !ValidMFAMethods(u.Methods) {
 		return res, ErrInvalidMFAMethods

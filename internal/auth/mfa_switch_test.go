@@ -134,6 +134,28 @@ func TestMFASwitch_UpdateIsAtomic(t *testing.T) {
 	}
 }
 
+// allowed_methods without mode is refused, not silently dropped, and the
+// switch sent alongside it is not applied either.
+func TestMFASwitch_MethodsWithoutModeRefused(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-methods-no-mode")
+
+	_, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{
+		Enabled: boolPtr(false),
+		Methods: []string{auth.MFAMethodEmail},
+	}, nil)
+	if !errors.Is(err, auth.ErrMFAMethodsNeedMode) {
+		t.Fatalf("error = %v, want ErrMFAMethodsNeedMode", err)
+	}
+	cfg, err := f.totpSvc.GetAppMFAConfig(f.ctx, appID)
+	if err != nil {
+		t.Fatalf("GetAppMFAConfig: %v", err)
+	}
+	if !cfg.Enabled || len(cfg.Methods) != 1 || cfg.Methods[0] != auth.MFAMethodTOTP {
+		t.Errorf("config after refused update = %+v, want untouched (enabled, [totp])", cfg)
+	}
+}
+
 // Switch off: a user with an active TOTP is not challenged; the factor stays
 // enrolled. Switch back on: the challenge returns at the next login.
 func TestMFASwitch_OffSkipsChallengeForEnrolledUser(t *testing.T) {

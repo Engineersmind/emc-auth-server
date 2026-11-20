@@ -125,6 +125,14 @@ func TestUpdateApplicationMFA_Switch(t *testing.T) {
 		t.Fatalf("empty body: %d %v, want 400", code, out)
 	}
 
+	// allowed_methods without mode is a 400, not a 200 that drops the methods.
+	if code, out := put(management, `{"mfa_enabled":true,"allowed_methods":["email"]}`); code != http.StatusBadRequest || out["error"] != auth.ErrMFAMethodsNeedMode.Error() {
+		t.Fatalf("methods without mode: %d %v, want 400 %q", code, out, auth.ErrMFAMethodsNeedMode.Error())
+	}
+	if cfg, err := totpSvc.GetAppMFAConfig(ctx, appID); err != nil || len(cfg.Methods) != 1 || cfg.Methods[0] != auth.MFAMethodTOTP {
+		t.Fatalf("methods after refused PUT: %+v (err %v), want untouched [totp]", cfg, err)
+	}
+
 	// A management (API-key) token cannot turn MFA off...
 	if code, out := put(management, `{"mfa_enabled":false}`); code != http.StatusForbidden || out["error"] != "mfa_switch_off_service_token" {
 		t.Fatalf("management off: %d %v, want 403 mfa_switch_off_service_token", code, out)
