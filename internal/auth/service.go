@@ -2124,6 +2124,10 @@ func (s *AuthService) EnrollPending(ctx context.Context, enrollmentToken string)
 		return nil, nil, fmt.Errorf("invalid or expired enrollment session")
 	}
 
+	if err := s.refusePendingEnrollmentIfSwitchedOff(ctx, session, key); err != nil {
+		return nil, session, err
+	}
+
 	// Forced enrollment must respect the application's allowed method set.
 	if !methodAllowed(session.Methods, MFAMethodTOTP) {
 		return nil, nil, ErrMFAMethodNotAllowed
@@ -2165,6 +2169,9 @@ func (s *AuthService) SendPendingEnrollmentCode(ctx context.Context, enrollmentT
 	if err != nil {
 		return nil, fmt.Errorf("invalid or expired enrollment session")
 	}
+	if err := s.refusePendingEnrollmentIfSwitchedOff(ctx, session, key); err != nil {
+		return session, err
+	}
 	if !methodAllowed(session.Methods, MFAMethodEmail) {
 		return session, ErrMFAMethodNotAllowed
 	}
@@ -2201,6 +2208,10 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 	session, err := s.loadOTPSession(ctx, key)
 	if err != nil {
 		return nil, nil, fmt.Errorf("invalid or expired enrollment session")
+	}
+
+	if err := s.refusePendingEnrollmentIfSwitchedOff(ctx, session, key); err != nil {
+		return nil, session, err
 	}
 
 	if err := s.bumpOTPAttempts(ctx, key, MFAEnrollmentSessionTTL); err != nil {
@@ -2363,6 +2374,29 @@ func appRowIDFromClaim(appID string) *int64 {
 		return nil
 	}
 	return &id
+}
+
+// refusePendingEnrollmentIfSwitchedOff re-reads the application's MFA master
+// switch for a forced-enrollment session (#192). The enrollment token was minted
+// at the password step; if the switch was turned off since, the token must not
+// go on to create a TOTP secret or activate an email factor. The session is
+// cleared so the token is dead: the user signs in again and, with the switch
+// off, gets tokens without enrolling. A read error fails closed, as in mfaGate.
+// A tenant-level session (no application) is not governed by the switch.
+func (s *AuthService) refusePendingEnrollmentIfSwitchedOff(ctx context.Context, session *OTPSession, key string) error {
+	appRowID := appRowIDFromClaim(session.AppID)
+	if appRowID == nil || s.totpSvc == nil {
+		return nil
+	}
+	cfg, err := s.totpSvc.GetAppMFAConfig(ctx, *appRowID)
+	if err != nil {
+		return fmt.Errorf("load app MFA policy: %w", err)
+	}
+	if !cfg.Enabled {
+		s.clearOTPSession(ctx, key)
+		return ErrMFASwitchedOff
+	}
+	return nil
 }
 
 // appNameByID resolves an application's display name from its string row id;

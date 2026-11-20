@@ -213,6 +213,61 @@ func TestMFASwitch_OffSkipsForcedEnrolmentUnderRequired(t *testing.T) {
 	}
 }
 
+// An enrolment token minted while MFA was on is refused by every pending path
+// once the switch is turned off, and is dead afterwards: turning the switch
+// back on does not revive it.
+func TestMFASwitch_OffRefusesPendingEnrolment(t *testing.T) {
+	cases := map[string]func(f *mfaFixture, token string) error{
+		"EnrollPending": func(f *mfaFixture, token string) error {
+			_, _, err := f.authSvc.EnrollPending(f.ctx, token)
+			return err
+		},
+		"SendPendingEnrollmentCode": func(f *mfaFixture, token string) error {
+			_, err := f.authSvc.SendPendingEnrollmentCode(f.ctx, token)
+			return err
+		},
+		"ActivatePending": func(f *mfaFixture, token string) error {
+			_, _, err := f.authSvc.ActivatePending(f.ctx, token, "123456")
+			return err
+		},
+	}
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMFAFixture(t)
+			app, appID := f.createApp(t, "switch-pending-"+name)
+			if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired,
+				[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
+				t.Fatalf("SetAppMFAPolicy(required): %v", err)
+			}
+			email := uniqueEmail("switch-pending")
+			userID := f.registerAppUser(t, app, email, "Password123!")
+
+			res, err := f.appLogin(t, app, email, "Password123!")
+			if err != nil || res.MFAEnrollment == nil {
+				t.Fatalf("Login = %+v, %v; want forced enrolment", res, err)
+			}
+			token := res.MFAEnrollment.EnrollmentToken
+
+			if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+				t.Fatalf("SetAppMFAEnabled(false): %v", err)
+			}
+			if err := call(f, token); !errors.Is(err, auth.ErrMFASwitchedOff) {
+				t.Fatalf("%s with switch off: error = %v, want ErrMFASwitchedOff", name, err)
+			}
+			if active, err := f.totpSvc.IsActive(f.ctx, userID); err != nil || active {
+				t.Fatalf("TOTP active = %v, %v; want no enrolment created", active, err)
+			}
+
+			if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, true, nil); err != nil {
+				t.Fatalf("SetAppMFAEnabled(true): %v", err)
+			}
+			if _, _, err := f.authSvc.EnrollPending(f.ctx, token); err == nil || errors.Is(err, auth.ErrMFASwitchedOff) {
+				t.Fatalf("EnrollPending after switch back on: error = %v, want invalid or expired session", err)
+			}
+		})
+	}
+}
+
 // Enrolment is refused with ErrMFASwitchedOff for both methods while the
 // switch is off — distinct from mode 'disabled'.
 func TestMFASwitch_OffRefusesEnrolment(t *testing.T) {

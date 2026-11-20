@@ -1065,6 +1065,9 @@ func (h *AuthHandler) MFAEnrollPending(c echo.Context) error {
 	result, session, err := h.svc.EnrollPending(c.Request().Context(), req.EnrollmentToken)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("pending MFA enroll failed")
+		if errors.Is(err, auth.ErrMFASwitchedOff) {
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		}
 		if containsMsg(err, "not configured") {
 			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
 		}
@@ -1137,6 +1140,9 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 		}
 		h.auditFailure(c, event, err)
 
+		if errors.Is(err, auth.ErrMFASwitchedOff) {
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		}
 		if errors.Is(err, auth.ErrTooManyOTPAttempts) {
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		}
@@ -2353,6 +2359,9 @@ func (h *AuthHandler) MFAEmailPending(c echo.Context) error {
 	_, err := h.svc.SendPendingEnrollmentCode(c.Request().Context(), req.EnrollmentToken)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("pending email MFA send failed")
+		if errors.Is(err, auth.ErrMFASwitchedOff) {
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		}
 		if errors.Is(err, auth.ErrMFAMethodNotAllowed) {
 			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 		}

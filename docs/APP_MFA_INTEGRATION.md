@@ -260,7 +260,7 @@ switch on `error`, never parse `message`. MFA switch codes:
 
 | Code | Status | When |
 |---|---|---|
-| `mfa_switched_off` | 403 | enrolment attempted while the app's MFA switch is off |
+| `mfa_switched_off` | 403 | enrolment attempted while the app's MFA switch is off — self-service enrolment, or a forced-enrolment token (`/auth/login/mfa/enroll`, `/email`, `/activate`) minted before the switch was turned off. The enrolment token is invalidated; sign in again |
 | `mfa_switch_off_service_token` | 403 | a service/API-key token tried to turn MFA off |
 | `mfa_switch_off_stale_session` | 403 | turning MFA off without an MFA sign-in in the last 10 minutes |
 
