@@ -559,7 +559,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// password endpoints never consult the policy.
 	pwlessPolicySvc := auth.NewPasswordlessPolicyService(deps.Pool, deps.Logger).
 		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
-			return totpSvc.GetAppMFAConfig(ctx, appRowID)
+			cfg, err := totpSvc.GetAppMFAConfig(ctx, appRowID)
+			return cfg.Mode, cfg.Methods, err
 		}).
 		WithTemplateEnabled(func(ctx context.Context, tenantID int64, appRowID *int64) bool {
 			return tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordlessCode)
