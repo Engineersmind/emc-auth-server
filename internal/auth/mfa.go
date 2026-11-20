@@ -67,6 +67,17 @@ func methodAllowed(methods []string, method string) bool {
 	return false
 }
 
+// withoutMethod returns methods minus method, as a new slice.
+func withoutMethod(methods []string, method string) []string {
+	out := make([]string, 0, len(methods))
+	for _, m := range methods {
+		if m != method {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // defaultMFAMethods is the implicit method set when no policy row exists and
 // the pre-00047 default for existing rows.
 func defaultMFAMethods() []string { return []string{MFAMethodTOTP} }
@@ -232,7 +243,7 @@ func (s *TOTPService) GetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 // tenant_id is still pinned in the upsert so a policy row can never point at
 // a foreign tenant.
 func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID int64, mode string, methods []string, updatedBy *int64) error {
-	return setAppMFAPolicy(ctx, s.pool, tenantID, appRowID, mode, methods, updatedBy)
+	return s.setAppMFAPolicy(ctx, s.pool, tenantID, appRowID, mode, methods, updatedBy)
 }
 
 // mfaSettingsQuerier is the subset of *pgxpool.Pool and pgx.Tx the settings
@@ -243,12 +254,29 @@ type mfaSettingsQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-func setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier, tenantID, appRowID int64, mode string, methods []string, updatedBy *int64) error {
+func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier, tenantID, appRowID int64, mode string, methods []string, updatedBy *int64) error {
 	if !ValidMFAMode(mode) {
 		return ErrInvalidMFAMode
 	}
 	if methods != nil && !ValidMFAMethods(methods) {
 		return ErrInvalidMFAMethods
+	}
+	// Required MFA with email as the only method cannot be satisfied by a user who
+	// signed in with an emailed code, so refuse it while email codes are on (#203).
+	// The stored methods are read through q, so inside the admin PUT's
+	// transaction this sees the same row the upsert below replaces.
+	if mode == MFAModeRequired && s.emailCodeEnabled != nil {
+		eff := methods
+		if eff == nil {
+			cur, cErr := storedAppMFAMethods(ctx, q, appRowID)
+			if cErr != nil {
+				return cErr
+			}
+			eff = cur
+		}
+		if len(eff) == 1 && eff[0] == MFAMethodEmail && s.emailCodeEnabled(ctx, tenantID, appRowID) {
+			return ErrPasswordlessMFAConflict
+		}
 	}
 	tag, err := q.Exec(ctx, `
 		INSERT INTO application_mfa_settings (application_id, tenant_id, mode, allowed_methods, updated_by, updated_at)
@@ -270,6 +298,22 @@ func setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier, tenantID, appRow
 		return ErrAppNotFound
 	}
 	return nil
+}
+
+// storedAppMFAMethods returns the application's stored allowed methods, or the
+// TOTP-only default when it has no settings row yet.
+func storedAppMFAMethods(ctx context.Context, q mfaSettingsQuerier, appRowID int64) ([]string, error) {
+	var methods []string
+	err := q.QueryRow(ctx, `
+		SELECT allowed_methods FROM application_mfa_settings WHERE application_id = $1
+	`, appRowID).Scan(&methods)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return defaultMFAMethods(), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read app MFA methods: %w", err)
+	}
+	return methods, nil
 }
 
 // SetAppMagicLink upserts the application's passwordless magic-link settings.
@@ -416,7 +460,7 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 	}
 
 	if u.Mode != "" {
-		if err = setAppMFAPolicy(ctx, tx, tenantID, appRowID, u.Mode, u.Methods, updatedBy); err != nil {
+		if err = s.setAppMFAPolicy(ctx, tx, tenantID, appRowID, u.Mode, u.Methods, updatedBy); err != nil {
 			return res, err
 		}
 	}

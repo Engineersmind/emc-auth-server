@@ -116,6 +116,13 @@ const (
 	ActionAdminUsersImported        = "admin.users_imported"
 	ActionAdminUsersImportCancelled = "admin.users_import_cancelled"
 
+	// Admin — bulk application RBAC import (#187). The validate dry run is audited
+	// for the same reason the user one is: its report discloses which permission
+	// and role names already exist.
+	ActionAdminRBACImportValidated = "admin.rbac_import_validated"
+	ActionAdminRBACImported        = "admin.rbac_imported"
+	ActionAdminRBACExported        = "admin.rbac_exported"
+
 	// Admin — per-app rate limit management (08-02)
 	ActionAdminAppLimitCreated = "admin.app_limit_created"
 	ActionAdminAppLimitUpdated = "admin.app_limit_updated"
@@ -197,6 +204,22 @@ const (
 
 	// Auth — passwordless magic-link sign-in (issue #63 follow-on)
 	ActionAuthMagicLinkRequested = "auth.magic_link_requested"
+
+	// Auth — passwordless sign-in and sign-up by emailed code (issue #203).
+	// A successful code sign-in is ordinary auth.login with AuthMethodEmailOTP, and
+	// a failed one is auth.login_failed, so login statistics, new-device and risk
+	// signals keep working. These are the events around it. None carries the code,
+	// the challenge id or the full address: the audit row holds an email hash and
+	// the domain.
+	ActionAuthPasswordlessStarted          = "auth.passwordless_started"
+	ActionAuthPasswordlessResent           = "auth.passwordless_resent"
+	ActionAuthPasswordlessThrottled        = "auth.passwordless_throttled"
+	ActionUserCreatedPasswordless          = "user.created_passwordless"
+	ActionAuthPreverificationNeutralized   = "auth.preverification_neutralized"
+	ActionAdminPasswordlessPolicyChanged   = "admin.passwordless_policy_changed"
+	ActionAdminPasswordlessThrottleCleared = "admin.passwordless_throttle_cleared"
+	ActionAdminUserEmailVerified           = "admin.user_email_verified"
+	ActionAdminUserEmailChanged            = "admin.user_email_changed"
 
 	// Auth — invitations, email change, lockout, breached passwords
 	ActionAdminUserInvited       = "admin.user_invited"

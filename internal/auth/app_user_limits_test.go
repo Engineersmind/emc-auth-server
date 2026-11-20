@@ -24,8 +24,8 @@ func TestUserLimitDefs_KeysUniqueAndCeilingsSane(t *testing.T) {
 			t.Fatalf("incomplete definition: %+v", d)
 		}
 	}
-	if len(seen) != 12 {
-		t.Fatalf("%d limits defined, want 12 (one per middleware.AppUserLimits field)", len(seen))
+	if len(seen) != 14 {
+		t.Fatalf("%d limits defined, want 14 (one per middleware.AppUserLimits field)", len(seen))
 	}
 }
 

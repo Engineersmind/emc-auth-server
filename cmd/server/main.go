@@ -27,6 +27,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	// Embeds the IANA timezone database. The production image is distroless/static,
+	// which ships none, so without this time.LoadLocation fails for every zone and
+	// emails could not be rendered in the user's own timezone.
+	_ "time/tzdata"
 
 	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
@@ -287,8 +291,18 @@ func main() {
 		audit.WithRiskAssessor(risk.New(pool, cfg.UntrustedIPCIDRs, logger)),
 		audit.WithSink(notifySink),
 	}
+	// emailGeo stays a nil func when no database is configured, so the security
+	// emails simply omit their location row.
+	var emailGeo mailer.GeoLookup
 	if geoResolver != nil {
 		auditOpts = append(auditOpts, audit.WithGeoIP(geoResolver))
+		emailGeo = func(ip string) (mailer.GeoPlace, bool) {
+			g, ok := geoResolver.Lookup(ip)
+			if !ok {
+				return mailer.GeoPlace{}, false
+			}
+			return mailer.GeoPlace{City: g.City, Country: g.Country, TimeZone: g.TimeZone}, true
+		}
 	}
 	if siemSink != nil {
 		auditOpts = append(auditOpts, audit.WithSink(siemSink))
@@ -329,6 +343,7 @@ func main() {
 		Pool:   pool,
 		Redis:  rdb,
 		Audit:  auditLog,
+		Geo:    emailGeo,
 		Config: api.RoutesConfig{
 			JWTIssuer:                 cfg.JWTIssuer,
 			Env:                       cfg.Env,
@@ -351,6 +366,8 @@ func main() {
 					OAuthExchange:      cfg.AppRateLimits.UserOAuthExchange,
 					PasskeyLogin:       cfg.AppRateLimits.UserPasskeyLogin,
 					ResendVerification: cfg.AppRateLimits.UserResendVerification,
+					PasswordlessStart:  cfg.AppRateLimits.UserPasswordlessStart,
+					PasswordlessVerify: cfg.AppRateLimits.UserPasswordlessVerify,
 				},
 			},
 			AppBaseURL:                             cfg.AppBaseURL,
@@ -386,6 +403,8 @@ func main() {
 			OAuthRequireState:                      cfg.OAuthRequireState,
 			CaptchaEnabled:                         cfg.CaptchaEnabled,
 			OrganizationsEnabled:                   cfg.OrganizationsEnabled,
+			PasswordlessEnabled:                    cfg.PasswordlessEnabled,
+			PasswordlessCodeHMACKey:                cfg.PasswordlessCodeHMACKey,
 			CaptchaHMACKey:                         cfg.CaptchaHMACKey,
 			CaptchaTTLSeconds:                      cfg.CaptchaTTLSeconds,
 		},

@@ -78,6 +78,10 @@ type AuthService struct {
 	// orgSvc resolves organisation membership at mint time. Nil, or present but
 	// switched off, means every application behaves as organizations_mode 'off'.
 	orgSvc *OrganizationService
+	// pwless is the passwordless email-code flow (issue #203). nil leaves the
+	// service exactly as it was: every passwordless entry point reports
+	// ErrPasswordlessUnavailable and the password endpoints never consult it.
+	pwless *passwordlessRuntime
 	logger zerolog.Logger
 }
 
@@ -1181,6 +1185,10 @@ func (s *AuthService) Register(ctx context.Context, in RegisterInput) (*Register
 		// arrive alongside app credentials and had to be checked against them.
 		tenantID, appRowID = tid, &aid
 		appID = strconv.FormatInt(aid, 10)
+		// Same closure as Login: refused before any hashing or write.
+		if s.PasswordFlowClosed(ctx, tid, &aid) {
+			return nil, ErrPasswordAuthDisabled
+		}
 	} else {
 		// First-party registration lands in the platform tenant.
 		//
@@ -1578,6 +1586,13 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		appID = strconv.FormatInt(aid, 10)
 	}
 
+	// An application that closed its password flow refuses here, before any user
+	// lookup or hash (passwordless plan section 4.9). A no-op unless the feature is
+	// enabled and the application opted in.
+	if appRowID != 0 && s.PasswordFlowClosed(ctx, appTenantID, &appRowID) {
+		return nil, ErrPasswordAuthDisabled
+	}
+
 	// User-base isolation: app-authenticated logins only see that application's
 	// own users; generic logins only see tenant-level users (application_id IS
 	// NULL) — an app-scoped account can never authenticate outside its app.
@@ -1897,6 +1912,28 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
 func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+	return s.mfaGateWith(ctx, mfaGateOptions{}, userID, tenantID, appRowID, appID, email, roleName, perms, persistent, activeRoles, org)
+}
+
+// mfaGateOptions tunes mfaGateWith. The zero value is exactly mfaGate's
+// behaviour, so adding a field here can never change an existing caller.
+type mfaGateOptions struct {
+	// inboxFirstFactor is set when the first factor was itself proof of control
+	// of the user's inbox (the passwordless email code). The email second-factor
+	// method is then neither offered nor emailed: the same inbox twice is
+	// ceremony, not a second factor. TOTP and passkeys are unaffected.
+	inboxFirstFactor bool
+}
+
+// mfaGateWith is mfaGate with options. See mfaGate for the contract.
+func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+	if opts.inboxFirstFactor {
+		// Carried to the stored challenge so the finished session keeps the email-code
+		// grant and amr. A context value rather than a new parameter on every helper
+		// between here and storePreAuthSession keeps those signatures, and so every
+		// existing caller, untouched.
+		ctx = withFirstFactor(ctx, FirstFactorEmailOTP)
+	}
 	// Administrators first: for them MFA is mandatory, so this branch runs even
 	// on a deployment where the per-application gate below would return early.
 	// Only a tenant-level login (appRowID 0) can be an administrator's — an
@@ -1957,6 +1994,9 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// users who had already enrolled it. A non-app login (appRowID 0) has no
 	// policy and honours every active factor.
 	permitted := func(method string) bool {
+		if opts.inboxFirstFactor && method == MFAMethodEmail {
+			return false
+		}
 		return appRowID == 0 || methodAllowed(allowedMethods, method)
 	}
 	var methods []string
@@ -1979,7 +2019,16 @@ func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID in
 	// (re)enroll a permitted method before finishing login; otherwise the login
 	// proceeds (the app does not enforce MFA).
 	if appRowID != 0 && mode == MFAModeRequired {
-		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, allowedMethods, persistent, activeRoles, org)
+		enrollmentMethods := allowedMethods
+		if opts.inboxFirstFactor {
+			enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
+		}
+		if opts.inboxFirstFactor && len(enrollmentMethods) == 0 {
+			// Fail loudly rather than hand the user an enrollment challenge they
+			// cannot complete: the policy needs a non-email method to be allowed.
+			return nil, ErrPasswordlessMFAConflict
+		}
+		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
 		if err != nil {
 			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
 		}
@@ -2055,16 +2104,9 @@ func (s *AuthService) LoginOTP(ctx context.Context, in LoginOTPInput) (*AuthResu
 	// session.AppID carries the application context through the challenge so
 	// an app-authenticated login keeps its app_id claim after the OTP step.
 	return s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
-		sessionContext{
-			persistent:  session.Persistent,
-			activeRoles: session.ActiveRoles,
-			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         []string{AMRPassword, AMROTP, AMRMFA},
-			// The grant is the one that began the flow. MFA is a second factor
-			// on a password login, not a grant of its own — amr already records
-			// that the OTP step happened.
-			grant: GrantPassword,
-		}, session.AppID)
+		// The grant is the one that began the flow. MFA is a second factor on that
+		// first factor, not a grant of its own: amr already records the OTP step.
+		completionSessionContext(session), session.AppID)
 }
 
 // EnrollPending generates the TOTP secret for a forced-enrollment login
@@ -2139,7 +2181,7 @@ func (s *AuthService) SendPendingEnrollmentCode(ctx context.Context, enrollmentT
 	}
 
 	appName := s.appNameByID(ctx, session.AppID)
-	if err := s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), MFAEnrollmentSessionTTL); err != nil {
+	if err := s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), MFAEnrollmentSessionTTL, "set up email two-factor authentication"); err != nil {
 		return session, err
 	}
 	return session, nil
@@ -2190,13 +2232,7 @@ func (s *AuthService) ActivatePending(ctx context.Context, enrollmentToken, code
 	s.clearOTPSession(ctx, key)
 
 	tokens, err := s.issueTokenPair(ctx, session.UserID, session.TenantID, session.Email, session.RoleName, session.Perms,
-		sessionContext{
-			persistent:  session.Persistent,
-			activeRoles: session.ActiveRoles,
-			org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
-			amr:         []string{AMRPassword, AMROTP, AMRMFA},
-			grant:       GrantPassword,
-		}, session.AppID)
+		completionSessionContext(session), session.AppID)
 	if err != nil {
 		return nil, session, err
 	}
@@ -2236,7 +2272,7 @@ func (s *AuthService) createOTPSessionWith(ctx context.Context, userID, tenantID
 	emailSent := false
 	if sendEmailNow && methodAllowed(methods, MFAMethodEmail) && s.emailSvc != nil {
 		appName := s.appNameByID(ctx, appID)
-		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(sessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL); err != nil {
+		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(sessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL, "finish signing in"); err != nil {
 			// If email is the ONLY method the challenge would be uncompletable —
 			// fail the login rather than strand the user. With TOTP also active
 			// the challenge still works, so log and continue.
@@ -2286,7 +2322,7 @@ func (s *AuthService) ResendLoginOTP(ctx context.Context, otpSessionToken string
 	}
 
 	appName := s.appNameByID(ctx, session.AppID)
-	return s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), OTPSessionTTL)
+	return s.emailSvc.mintAndSend(ctx, key+":email", session.Email, appName, session.TenantID, appRowIDFromClaim(session.AppID), OTPSessionTTL, "finish signing in")
 }
 
 // createMFAEnrollmentSession stores pre-auth state for a forced enrollment and
@@ -2353,6 +2389,9 @@ func (s *AuthService) storePreAuthSession(ctx context.Context, keyFn func(string
 	raw, err := GenerateRefreshToken()
 	if err != nil {
 		return "", err
+	}
+	if sess.FirstFactor == "" {
+		sess.FirstFactor = firstFactorFrom(ctx)
 	}
 	payload, err := json.Marshal(sess)
 	if err != nil {
@@ -2497,6 +2536,36 @@ type GraceResult struct {
 	OrgName        string
 	OrgRoles       []string
 	OrgPermissions []string
+}
+
+// RefreshTokenScope reports the tenant and application (0 for a tenant-level
+// session) a live refresh token belongs to. Read only: it neither rotates nor
+// revokes. ok is false when the token names no live session, an expired or
+// made-up token.
+//
+// For the rate limiter, which charges a backend's refresh, logout and
+// switch-organization calls to its own application's quota only for its own
+// users (see middleware.ScopeToCaller).
+func (s *AuthService) RefreshTokenScope(ctx context.Context, rawRefreshToken string) (tenantID, appID int64, ok bool) {
+	if rawRefreshToken == "" {
+		return 0, 0, false
+	}
+	var appRowID *int64
+	err := s.pool.QueryRow(ctx, `
+		SELECT s.tenant_id, s.application_id
+		FROM refresh_tokens rt
+		JOIN user_sessions s ON s.id = rt.session_id
+		WHERE rt.token_hash = $1
+		  AND `+LiveTokenWhere("rt.")+`
+		  AND `+LiveSessionWhere("s."),
+		HashToken(rawRefreshToken)).Scan(&tenantID, &appRowID)
+	if err != nil {
+		return 0, 0, false
+	}
+	if appRowID != nil {
+		appID = *appRowID
+	}
+	return tenantID, appID, true
 }
 
 // Refresh rotates a refresh token pair (AUTH-03).

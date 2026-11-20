@@ -28,9 +28,12 @@ const (
 
 // TOTPService handles TOTP enrollment, verification, and management.
 type TOTPService struct {
-	pool   *pgxpool.Pool
-	encKey []byte
-	logger zerolog.Logger
+	// emailCodeEnabled reports whether email-code sign-in is on for an application
+	// (nil = never). Used to refuse an MFA policy that email-code users could not satisfy.
+	emailCodeEnabled func(ctx context.Context, tenantID, appRowID int64) bool
+	pool             *pgxpool.Pool
+	encKey           []byte
+	logger           zerolog.Logger
 }
 
 // ErrTOTPZeroKey is returned when TOTP_ENCRYPTION_KEY is the all-zero dev key
@@ -475,6 +478,13 @@ type OTPSession struct {
 	// client asked for. Neither is authority — the mint re-checks membership.
 	OrgRequest       string `json:",omitempty"`
 	SkipOrganization bool   `json:",omitempty"`
+
+	// FirstFactor records which first factor began this sign-in when it was not
+	// the password. Empty means password, which is every session stored before
+	// passwordless existed, so an in-flight challenge across a deploy completes
+	// exactly as it always did. It selects the grant and amr the finished session
+	// carries (see completionSession).
+	FirstFactor string `json:",omitempty"`
 }
 
 // OTPSessionTTL is how long the intermediate TOTP challenge state lives.
@@ -490,3 +500,46 @@ const MFAEnrollmentSessionTTL = 10 * time.Minute
 // from the password step. Hard cap against 6-digit brute force inside the
 // session TTL window.
 const MaxOTPAttempts = 5
+
+// FirstFactorEmailOTP marks a sign-in that began with a passwordless emailed code.
+const FirstFactorEmailOTP = "email_otp"
+
+type firstFactorKey struct{}
+
+// withFirstFactor returns ctx carrying the first factor for the pre-auth session
+// stored under it. The zero value (nothing carried) means password.
+func withFirstFactor(ctx context.Context, f string) context.Context {
+	return context.WithValue(ctx, firstFactorKey{}, f)
+}
+
+func firstFactorFrom(ctx context.Context) string {
+	f, _ := ctx.Value(firstFactorKey{}).(string)
+	return f
+}
+
+// completionSessionContext is the session a sign-in carries once its second factor
+// has passed. The grant is the one that began the flow, spelled as a Grant*
+// constant at each assignment (TestEveryMintSitePassesAGrantConstant requires it):
+// the password grant by default, which is every session stored before passwordless
+// existed, and the email-code grant when the first factor was an emailed code.
+func completionSessionContext(session *OTPSession) sessionContext {
+	sc := sessionContext{
+		persistent:  session.Persistent,
+		activeRoles: session.ActiveRoles,
+		org:         orgSessionRequest{requested: session.OrgRequest, skip: session.SkipOrganization},
+		amr:         []string{AMRPassword, AMROTP, AMRMFA},
+		grant:       GrantPassword,
+	}
+	if session.FirstFactor == FirstFactorEmailOTP {
+		sc.amr = []string{AMREmailOTP, AMROTP, AMRMFA}
+		sc.grant = GrantEmailOTP
+	}
+	return sc
+}
+
+// WithEmailCodeCheck supplies the email-code policy reader that SetAppMFAPolicy
+// uses to refuse required MFA with email as the only method.
+func (s *TOTPService) WithEmailCodeCheck(f func(ctx context.Context, tenantID, appRowID int64) bool) *TOTPService {
+	s.emailCodeEnabled = f
+	return s
+}

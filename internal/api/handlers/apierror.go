@@ -104,6 +104,19 @@ var errorMessages = map[string]string{
 	"account_locked":      "Too many failed sign-in attempts. Try again shortly, or reset your password to unlock the account now.",
 	"session_terminated":  "Your session was ended for security reasons. Sign in again to continue.",
 
+	// --- Passwordless (email code) ----------------------------------------
+	//
+	// invalid_or_expired_code is one answer for a wrong, expired, unknown or
+	// refused code on purpose: telling them apart would turn verification into an
+	// oracle for which addresses are registered.
+	"invalid_or_expired_code":  "That code did not work. It may have expired or already been used. Request a new code and try again.",
+	"passwordless_disabled":    "Signing in with an email code is not turned on for this application.",
+	"invalid_email":            "Enter a valid email address.",
+	"resend_cooldown":          "Please wait a moment before asking for another code.",
+	"too_many_resends":         "You have asked for too many codes. Start again to get a new one.",
+	"passwordless_unavailable": "Signing in with an email code is temporarily unavailable. Try again in a few minutes.",
+	"password_auth_disabled":   "This application signs people in with an email code. Request a code to continue.",
+
 	// --- Organizations ---------------------------------------------------
 	//
 	// organization_access_denied is one message for every reason — unknown

@@ -279,12 +279,12 @@ const (
 	GrantRefreshToken = "refresh_token"
 	// GrantMagicLink is passwordless email-link login.
 	GrantMagicLink = "magic_link"
+	// GrantEmailOTP is passwordless sign-in or sign-up by an emailed one-time code.
+	GrantEmailOTP = "email_otp"
 	// GrantSocial is a social/OIDC identity-provider callback (Google, #64).
 	GrantSocial = "social"
 	// GrantPasskey is WebAuthn passkey assertion (#112).
 	GrantPasskey = "passkey"
-	// GrantSAML is SAML 2.0 JIT login.
-	GrantSAML = "saml"
 	// GrantTenantSwitch is a token re-minted for a second tenant the caller
 	// already proved they belong to. No credential is presented, so it is named
 	// separately from the grant that authenticated the original session.
@@ -315,9 +315,9 @@ var (
 		GrantAuthorizationCode,
 		GrantRefreshToken,
 		GrantMagicLink,
+		GrantEmailOTP,
 		GrantSocial,
 		GrantPasskey,
-		GrantSAML,
 		GrantTenantSwitch,
 	}
 
