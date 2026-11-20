@@ -508,14 +508,18 @@ var ErrMFASwitchOffStaleSession = errors.New("turning MFA off requires signing i
 // token's claims.
 //
 //   - not a human grant → ErrMFASwitchOffServiceToken;
-//   - no session, a revoked session, a session without MFA in its amr, or one
-//     whose auth_time is older than MFASwitchOffMaxAuthAge →
+//   - no session, a session that is no longer live (revoked, or past its idle
+//     or absolute deadline — LiveSessionWhere), a session without MFA in its
+//     amr, or one whose auth_time is older than MFASwitchOffMaxAuthAge →
 //     ErrMFASwitchOffStaleSession.
 //
-// The age is compared against the database clock, the same clock that wrote
-// auth_time, so server clock skew cannot widen the window. A token whose grant
-// is a refresh or tenant switch still qualifies: the session row keeps the
-// ORIGINAL auth_time and amr, which is what is checked.
+// The age is measured on the application clock, not the database's NOW():
+// auth_time is written from time.Now() in issueTokenPair, so comparing it with
+// the database clock would let skew between the two widen the window (an
+// application clock two minutes fast makes an eleven-minute-old sign-in look
+// nine minutes old). The cutoff is computed here and passed in. A token whose
+// grant is a refresh or tenant switch still qualifies: the session row keeps
+// the ORIGINAL auth_time and amr, which is what is checked.
 func (s *TOTPService) AuthorizeMFASwitchOff(ctx context.Context, gty, sessionID, userID string) error {
 	if !slices.Contains(HumanGrants, gty) {
 		if gty == "" {
@@ -534,12 +538,14 @@ func (s *TOTPService) AuthorizeMFASwitchOff(ctx context.Context, gty, sessionID,
 		return ErrMFASwitchOffServiceToken
 	}
 
+	cutoff := time.Now().UTC().Add(-MFASwitchOffMaxAuthAge)
 	var ok bool
 	err = s.pool.QueryRow(ctx, `
-		SELECT $3 = ANY (amr) AND auth_time > NOW() - make_interval(secs => $4)
+		SELECT $3 = ANY (amr) AND auth_time > $4
 		FROM user_sessions
-		WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
-	`, sid, uid, AMRMFA, MFASwitchOffMaxAuthAge.Seconds()).Scan(&ok)
+		WHERE id = $1 AND user_id = $2
+		  AND `+LiveSessionWhere("")+`
+	`, sid, uid, AMRMFA, cutoff).Scan(&ok)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrMFASwitchOffStaleSession

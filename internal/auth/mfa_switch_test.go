@@ -398,6 +398,41 @@ func TestMFASwitchOff_StaleSessionRefused(t *testing.T) {
 	}
 }
 
+// The age is judged on the application clock that wrote auth_time: a sign-in
+// eleven minutes old by time.Now() is refused whatever the database clock says.
+func TestMFASwitchOff_AgeJudgedOnApplicationClock(t *testing.T) {
+	f := newMFAFixture(t)
+	c := f.mfaSession(t, "switchoff-appclock")
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE user_sessions SET auth_time = $2 WHERE id::TEXT = $1`, c.SessionID, time.Now().UTC().Add(-11*time.Minute),
+	); err != nil {
+		t.Fatalf("age session: %v", err)
+	}
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); !errors.Is(err, auth.ErrMFASwitchOffStaleSession) {
+		t.Fatalf("stale session error = %v, want ErrMFASwitchOffStaleSession", err)
+	}
+}
+
+// A session past its deadline cannot turn MFA off, even with a fresh MFA
+// sign-in and an access token that is still valid. Only the idle deadline is
+// moved: CHECK (idle_expires_at <= absolute_expires_at) means a past absolute
+// deadline always comes with a past idle one.
+func TestMFASwitchOff_ExpiredSessionRefused(t *testing.T) {
+	f := newMFAFixture(t)
+	c := f.mfaSession(t, "switchoff-expired")
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); err != nil {
+		t.Fatalf("live session refused: %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE user_sessions SET idle_expires_at = NOW() - INTERVAL '1 second' WHERE id::TEXT = $1`, c.SessionID,
+	); err != nil {
+		t.Fatalf("expire session: %v", err)
+	}
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); !errors.Is(err, auth.ErrMFASwitchOffStaleSession) {
+		t.Fatalf("expired session error = %v, want ErrMFASwitchOffStaleSession", err)
+	}
+}
+
 func TestMFASwitchOff_SessionWithoutMFARefused(t *testing.T) {
 	f := newMFAFixture(t)
 	app, _ := f.createApp(t, "switchoff-nomfa")
