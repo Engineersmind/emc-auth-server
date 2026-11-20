@@ -157,7 +157,7 @@ type MFAPolicy struct {
 // AppMFAConfig is the effective login-time MFA configuration of one
 // application.
 type AppMFAConfig struct {
-	// Enabled is the master switch (migration 00105). While false the
+	// Enabled is the master switch (migration 00106). While false the
 	// application runs without MFA whatever Mode says: no challenge, no forced
 	// enrolment, no new enrolment. Mode and Methods are kept, not cleared.
 	Enabled bool
