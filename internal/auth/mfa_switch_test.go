@@ -381,6 +381,35 @@ func TestMFASwitch_MyMFAStatusForAppUser(t *testing.T) {
 
 // Administrators keep the administrator-policy logic and are never governed by
 // any application's switch.
+// An application user whose permissions happen to be named like the console's
+// administrator permissions is still judged by the application's policy: the
+// switch being off must show as off, not as administrator-required.
+func TestMFASwitch_MyMFAStatusAppUserWithAdminNamedPerms(t *testing.T) {
+	f := newMFAFixture(t)
+	svc := f.withAdminMFA(t)
+	f.setAdminPolicy(t, svc, auth.MFAMethodTOTP)
+	app, appID := f.createApp(t, "switch-status-adminperm")
+	userID := f.registerAppUser(t, app, uniqueEmail("switch-status-adminperm"), "Password123!")
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+
+	for _, perm := range []string{"admin:access", "tenant:manage"} {
+		st, err := f.authSvc.MyMFAStatus(f.ctx, userID, f.tenantID, []string{perm})
+		if err != nil {
+			t.Fatalf("MyMFAStatus(%s): %v", perm, err)
+		}
+		if st.MFAEnabled || st.MFARequired || st.Mode != auth.MFAModeOptional {
+			t.Errorf("%s: status = %+v, want the app's policy (switch off, optional, not required)", perm, st)
+		}
+		for _, m := range st.Methods {
+			if m.Allowed {
+				t.Errorf("%s: %s allowed = true, want false while the app switch is off", perm, m.Method)
+			}
+		}
+	}
+}
+
 func TestMFASwitch_MyMFAStatusForAdmin(t *testing.T) {
 	f := newMFAFixture(t)
 	svc := f.withAdminMFA(t)

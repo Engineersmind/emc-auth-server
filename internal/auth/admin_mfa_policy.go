@@ -512,8 +512,24 @@ type MFAStatus struct {
 // offered methods the application had disabled and enrolment then failed.
 func (s *AuthService) MyMFAStatus(ctx context.Context, userID, tenantID int64, perms []string) (*MFAStatus, error) {
 	out := &MFAStatus{MFAEnabled: true, Mode: MFAModeOptional}
+
+	uc, err := loadUserMFAContext(ctx, s.pool, userID, tenantID)
+	switch {
+	case errors.Is(err, ErrUserNotFound):
+		// Token tenant differs from the user's home tenant (a tenant switch):
+		// not an application user here, so no application policy applies.
+		uc = &userMFAContext{enabled: true, mode: MFAModeOptional}
+	case err != nil:
+		return nil, err
+	}
+
+	// Only a tenant-level account can be an administrator, exactly as in
+	// mfaGate. An application-scoped account is judged by its application's
+	// policy whatever its permissions are named: an application may define its
+	// own "admin:access" or "tenant:manage", and administratorKind matches
+	// permission names without knowing their scope.
 	var policy *AdminMFAPolicy
-	if s.adminMFA != nil {
+	if s.adminMFA != nil && uc.appRowID == nil {
 		admin, platform, err := s.administratorKind(ctx, userID, perms)
 		if err != nil {
 			return nil, err
@@ -528,24 +544,14 @@ func (s *AuthService) MyMFAStatus(ctx context.Context, userID, tenantID int64, p
 	}
 
 	allowed := func(string) bool { return true }
-	if policy != nil {
+	switch {
+	case policy != nil:
 		allowed = policy.Allows
-	} else {
-		uc, err := loadUserMFAContext(ctx, s.pool, userID, tenantID)
-		switch {
-		case errors.Is(err, ErrUserNotFound):
-			// Token tenant differs from the user's home tenant (a tenant switch):
-			// not an application user here, so no application policy applies.
-			uc = &userMFAContext{enabled: true, mode: MFAModeOptional}
-		case err != nil:
-			return nil, err
-		}
-		if uc.appRowID != nil {
-			out.MFAEnabled = uc.enabled
-			out.Mode = uc.mode
-			allowed = func(m string) bool {
-				return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.allowedMethods, m)
-			}
+	case uc.appRowID != nil:
+		out.MFAEnabled = uc.enabled
+		out.Mode = uc.mode
+		allowed = func(m string) bool {
+			return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.allowedMethods, m)
 		}
 	}
 
