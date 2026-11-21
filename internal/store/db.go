@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 )
@@ -25,6 +26,10 @@ func NewDB(ctx context.Context, databaseURL string, logger zerolog.Logger) (*pgx
 	config.MaxConnLifetimeJitter = 5 * time.Minute
 	config.MaxConnIdleTime = 15 * time.Minute
 	config.HealthCheckPeriod = 1 * time.Minute
+
+	// Trace every query as a span (no-op until the OTel tracer provider is set). Statement text is
+	// kept out of spans so values and PII never reach the APM store.
+	config.ConnConfig.Tracer = otelpgx.NewTracer(otelpgx.WithDisableSQLStatementInAttributes())
 
 	var pool *pgxpool.Pool
 

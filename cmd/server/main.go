@@ -164,8 +164,9 @@ func main() {
 	if err != nil {
 		logger.Warn().Err(err).Msg("otel init failed — continuing without telemetry")
 	} else {
-		// Attach hook after Init so the global log provider is already set
-		logger = logger.Hook(telemetry.NewOTelHook())
+		// Forward ERROR+ lines (with their fields) after Init, so the global log provider is set.
+		// A writer sees the whole JSON line; a zerolog hook sees only the message.
+		logger = logger.Output(zerolog.MultiLevelWriter(os.Stdout, telemetry.NewOTelWriter()))
 	}
 
 	// Initialise Sentry (no-op when SENTRY_DSN is unset)
