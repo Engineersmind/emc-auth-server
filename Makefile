@@ -132,7 +132,7 @@ lint:
 gosec:
 	gosec -exclude=$(GOSEC_EXCLUDE) ./...
 
-## Run govulncheck (CVE scan) through the same gate as CI, incl. its [CI-13] allowlist
+## Run govulncheck (CVE scan) through the same gate as CI, incl. its [CI-13] allowlist (needs govulncheck + jq)
 .PHONY: vuln
 vuln:
 	bash scripts/govulncheck-gate.sh

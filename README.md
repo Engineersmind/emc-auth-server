@@ -555,7 +555,7 @@ These run on every push and PR via `.github/workflows/ci.yml`:
 
 ```bash
 gosec ./...              # security-focused Go linter — SARIF output uploaded to GitHub Security
-govulncheck ./...        # known CVE scan across all dependencies
+make vuln                # govulncheck through scripts/govulncheck-gate.sh (needs jq)
 golangci-lint run        # errcheck, staticcheck, unused, shadow, etc.
 go test ./...            # build + unit tests (coverage report artifact)
 docker build .           # smoke-tests the production image builds cleanly

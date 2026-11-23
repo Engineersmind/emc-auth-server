@@ -69,6 +69,10 @@ name: CI
 #          TRUSTED_PROXIES only; required in production by config.Validate).
 #          6872 also needs echo's RateLimiter and 6875 echo's Proxy middleware; we
 #          register neither (only RequestID, Recover, RequestLoggerWithConfig).
+#   Guard: cmd/server/ci13_guard_test.go fails if any non-test code uses echo's
+#          RateLimiter or Proxy middleware, or if the single echo.New() in main.go
+#          loses its ClientIPExtractor. The gate runs it before allowing either ID,
+#          so either ID blocks again once the reason above stops being true.
 #   Fix:   scripts/govulncheck-gate.sh fails on any called finding except exactly
 #          these two IDs; any other ID, new or old, still blocks. Remove an ID (and
 #          this note) when its v4 OSV record lists a fixed version we are on, or when
