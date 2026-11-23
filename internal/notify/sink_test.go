@@ -53,6 +53,9 @@ func (m *captureMailer) SendReset(context.Context, *mailer.SMTPConfig, *mailer.T
 func (m *captureMailer) SendMFACode(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.MFACodeEmail) error {
 	return nil
 }
+func (m *captureMailer) SendPasswordlessCode(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.PasswordlessCodeEmail) error {
+	return nil
+}
 func (m *captureMailer) SendMagicLink(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.MagicLinkEmail) error {
 	return nil
 }

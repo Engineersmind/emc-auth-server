@@ -110,7 +110,13 @@ func (s *VerificationService) SendVerification(ctx context.Context, tenantID int
 	}
 
 	link := fmt.Sprintf("%s/api/v1/auth/verify-email?token=%s", s.appBaseURL, rawToken)
-	msg := mailer.VerificationEmail{To: email, Link: link, AppName: appName, TTLMinutes: int(VerificationTokenTTL.Minutes())}
+	msg := mailer.VerificationEmail{
+		To: email, Link: link, AppName: appName, TTLMinutes: int(VerificationTokenTTL.Minutes()),
+		// Token is the raw token only; Link above is the full URL. Lets an
+		// integrator route the user through its own page.
+		Token: rawToken,
+		Name:  firstNameByID(ctx, s.pool, userID),
+	}
 
 	sender := s.resolveSender(ctx, tenantID, appRowID)
 	tmpl := s.tmplSvc.ResolveTemplate(ctx, tenantID, appRowID, mailer.TemplateEmailVerification)
@@ -180,9 +186,10 @@ func (s *VerificationService) VerifyEmail(ctx context.Context, rawToken string) 
 	if s.tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplateWelcome) {
 		sender := s.resolveSender(ctx, tenantID, appRowID)
 		tmpl := s.tmplSvc.ResolveTemplate(ctx, tenantID, appRowID, mailer.TemplateWelcome)
-		if err := s.mailer.SendWelcome(ctx, sender, tmpl, mailer.WelcomeEmail{To: email, AppName: appName}); err != nil {
+		welcome := mailer.WelcomeEmail{To: email, AppName: appName, Name: firstNameByID(ctx, s.pool, userID)}
+		if err := s.mailer.SendWelcome(ctx, sender, tmpl, welcome); err != nil {
 			if sender != nil {
-				_ = s.mailer.SendWelcome(ctx, nil, tmpl, mailer.WelcomeEmail{To: email, AppName: appName})
+				_ = s.mailer.SendWelcome(ctx, nil, tmpl, welcome)
 			}
 		}
 	} else {

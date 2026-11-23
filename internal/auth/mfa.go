@@ -65,6 +65,17 @@ func methodAllowed(methods []string, method string) bool {
 	return false
 }
 
+// withoutMethod returns methods minus method, as a new slice.
+func withoutMethod(methods []string, method string) []string {
+	out := make([]string, 0, len(methods))
+	for _, m := range methods {
+		if m != method {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 // defaultMFAMethods is the implicit method set when no policy row exists and
 // the pre-00047 default for existing rows.
 func defaultMFAMethods() []string { return []string{MFAMethodTOTP} }
@@ -206,6 +217,19 @@ func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 	}
 	if methods != nil && !ValidMFAMethods(methods) {
 		return ErrInvalidMFAMethods
+	}
+	// Required MFA with email as the only method cannot be satisfied by a user who
+	// signed in with an emailed code, so refuse it while email codes are on.
+	if mode == MFAModeRequired && s.emailCodeEnabled != nil {
+		eff := methods
+		if eff == nil {
+			if _, cur, cErr := s.GetAppMFAConfig(ctx, appRowID); cErr == nil {
+				eff = cur
+			}
+		}
+		if len(eff) == 1 && eff[0] == MFAMethodEmail && s.emailCodeEnabled(ctx, tenantID, appRowID) {
+			return ErrPasswordlessMFAConflict
+		}
 	}
 	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO application_mfa_settings (application_id, tenant_id, mode, allowed_methods, updated_by, updated_at)

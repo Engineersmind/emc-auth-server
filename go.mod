@@ -13,7 +13,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.9.2
 	github.com/joho/godotenv v1.5.1
-	github.com/labstack/echo/v4 v4.15.4
+	github.com/labstack/echo/v4 v4.16.0
 	github.com/mssola/useragent v1.0.0
 	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/pquerna/otp v1.5.0

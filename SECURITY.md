@@ -61,6 +61,25 @@ If you cannot use GitHub advisories, email the maintainer listed in CODEOWNERS w
 | Audit logging | 21 event types, tenant-scoped + system-wide, fire-and-forget |
 | Tenant isolation | All queries scoped to `tenant_id`; cross-tenant requires `tenant:manage` |
 | CORS | Per-tenant origin whitelist, Redis-cached |
+| Passwordless email codes | 6 digits from `crypto/rand`, stored as an HMAC-SHA-256 keyed by `PASSWORDLESS_CODE_HMAC_KEY` and bound to the challenge id; single-use via one atomic Redis script; 5 attempts per code and 10 failures per hour per address; identical responses, decoy challenges, asynchronous send and padded latency so the flow cannot enumerate accounts. See `docs/PASSWORDLESS_INTEGRATION.md`. |
+
+### Passwordless email codes: residual risks
+
+These are accepted and documented rather than hidden:
+
+- **Mailbox compromise (T5).** An email code proves control of an inbox and nothing
+  more, so whoever controls the mailbox can sign in. It is treated as a single
+  factor and is **not** NIST SP 800-63B AAL2. Applications needing more should
+  require TOTP or a passkey on top.
+- **Real-time phishing relay (T6).** A user can be tricked into typing a code into
+  an attacker's page, which relays it at once. Email codes are not
+  phishing-resistant; passkeys are.
+- **Pre-hijack in "both" mode (T3).** When an attacker registered an address with a
+  password before the owner first signed in by code, the owner's code sign-in ends
+  the attacker's sessions and verifies the address, but the stored password is kept
+  (it is never deleted by this feature) and still works until the owner resets it.
+  In passwordless-only applications the password flow is closed. The same risk
+  exists without this feature.
 
 ---
 

@@ -51,6 +51,9 @@ func (m *recordingMailer) SendWelcome(context.Context, *mailer.SMTPConfig, *mail
 func (m *recordingMailer) SendMFACode(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.MFACodeEmail) error {
 	return nil
 }
+func (m *recordingMailer) SendPasswordlessCode(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.PasswordlessCodeEmail) error {
+	return nil
+}
 func (m *recordingMailer) SendMagicLink(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.MagicLinkEmail) error {
 	return nil
 }
