@@ -366,6 +366,13 @@ type Service struct {
 	// signingKeys mints a tenant's asymmetric JWT key pair at creation time
 	// (issue #95). nil is safe — key generation then falls back to lazy.
 	signingKeys *auth.SigningKeyService
+
+	// secretBox encrypts tenants.jwt_secret on tenant creation
+	// (GHSA-4x5m-3gph-938r). Optional: when nil the plaintext column is written
+	// — the pre-#94 behaviour, tolerated so tests and embedders without an
+	// encryption key keep working. Production wires it unconditionally (the
+	// signing-key box fails closed in production/staging if unset).
+	secretBox *auth.SecretBox
 	// authSvc owns session revocation. Admin revocation goes through it rather
 	// than issuing its own UPDATE so that revoking from the admin API and revoking
 	// from a logout take exactly the same code path — including the revoked-session
@@ -458,6 +465,15 @@ func (s *Service) WithSigningKeys(keys *auth.SigningKeyService) *Service {
 	return s
 }
 
+// WithSecretBox wires the encryption box used for tenants.jwt_secret
+// (GHSA-4x5m-3gph-938r). Reuses the signing-key box: a tenant's symmetric
+// secret is signing authority, the same asset class as
+// signing_keys.private_key_enc.
+func (s *Service) WithSecretBox(box *auth.SecretBox) *Service {
+	s.secretBox = box
+	return s
+}
+
 // ---------------------------------------------------------------------------
 // Tenant management (super_admin only — caller must hold "tenant:manage" perm)
 // ---------------------------------------------------------------------------
@@ -530,6 +546,18 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	if err != nil {
 		return nil, fmt.Errorf("generate jwt secret: %w", err)
 	}
+	// Encrypt the secret for storage when a box with a real key is wired; the
+	// plaintext column then carries '' — never a usable key
+	// (GHSA-4x5m-3gph-938r). A box on the development zero key must NOT write:
+	// that ciphertext becomes undecryptable the moment a real key is set.
+	storedSecret := secret
+	var secretEnc any
+	if s.secretBox != nil && !s.secretBox.UsesInsecureZeroKey() {
+		if secretEnc, err = s.secretBox.Encrypt(secret); err != nil {
+			return nil, fmt.Errorf("encrypt jwt secret: %w", err)
+		}
+		storedSecret = ""
+	}
 
 	plan := in.Plan
 	if plan == "" {
@@ -545,11 +573,11 @@ func (s *Service) CreateTenant(ctx context.Context, in CreateTenantInput) (*Crea
 	// Step 1: insert tenant row.
 	var tenantID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO tenants (name, slug, jwt_secret, display_name, domain, region, plan, is_active)
-		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, true)
+		INSERT INTO tenants (name, slug, jwt_secret, jwt_secret_enc, display_name, domain, region, plan, is_active)
+		VALUES ($1, $2, $3, NULLIF($8, ''), NULLIF($4, ''), NULLIF($5, ''), NULLIF($6, ''), $7, true)
 		RETURNING id
-	`, in.Name, in.Slug, secret,
-		in.DisplayName, in.Domain, in.Region, plan,
+	`, in.Name, in.Slug, storedSecret,
+		in.DisplayName, in.Domain, in.Region, plan, secretEnc,
 	).Scan(&tenantID)
 	if err != nil {
 		if isDuplicateErr(err) {
