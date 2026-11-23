@@ -91,3 +91,11 @@ docs/WEBAUTHN_TEST_PROCEDURE.md
 # Passkey gap tracker — local follow-up notes, same class as GAP_ANALYSIS.md.
 # Its contents become GitHub issues; the file itself stays private.
 docs/PASSKEY_GAPS.md
+
+# Perf suite run state (issue #218) — holds seeded client secrets and user
+# passwords. Never committed; teardown removes it.
+perf/.state/
+
+# Perf run output (issue #218) — generated per run and uploaded as CI
+# artifacts; only docs/perf/README.md is tracked.
+docs/perf/2*/

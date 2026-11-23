@@ -576,7 +576,8 @@ go tool cover -func=coverage.out
 # - SQL injection probes on search and filter params
 
 # 07-03: Load test + distroless production image
-k6 run --vus 500 --duration 60s load/login.js   # p99 ≤ 200ms target
+# Load test delivered as the perf/ NFR suite (issue #218) — see perf/README.md
+k6 run perf/k6/main.js   # scenarios + p95/p99/error-rate thresholds from perf/targets.json
 ```
 
 ### CI/CD Pipeline (Phase 7 — GitHub Actions — Implemented)

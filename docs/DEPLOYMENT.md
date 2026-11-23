@@ -191,20 +191,44 @@ Key metrics exposed on `/metrics`:
 
 ## Load Testing
 
-Run the k6 load test to verify SLA compliance before going live:
+The NFR suite lives in `perf/` (issue #218): a k6 scenario suite covering tenant
+login, app login/register, `client_credentials` and `refresh_token` grants,
+JWKS, and `/apps/me`, plus a dedicated rate-limit probe. VU/RPS and p95/p99
+latency and error-rate thresholds all come from one file, `perf/targets.json`;
+a breached threshold fails the run.
+
+Run the smoke scenario against the **local** docker compose stack
+(`http://localhost:9090`):
 
 ```bash
 # Requires k6 installed: https://k6.io/docs/getting-started/installation/
-make load-test
+# 1. Seed the fixtures — creates an isolated perf tenant, three apps and the
+#    user pools. Needs a freshly minted admin JWT (see perf/README.md):
+BASE_URL=http://localhost:9090 PERF_ADMIN_TOKEN=<admin JWT> \
+  TARGETS_FILE=$PWD/perf/targets.local.json node perf/seed/seed.js
 
-# Or against a specific target:
-BASE_URL=https://auth.your-domain.com k6 run scripts/load-test.js
+# 2. Run the suite (results land in docs/perf/<date>/<scenario>-<sha>-<ts>/):
+RESULTS_DIR=$(GIT_SHA=$(git rev-parse --short HEAD) node perf/scripts/results-dir.js smoke) && \
+mkdir -p "$RESULTS_DIR" && \
+BASE_URL=http://localhost:9090 SCENARIO=smoke \
+  TARGETS_FILE=$PWD/perf/targets.local.json \
+  PERF_STATE_FILE=$PWD/perf/.state/latest.json \
+  GIT_SHA=$(git rev-parse --short HEAD) RESULTS_DIR=$RESULTS_DIR \
+  k6 run perf/k6/main.js
+
+# 3. Tear down the perf tenant when finished:
+PERF_ADMIN_TOKEN=<admin JWT> PERF_STATE_FILE=$PWD/perf/.state/latest.json \
+  node perf/seed/teardown.js
 ```
 
-SLA thresholds declared in `scripts/load-test.js`:
-- p99 login latency ≤ 200ms (NFR-02)
-- HTTP error rate < 1% (429s from rate limiter are expected and do not count as failures)
-- Zero HTTP 5xx responses
+`make load-test` wraps step 2 once fixtures are seeded.
+
+This suite is for local/CI targets only: the target guard in
+`perf/scripts/check-target.js` refuses production hosts, and the seeded
+credentials, per-iteration `X-Forwarded-For`, and raised app quotas assume a
+disposable deployment. Never point it at a live instance. The measured flows
+are sized so 429s never occur — a 429 there fails the run; the separate
+`ratelimit` scenario exists to prove the compiled-in defaults still fire.
 
 ## Upgrading to Audience-Validated Tokens (One Forced Re-Login)
 

@@ -1,0 +1,8 @@
+{
+  "comment": "Hosts the perf suite must never target (issue #218, FR7). The guard refuses a target whose host equals one of these domains or ends in '.' + domain, with reason 'production-domain'. Source: production-looking hosts already present in this repo (docker-compose.yml GLOBAL_CORS_ORIGINS, deploy scripts, docs) plus the orchestrator-provided pollenx.ai entry — see issue facts F8.",
+  "denied": [
+    { "domain": "senie.ai", "comment": "Production hostnames seen in the repo: auth.senie.ai, emc-auth.senie.ai, app.senie.ai (F8)." },
+    { "domain": "engineersmind.com", "comment": "Production hostnames seen in the repo: admin./api./app./auth./staging.engineersmind.com (F8)." },
+    { "domain": "pollenx.ai", "comment": "Production domain added by the orchestrator (F8)." }
+  ]
+}
