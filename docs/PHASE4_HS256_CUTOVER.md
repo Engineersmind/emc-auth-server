@@ -132,7 +132,7 @@ dropping the columns.
 Only after step 2 has been stable and `..._total{reason="rejected"}` is not climbing.
 
 `jwt_secret` and `jwt_secret_enc` come out **together**. Dropping only `jwt_secret`
-would leave the actual secret behind: since migration 00105 the real value lives in
+would leave the actual secret behind: since migration 00106 the real value lives in
 `jwt_secret_enc` and the plaintext column is blanked, so a partial drop removes a
 column that is already empty and keeps the credential.
 
@@ -178,7 +178,7 @@ Remove the dependent code — everything that reads or writes either column:
 - Docs that describe the column: this file, and the `jwt_secret` references in
   `README.md`, `docs/DEPLOYMENT.md`, and `.env.example`
 
-Then add this as the next migration (`00106_drop_tenant_jwt_secret_columns.sql`).
+Then add this as the next free migration number (`00107_drop_tenant_jwt_secret_columns.sql` at the time of writing; check `migrations/` first).
 It is **not** in the repo yet on purpose: goose auto-applies on boot, so committing
 it earlier would drop the columns on the very first deploy, while HS256 verification
 was still expected to work.
@@ -190,7 +190,7 @@ was still expected to work.
 -- Issue #95, Phase 4. Removes the symmetric signing secret entirely. Signing keys
 -- have lived in signing_keys since migration 00065; jwt_secret has been
 -- verification-only since and unused entirely since JWT_ALLOW_LEGACY_HS256=false,
--- and jwt_secret_enc (00105) holds the only remaining copies of those secrets.
+-- and jwt_secret_enc (00106) holds the only remaining copies of those secrets.
 -- Both come out together — dropping jwt_secret alone would leave the real secret
 -- behind, which is the asset this phase exists to remove.
 --
