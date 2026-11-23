@@ -81,3 +81,28 @@ func TestLoginRateLimiter_RotatingXFFBehindProxy(t *testing.T) {
 		t.Fatalf("blocked %d of 20, want 15 (limit 5/min for one real client IP)", blocked)
 	}
 }
+
+// why: #216 — TrustedPeer gates X-Forwarded-Proto and must trust exactly the
+// peers ClientIPExtractor trusts for X-Forwarded-For: one TRUSTED_PROXIES, one rule.
+func TestTrustedPeer_MatchesClientIPExtractor(t *testing.T) {
+	e := newEchoBehindProxy(t)
+	_, dockerNet, _ := net.ParseCIDR("172.18.0.0/16")
+	trusted := middleware.TrustedPeer([]*net.IPNet{dockerNet})
+	for _, remote := range []string{
+		"172.18.0.1:5000", "127.0.0.1:5000", "[::1]:5000",
+		"198.51.100.5:5000", "10.0.0.5:5000", "192.168.1.1:5000", "169.254.1.1:5000", "[fe80::1]:5000",
+	} {
+		t.Run(remote, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = remote
+			req.Header.Set("X-Forwarded-For", "203.0.113.9")
+			extractorTrusts := e.NewContext(req, httptest.NewRecorder()).RealIP() == "203.0.113.9"
+			if got := trusted(req); got != extractorTrusts {
+				t.Fatalf("TrustedPeer = %v, ClientIPExtractor trusts = %v", got, extractorTrusts)
+			}
+		})
+	}
+	if trusted(&http.Request{RemoteAddr: "not-an-ip"}) {
+		t.Fatal("unparseable peer must not be trusted")
+	}
+}
