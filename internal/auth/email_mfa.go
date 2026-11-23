@@ -115,7 +115,8 @@ func (s *EmailMFAService) IsActive(ctx context.Context, userID int64) (bool, err
 // The sender resolves on a priority basis — application sender → tenant
 // sender → global — and a white-label relay failure falls back to the global
 // sender: a tenant's broken SMTP must never lock their users out of login.
-func (s *EmailMFAService) mintAndSend(ctx context.Context, key, email, appName string, tenantID int64, appRowID *int64, ttl time.Duration) error {
+// purpose says what the code is for, in words that finish "use the code below to …".
+func (s *EmailMFAService) mintAndSend(ctx context.Context, key, email, appName string, tenantID int64, appRowID *int64, ttl time.Duration, purpose string) error {
 	code, err := generateEmailOTP()
 	if err != nil {
 		return err
@@ -139,6 +140,8 @@ func (s *EmailMFAService) mintAndSend(ctx context.Context, key, email, appName s
 		Code:       code,
 		AppName:    appName,
 		TTLMinutes: int(ttl.Minutes()),
+		Purpose:    purpose,
+		Name:       firstNameByEmail(ctx, s.pool, tenantID, appRowID, email),
 	}
 
 	var sender *mailer.SMTPConfig
@@ -221,7 +224,7 @@ func (s *EmailMFAService) BeginEnrollment(ctx context.Context, userID, tenantID 
 		return fmt.Errorf("record email MFA enrollment: %w", err)
 	}
 
-	return s.mintAndSend(ctx, emailVerifyKey(userID), email, uc.appName, tenantID, uc.appRowID, EmailOTPTTL)
+	return s.mintAndSend(ctx, emailVerifyKey(userID), email, uc.appName, tenantID, uc.appRowID, EmailOTPTTL, "set up email two-factor authentication")
 }
 
 // ActivateEnrollment verifies the emailed code and marks email MFA active.
@@ -256,7 +259,7 @@ func (s *EmailMFAService) SendVerificationCode(ctx context.Context, userID, tena
 	if err != nil {
 		return err
 	}
-	return s.mintAndSend(ctx, emailVerifyKey(userID), email, uc.appName, tenantID, uc.appRowID, EmailOTPTTL)
+	return s.mintAndSend(ctx, emailVerifyKey(userID), email, uc.appName, tenantID, uc.appRowID, EmailOTPTTL, "confirm a change to your two-factor authentication")
 }
 
 // Disable removes email MFA after verifying an emailed code (requested via

@@ -320,7 +320,7 @@ func (s *OrganizationService) CreateInvitation(ctx context.Context, sc Organizat
 	}
 
 	if in.SendEmail {
-		out.EmailSent = s.sendInvitationEmail(ctx, sc, org.DisplayName, email, link, in.InviterName, ttl)
+		out.EmailSent = s.sendInvitationEmail(ctx, sc, org.DisplayName, email, link, token, in.InviterName, ttl)
 	}
 	return out, nil
 }
@@ -329,11 +329,11 @@ func (s *OrganizationService) CreateInvitation(ctx context.Context, sc Organizat
 // branded user_invitation template. Delivery failure does not undo the
 // invitation — the caller still holds the token and the response says the
 // mail was not sent.
-func (s *OrganizationService) sendInvitationEmail(ctx context.Context, sc OrganizationScope, orgName, email, link, inviter string, ttl time.Duration) bool {
+func (s *OrganizationService) sendInvitationEmail(ctx context.Context, sc OrganizationScope, orgName, email, link, token, inviter string, ttl time.Duration) bool {
 	appRowID := sc.AppRowID
 	msg := mailer.InvitationEmail{
 		To: email, Link: link, AppName: orgName, InviterName: inviter,
-		TTLMinutes: int(ttl.Minutes()),
+		TTLMinutes: int(ttl.Minutes()), Token: token,
 	}
 	sent, err := s.notify.Send(ctx, sc.TenantID, &appRowID, mailer.TemplateUserInvitation,
 		func(sender *mailer.SMTPConfig, tmpl *mailer.Template) error {
@@ -461,6 +461,24 @@ func liveRoleNames(ctx context.Context, q pgx.Tx, p *pendingInvitation) ([]strin
 		return nil, fmt.Errorf("resolve invitation roles: %w", err)
 	}
 	return names, nil
+}
+
+// InvitationScope reports the tenant and application a pending invitation token
+// belongs to. Read only. ok is false for an unknown, used, revoked or expired
+// token (or while organisations are off).
+//
+// For the rate limiter, which charges a backend's invitation preview and accept
+// calls to its own application's quota only for its own invitations (see
+// middleware.ScopeToCaller).
+func (s *OrganizationService) InvitationScope(ctx context.Context, token string) (tenantID, appID int64, ok bool) {
+	if s.guard() != nil {
+		return 0, 0, false
+	}
+	p, err := loadPendingInvitation(ctx, s.pool, token, false)
+	if err != nil {
+		return 0, 0, false
+	}
+	return p.tenant, p.appRowID, true
 }
 
 // PreviewInvitation describes a pending invitation to the holder of its token.

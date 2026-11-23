@@ -1198,3 +1198,28 @@ Limits: 10,000 organisations per application · 5,000 members per organisation �
 - [ ] Batch jobs are idempotent and retry `429` with back-off.
 - [ ] Sensitive actions call `/oauth/introspect`.
 - [ ] Tested end to end in staging: sign up → verify → create org → switch → invite → accept → teammate sign-in → remove → access lost.
+
+## Rate limits and credentials per route
+
+A product backend that calls these routes for its users should send its client
+credentials, so it is charged to the application's shared quota instead of the
+per-IP limit (5/min), which a single egress IP would exhaust at once.
+
+| Route | Credentials header | Limit with valid credentials |
+|---|---|---|
+| `POST /auth/apps/login/organization` | `Authorization: Basic` | Application quota, for that application's selection tokens only |
+| `POST /auth/apps/switch-organization` | `Authorization: Basic` | Application quota, for that application's refresh tokens only |
+| `GET /auth/apps/organizations/invitations/preview` | `Authorization: Basic` | Application quota, for that application's invitation tokens only |
+| `POST /auth/apps/organizations/invitations/accept` | `X-Client-Authorization: Basic …` next to the user's `Authorization: Bearer` | Application quota, same rule |
+| `/auth/apps/organizations/*` (management) | `Authorization: Basic` | Application quota |
+| `POST /auth/refresh`, `POST /auth/logout` | none | Unchanged: not rate limited per application |
+
+- Tokens belonging to another tenant or another application, wrong secrets and
+  anonymous calls keep the per-IP limit and are never charged to the application.
+- Expired or unknown tokens stay on the application quota, so a backend whose
+  users' sessions expire is not pushed back onto the per-IP limit.
+- Credentialed calls from an unregistered IP also spend the shared 600/min
+  per-IP flood guard. If the application quota is raised above 600/min, register
+  the backend's egress IPs as server IPs.
+- Body requests to the organisation routes must be JSON; an empty, form-encoded
+  or oversized body (past 64 KiB before the token) is rejected with 400.
