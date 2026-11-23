@@ -10,6 +10,37 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Passwordless sign-in and sign-up with email codes** — one pair of calls
+  (`/auth/apps/passwordless/start` and `/verify`, plus `/resend`) covers both
+  registration and login with a 6-digit emailed code. See
+  `docs/PASSWORDLESS_INTEGRATION.md`.
+  - Opt-in twice and off by default: `PASSWORDLESS_ENABLED` (routes answer 404
+    while false) and a per-application policy (platform, tenant and application
+    scope, inheriting field by field, platform values acting as ceilings). An
+    application with no policy is exactly what it was. Password login, the magic
+    link and email MFA are not changed.
+  - Three modes per application: password only (default), both, passwordless only.
+    `password_enabled=false` closes the password flow (`403 password_auth_disabled`
+    on login, register, forgot and reset, before any lookup, not counted toward
+    lockout); stored passwords are never deleted or changed.
+  - Safe against account enumeration (identical response for every address, decoy
+    challenges, asynchronous send, padded latency) and against pre-hijack (an
+    unverified account's sessions are ended on the owner's first proof of the
+    inbox; its password is kept).
+  - Codes are stored in Redis as an HMAC bound to the challenge id, verified by one
+    atomic script with a 5-attempt budget and a per-address failure block. After an
+    emailed first factor the email method is not offered as a second factor.
+  - New token values: `gty=email_otp` and `amr` `email_otp` (relying parties with
+    fixed allow-lists must add them). New email template `passwordless_code`, which
+    appears in the template list for every tenant and application.
+  - Admin API: policy routes at platform, tenant and application scope with
+    optimistic concurrency, an impact preview, history and restore, usage
+    statistics, per-user sign-in methods, mark-verified, throttle clearing and an
+    audited admin-assisted email change.
+  - Config: `PASSWORDLESS_ENABLED`, `PASSWORDLESS_CODE_HMAC_KEY` (required only when
+    the feature is on in production or staging),
+    `RATE_LIMIT_APP_USER_PASSWORDLESS_START` and `_VERIFY`. Migration `00105` adds
+    two tables and changes no existing one.
 - **Organizations** — per-organisation membership and roles inside an
   application ("Admin at Acme, Viewer at Globex"). See `docs/ORGANIZATIONS.md`.
   - Opt-in twice: `ORGANIZATIONS_ENABLED` (default `false`) and a per-application

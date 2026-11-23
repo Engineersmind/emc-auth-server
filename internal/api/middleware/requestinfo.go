@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"strings"
+
 	"github.com/labstack/echo/v4"
 
 	"github.com/engineersmind/emc-auth-server/internal/requestctx"
@@ -19,11 +21,25 @@ import (
 // c.RealIP() is used rather than the raw RemoteAddr so the value reflects the
 // true client behind a load balancer. That makes it only as trustworthy as the
 // proxy chain, which is why nothing authorizes on it — see requestctx.
+// isBasic reports whether a credentials header carries HTTP Basic credentials, which
+// is how an application identifies itself. Routes that need the user's own Bearer
+// token send the application's credentials in ClientAuthHeader instead.
+func isBasic(h string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(h)), "basic ")
+}
+
 func RequestInfo() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
 			req := c.Request()
-			ctx := requestctx.WithRequestInfo(req.Context(), c.RealIP(), req.UserAgent())
+			// Trusted by default: with no application backend in front, RealIP and the
+			// User-Agent are the person's own. AppS2S.Resolve refines this for routes
+			// it guards. Routes it does not guard (verify-email, email-change
+			// confirmation, MFA enrolment) cannot be classified there, so a request
+			// that presents application credentials is treated as the BACKEND here,
+			// rather than letting its address and HTTP client pass as the user's.
+			fromBackend := isBasic(req.Header.Get(echo.HeaderAuthorization)) || isBasic(req.Header.Get(ClientAuthHeader))
+			ctx := requestctx.WithClientIdentity(req.Context(), c.RealIP(), req.UserAgent(), "", !fromBackend, !fromBackend)
 			c.SetRequest(req.WithContext(ctx))
 			return next(c)
 		}

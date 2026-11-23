@@ -25,7 +25,10 @@ import (
 
 // AdminHandler holds handlers for all Admin API endpoints.
 type AdminHandler struct {
-	svc         *admin.Service
+	svc *admin.Service
+	// pwless backs the passwordless policy and recovery routes. nil makes them
+	// answer 503 rather than panicking.
+	pwless      *PasswordlessAdminDeps
 	appLimitSvc *auth.AppRateLimitService
 	// trustSvc backs the server-trust routes (server IPs, forwarded IP). nil
 	// makes them answer 503.
@@ -3456,6 +3459,9 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		if errors.Is(err, auth.ErrAppNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
 		}
+		if errors.Is(err, auth.ErrPasswordlessMFAConflict) {
+			return c.JSON(http.StatusUnprocessableEntity, map[string]string{"error": "passwordless_mfa_conflict", "message": err.Error()})
+		}
 		h.logger.Error().Err(err).Msg("admin: set application MFA policy failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to set MFA policy"})
 	}
@@ -4161,6 +4167,13 @@ func (h *AdminHandler) UpsertEmailTemplate(c echo.Context) error {
 		}
 		h.logger.Error().Err(err).Msg("admin: upsert email template failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to save email template"})
+	}
+
+	// Warn, do not reject: a template saved with an unknown variable already
+	// falls back to the built-in at send time, so refusing the save now would only
+	// start failing edits that have always worked. The editor shows the warning.
+	if verr := mailer.ValidateTemplate(&mailer.Template{Subject: req.Subject, HTML: req.HTMLBody, Text: req.TextBody}, tt); verr != nil {
+		tmpl.Warnings = []string{"this template will not be used until it is fixed — every send falls back to the built-in: " + renderErrorHint(verr)}
 	}
 
 	rt, rid := senderResource(tenantID, appRowID)
