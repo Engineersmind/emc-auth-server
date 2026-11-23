@@ -119,7 +119,7 @@ jobs:
             "RPASS=$(grep '^REDIS_PASSWORD=' /tmp/app.env | cut -d= -f2-) && echo \"REDIS_URL=redis://:${RPASS}@emc-auth-redis:6379\" >> /tmp/app.env",
             "echo ENV=production >> /tmp/app.env && echo PORT=8080 >> /tmp/app.env && echo JWT_ISSUER=https://" + domain + " >> /tmp/app.env && echo APP_BASE_URL=https://" + domain + " >> /tmp/app.env",
             "docker rm -f emc-auth-app 2>/dev/null || true",
-            f"docker run -d --name emc-auth-app --network emc-auth-net --restart unless-stopped -p 127.0.0.1:8080:8080 --env-file /tmp/app.env {img}",
+            f"docker run -d --name emc-auth-app --network emc-auth-net --restart unless-stopped -p 127.0.0.1:8080:8080 -v /opt/emc-auth/geoip:/data/geoip:ro --env-file /tmp/app.env {img}",
             f"echo Deployed: {img}",
           ]
           payload = {"DocumentName": "AWS-RunShellScript", "InstanceIds": [instance], "Parameters": {"commands": cmds}}
