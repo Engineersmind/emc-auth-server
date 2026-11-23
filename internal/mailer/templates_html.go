@@ -46,6 +46,7 @@ var htmlFiles = map[TemplateType]string{
 	TemplateAdminActivity:      "templates/12_admin_activity.html",
 	TemplateAccessChanged:      "templates/13_access_changed.html",
 	TemplateProviderTest:       "templates/14_provider_test.html",
+	TemplatePasswordlessCode:   "templates/15_passwordless_code.html",
 }
 
 // init replaces each built-in's HTML with the embedded file.

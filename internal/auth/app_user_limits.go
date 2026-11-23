@@ -60,6 +60,8 @@ const (
 	UserLimitOAuthExchange      = "oauth_exchange"
 	UserLimitPasskeyLogin       = "passkey_login"
 	UserLimitResendVerification = "resend_verification"
+	UserLimitPasswordlessStart  = "passwordless_start"
+	UserLimitPasswordlessVerify = "passwordless_verify"
 )
 
 // UserLimitDefs lists every overridable per-user limit, in display order.
@@ -87,6 +89,10 @@ var UserLimitDefs = []UserLimitDef{
 		Endpoints: []string{"POST /api/v1/auth/reset-password"}, Max: 60},
 	{Key: UserLimitResendVerification, Name: "Resend verification email", KeyedBy: "email",
 		Endpoints: []string{"POST /api/v1/auth/resend-verification"}, Max: 10},
+	{Key: UserLimitPasswordlessStart, Name: "Passwordless code email", KeyedBy: "email",
+		Endpoints: []string{"POST /api/v1/auth/apps/passwordless/start"}, Max: 10},
+	{Key: UserLimitPasswordlessVerify, Name: "Passwordless code verify and resend", KeyedBy: "user IP (forwarded)",
+		Endpoints: []string{"POST /api/v1/auth/apps/passwordless/verify", "POST /api/v1/auth/apps/passwordless/resend"}, Max: 60},
 	{Key: UserLimitOAuthExchange, Name: "Social login code exchange", KeyedBy: "user IP (forwarded)",
 		Endpoints: []string{"POST /api/v1/auth/oauth/exchange"}, Max: 60},
 	{Key: UserLimitRoles, Name: "User roles", KeyedBy: "user id",

@@ -74,6 +74,8 @@ type s2sReq struct {
 	header    string // credentials header; default Authorization
 	body      string
 	forwarded string
+	fwdUA     string // X-EMC-Forwarded-User-Agent
+	fwdTZ     string // X-EMC-Forwarded-Timezone
 	bearer    string
 }
 
@@ -83,6 +85,7 @@ type s2sResult struct {
 	caller    *middleware.AppCaller
 	endUserIP string
 	ctxIP     string
+	ctxInfo   requestctx.RequestInfo
 	header    http.Header
 }
 
@@ -96,6 +99,7 @@ func runS2S(t *testing.T, chain []echo.MiddlewareFunc, r s2sReq) s2sResult {
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/apps/login", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.RemoteAddr = r.remote + ":40000"
+	req.Header.Set("User-Agent", "backend/1.0")
 	if r.clientID != "" {
 		h := r.header
 		if h == "" {
@@ -106,11 +110,18 @@ func runS2S(t *testing.T, chain []echo.MiddlewareFunc, r s2sReq) s2sResult {
 	if r.forwarded != "" {
 		req.Header.Set(middleware.ForwardedForHeader, r.forwarded)
 	}
+	if r.fwdUA != "" {
+		req.Header.Set(middleware.ForwardedUserAgentHeader, r.fwdUA)
+	}
+	if r.fwdTZ != "" {
+		req.Header.Set(middleware.ForwardedTimezoneHeader, r.fwdTZ)
+	}
 	if r.bearer != "" {
 		req.Header.Set(echo.HeaderAuthorization, "Bearer "+r.bearer)
 	}
-	// Mirror production, where RequestInfo runs globally first.
-	req = req.WithContext(requestctx.WithRequestInfo(req.Context(), r.remote, "backend/1.0"))
+	// Mirror production, where RequestInfo runs globally first and marks the
+	// identity trusted until AppS2S says otherwise.
+	req = req.WithContext(requestctx.WithClientIdentity(req.Context(), r.remote, "backend/1.0", "", true, true))
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
 
@@ -118,7 +129,8 @@ func runS2S(t *testing.T, chain []echo.MiddlewareFunc, r s2sReq) s2sResult {
 	h := func(c echo.Context) error {
 		res.caller, _ = middleware.CallerFrom(c)
 		res.endUserIP = middleware.EndUserIP(c)
-		res.ctxIP = requestctx.FromContext(c.Request().Context()).IPAddress
+		res.ctxInfo = requestctx.FromContext(c.Request().Context())
+		res.ctxIP = res.ctxInfo.IPAddress
 		return c.JSON(http.StatusOK, map[string]string{"status": "ok"})
 	}
 	for i := len(chain) - 1; i >= 0; i-- {
@@ -519,5 +531,84 @@ func TestAppS2S_UserDefaultsNotStricterThanBefore(t *testing.T) {
 		if v < before {
 			t.Errorf("default %s limit %d is below the %d/min a user had before", name, v, before)
 		}
+	}
+}
+
+// The end user's device and timezone ride the same trust as their IP, and a
+// backend speaking for itself must never be mistaken for the user.
+func TestAppS2S_ForwardedIdentityTrust(t *testing.T) {
+	const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0 Safari/537.36"
+	cases := []struct {
+		name        string
+		trust       fakeTrust
+		remote      string
+		secret      string
+		forwarded   string
+		fwdUA       string
+		fwdTZ       string
+		wantTrusted bool
+		wantUATrust bool
+		wantUA      string
+		wantTZ      string
+	}{
+		{"forwarded and trusted", trustWith([]string{backendIP + "/32"}, true), backendIP, appSecret, endUserIPOne, ua, "Asia/Kolkata", true, true, ua, "Asia/Kolkata"},
+		{"trusted IP, no UA header keeps the request UA", trustWith([]string{backendIP + "/32"}, true), backendIP, appSecret, endUserIPOne, "", "", true, false, "backend/1.0", ""},
+		{"unknown timezone dropped, identity still trusted", trustWith([]string{backendIP + "/32"}, true), backendIP, appSecret, endUserIPOne, ua, "Mars/Olympus", true, true, ua, ""},
+		{"timezone with junk dropped", trustWith([]string{backendIP + "/32"}, true), backendIP, appSecret, endUserIPOne, ua, "../../etc/passwd", true, true, ua, ""},
+		{"control characters in UA ignored", trustWith([]string{backendIP + "/32"}, true), backendIP, appSecret, endUserIPOne, "bad\x01agent", "", true, false, "backend/1.0", ""},
+		// A verified backend that forwards nothing is the backend, not the user.
+		{"verified backend, nothing forwarded", trustWith([]string{backendIP + "/32"}, true), backendIP, appSecret, "", "", "", false, false, "backend/1.0", ""},
+		// Headers sent without the trust to back them are ignored outright.
+		{"forwarding off: UA and timezone ignored", trustWith([]string{backendIP + "/32"}, false), backendIP, appSecret, endUserIPOne, ua, "Asia/Kolkata", false, false, "backend/1.0", ""},
+		{"from an unregistered IP: ignored", trustWith([]string{backendIP + "/32"}, true), strangerIP, appSecret, endUserIPOne, ua, "Asia/Kolkata", false, false, "backend/1.0", ""},
+		// Still the backend's own address (a registered server IP), so still not the user.
+		{"secret did not verify: ignored", trustWith([]string{backendIP + "/32"}, true), backendIP, "wrong", endUserIPOne, ua, "Asia/Kolkata", false, false, "backend/1.0", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newS2S(middleware.AppS2SConfig{}, tc.trust)
+			res := runS2S(t, loginChain(s), s2sReq{remote: tc.remote, clientID: appClient, secret: tc.secret,
+				forwarded: tc.forwarded, fwdUA: tc.fwdUA, fwdTZ: tc.fwdTZ, body: emailBody("bob@x.com")})
+			if res.code != http.StatusOK {
+				t.Fatalf("got %d %v, want 200", res.code, res.body)
+			}
+			if res.ctxInfo.Trusted != tc.wantTrusted {
+				t.Errorf("Trusted = %v, want %v", res.ctxInfo.Trusted, tc.wantTrusted)
+			}
+			if res.ctxInfo.UserAgentTrusted != tc.wantUATrust {
+				t.Errorf("UserAgentTrusted = %v, want %v", res.ctxInfo.UserAgentTrusted, tc.wantUATrust)
+			}
+			if res.ctxInfo.UserAgent != tc.wantUA {
+				t.Errorf("UserAgent = %q, want %q", res.ctxInfo.UserAgent, tc.wantUA)
+			}
+			if res.ctxInfo.Timezone != tc.wantTZ {
+				t.Errorf("Timezone = %q, want %q", res.ctxInfo.Timezone, tc.wantTZ)
+			}
+		})
+	}
+}
+
+// A forwarded identity is vouched for by ONE application. If the request turns out
+// to be about another application's user, the identity must not describe that user
+// in an email either.
+func TestAppS2S_OutOfScopeWithdrawsForwardedIdentity(t *testing.T) {
+	s, _ := newS2S(middleware.AppS2SConfig{}, trustWith([]string{backendIP + "/32"}, true))
+	otherApp := func(echo.Context) (int64, int64, bool) { return appTenantID, appRowID + 1000, true }
+	chain := []echo.MiddlewareFunc{s.Resolve(middleware.SurfaceApp), middleware.ScopeToCaller(otherApp)}
+
+	res := runS2S(t, chain, s2sReq{remote: backendIP, clientID: appClient, secret: appSecret,
+		forwarded: endUserIPOne, fwdUA: "Mozilla/5.0 Chrome/120", fwdTZ: "Asia/Kolkata", body: emailBody("bob@x.com")})
+	if res.code != http.StatusOK {
+		t.Fatalf("got %d %v, want 200", res.code, res.body)
+	}
+	if !res.caller.OutOfScope {
+		t.Fatal("setup: caller should be out of scope")
+	}
+	if res.ctxInfo.Trusted || res.ctxInfo.UserAgentTrusted || res.ctxInfo.Timezone != "" {
+		t.Errorf("out-of-scope request kept the forwarded identity: %+v", res.ctxInfo)
+	}
+	// Still recorded for session attribution.
+	if res.ctxInfo.IPAddress != endUserIPOne {
+		t.Errorf("IPAddress = %q, want it kept for attribution", res.ctxInfo.IPAddress)
 	}
 }

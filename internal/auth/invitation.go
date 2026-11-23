@@ -177,6 +177,8 @@ func (s *InvitationService) invite(ctx context.Context, tenantID int64, appRowID
 		InviterName: inviterDisplay,
 		Name:        name,
 		TTLMinutes:  int(InvitationTTL.Minutes()),
+		// Raw token only (Link carries the full URL).
+		Token: rawToken,
 	}
 	if adminRole != "" {
 		msg.AdminRole = humanAdminRole(adminRole)

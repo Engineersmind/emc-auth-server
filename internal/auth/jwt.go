@@ -279,6 +279,8 @@ const (
 	GrantRefreshToken = "refresh_token"
 	// GrantMagicLink is passwordless email-link login.
 	GrantMagicLink = "magic_link"
+	// GrantEmailOTP is passwordless sign-in or sign-up by an emailed one-time code.
+	GrantEmailOTP = "email_otp"
 	// GrantSocial is a social/OIDC identity-provider callback (Google, #64).
 	GrantSocial = "social"
 	// GrantPasskey is WebAuthn passkey assertion (#112).
@@ -313,6 +315,7 @@ var (
 		GrantAuthorizationCode,
 		GrantRefreshToken,
 		GrantMagicLink,
+		GrantEmailOTP,
 		GrantSocial,
 		GrantPasskey,
 		GrantTenantSwitch,

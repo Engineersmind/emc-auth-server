@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -93,6 +94,18 @@ func AppRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, log
 //     bogus requests and lock out every real user — the same cross-surface DoS
 //     the "appauth:"/"app:" split prevents, one level down.
 func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
+	return appClientRateLimiter(svc, redisCli, logger, "appauth:", "appauth-unverified:")
+}
+
+// PasswordlessClientRateLimiter is AppClientRateLimiter on its OWN bucket
+// namespace, charged the same per-application quota. The passwordless start
+// route sends email, so a flood of code requests must not be able to exhaust
+// the quota that real password logins spend (passwordless plan, impact I9).
+func PasswordlessClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger) echo.MiddlewareFunc {
+	return appClientRateLimiter(svc, redisCli, logger, "appauth-pwless:", "appauth-pwless-unverified:")
+}
+
+func appClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Client, logger zerolog.Logger, verifiedPrefix, unverifiedPrefix string) echo.MiddlewareFunc {
 	limiter := redis_rate.NewLimiter(redisCli)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
@@ -124,7 +137,7 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 				switch {
 				case TrustedBackend(c) && caller.ClientID == clientID && caller.AppID > 0:
 					rpm, burst := svc.GetLimit(c.Request().Context(), caller.TenantID, caller.AppID)
-					return enforceAppLimit(c, next, limiter, logger, "appauth:", caller.TenantID, caller.AppID, rpm, burst)
+					return enforceAppLimit(c, next, limiter, logger, verifiedPrefix, caller.TenantID, caller.AppID, rpm, burst)
 				case caller.Failed:
 					return next(c)
 				}
@@ -132,13 +145,13 @@ func AppClientRateLimiter(svc *auth.AppRateLimitService, redisCli *redisv9.Clien
 				if !ok {
 					return next(c)
 				}
-				return enforceAppLimit(c, next, limiter, logger, "appauth-unverified:", tenantID, appID, rpm, burst)
+				return enforceAppLimit(c, next, limiter, logger, unverifiedPrefix, tenantID, appID, rpm, burst)
 			}
 			tenantID, appID, rpm, burst, ok := svc.GetLimitForClientID(c.Request().Context(), clientID)
 			if !ok {
 				return next(c)
 			}
-			return enforceAppLimit(c, next, limiter, logger, "appauth:", tenantID, appID, rpm, burst)
+			return enforceAppLimit(c, next, limiter, logger, verifiedPrefix, tenantID, appID, rpm, burst)
 		}
 	}
 }
@@ -181,7 +194,10 @@ func enforceAppLimit(c echo.Context, next echo.HandlerFunc, limiter *redis_rate.
 
 	if res.Allowed == 0 {
 		metrics.RateLimitHits.WithLabelValues(limiterLabel).Inc()
-		retryAfter := int(res.RetryAfter.Seconds())
+		retryAfter := int(math.Ceil(res.RetryAfter.Seconds()))
+		if retryAfter < 1 {
+			retryAfter = 1
+		}
 		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		return c.JSON(http.StatusTooManyRequests, map[string]string{
 			"error": "rate limit exceeded for application " + strconv.FormatInt(appID, 10),

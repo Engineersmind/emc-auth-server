@@ -116,6 +116,9 @@ func (m *RecordingMailer) SendMFACode(context.Context, *mailer.SMTPConfig, *mail
 	return nil
 }
 
+func (m *RecordingMailer) SendPasswordlessCode(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.PasswordlessCodeEmail) error {
+	return nil
+}
 func (m *RecordingMailer) SendMagicLink(context.Context, *mailer.SMTPConfig, *mailer.Template, mailer.MagicLinkEmail) error {
 	return nil
 }

@@ -40,6 +40,10 @@ const (
 	CaptchaFlowRegister CaptchaFlow = "register"
 	// CaptchaFlowForgotPassword covers POST /auth/forgot-password.
 	CaptchaFlowForgotPassword CaptchaFlow = "forgot_password"
+	// CaptchaFlowPasswordless covers POST /auth/apps/passwordless/start. It is
+	// valid but NOT in the default protected set, so enabling it is an explicit
+	// per-scope choice and no existing policy changes behaviour.
+	CaptchaFlowPasswordless CaptchaFlow = "passwordless"
 )
 
 // ValidCaptchaFlows is every flow the gate understands. A policy naming anything
@@ -51,6 +55,7 @@ var ValidCaptchaFlows = []CaptchaFlow{
 	CaptchaFlowLoginOTP,
 	CaptchaFlowRegister,
 	CaptchaFlowForgotPassword,
+	CaptchaFlowPasswordless,
 }
 
 // IsValidCaptchaFlow reports whether name is a flow the gate can enforce.
