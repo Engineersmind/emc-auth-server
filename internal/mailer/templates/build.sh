@@ -437,4 +437,29 @@ C
   "{{.ProductName}} &mdash; Test email" \
   "Test message confirming your email provider settings are working."
 
+
+# ── 15 passwordless_code ──────────────────────────────────────────────────────
+# One template, two wordings selected by .Reason ("verify" confirms an address,
+# anything else is a sign-in). The code is alone on its own line so mail apps can
+# offer to copy or autofill it; it is never in the subject.
+{
+  eyebrow "{{if eq .Reason \"verify\"}}Verify your email{{else}}Sign in{{end}}" "muted"
+  h1 "{{if eq .Reason \"verify\"}}Confirm your email address{{else}}Your sign-in code{{end}}"
+  p "{{if eq .Reason \"verify\"}}Enter this code to confirm your email address{{if .AppName}} for {{.AppName}}{{end}}:{{else}}Enter this code to sign in{{if .AppName}} to {{.AppName}}{{end}}:{{end}}"
+  cat <<'C'
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 14px 0;">
+                      <tr>
+                        <td align="center" class="bg-subtle" style="background-color:#1f2229;border:1px solid #23262d;border-radius:8px;padding:20px;">
+                          <span class="text-primary" style="font-family:'Courier New',Courier,monospace;font-size:30px;font-weight:700;letter-spacing:8px;color:#fafafa;">{{.Code}}</span>
+                        </td>
+                      </tr>
+                    </table>
+C
+  callout "&#9888;&nbsp; $(ttl "This code expires in")" "warn"
+  p "{{if .Origin}}This request came from {{.Origin}}. {{end}}Use only the newest code if you asked for more than one."
+  rule
+  note "If you did not ask for this code, ignore this email: nothing on your account has changed. Never share this code. {{.ProductName}} staff will never ask you for it."
+} | emit "15_passwordless_code.html" \
+  "{{if eq .Reason \"verify\"}}Confirm your email address{{else}}Sign in{{if .AppName}} to {{.AppName}}{{end}}{{end}}" \
+  "Your one-time code expires in {{.TTLMinutes}} minutes."
 echo "done."

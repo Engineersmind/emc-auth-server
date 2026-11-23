@@ -404,7 +404,7 @@ func (s *AuthService) sendLoginEmailInBackground(ctx context.Context, otpSession
 		ctx, cancel := context.WithTimeout(bg, loginEmailSendTimeout)
 		defer cancel()
 		appName := s.appNameByID(ctx, appID)
-		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(otpSessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL); err != nil {
+		if err := s.emailSvc.mintAndSend(ctx, otpSessionKey(otpSessionToken)+":email", email, appName, tenantID, appRowIDFromClaim(appID), OTPSessionTTL, "finish signing in"); err != nil {
 			s.logger.Warn().Err(err).Int64("tenant_id", tenantID).
 				Msg("admin sign-in: emailing the code failed — the user can ask for a new one")
 		}
