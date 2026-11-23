@@ -1,0 +1,44 @@
+# Prometheus configuration for the LOCAL monitoring profile
+# (docker compose --profile monitoring up), added for issue #217.
+#
+# Deliberately separate from prometheus.yml (the prod config): prod targets
+# `app:9090`, the service name inside infra/docker-compose.prod.yml, while the
+# local compose service is `emc-auth-server`. This file also wires alert
+# delivery to the profile's Alertmanager and scrapes node-exporter so the
+# HostCPUHigh rule has data.
+#
+# No METRICS_TOKEN here: the local stack runs ENV=development, under which
+# /metrics is registered without a bearer token
+# (internal/api/middleware/metricsauth.go — MetricsRouteEnabled). If a local
+# deployment ever sets METRICS_TOKEN on the app, hand it to the scrape the
+# same way prod does:
+#   authorization:
+#     credentials_file: /run/secrets/metrics_token
+# A token on the app but none here yields a 404 scrape — up drops to 0 and
+# EmcAuthScrapeDown fires, which is the intended alarm for that mismatch.
+global:
+  scrape_interval:     15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "audit_alerts.yml"
+  - "service_alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: "emc-auth-server"
+    static_configs:
+      - targets: ["emc-auth-server:9090"]
+    metrics_path: /metrics
+
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  - job_name: "alertmanager"
+    static_configs:
+      - targets: ["alertmanager:9093"]

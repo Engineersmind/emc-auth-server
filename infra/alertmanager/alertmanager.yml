@@ -1,0 +1,20 @@
+# Alertmanager configuration for the LOCAL monitoring profile (issue #217).
+#
+# One route → one webhook receiver whose URL comes from a file
+# (webhook_configs.url_file, Alertmanager ≥ v0.26), so no real receiver URL is
+# ever committed. The file is a bind mount — see docker-compose.yml:
+#   ${ALERTMANAGER_WEBHOOK_URL_FILE:-./infra/alertmanager/webhook_url.local}
+# The committed default points at the alert-sink echo service in the same
+# profile; for a real endpoint point the env var at a gitignored *.secret
+# file with identical contents (the URL, no trailing newline).
+route:
+  receiver: webhook
+  # Short timings on purpose: this profile exists so a local test alert can
+  # be seen reaching the sink quickly.
+  group_wait: 5s
+  group_interval: 30s
+  repeat_interval: 1m
+receivers:
+  - name: webhook
+    webhook_configs:
+      - url_file: /etc/alertmanager/secrets/webhook_url
