@@ -132,7 +132,11 @@ const (
 	AMROTP       = "otp"  // one-time password: authenticator app or emailed code
 	AMRMFA       = "mfa"  // multiple factors were used
 	AMRMagicLink = "link" // emailed sign-in link (no registered RFC 8176 value)
-	AMRFederated = "fed"  // federated / external identity provider
+	// AMREmailOTP is an emailed one-time code used as the FIRST factor (no
+	// registered RFC 8176 value, same precedent as AMRMagicLink). It proves control
+	// of the inbox only, so it is a single factor and is never reported as AAL2.
+	AMREmailOTP  = "email_otp"
+	AMRFederated = "fed" // federated / external identity provider
 	// AMRWebAuthn is RFC 8176 "hwk": proof of possession of a hardware-backed
 	// key. Covers every passkey — platform authenticators (Windows Hello, Touch
 	// ID) and roaming security keys alike, since the distinction is not one the
@@ -410,7 +414,7 @@ func DenyAccountSessions(ctx context.Context, logger zerolog.Logger, userID, ten
 	if pkgDenier == nil {
 		return
 	}
-	if err := pkgDenier.Set(ctx, userDenyKey(userID, tenantID), "1", AccessTokenTTL).Err(); err != nil {
+	if err := pkgDenier.Set(ctx, userDenyKey(userID, tenantID), revocationStamp(), AccessTokenTTL).Err(); err != nil {
 		metrics.SessionDenylistErrors.WithLabelValues("write_user").Inc()
 		logger.Warn().Err(err).Int64("user_id", userID).Int64("tenant_id", tenantID).
 			Msg("session denylist: account-wide write failed; revocation only enforced at refresh")

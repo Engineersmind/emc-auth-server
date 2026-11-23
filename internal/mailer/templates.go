@@ -71,6 +71,11 @@ const (
 	// the person the action was taken on, who would otherwise discover it only
 	// by being refused something they could do yesterday.
 	TemplateAccessChanged TemplateType = "access_changed"
+	// TemplatePasswordlessCode is the one-time code for passwordless sign-in and
+	// sign-up by email. One template with two wordings chosen by TemplateData.Reason
+	// ("verify" confirms an address, anything else is a sign-in). The code is never
+	// in the subject.
+	TemplatePasswordlessCode TemplateType = "passwordless_code"
 )
 
 // AllTemplateTypes lists every customizable template, for admin listing and
@@ -89,6 +94,7 @@ var AllTemplateTypes = []TemplateType{
 	TemplateTenantLockoutAlert,
 	TemplateAdminActivity,
 	TemplateAccessChanged,
+	TemplatePasswordlessCode,
 }
 
 // ValidTemplateType reports whether t is a known template type.
@@ -120,6 +126,7 @@ type TemplateData struct {
 	Code        string // one-time code (MFA)
 	TTLMinutes  int    // validity window for links/codes
 	Name        string // recipient display name (may be empty)
+	Origin      string // approximate request origin, e.g. "Berlin, Germany" (passwordless_code; may be empty)
 	Email       string // recipient address
 	InviterName string // who sent an invitation (user_invitation; may be empty)
 	// AdminRole is the administrator role an invitation confers, spelled for
@@ -183,6 +190,52 @@ type TemplateData struct {
 	// Filled centrally in dispatch, so every send path and the built-ins get it
 	// without each caller remembering.
 	Year int
+
+	// ---- Fields below are for custom templates (the console editor). ----
+	//
+	// html/template fails the WHOLE render on an unknown field, which silently
+	// sends the built-in instead — so every variable a template might reasonably
+	// use is declared here for every template type, populated or not. Wrap the
+	// optional ones in {{if .Field}}…{{end}}.
+
+	// Token is the raw single-use token embedded in Link — the token ONLY, not a
+	// URL — so an integrator can build a link to its own frontend
+	// ("https://app.example/verify?token={{.Token}}"). Set for email_verification,
+	// password_reset, magic_link and user_invitation; empty elsewhere. Link is
+	// unaffected and still carries the full URL.
+	Token string
+
+	// Timezone labels OccurredAt and ExpiryTime ("UTC", "IST"). Filled centrally.
+	Timezone string
+	// ExpiryTime is the clock time a link or code stops working, derived from
+	// TTLMinutes and shown in Timezone. Filled centrally; empty when TTLMinutes
+	// is zero.
+	ExpiryTime string
+	// SupportEmail is the sender's reply-to address, else its From address.
+	// Filled centrally.
+	SupportEmail string
+	// MaskedEmail is Email with the local part hidden ("a***@acme.com"). Filled
+	// centrally.
+	MaskedEmail string
+	// Purpose finishes "use the code below to …" in a code email. Set by the
+	// code-sending paths; empty elsewhere.
+	Purpose string
+	// ResetLink is a second action link: a password reset offered beside the
+	// unlock link in blocked_account. Empty elsewhere.
+	ResetLink string
+	// LoginURL is where the recipient signs in. Empty unless a flow supplies it.
+	LoginURL string
+
+	// Browser, OS, City, Country and Location describe the END USER's device and
+	// approximate place, for security emails. Populated only when the request's
+	// identity is trusted (see requestctx.RequestInfo.Trusted) and the template is
+	// one that describes the recipient's own request; empty otherwise, which is
+	// the template's cue to drop the row. Location is "City, Country".
+	Browser  string
+	OS       string
+	City     string
+	Country  string
+	Location string
 }
 
 // EmailChangeApplied is the TemplateData.Reason value that turns the
@@ -635,6 +688,28 @@ this, contact whoever administers this tenant.
 
 - {{.ProductName}}`,
 	},
+
+	// The passwordless sign-in / verify-address code. The subject never carries
+	// the code, and the code sits alone on its own line so mail apps can offer to
+	// copy or autofill it. Reason "verify" selects the confirm-your-address
+	// wording; anything else is a sign-in.
+	TemplatePasswordlessCode: {
+		Subject: `{{if eq .Reason "verify"}}Confirm your email address{{else}}Sign in{{if .AppName}} to {{.AppName}}{{end}}{{end}}`,
+		HTML: shell(`<h2>{{if eq .Reason "verify"}}Confirm your email address{{else}}Your sign-in code{{end}}</h2>
+<p>{{if eq .Reason "verify"}}Enter this code to confirm your email address{{else}}Enter this code to sign in{{end}}{{if .AppName}} {{if eq .Reason "verify"}}for{{else}}to{{end}} {{.AppName}}{{end}}:</p>
+<p style="font-size:24px;font-weight:bold;letter-spacing:3px;font-family:monospace">{{.Code}}</p>
+<p>It expires in {{.TTLMinutes}} minutes.{{if .Origin}} This request came from {{.Origin}}.{{end}} Use only the newest code if you asked for more than one.</p>
+<p style="font-size:12px;color:#666">If you did not ask for this code, ignore this email: nothing on your account has changed. Never share this code.</p>`),
+		Text: `{{if eq .Reason "verify"}}Enter this code to confirm your email address{{else}}Enter this code to sign in{{end}}{{if .AppName}} {{if eq .Reason "verify"}}for{{else}}to{{end}} {{.AppName}}{{end}}:
+
+    {{.Code}}
+
+It expires in {{.TTLMinutes}} minutes.{{if .Origin}} This request came from {{.Origin}}.{{end}} Use only the newest code if you asked for more than one.
+
+If you did not ask for this code, ignore this email: nothing on your account has changed. Never share this code.
+
+- {{.ProductName}}`,
+	},
 }
 
 // BuiltinTemplate returns the default template for a type (used by the admin
@@ -741,6 +816,11 @@ func bodyOpenIndex(html string) int {
 func ValidateTemplate(tmpl *Template, tt TemplateType) error {
 	if tmpl == nil {
 		return nil // no override: the built-in default always renders
+	}
+	// Structural check first: it covers every branch, including ones the sample data
+	// below would not execute.
+	if err := tmpl.checkFields(); err != nil {
+		return err
 	}
 	data := sampleTestData()
 	data.ProductName = defaultProductName

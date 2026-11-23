@@ -45,6 +45,13 @@ type EmailTemplate struct {
 	IsActive      bool       `json:"is_active"`
 	IsDefault     bool       `json:"is_default"` // true when returned from the built-in fallback
 	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
+	// Variables lists every variable a template of this type may reference, so
+	// the editor shows what the server really renders. Read-only.
+	Variables []mailer.TemplateVariable `json:"variables,omitempty"`
+	// Warnings is set only on a save response: problems found in the template just
+	// stored (for example an unknown variable, which would make every send fall
+	// back to the built-in). The save itself still succeeded.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // UpsertTemplateInput is the write payload for a template.
@@ -149,6 +156,15 @@ func (s *EmailTemplateService) Upsert(ctx context.Context, tenantID int64, appRo
 // Get returns the stored template for one exact scope+type, or the built-in
 // default (IsDefault=true) when no row exists.
 func (s *EmailTemplateService) Get(ctx context.Context, tenantID int64, appRowID *int64, tt mailer.TemplateType) (*EmailTemplate, error) {
+	t, err := s.getRaw(ctx, tenantID, appRowID, tt)
+	if err != nil {
+		return nil, err
+	}
+	t.Variables = mailer.VariablesFor(tt)
+	return t, nil
+}
+
+func (s *EmailTemplateService) getRaw(ctx context.Context, tenantID int64, appRowID *int64, tt mailer.TemplateType) (*EmailTemplate, error) {
 	if !mailer.ValidTemplateType(tt) {
 		return nil, ErrInvalidTemplateType
 	}

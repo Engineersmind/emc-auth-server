@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -242,6 +243,23 @@ type Config struct {
 	// whole-feature rollback, and needs no migration.
 	OrganizationsEnabled bool
 
+	// PasswordlessEnabled is the deployment-level switch for passwordless
+	// sign-in by emailed code (docs/plans/passwordless-email-otp.md). Set via
+	// PASSWORDLESS_ENABLED; false by default. While false the three
+	// /auth/apps/passwordless routes answer 404 and every application behaves
+	// as password only, whatever the database says. It is the whole-feature
+	// rollback, but see the plan before using it: users created without a
+	// password cannot sign in while it is off.
+	PasswordlessEnabled bool
+
+	// PasswordlessCodeHMACKey keys the HMAC the one-time codes are stored under
+	// in Redis. A 6-digit code is a 10^6 space, so a plain hash would be
+	// recoverable instantly from a Redis read; the key is what prevents that.
+	// Required (hex, at least 32 bytes) when PasswordlessEnabled is true in
+	// production or staging, and only then, so an upgrade never needs a new
+	// variable. Set via PASSWORDLESS_CODE_HMAC_KEY.
+	PasswordlessCodeHMACKey string
+
 	// CaptchaHMACKey keys the HMAC that challenge answers are stored under.
 	// Required when CaptchaEnabled is true — the server refuses to start
 	// without it rather than degrading to an unkeyed hash.
@@ -457,6 +475,8 @@ func Load() *Config {
 		WebAuthnRequireUserVerification: getEnv("WEBAUTHN_REQUIRE_UV", "true") != "false",
 		CaptchaEnabled:                  getEnv("CAPTCHA_ENABLED", "false") == "true",
 		OrganizationsEnabled:            getEnv("ORGANIZATIONS_ENABLED", "false") == "true",
+		PasswordlessEnabled:             getEnv("PASSWORDLESS_ENABLED", "false") == "true",
+		PasswordlessCodeHMACKey:         getEnv("PASSWORDLESS_CODE_HMAC_KEY", ""),
 		CaptchaHMACKey:                  getEnv("CAPTCHA_HMAC_KEY", ""),
 		CaptchaTTLSeconds:               mustAtoi(getEnv("CAPTCHA_TTL_SECONDS", "120")),
 		GeoIPDatabasePath:               getEnv("GEOIP_DATABASE_PATH", ""),
@@ -485,6 +505,8 @@ func Load() *Config {
 			UserOAuthExchange:       mustAtoi(getEnv("RATE_LIMIT_APP_USER_OAUTH_EXCHANGE", "0")),
 			UserPasskeyLogin:        mustAtoi(getEnv("RATE_LIMIT_APP_USER_PASSKEY_LOGIN", "0")),
 			UserResendVerification:  mustAtoi(getEnv("RATE_LIMIT_APP_USER_RESEND_VERIFICATION", "0")),
+			UserPasswordlessStart:   mustAtoi(getEnv("RATE_LIMIT_APP_USER_PASSWORDLESS_START", "0")),
+			UserPasswordlessVerify:  mustAtoi(getEnv("RATE_LIMIT_APP_USER_PASSWORDLESS_VERIFY", "0")),
 		},
 		AuditSIEMWebhookURL:    getEnv("AUDIT_SIEM_WEBHOOK_URL", ""),
 		AuditSIEMWebhookSecret: getEnv("AUDIT_SIEM_WEBHOOK_SECRET", ""),
@@ -545,6 +567,14 @@ func (c *Config) Validate() error {
 	if strings.Trim(c.TOTPEncryptionKey, "0") == "" {
 		return errors.New("TOTP_ENCRYPTION_KEY must be set to a real key when ENV=production or staging: TOTP seeds, SMTP passwords and email-provider API keys would otherwise be encrypted under the publicly known all-zero key (generate one with openssl rand -hex 32)")
 	}
+	// Passwordless codes are a 10^6 space: without a real key a read of Redis
+	// would recover any outstanding code. Checked only when the feature is on, so
+	// an upgrade that does not enable it needs no new variable.
+	if c.PasswordlessEnabled {
+		if err := validatePasswordlessKey(c.PasswordlessCodeHMACKey); err != nil {
+			return err
+		}
+	}
 	if len(c.TrustedProxies) == 0 {
 		return errors.New("TRUSTED_PROXIES must be set when ENV=production or staging: without it the client IP resolves to the reverse proxy for every request, so all users share one rate-limit bucket")
 	}
@@ -586,6 +616,8 @@ type AppRateLimitConfig struct {
 	UserOAuthExchange      int
 	UserPasskeyLogin       int
 	UserResendVerification int
+	UserPasswordlessStart  int
+	UserPasswordlessVerify int
 }
 
 func (a AppRateLimitConfig) validate() error {
@@ -605,6 +637,8 @@ func (a AppRateLimitConfig) validate() error {
 		"RATE_LIMIT_APP_USER_OAUTH_EXCHANGE":        a.UserOAuthExchange,
 		"RATE_LIMIT_APP_USER_PASSKEY_LOGIN":         a.UserPasskeyLogin,
 		"RATE_LIMIT_APP_USER_RESEND_VERIFICATION":   a.UserResendVerification,
+		"RATE_LIMIT_APP_USER_PASSWORDLESS_START":    a.UserPasswordlessStart,
+		"RATE_LIMIT_APP_USER_PASSWORDLESS_VERIFY":   a.UserPasswordlessVerify,
 	} {
 		if v < 0 {
 			return fmt.Errorf("%s must be 0 (default) or a positive number of requests per minute, got %d", name, v)
@@ -707,4 +741,17 @@ func splitEnvList(raw string, stripTrailingSlash bool) []string {
 		}
 	}
 	return out
+}
+
+// validatePasswordlessKey checks PASSWORDLESS_CODE_HMAC_KEY: hex, at least 32
+// bytes, and not the all-zero placeholder.
+func validatePasswordlessKey(key string) error {
+	const msg = "PASSWORDLESS_CODE_HMAC_KEY must be set to a real key (at least 64 hex characters, generate with openssl rand -hex 32) when PASSWORDLESS_ENABLED=true and ENV=production or staging: one-time codes are a 10^6 space and would otherwise be recoverable from a Redis read"
+	if len(key) < 64 || strings.Trim(key, "0") == "" {
+		return errors.New(msg)
+	}
+	if _, err := hex.DecodeString(key); err != nil {
+		return errors.New(msg)
+	}
+	return nil
 }
