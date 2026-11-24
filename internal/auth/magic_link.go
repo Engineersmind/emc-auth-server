@@ -169,13 +169,23 @@ func (s *AuthService) RequestMagicLink(ctx context.Context, clientID, clientSecr
 // (single-use), and completes the login through the exact same MFA gate as a
 // password login — the result may therefore be tokens, an OTP challenge, or
 // a forced-enrollment challenge.
-func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecret, token string) (*LoginResult, error) {
+func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecret, token string) (_ *LoginResult, err error) {
+	// Counted as a login attempt like a password sign-in, on the same rule
+	// (#226): a refusal before the presented token was checked — Redis
+	// unwired, client authentication failing — is not an attempt. The
+	// verified anchor is the fresh user-row load below, so a gate or mint
+	// error after it still counts as success.
+	att := &loginAttempt{op: loginOpMagicLink}
+	defer func() { att.record(err) }()
+
 	if s.redisCli == nil {
+		att.notAttempt = true
 		return nil, fmt.Errorf("magic link not configured on this server")
 	}
 
 	tenantID, appRowID, err := s.authenticateApp(ctx, clientID, clientSecret)
 	if err != nil {
+		att.notAttempt = true
 		return nil, err
 	}
 
@@ -212,6 +222,10 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 		}
 		return nil, fmt.Errorf("load magic link user: %w", err)
 	}
+	// The verified anchor for the login_* counter: the token redeemed to a
+	// live account, so a gate or mint error after this still counts as
+	// success.
+	att.verified = true
 
 	perms, err := s.loadPermissions(ctx, sess.UserID, tenantID)
 	if err != nil {

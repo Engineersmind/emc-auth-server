@@ -1133,7 +1133,10 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	// transaction has then rolled back, so the eviction never happened. Denying in
 	// that case would sign users out of sessions that were never actually evicted.
 	// A Redis entry cannot be rolled back, so it must not be written until the
-	// database says the eviction is real.
+	// database says the eviction is real. The counters are recorded here for the
+	// same reason: a count taken inside the transaction survives a rollback that
+	// undid the eviction.
+	RecordSessionRevocations(RevokeReasonCapEvicted, int64(len(evicted)))
 	for _, id := range evicted {
 		s.denySession(ctx, id)
 	}
@@ -1545,13 +1548,92 @@ type loginCandidate struct {
 	isActive bool
 }
 
+// First-factor login operation labels for emc_auth_operations_total — one per
+// METHOD, all matching the HighFailedLoginRate alert's operation=~"login.*"
+// selector. A single name per method rather than per route: the four password
+// endpoints all funnel into Login, and an attacker spreading attempts across
+// them is still one campaign. Constants rather than literals because a typo in
+// a label value does not fail a build — it silently creates a series nothing
+// is watching.
+const (
+	loginOpPassword     = "login_password"
+	loginOpMagicLink    = "login_magic_link"
+	loginOpPasswordless = "login_passwordless"
+	loginOpPasskey      = "login_passkey"
+)
+
+// loginAttempt tracks one first-factor sign-in for
+// emc_auth_operations_total — the series the HighFailedLoginRate alert reads
+// (#226). Every login method creates one and defers record, so each return
+// path is classified exactly once and an early return added later defaults
+// to failure rather than vanishing from the count.
+//
+// The classification rule:
+//
+//   - not counted (notAttempt set): the method refused before it compared
+//     any presented credential — configuration missing, client
+//     authentication failing for any reason, a feature or policy that is
+//     off, the per-address throttle, a malformed assertion body, or an
+//     infrastructure error raised before the comparison.
+//   - failure (the default for any error): a presented credential was
+//     compared and refused, or there was nothing to compare it with — an
+//     unknown user, challenge, token or credential, a wrong password or
+//     code, a bad signature, a locked account, a cloned passkey.
+//   - success (verified set, or a nil error): the method reached its
+//     verified anchor — where the credential is proven and the account is
+//     not locked. Whatever happens after still counts as success: an MFA
+//     challenge, an MFA-gate error, a role or organisation refusal, an
+//     invalid legacy client_id, a token-issuance error, a cookie-session
+//     refusal.
+//
+// Never labelled by user, email, or failure reason — the reason would be an
+// enumeration oracle and unbounded cardinality.
+type loginAttempt struct {
+	op         string
+	notAttempt bool
+	verified   bool
+}
+
+// record emits the single outcome for this attempt, in priority order: a
+// refusal before any credential check counts nowhere, a verified credential
+// or a clean return counts success, anything else counts failure.
+func (a *loginAttempt) record(err error) {
+	if a.notAttempt {
+		return
+	}
+	if a.verified || err == nil {
+		metrics.RecordOp(a.op, "success")
+		return
+	}
+	metrics.RecordOp(a.op, "failure")
+}
+
+// markVerified sets the verified anchor: the credential is proven and the
+// account is not locked, so everything after counts as success. Nil-safe so
+// helpers two calls deep can take an optional tracker.
+func (a *loginAttempt) markVerified() {
+	if a != nil {
+		a.verified = true
+	}
+}
+
 // Login authenticates a user by email and password. Without application
 // credentials the caller never specifies a tenant — the same email may have
 // separate accounts (separate passwords) in multiple tenants, so Login fetches
 // every active account matching the email and checks the password against each
 // one to find the single tenant it belongs to. With ClientID + ClientSecret
 // the application is authenticated first and the search is pinned to its tenant.
-func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
+func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult, err error) {
+	// One counter entry per attempt — deferred so no return path below can
+	// skip it, and an early return added later defaults to failure rather than
+	// dropping out of the count (#226). Paths mark notAttempt where the method
+	// refuses before a user credential is compared; verified is set at
+	// ResetFailedLogins, where the password is proven and the account is not
+	// locked, so a role refusal, the MFA gate or a mint error after it still
+	// counts as success.
+	att := &loginAttempt{op: loginOpPassword}
+	defer func() { att.record(err) }()
+
 	// Timing-uniformity clock. Every return path below settles against this so
 	// latency does not reveal whether the email exists, how many accounts hold
 	// it, or whether the password was correct. See loginTimingBudget.
@@ -1580,6 +1662,10 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	case in.ClientSecret != "":
 		tid, aid, err := s.authenticateApp(ctx, in.ClientID, in.ClientSecret)
 		if err != nil {
+			// Refused before any user credential was compared — bad client
+			// credentials or a missing app service are client configuration,
+			// not a login attempt.
+			att.notAttempt = true
 			return nil, err
 		}
 		appTenantID, appRowID = tid, aid
@@ -1590,6 +1676,8 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// lookup or hash (passwordless plan section 4.9). A no-op unless the feature is
 	// enabled and the application opted in.
 	if appRowID != 0 && s.PasswordFlowClosed(ctx, appTenantID, &appRowID) {
+		// The flow is closed: no credential was checked.
+		att.notAttempt = true
 		return nil, ErrPasswordAuthDisabled
 	}
 
@@ -1671,6 +1759,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	}
 	rows, err := s.pool.Query(ctx, candidateQuery, args...)
 	if err != nil {
+		att.notAttempt = true // infrastructure failure before any comparison
 		return nil, fmt.Errorf("fetch login candidates: %w", err)
 	}
 
@@ -1679,12 +1768,14 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 		var c loginCandidate
 		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName, &c.isActive); err != nil {
 			rows.Close()
+			att.notAttempt = true
 			return nil, fmt.Errorf("scan login candidate: %w", err)
 		}
 		candidates = append(candidates, c)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		att.notAttempt = true
 		return nil, fmt.Errorf("iterate login candidates: %w", err)
 	}
 
@@ -1826,6 +1917,10 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// rather than after the MFA gate: a user who holds the right password should
 	// not accumulate lockout progress while completing a second factor.
 	s.blockSvc.ResetFailedLogins(ctx, tenantID, userID)
+	// The verified anchor for the login_* counter: the credential is proven
+	// and the account is not locked, so a role or organisation refusal, an MFA
+	// gate outcome or a mint error after this still counts as success.
+	att.verified = true
 
 	// Advisory breached-password check (detached; never delays or blocks login).
 	s.brchSvc.Notify(ctx, tenantID, appRowIDFromClaim(appID), userID, email, in.Password)
@@ -2601,6 +2696,7 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
 	metrics.SessionRevocations.WithLabelValues(RevokeReasonRotated).Inc()
+	metrics.TokensRevoked.WithLabelValues(RevokeReasonRotated).Inc()
 
 	var email, roleName string
 	var roleID, applicationID *int64
@@ -2923,6 +3019,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		return nil, nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
 	metrics.SessionRevocations.WithLabelValues(RevokeReasonRotated).Inc()
+	metrics.TokensRevoked.WithLabelValues(RevokeReasonRotated).Inc()
 
 	// Fresh user load from DB — catches suspensions, role changes, or email bans
 	// that occurred during the access token's lifetime (key security gate).
@@ -3145,6 +3242,9 @@ func (s *AuthService) RevokeRefreshTokenForTenant(ctx context.Context, rawRefres
 	`, hash, tenantID, appRowID)
 	if err != nil {
 		return false, fmt.Errorf("revoke refresh token: %w", err)
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		metrics.TokensRevoked.WithLabelValues(RevokeReasonOAuthRevoke).Add(float64(n))
 	}
 	return tag.RowsAffected() > 0, nil
 }

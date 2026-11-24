@@ -43,7 +43,10 @@ const (
 //
 // A no-op when there is no pending grant, which is the common case: most
 // invitations are ordinary application users.
-func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID int64) error {
+//
+// Returns the number of sessions the activation revoked (0 when nothing was
+// activated), so the caller can record them once its own commit lands.
+func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID int64) (int64, error) {
 	var adminID int64
 	var adminRole string
 	err := tx.QueryRow(ctx, `
@@ -53,9 +56,9 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	`, userID, tenantID).Scan(&adminID, &adminRole)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
+			return 0, nil
 		}
-		return fmt.Errorf("look up pending admin grant: %w", err)
+		return 0, fmt.Errorf("look up pending admin grant: %w", err)
 	}
 
 	var roleID int64
@@ -67,13 +70,13 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 		// The role is seeded when the grant is created, so its absence means
 		// someone deleted it underneath us. Refuse rather than activate a grant
 		// that would carry no permissions and look active in the listing.
-		return fmt.Errorf("resolve %s role for tenant %d: %w", adminRole, tenantID, err)
+		return 0, fmt.Errorf("resolve %s role for tenant %d: %w", adminRole, tenantID, err)
 	}
 
 	if _, err = tx.Exec(ctx,
 		`UPDATE tenant_admins SET activated_at = NOW(), updated_at = NOW() WHERE id = $1`, adminID,
 	); err != nil {
-		return fmt.Errorf("activate admin grant: %w", err)
+		return 0, fmt.Errorf("activate admin grant: %w", err)
 	}
 	// Mirror the activation into admin_grants (00078), inside this transaction.
 	//
@@ -89,7 +92,7 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 		  AND g.admin_role = ta.admin_role
 		  AND g.deleted_at IS NULL AND g.activated_at IS NULL
 	`, adminID); err != nil {
-		return fmt.Errorf("activate admin grant mirror: %w", err)
+		return 0, fmt.Errorf("activate admin grant mirror: %w", err)
 	}
 	// token_version is bumped here rather than relying on the caller. Accept
 	// bumps it too, but this function is the one that changes what the account
@@ -112,12 +115,12 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 		 WHERE id = $2 AND deleted_at IS NULL`, roleID, userID,
 	)
 	if err != nil {
-		return fmt.Errorf("attach administrative role: %w", err)
+		return 0, fmt.Errorf("attach administrative role: %w", err)
 	}
 	// A grant that activates without attaching its role is the exact silent
 	// failure above, so refuse rather than commit a half-applied activation.
 	if res.RowsAffected() == 0 {
-		return fmt.Errorf("attach administrative role: user %d not found", userID)
+		return 0, fmt.Errorf("attach administrative role: user %d not found", userID)
 	}
 	// Mirrored into user_roles in the same transaction. Since #146 phase 2 that
 	// table is what loadPermissions resolves, so writing role_id alone would
@@ -131,7 +134,7 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 		SELECT u.id, $1, u.tenant_id, NULL FROM users u WHERE u.id = $2
 		ON CONFLICT (user_id, role_id) DO NOTHING
 	`, roleID, userID); err != nil {
-		return fmt.Errorf("attach administrative role: record grant: %w", err)
+		return 0, fmt.Errorf("attach administrative role: record grant: %w", err)
 	}
 	// Every live session ends when a grant activates, and unlike the password
 	// branch in Accept this is unconditional.
@@ -142,10 +145,11 @@ func activatePendingAdminGrant(ctx context.Context, tx pgx.Tx, userID, tenantID 
 	// would otherwise keep minting access tokens — now carrying admin_scope,
 	// because rotation re-reads the grant it was stolen ahead of. Signing an
 	// incoming administrator out once is a cheap price for that not being true.
-	if err = RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
-		return fmt.Errorf("revoke sessions on admin grant activation: %w", err)
+	revoked, err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange)
+	if err != nil {
+		return 0, fmt.Errorf("revoke sessions on admin grant activation: %w", err)
 	}
-	return nil
+	return revoked, nil
 }
 
 // loadAdminScope resolves a user's administrative reach over their tenant's

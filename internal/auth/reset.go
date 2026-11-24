@@ -435,7 +435,8 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 		return fmt.Errorf("update password hash: %w", err)
 	}
 
-	if err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
+	revoked, err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange)
+	if err != nil {
 		return fmt.Errorf("revoke sessions on password reset: %w", err)
 	}
 
@@ -456,7 +457,8 @@ func (s *ResetService) ResetPassword(ctx context.Context, in ResetPasswordInput)
 	// rolled back. The refresh-token revocation above only stops RENEWAL, so
 	// without this a password reset left whoever held the old session — including
 	// an attacker the reset was meant to evict — working normally until their
-	// access token expired.
+	// access token expired. The counters sit on the same side of the commit.
+	RecordSessionRevocations(RevokeReasonCredentialChange, revoked)
 	DenyAccountSessions(ctx, s.logger, userID, tenantID)
 
 	s.logger.Info().

@@ -74,7 +74,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Tokens revoked/sec by reason",
-      "description": "emc_auth_tokens_revoked_total is declared in internal/metrics but nothing increments it yet, so this panel shows No data until revocation paths are instrumented. The session revocations panel covers revocation activity today.",
+      "description": "emc_auth_tokens_revoked_total counts revoked rows per second, labelled by reason. Transactional revocations (credential_change, admin_revoked_all, cap_evicted, passkey_cloned, preverification_neutralized) are recorded only after the owning transaction commits, so a rollback never moves the counter. rotated fires on every refresh-token rotation, so it is by far the busiest label.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 10, "x": 14, "y": 0 },
       "targets": [

@@ -610,17 +610,29 @@ type PasswordlessVerifyMeta struct {
 // PasswordlessVerify proves a code and completes the sign-in (or sign-up). The
 // result is tokens, an OTP challenge or an enrolment challenge, exactly as for a
 // password login. Every refusal is ErrPasswordlessInvalidCode.
-func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVerifyInput) (*LoginResult, *PasswordlessVerifyMeta, error) {
+func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVerifyInput) (_ *LoginResult, _ *PasswordlessVerifyMeta, err error) {
+	// Counted as a login attempt like a password sign-in, on the same rule
+	// (#226): refusals made before the presented code could be compared — the
+	// flow unwired or the policy off, bad client credentials, the per-address
+	// block, a Redis error — are not attempts. The verified anchor lives in
+	// completePasswordlessLogin, where the code is proven and the account is
+	// not locked.
+	att := &loginAttempt{op: loginOpPasswordless}
+	defer func() { att.record(err) }()
+
 	if err := s.pwlessReady(); err != nil {
+		att.notAttempt = true
 		return nil, nil, err
 	}
 	tenantID, appRowID, err := s.authenticateApp(ctx, in.ClientID, in.ClientSecret)
 	if err != nil {
+		att.notAttempt = true
 		return nil, nil, err
 	}
 	settings := s.pwless.policy.Resolve(ctx, tenantID, &appRowID)
 	if !settings.EmailOTPEnabled {
 		metrics.PasswordlessVerifies.WithLabelValues("refused").Inc()
+		att.notAttempt = true
 		return nil, nil, ErrPasswordlessInvalidCode
 	}
 	code := strings.TrimSpace(in.Code)
@@ -638,12 +650,14 @@ func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVer
 			metrics.PasswordlessVerifies.WithLabelValues("invalid").Inc()
 			return nil, nil, ErrPasswordlessInvalidCode
 		}
+		att.notAttempt = true // Redis error, before the code was compared
 		return nil, nil, ErrPasswordlessUnavailable
 	}
 	blockKey := pwlessScoped("block", appRowID, email)
 	if n, bErr := s.redisCli.Exists(ctx, blockKey).Result(); bErr == nil && n > 0 {
 		metrics.PasswordlessVerifies.WithLabelValues("blocked").Inc()
 		metrics.PasswordlessThrottled.WithLabelValues("verify_email").Inc()
+		att.notAttempt = true // throttled: the code was never compared
 		return nil, nil, ErrPasswordlessInvalidCode
 	}
 
@@ -651,6 +665,7 @@ func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVer
 		pwlessMAC(s.pwless.key, in.ChallengeID, code),
 		strconv.FormatInt(appRowID, 10), strconv.FormatInt(tenantID, 10)).Slice()
 	if err != nil {
+		att.notAttempt = true // Redis error, before the code was compared
 		return nil, nil, ErrPasswordlessUnavailable
 	}
 	if ok, _ := res[0].(int64); ok != 1 {
@@ -663,7 +678,7 @@ func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVer
 	last, _ := res[4].(string)
 
 	meta := &PasswordlessVerifyMeta{TenantID: tenantID, AppRowID: appRowID, Email: email}
-	result, err := s.pwlessResolveAndComplete(ctx, meta, settings, first, last, persistent == "1", in)
+	result, err := s.pwlessResolveAndComplete(ctx, att, meta, settings, first, last, persistent == "1", in)
 	if err != nil {
 		if errors.Is(err, ErrPasswordlessInvalidCode) {
 			metrics.PasswordlessVerifies.WithLabelValues("refused").Inc()
@@ -741,8 +756,10 @@ func (s *AuthService) pwlessLoadUser(ctx context.Context, tenantID, appRowID int
 }
 
 // pwlessResolveAndComplete applies plan section 4.4 after a correct code: sign in
-// an existing user, secure an unverified account, or create one.
-func (s *AuthService) pwlessResolveAndComplete(ctx context.Context, meta *PasswordlessVerifyMeta, st PasswordlessSettings, first, last string, persistent bool, in PasswordlessVerifyInput) (*LoginResult, error) {
+// an existing user, secure an unverified account, or create one. att carries the
+// caller's login-attempt tracker through to completePasswordlessLogin's verified
+// anchor; a failure before it still counts as a failed attempt.
+func (s *AuthService) pwlessResolveAndComplete(ctx context.Context, att *loginAttempt, meta *PasswordlessVerifyMeta, st PasswordlessSettings, first, last string, persistent bool, in PasswordlessVerifyInput) (*LoginResult, error) {
 	tenantID, appRowID, email := meta.TenantID, meta.AppRowID, meta.Email
 
 	u, err := s.pwlessLoadUser(ctx, tenantID, appRowID, email)
@@ -781,7 +798,7 @@ func (s *AuthService) pwlessResolveAndComplete(ctx context.Context, meta *Passwo
 			return nil, err
 		}
 	}
-	return s.completePasswordlessLogin(ctx, tenantID, appRowID, u, email, persistent && st.AllowPersistent, in)
+	return s.completePasswordlessLogin(ctx, att, tenantID, appRowID, u, email, persistent && st.AllowPersistent, in)
 }
 
 func emailDomain(email string) string {
@@ -859,8 +876,9 @@ func (s *AuthService) pwlessSecureUnverified(ctx context.Context, tenantID, appR
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	var revoked int64
 	if u.hasPassword {
-		if err := RevokeAllSessionsTx(ctx, tx, u.id, tenantID, "preverification_neutralized"); err != nil {
+		if revoked, err = RevokeAllSessionsTx(ctx, tx, u.id, tenantID, "preverification_neutralized"); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE users SET email_verified = true, token_version = token_version + 1, updated_at = NOW() WHERE id = $1`, u.id); err != nil {
@@ -875,6 +893,7 @@ func (s *AuthService) pwlessSecureUnverified(ctx context.Context, tenantID, appR
 	u.emailVerified = true
 
 	if u.hasPassword {
+		RecordSessionRevocations("preverification_neutralized", revoked)
 		DenyAccountSessions(ctx, s.logger, u.id, tenantID)
 		metrics.PasswordlessPreverification.Inc()
 		s.pwlessAudit(ctx, audit.Event{
@@ -931,7 +950,7 @@ func (s *AuthService) pwlessWelcome(ctx context.Context, tenantID, appRowID int6
 //
 // Every refusal is ErrPasswordlessInvalidCode, never a distinct error, so a
 // refusal does not say why.
-func (s *AuthService) completePasswordlessLogin(ctx context.Context, tenantID, appRowID int64, u *pwlessUser, email string, persistent bool, in PasswordlessVerifyInput) (*LoginResult, error) {
+func (s *AuthService) completePasswordlessLogin(ctx context.Context, att *loginAttempt, tenantID, appRowID int64, u *pwlessUser, email string, persistent bool, in PasswordlessVerifyInput) (*LoginResult, error) {
 	lockoutScope := &appRowID
 	lockoutPolicy := s.lockoutSvc.Resolve(ctx, tenantID, lockoutScope)
 
@@ -950,6 +969,11 @@ func (s *AuthService) completePasswordlessLogin(ctx context.Context, tenantID, a
 		}
 		s.blockSvc.ResetFailedLogins(ctx, tenantID, u.id)
 	}
+	// The verified anchor for the login_* counter, matching Login's at
+	// ResetFailedLogins: the code is proven and the account is not locked, so
+	// a role refusal, the MFA gate or a mint error after this still counts as
+	// success. Set even when blockSvc is nil — the mark is unconditional.
+	att.markVerified()
 
 	// A requested session scope the account does not hold is refused outright,
 	// with the same uniform error, before any token is minted.

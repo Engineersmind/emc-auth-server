@@ -1,0 +1,126 @@
+# promtool unit tests for audit_alerts.yml (issue #226).
+#
+# Covers the two rules this file's counters feed: HighFailedLoginRate (needs a
+# sustained >5/s failed-login rate — the series had no writers until #226
+# wired RecordOp into the login paths) and AuditEventsDropped (must catch the
+# FIRST drop for a newly-appearing reason series, not just a steady increase).
+#
+# Run via scripts/check-observability.sh, or directly:
+#   promtool test rules /etc/prometheus/tests/audit_alerts_test.yml
+#
+# Series syntax: <val>(+<inc>|_x<misses>)x<count> at the test interval —
+# "0+80x119" is 120 samples growing by 80 each step (~5.3/s at 15s), and
+# "_x4 1x115" is 5 absent samples then 120 samples of 1: the exact shape a
+# lazy counter takes when it is created on first use, which is the bug.
+#
+# Every firing case asserts its rendered annotations too. A missing
+# exp_annotations is "expect NO annotations", not "unchecked" — promtool fails
+# the case — and the rendered values are deterministic here: the unless branch
+# reports the raw counter, and the increase() and rate() branches report
+# extrapolated floats that are stable at these exact sample shapes.
+rule_files:
+  - ../audit_alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------
+  # HighFailedLoginRate: >5 failed logins/s sustained for 10m.
+  # ---------------------------------------------------------------------
+
+  # 5.3 failures/s — over the 5/s threshold, held long enough for `for: 10m`.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_operations_total{job="emc-auth",instance="auth-1",operation="login_password",outcome="failure"}'
+        values: "0+80x119"
+      # A success series on the same operation must NOT feed the failure rate:
+      # if the outcome="failure" selector ever dropped, this series alone would
+      # take the sum far over threshold and the test would pass for the wrong
+      # reason — and so would the alert. Its presence is the regression guard.
+      - series: 'emc_auth_operations_total{job="emc-auth",instance="auth-1",operation="login_password",outcome="success"}'
+        values: "0+400x119"
+
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: HighFailedLoginRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: security
+            exp_annotations:
+              summary: "High failed-login rate (5.333/s)"
+              description: "Sustained failed logins across the fleet — possible credential stuffing / brute force."
+
+  # 4 failures/s — under the threshold, so it must stay silent however long
+  # it runs. This is the "ordinary bad-password noise" level.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_operations_total{job="emc-auth",instance="auth-1",operation="login_password",outcome="failure"}'
+        values: "0+60x119"
+
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: HighFailedLoginRate
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------
+  # AuditEventsDropped: the first drop for a NEW reason must fire.
+  # ---------------------------------------------------------------------
+
+  # A reason series that appears already at 1 — the lazy-counter case the
+  # increase()-only expression missed. The unless-offset branch catches it,
+  # and its $value is the raw counter (1), so the rendered summary is pinned.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_audit_events_dropped_total{job="emc-auth",instance="auth-1",reason="queue_full"}'
+        values: "_x4 1x115"
+
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: AuditEventsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: audit
+              reason: queue_full
+              instance: auth-1
+              job: emc-auth
+            exp_annotations:
+              summary: "Audit events are being dropped (1 in 5m)"
+              description: "reason=queue_full. The audit trail is losing events — check DB health and queue depth."
+
+  # A steadily-growing series — the case the original expression already
+  # caught. Kept so the unless branch cannot have broken it. $value is the
+  # extrapolated increase() (40 in 5m at this shape), so the annotations are
+  # pinned like the others.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_audit_events_dropped_total{job="emc-auth",instance="auth-1",reason="writer_error"}'
+        values: "0+2x119"
+
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AuditEventsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: audit
+              reason: writer_error
+              instance: auth-1
+              job: emc-auth
+            exp_annotations:
+              summary: "Audit events are being dropped (40 in 5m)"
+              description: "reason=writer_error. The audit trail is losing events — check DB health and queue depth."
+
+  # A series flat from the start — drops happened in the past but none are
+  # happening now. The counter existed at 1 throughout, so the unless branch
+  # is suppressed by its own offset and increase() reads 0: silent.
+  - interval: 15s
+    input_series:
+      - series: 'emc_auth_audit_events_dropped_total{job="emc-auth",instance="auth-1",reason="queue_full"}'
+        values: "1x119"
+
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AuditEventsDropped
+        exp_alerts: []

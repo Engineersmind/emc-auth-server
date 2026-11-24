@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 const (
@@ -299,6 +301,7 @@ func (s *AgentService) RevokeAgent(ctx context.Context, tenantID int64, agentID 
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("agent not found or already revoked")
 	}
+	metrics.TokensRevoked.WithLabelValues(RevokeReasonAgent).Inc()
 	return nil
 }
 

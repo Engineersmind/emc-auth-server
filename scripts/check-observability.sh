@@ -24,10 +24,10 @@ docker run --rm --entrypoint promtool \
   -v "$ROOT/infra/prometheus:/etc/prometheus:ro" \
   "$PROM_IMAGE" check rules /etc/prometheus/audit_alerts.yml /etc/prometheus/service_alerts.yml
 
-echo "== promtool test rules (tests/service_alerts_test.yml) =="
+echo "== promtool test rules (tests/service_alerts_test.yml, tests/audit_alerts_test.yml) =="
 docker run --rm --entrypoint promtool \
   -v "$ROOT/infra/prometheus:/etc/prometheus:ro" \
-  "$PROM_IMAGE" test rules /etc/prometheus/tests/service_alerts_test.yml
+  "$PROM_IMAGE" test rules /etc/prometheus/tests/service_alerts_test.yml /etc/prometheus/tests/audit_alerts_test.yml
 
 echo "== amtool check-config (alertmanager.yml) =="
 docker run --rm --entrypoint amtool \

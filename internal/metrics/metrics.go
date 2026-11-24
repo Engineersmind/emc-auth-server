@@ -70,11 +70,24 @@ var (
 	)
 
 	// AuthOperations counts discrete auth events with an outcome label.
-	// operation values: login, login_otp, register, token_refresh, logout,
+	// operation values: login_password, login_magic_link, login_passwordless,
+	//                   login_passkey (one per first-factor method, #226;
+	//                   the login_* prefix is what the HighFailedLoginRate
+	//                   alert's operation=~"login.*" selector matches),
+	//                   login, login_otp, register, token_refresh, logout,
 	//                   password_reset_request, password_reset_complete,
 	//                   totp_enroll, totp_activate, totp_disable, totp_verify,
 	//                   api_key_create, api_key_revoke, api_key_auth
 	// outcome values: success, failure
+	//
+	// The login_* operations follow one classification rule (#226): a request
+	// refused before any presented credential could be compared — missing
+	// configuration, failed client authentication, a feature or policy that
+	// is off, a throttle, a malformed assertion body — is not an attempt and
+	// increments neither outcome; a credential compared and refused (or a
+	// lookup with nothing to compare it with) is a failure; and a request
+	// that reached the method's verified anchor is a success whatever
+	// happened after it.
 	AuthOperations = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "emc_auth",
@@ -413,7 +426,14 @@ var (
 	)
 
 	// TokensRevoked counts token/session revocations by reason.
-	// reason: logout | replay_detected | refresh_rotation.
+	// reason (session reasons, internal/auth/session.go RevokeReason*):
+	//   rotated | logout | user_revoked | admin_revoked | admin_revoked_all |
+	//   replay_detected | cap_evicted | credential_change | passkey_cloned |
+	//   session_rejected | preverification_neutralized
+	// reason (non-session revocations, no revoked_reason column):
+	//   oauth_revoke | api_key_revoked | agent_revoked
+	// Counted per revoked row, matching SessionRevocations and the
+	// tokens_revoked audit metadata on logout.
 	TokensRevoked = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "emc_auth",

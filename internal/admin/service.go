@@ -2886,7 +2886,7 @@ func (s *Service) RevokeAllUserSessions(ctx context.Context, tenantID int64, app
 		return 0, fmt.Errorf("count sessions to revoke: %w", err)
 	}
 
-	err = auth.RevokeAllSessionsTx(ctx, tx, userID, tenantID, auth.RevokeReasonAdminAll)
+	n, err := auth.RevokeAllSessionsTx(ctx, tx, userID, tenantID, auth.RevokeReasonAdminAll)
 	if err != nil {
 		return 0, fmt.Errorf("revoke all sessions: %w", err)
 	}
@@ -2899,6 +2899,7 @@ func (s *Service) RevokeAllUserSessions(ctx context.Context, tenantID int64, app
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit revoke-all: %w", err)
 	}
+	auth.RecordSessionRevocations(auth.RevokeReasonAdminAll, n)
 
 	if s.authSvc != nil {
 		s.authSvc.DenyUserSessions(ctx, userID, tenantID)
@@ -2907,7 +2908,8 @@ func (s *Service) RevokeAllUserSessions(ctx context.Context, tenantID int64, app
 			Msg("admin: auth service not wired; revoke-all will not sign the user out until their access token expires")
 	}
 
-	// The metric is emitted by RevokeAllSessionsTx, so it is not repeated here.
+	// The metric is emitted above, after the commit: counting inside the
+	// transaction would survive a rollback that undid the revocation.
 	return revoked, nil
 }
 
