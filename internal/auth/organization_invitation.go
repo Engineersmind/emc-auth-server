@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/mail"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -451,16 +452,68 @@ func loadPendingInvitation(ctx context.Context, q queryRower, token string, forU
 	return &p, nil
 }
 
-func liveRoleNames(ctx context.Context, q pgx.Tx, p *pendingInvitation) ([]string, error) {
-	var names []string
-	if err := q.QueryRow(ctx, `
-		SELECT COALESCE(ARRAY_AGG(name ORDER BY name), '{}') FROM roles
-		WHERE id = ANY($1) AND tenant_id = $2 AND application_id = $3
-		  AND is_system = false AND deleted_at IS NULL
-	`, p.roleIDs, p.tenant, p.appRowID).Scan(&names); err != nil {
-		return nil, fmt.Errorf("resolve invitation roles: %w", err)
+// lockInvitationRolesSQL takes FOR SHARE on every roles row an acceptance can
+// touch — the invitation's roles plus, for a new account ($4), the
+// application's default — in ONE statement ordered by id. The single statement
+// is the point (#220): locking the default where createInvitedUser ran and the
+// invitation roles here meant one transaction held a higher-id row while it
+// waited on a lower-id one an id-ordered locker (runRBACImport) already held.
+// A package-level const so the lock-order unit test can check the ORDER BY
+// clause sits before FOR SHARE.
+const lockInvitationRolesSQL = `
+	SELECT id, name, is_default FROM roles
+	WHERE tenant_id = $1 AND application_id = $2
+	  AND is_system = false AND deleted_at IS NULL
+	  AND (id = ANY($3) OR ($4::BOOLEAN AND is_default))
+	ORDER BY id
+	FOR SHARE`
+
+// lockInvitationRoles resolves the invitation's role ids to names for
+// assignRolesTx and, for a new account, finds the application's default role —
+// locking all of them FOR SHARE in one id-ordered statement, the same
+// lock-contract #220 puts on resolveApplicationRoles. includeDefault is false
+// for a signed-in invitee: only a newly created account takes the default.
+//
+// names is sorted here rather than taken in lock order: under READ COMMITTED a
+// row re-checked after a wait can come back out of ORDER BY order, and the
+// alphabetical slice is what callers were given when the query ordered by
+// name. It is a non-nil empty slice when no invitation role is live — the same
+// shape the old query produced. defaultRoleID is nil when the application has
+// no default, or when a SetDefaultRole committed while the statement waited:
+// the re-checked is_default then matches nothing and the account simply gets
+// none, exactly as the old re-checked SELECT behaved.
+func lockInvitationRoles(ctx context.Context, tx pgx.Tx, p *pendingInvitation, includeDefault bool) (names []string, defaultRoleID *int64, err error) {
+	rows, err := tx.Query(ctx, lockInvitationRolesSQL, p.tenant, p.appRowID, p.roleIDs, includeDefault)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve invitation roles: %w", err)
 	}
-	return names, nil
+	defer rows.Close()
+	invited := make(map[int64]struct{}, len(p.roleIDs))
+	for _, id := range p.roleIDs {
+		invited[id] = struct{}{}
+	}
+	names = []string{}
+	for rows.Next() {
+		var id int64
+		var name string
+		var isDefault bool
+		if err := rows.Scan(&id, &name, &isDefault); err != nil {
+			return nil, nil, fmt.Errorf("scan invitation role: %w", err)
+		}
+		// A role can be both an invitation role and the default; it then
+		// counts in both results.
+		if _, ok := invited[id]; ok {
+			names = append(names, name)
+		}
+		if isDefault && includeDefault {
+			defaultRoleID = &id
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate invitation roles: %w", err)
+	}
+	sort.Strings(names)
+	return names, defaultRoleID, nil
 }
 
 // InvitationScope reports the tenant and application a pending invitation token
@@ -559,6 +612,17 @@ func (s *OrganizationService) AcceptInvitation(ctx context.Context, in AcceptOrg
 	}
 	sc := OrganizationScope{TenantID: p.tenant, AppRowID: p.appRowID}
 
+	// Every roles row this transaction will touch, locked in one id-ordered
+	// statement right after the organisation and invitation locks and before
+	// any write to users, user_roles or organization_member_roles — the
+	// #220 lock contract. For a new account the set includes the default
+	// role, which createInvitedUser consumes; for a signed-in invitee it is
+	// just the invitation's roles.
+	names, defaultRoleID, err := lockInvitationRoles(ctx, tx, p, in.ExistingUserID == nil)
+	if err != nil {
+		return nil, err
+	}
+
 	var userID int64
 	created := false
 	if in.ExistingUserID != nil {
@@ -590,17 +654,13 @@ func (s *OrganizationService) AcceptInvitation(ctx context.Context, in AcceptOrg
 		if exists {
 			return nil, ErrOrganizationInvitationAccountExists
 		}
-		if userID, err = createInvitedUser(ctx, tx, p, strings.TrimSpace(in.FirstName), strings.TrimSpace(in.LastName), hash); err != nil {
+		if userID, err = createInvitedUser(ctx, tx, p, strings.TrimSpace(in.FirstName), strings.TrimSpace(in.LastName), hash, defaultRoleID); err != nil {
 			return nil, err
 		}
 		created = true
 	}
 
 	if _, err := s.addMemberTx(ctx, tx, sc, p.orgRowID, userID, nil); err != nil {
-		return nil, err
-	}
-	names, err := liveRoleNames(ctx, tx, p)
-	if err != nil {
 		return nil, err
 	}
 	if len(names) > 0 {
@@ -631,35 +691,27 @@ func (s *OrganizationService) AcceptInvitation(ctx context.Context, in AcceptOrg
 // createInvitedUser creates the invitee's account in the invitation's
 // application, the same shape Register writes: the application's default role,
 // its user_roles grant and a credential. The address is verified — the invitee
-// followed a link sent to it.
-func createInvitedUser(ctx context.Context, tx pgx.Tx, p *pendingInvitation, first, last, hash string) (int64, error) {
-	var roleID *int64
-	if err := tx.QueryRow(ctx, `
-		SELECT id FROM roles
-		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
-		  AND is_system = false AND deleted_at IS NULL
-		FOR SHARE
-	`, p.tenant, p.appRowID).Scan(&roleID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return 0, fmt.Errorf("fetch default role: %w", err)
-	}
+// followed a link sent to it. defaultRoleID was found and locked by
+// lockInvitationRoles before this transaction wrote anything.
+func createInvitedUser(ctx context.Context, tx pgx.Tx, p *pendingInvitation, first, last, hash string, defaultRoleID *int64) (int64, error) {
 	var userID int64
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO users (tenant_id, email, first_name, last_name, role_id, application_id,
 		                   is_active, email_verified)
 		VALUES ($1, $2, $3, $4, $5, $6, true, true)
 		RETURNING id
-	`, p.tenant, p.email, first, last, roleID, p.appRowID).Scan(&userID); err != nil {
+	`, p.tenant, p.email, first, last, defaultRoleID, p.appRowID).Scan(&userID); err != nil {
 		if isUniqueViolation(err) {
 			return 0, ErrOrganizationInvitationAccountExists
 		}
 		return 0, fmt.Errorf("insert invited user: %w", err)
 	}
-	if roleID != nil {
+	if defaultRoleID != nil {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO user_roles (user_id, role_id, tenant_id, granted_by)
 			VALUES ($1, $2, $3, NULL)
 			ON CONFLICT (user_id, role_id) DO NOTHING
-		`, userID, *roleID, p.tenant); err != nil {
+		`, userID, *defaultRoleID, p.tenant); err != nil {
 			return 0, fmt.Errorf("record default role grant: %w", err)
 		}
 	}

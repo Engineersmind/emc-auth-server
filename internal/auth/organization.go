@@ -1055,20 +1055,44 @@ func (s *OrganizationService) AssignMemberRoles(ctx context.Context, sc Organiza
 	return &MemberRolesResult{UserID: m.UserID, Roles: m.Roles, Assigned: assigned, Removed: removed}, nil
 }
 
+// resolveApplicationRolesSQL locks every role a grant names in ONE statement,
+// ordered by id. A package-level const so the lock-order unit test can check
+// the ORDER BY clause sits before FOR SHARE.
+const resolveApplicationRolesSQL = `
+	SELECT id, name FROM roles
+	WHERE tenant_id = $1 AND application_id = $2 AND name = ANY($3)
+	  AND is_system = false AND deleted_at IS NULL
+	ORDER BY id
+	FOR SHARE`
+
 // resolveApplicationRoles maps role names to ids within the application. Every
 // name must be a live, non-system role of the application, or the call fails
 // naming the ones that are not — the caller authenticated as the application,
 // so it is being told about its own configuration.
+//
+// FOR SHARE, not FOR KEY SHARE: the caller goes on to insert
+// organization_member_roles rows for these roles, and DeleteRole soft-deletes
+// with an UPDATE — a FOR NO KEY UPDATE lock that does not wait on FOR KEY
+// SHARE. FOR SHARE does conflict, so a delete in flight either commits first
+// (and the re-checked deleted_at predicate drops the role, failing the grant)
+// or waits for the grant to commit and then sees and removes the grant.
+//
+// The ORDER BY is what keeps the lock itself from deadlocking (#220): every
+// transaction that locks more than one roles row takes all of them in ONE
+// statement, ordered by id, and takes no further roles lock later except on
+// rows it already holds. runRBACImport locks every live role of the
+// application FOR NO KEY UPDATE in id order, and SetDefaultRole locks its old
+// and new defaults the same way — a grant that took its rows in any other
+// order could hold one while waiting on another they already hold. Role locks
+// also come after any organizations or organization_invitations lock and
+// before any write to organization_member_roles, users or user_roles, which
+// is where this statement sits in every caller already.
 func resolveApplicationRoles(ctx context.Context, tx pgx.Tx, sc OrganizationScope, names []string) (map[string]int64, error) {
 	ids := make(map[string]int64, len(names))
 	if len(names) == 0 {
 		return ids, nil
 	}
-	rows, err := tx.Query(ctx, `
-		SELECT id, name FROM roles
-		WHERE tenant_id = $1 AND application_id = $2 AND name = ANY($3)
-		  AND is_system = false AND deleted_at IS NULL
-	`, sc.TenantID, sc.AppRowID, names)
+	rows, err := tx.Query(ctx, resolveApplicationRolesSQL, sc.TenantID, sc.AppRowID, names)
 	if err != nil {
 		return nil, fmt.Errorf("resolve roles: %w", err)
 	}
@@ -1114,10 +1138,15 @@ func (s *OrganizationService) assignRolesTx(ctx context.Context, tx pgx.Tx, sc O
 		return nil, nil, ErrOrganizationMemberNotFound
 	}
 
+	// deleted_at on the join, not the caller: a grant row that outlived its
+	// role (committed between DeleteRole's holder collection and its omr
+	// delete, before the role read above was locked — #220) must count as
+	// neither held nor toward MaxOrganizationRolesPerMember. Left in, an
+	// orphan's name shadows a same-named live role forever.
 	held := map[string]int64{}
 	rows, err := tx.Query(ctx, `
 		SELECT r.id, r.name FROM organization_member_roles omr
-		JOIN roles r ON r.id = omr.role_id
+		JOIN roles r ON r.id = omr.role_id AND r.deleted_at IS NULL
 		WHERE omr.organization_id = $1 AND omr.user_id = $2
 	`, orgRowID, userID)
 	if err != nil {
