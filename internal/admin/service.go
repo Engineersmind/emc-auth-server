@@ -1615,6 +1615,25 @@ func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) ([]int
 	return holders, nil
 }
 
+// setDefaultRoleLockSQL takes FOR NO KEY UPDATE on every roles row
+// SetDefaultRole's UPDATEs can write — the current default and the target —
+// in ONE statement ordered by id. Without it the two UPDATEs lock
+// old-default-then-target, which is descending id order whenever the new
+// default's id is lower, and a grant path locking the same rows in ascending
+// order (#220) deadlocks against it.
+//
+// No deleted_at predicate: the lock has to cover the same rows the
+// clear-is_default UPDATE below does, and that statement deliberately ignores
+// tombstones (see its comment). A package-level const so the lock-order unit
+// test can check the ORDER BY clause sits before FOR NO KEY UPDATE.
+const setDefaultRoleLockSQL = `
+	SELECT 1 FROM (
+		SELECT id FROM roles
+		WHERE tenant_id = $1 AND application_id = $2 AND (is_default = true OR id = $3)
+		ORDER BY id
+		FOR NO KEY UPDATE
+	) locked`
+
 // SetDefaultRole marks roleID as the default role for applicationID, clearing
 // any previously-default role for that application in one transaction. Only
 // application-scoped, non-system roles are eligible — tenant-management roles
@@ -1625,6 +1644,15 @@ func (s *Service) SetDefaultRole(ctx context.Context, tenantID, applicationID, r
 		return fmt.Errorf("begin set default role tx: %w", err)
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Lock the old default and the target in id order before the lookup and
+	// before either UPDATE — the #220 lock contract. FOR NO KEY UPDATE is the
+	// lock the UPDATEs themselves take, so this covers exactly the later
+	// writes. A target outside this application (or a system role) is simply
+	// not locked here; the lookup rejects it the same as before.
+	if _, err := tx.Exec(ctx, setDefaultRoleLockSQL, tenantID, applicationID, roleID); err != nil {
+		return fmt.Errorf("set default role: lock roles: %w", err)
+	}
 
 	var isSystem bool
 	var appID *int64
