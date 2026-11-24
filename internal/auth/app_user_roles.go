@@ -53,6 +53,20 @@ var ErrUserNotInApplication = errors.New("user not found in this application")
 // 500 branch, reporting the caller's mistake as a server failure.
 var ErrNoRolesRequested = errors.New("at least one role is required")
 
+// assignAppUserRolesResolveSQL locks every role a request names in ONE
+// statement, ordered by id — the #220 lock contract every multi-row roles
+// lock follows, so this path takes its FOR SHARE locks in the same order
+// runRBACImport and SetDefaultRole take theirs. A package-level const so the
+// lock-order unit test can check the ORDER BY clause sits before FOR SHARE.
+const assignAppUserRolesResolveSQL = `
+	SELECT id, name FROM roles
+	WHERE tenant_id = $1 AND application_id = $2
+	  AND name = ANY($3::TEXT[])
+	  AND is_system = false
+	  AND deleted_at IS NULL
+	ORDER BY id
+	FOR SHARE`
+
 // AssignAppUserRolesInput is one application-credentialed role assignment.
 type AssignAppUserRolesInput struct {
 	ClientID     string
@@ -159,14 +173,7 @@ func (s *AuthService) AssignAppUserRoles(ctx context.Context, in AssignAppUserRo
 	// either side. A share lock blocks that UPDATE until this transaction commits
 	// while still letting concurrent assignments of the same role proceed, which
 	// an exclusive lock would serialise for no benefit.
-	rows, err := tx.Query(ctx, `
-		SELECT id, name FROM roles
-		WHERE tenant_id = $1 AND application_id = $2
-		  AND name = ANY($3::TEXT[])
-		  AND is_system = false
-		  AND deleted_at IS NULL
-		FOR SHARE
-	`, tenantID, appRowID, names)
+	rows, err := tx.Query(ctx, assignAppUserRolesResolveSQL, tenantID, appRowID, names)
 	if err != nil {
 		return nil, fmt.Errorf("assign app user roles: resolve roles: %w", err)
 	}
