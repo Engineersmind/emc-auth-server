@@ -13,10 +13,11 @@
 # "_x4 1x115" is 5 absent samples then 120 samples of 1: the exact shape a
 # lazy counter takes when it is created on first use, which is the bug.
 #
-# exp_annotations is asserted only where the rendered {{ $value }} is
-# deterministic: the unless branch reports the raw counter (1), while the
-# increase() and rate() branches report extrapolated floats that would make
-# the expectation brittle without testing anything the label set doesn't.
+# Every firing case asserts its rendered annotations too. A missing
+# exp_annotations is "expect NO annotations", not "unchecked" — promtool fails
+# the case — and the rendered values are deterministic here: the unless branch
+# reports the raw counter, and the increase() and rate() branches report
+# extrapolated floats that are stable at these exact sample shapes.
 rule_files:
   - ../audit_alerts.yml
 
@@ -46,6 +47,9 @@ tests:
           - exp_labels:
               severity: warning
               component: security
+            exp_annotations:
+              summary: "High failed-login rate (5.333/s)"
+              description: "Sustained failed logins across the fleet — possible credential stuffing / brute force."
 
   # 4 failures/s — under the threshold, so it must stay silent however long
   # it runs. This is the "ordinary bad-password noise" level.
@@ -86,8 +90,9 @@ tests:
               description: "reason=queue_full. The audit trail is losing events — check DB health and queue depth."
 
   # A steadily-growing series — the case the original expression already
-  # caught. Kept so the unless branch cannot have broken it. $value would be
-  # the extrapolated increase(), so annotations are left unchecked here.
+  # caught. Kept so the unless branch cannot have broken it. $value is the
+  # extrapolated increase() (40 in 5m at this shape), so the annotations are
+  # pinned like the others.
   - interval: 15s
     input_series:
       - series: 'emc_auth_audit_events_dropped_total{job="emc-auth",instance="auth-1",reason="writer_error"}'
@@ -103,6 +108,9 @@ tests:
               reason: writer_error
               instance: auth-1
               job: emc-auth
+            exp_annotations:
+              summary: "Audit events are being dropped (40 in 5m)"
+              description: "reason=writer_error. The audit trail is losing events — check DB health and queue depth."
 
   # A series flat from the start — drops happened in the past but none are
   # happening now. The counter existed at 1 throughout, so the unless branch
