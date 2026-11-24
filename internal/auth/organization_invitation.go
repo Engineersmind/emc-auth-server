@@ -451,14 +451,34 @@ func loadPendingInvitation(ctx context.Context, q queryRower, token string, forU
 	return &p, nil
 }
 
+// liveRoleNames resolves the invitation's role ids to names for assignRolesTx.
+// The rows are locked FOR SHARE so AcceptInvitation's grant cannot commit on a
+// role DeleteRole has soft-deleted mid-acceptance — the same race #220 fixes in
+// resolveApplicationRoles. An aggregate cannot take a locking clause, so the
+// rows are fetched ordered and collected here; the result is the same slice
+// ARRAY_AGG produced, including the non-nil empty slice when nothing matches.
 func liveRoleNames(ctx context.Context, q pgx.Tx, p *pendingInvitation) ([]string, error) {
-	var names []string
-	if err := q.QueryRow(ctx, `
-		SELECT COALESCE(ARRAY_AGG(name ORDER BY name), '{}') FROM roles
+	rows, err := q.Query(ctx, `
+		SELECT name FROM roles
 		WHERE id = ANY($1) AND tenant_id = $2 AND application_id = $3
 		  AND is_system = false AND deleted_at IS NULL
-	`, p.roleIDs, p.tenant, p.appRowID).Scan(&names); err != nil {
+		ORDER BY name
+		FOR SHARE
+	`, p.roleIDs, p.tenant, p.appRowID)
+	if err != nil {
 		return nil, fmt.Errorf("resolve invitation roles: %w", err)
+	}
+	defer rows.Close()
+	names := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan invitation role: %w", err)
+		}
+		names = append(names, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate invitation roles: %w", err)
 	}
 	return names, nil
 }
