@@ -13,7 +13,6 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	otellog "go.opentelemetry.io/otel/log"
-	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -87,7 +86,7 @@ func Init(ctx context.Context) (ShutdownFunc, error) {
 		log.WithProcessor(log.NewBatchProcessor(logExp)),
 		log.WithResource(res),
 	)
-	global.SetLoggerProvider(lp)
+	otel.SetLoggerProvider(lp)
 
 	shutdown := func(ctx context.Context) error {
 		err1 := tp.Shutdown(ctx)
@@ -102,5 +101,5 @@ func Init(ctx context.Context) (ShutdownFunc, error) {
 
 // Logger returns the OTel logger for the given scope (used by OTelHook).
 func Logger(scope string) otellog.Logger {
-	return global.GetLoggerProvider().Logger(scope)
+	return otel.GetLoggerProvider().Logger(scope)
 }
