@@ -248,6 +248,64 @@ func TestOrganizations_SelectionRechecksTheAccount(t *testing.T) {
 	})
 }
 
+// The identity stored in a selection token is up to five minutes old by the
+// time the user picks an organisation, so what the minted token says about the
+// ACCOUNT — email, primary role, permissions — must be re-read at completion
+// rather than trusted from the cached state. The role change below is written
+// directly, standing in for the admin API the way holdRole does: the real
+// path (AssignAppUserRoles) also revokes the account's sessions, which is the
+// different refusal the test above already pins.
+func TestOrganizations_SelectionMintsTheCurrentIdentity(t *testing.T) {
+	f := newOrgFixture(t, "sel-reload", auth.OrganizationsModeRequired)
+	f.svc.WithTOTP(nil, testhelper.NewTestRedis(t)) // skips without REDIS_URL
+	email := uniqueEmail("sel-reload")
+	uid := f.registerUser(t, email)
+	acme := f.createOrg(t, "acme")
+	f.addMember(t, acme, uid)
+	f.addMember(t, f.createOrg(t, "globex"), uid)
+	ctx := context.Background()
+
+	_, err := f.login(email, "")
+	var sel *auth.OrganizationSelectionRequiredError
+	if !errors.As(err, &sel) {
+		t.Fatalf("Login() error = %v, want OrganizationSelectionRequiredError", err)
+	}
+
+	// While the list is on screen the account's only role — the registration
+	// default "viewer" (widgets:read) — is replaced by "editor"
+	// (widgets:write), and its email changes.
+	editor := grantRole(t, f.roleFixture, "editor", "widgets:write")
+	newEmail := uniqueEmail("sel-reload-new")
+	if _, err := f.pool.Exec(ctx,
+		`DELETE FROM user_roles WHERE user_id = $1 AND tenant_id = $2`, uid, f.tenantID); err != nil {
+		t.Fatalf("drop held roles: %v", err)
+	}
+	holdRole(t, f.roleFixture, uid, editor)
+	if _, err := f.pool.Exec(ctx,
+		`UPDATE users SET role_id = $1, email = $2 WHERE id = $3`, editor, newEmail, uid); err != nil {
+		t.Fatalf("repoint primary role and email: %v", err)
+	}
+
+	res, err := f.svc.CompleteOrganizationSelection(ctx, sel.SelectionToken, "acme")
+	if err != nil {
+		t.Fatalf("CompleteOrganizationSelection() error = %v", err)
+	}
+	c := f.claimsOf(t, res.AccessToken)
+	if c.OrgID != acme.ID {
+		t.Errorf("org_id = %q, want %q", c.OrgID, acme.ID)
+	}
+	if c.Email != newEmail {
+		t.Errorf("email = %q, want %q — the selection minted the cached snapshot, not the current account", c.Email, newEmail)
+	}
+	if c.Role != "editor" {
+		t.Errorf("role = %q, want %q — the selection minted the cached snapshot, not the current account", c.Role, "editor")
+	}
+	if !hasPerm(c.Permissions, "widgets:write") || hasPerm(c.Permissions, "widgets:read") {
+		t.Errorf("permissions = %v, want exactly the editor's widgets:write grant — "+
+			"the selection minted the cached snapshot, not the current account", c.Permissions)
+	}
+}
+
 // --- Races (review comments 3 and 9) ----------------------------------------
 
 // A removal that is in flight while a login mints must not leave a session the
