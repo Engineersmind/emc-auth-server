@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+
+	"github.com/engineersmind/emc-auth-server/internal/metrics"
 )
 
 const (
@@ -138,6 +140,7 @@ func (s *APIKeyService) RevokeAPIKey(ctx context.Context, tenantID, keyID int64)
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("API key not found or already revoked")
 	}
+	metrics.TokensRevoked.WithLabelValues(RevokeReasonAPIKey).Inc()
 	return nil
 }
 

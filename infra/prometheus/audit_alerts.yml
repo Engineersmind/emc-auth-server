@@ -9,8 +9,21 @@ groups:
       # Any sustained drop means the trail is incomplete — investigate DB health
       # or scale the writer.
       - alert: AuditEventsDropped
-        expr: increase(emc_auth_audit_events_dropped_total[5m]) > 0
-        for: 5m
+        # Lazy counters: a reason series exists only from its first drop, so the
+        # first drop creates the series already at 1 and increase() reads 0 —
+        # the single drop that matters most (the FIRST one, when a queue just
+        # started shedding) never fired. The unless branch therefore also fires
+        # on any positive series that did not exist 5m ago — the same fix #224
+        # applied to EmcAuthRateLimitFailOpen. No sum(): the description prints
+        # {{ $labels.reason }}, so the label must survive into the alert.
+        expr: >-
+          increase(emc_auth_audit_events_dropped_total[5m]) > 0
+          or
+          (emc_auth_audit_events_dropped_total > 0) unless emc_auth_audit_events_dropped_total offset 5m
+        # 1m, not the 5m this used to be: the new-series window the unless
+        # branch opens lasts exactly 5m, so a `for` of 5m could never complete
+        # inside it and the first-drop case would still never fire.
+        for: 1m
         labels: { severity: warning, component: audit }
         annotations:
           summary: "Audit events are being dropped ({{ $value }} in 5m)"

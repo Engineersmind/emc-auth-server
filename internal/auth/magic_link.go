@@ -169,7 +169,11 @@ func (s *AuthService) RequestMagicLink(ctx context.Context, clientID, clientSecr
 // (single-use), and completes the login through the exact same MFA gate as a
 // password login — the result may therefore be tokens, an OTP challenge, or
 // a forced-enrollment challenge.
-func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecret, token string) (*LoginResult, error) {
+func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecret, token string) (_ *LoginResult, err error) {
+	// Counted as a login attempt like a password sign-in (#226); a bad client
+	// secret is skipped — the link token was never checked.
+	defer func() { recordLoginOutcome(loginOpMagicLink, err, ErrInvalidClient) }()
+
 	if s.redisCli == nil {
 		return nil, fmt.Errorf("magic link not configured on this server")
 	}

@@ -1487,7 +1487,13 @@ func (s *AuthService) LoginWebAuthnForCookieSession(ctx context.Context, token s
 
 // loginWebAuthn is the shared body. refuseApplicationScoped stops between
 // verifying the assertion and issuing tokens.
-func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.Request, refuseApplicationScoped bool) (*AuthResult, *WebAuthnIdentity, error) {
+func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.Request, refuseApplicationScoped bool) (_ *AuthResult, _ *WebAuthnIdentity, err error) {
+	// One counter entry covers both public entry points (#226). A request that
+	// reaches here always carries an assertion, so every error — a bad
+	// signature, an expired challenge, a refused session — is a failed attempt.
+	// ErrWebAuthnNotConfigured is skipped: nothing was presented to check.
+	defer func() { recordLoginOutcome(loginOpPasskey, err, ErrWebAuthnNotConfigured) }()
+
 	if s.webauthnSvc == nil {
 		return nil, nil, ErrWebAuthnNotConfigured
 	}

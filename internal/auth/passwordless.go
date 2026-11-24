@@ -610,7 +610,11 @@ type PasswordlessVerifyMeta struct {
 // PasswordlessVerify proves a code and completes the sign-in (or sign-up). The
 // result is tokens, an OTP challenge or an enrolment challenge, exactly as for a
 // password login. Every refusal is ErrPasswordlessInvalidCode.
-func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVerifyInput) (*LoginResult, *PasswordlessVerifyMeta, error) {
+func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVerifyInput) (_ *LoginResult, _ *PasswordlessVerifyMeta, err error) {
+	// Counted as a login attempt like a password sign-in (#226); a bad client
+	// secret is skipped — the presented code was never checked.
+	defer func() { recordLoginOutcome(loginOpPasswordless, err, ErrInvalidClient) }()
+
 	if err := s.pwlessReady(); err != nil {
 		return nil, nil, err
 	}

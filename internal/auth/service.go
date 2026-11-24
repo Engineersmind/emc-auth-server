@@ -1545,13 +1545,57 @@ type loginCandidate struct {
 	isActive bool
 }
 
+// First-factor login operation labels for emc_auth_operations_total — one per
+// METHOD, all matching the HighFailedLoginRate alert's operation=~"login.*"
+// selector. A single name per method rather than per route: the four password
+// endpoints all funnel into Login, and an attacker spreading attempts across
+// them is still one campaign. Constants rather than literals because a typo in
+// a label value does not fail a build — it silently creates a series nothing
+// is watching.
+const (
+	loginOpPassword     = "login_password"
+	loginOpMagicLink    = "login_magic_link"
+	loginOpPasswordless = "login_passwordless"
+	loginOpPasskey      = "login_passkey"
+)
+
+// recordLoginOutcome counts one first-factor login attempt on
+// emc_auth_operations_total — the series the HighFailedLoginRate alert reads
+// (#226). A nil error means the credentials verified (tokens or a challenge
+// came back); any other error counts as failure, EXCEPT the listed sentinel
+// refusals, which fire before a credential is ever checked: a bad client
+// secret or a closed password flow is client misconfiguration, not a login
+// attempt, and counting it would drown the credential-attack signal in noise.
+//
+// Called once per entry point via defer, so every return path is counted
+// exactly once and adding another early return cannot skip the increment.
+// Never labelled by user, email, or failure reason — the reason would be an
+// enumeration oracle and unbounded cardinality.
+func recordLoginOutcome(operation string, err error, skip ...error) {
+	if err == nil {
+		metrics.RecordOp(operation, "success")
+		return
+	}
+	for _, s := range skip {
+		if errors.Is(err, s) {
+			return
+		}
+	}
+	metrics.RecordOp(operation, "failure")
+}
+
 // Login authenticates a user by email and password. Without application
 // credentials the caller never specifies a tenant — the same email may have
 // separate accounts (separate passwords) in multiple tenants, so Login fetches
 // every active account matching the email and checks the password against each
 // one to find the single tenant it belongs to. With ClientID + ClientSecret
 // the application is authenticated first and the search is pinned to its tenant.
-func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, error) {
+func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult, err error) {
+	// One counter entry per attempt — deferred so no return path below can skip
+	// it (#226). A bad client secret and a closed password flow are skipped:
+	// both are refused before a user credential is checked.
+	defer func() { recordLoginOutcome(loginOpPassword, err, ErrInvalidClient, ErrPasswordAuthDisabled) }()
+
 	// Timing-uniformity clock. Every return path below settles against this so
 	// latency does not reveal whether the email exists, how many accounts hold
 	// it, or whether the password was correct. See loginTimingBudget.
@@ -2601,6 +2645,7 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
 	metrics.SessionRevocations.WithLabelValues(RevokeReasonRotated).Inc()
+	metrics.TokensRevoked.WithLabelValues(RevokeReasonRotated).Inc()
 
 	var email, roleName string
 	var roleID, applicationID *int64
@@ -2923,6 +2968,7 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		return nil, nil, fmt.Errorf("revoke old refresh token: %w", err)
 	}
 	metrics.SessionRevocations.WithLabelValues(RevokeReasonRotated).Inc()
+	metrics.TokensRevoked.WithLabelValues(RevokeReasonRotated).Inc()
 
 	// Fresh user load from DB — catches suspensions, role changes, or email bans
 	// that occurred during the access token's lifetime (key security gate).
@@ -3145,6 +3191,9 @@ func (s *AuthService) RevokeRefreshTokenForTenant(ctx context.Context, rawRefres
 	`, hash, tenantID, appRowID)
 	if err != nil {
 		return false, fmt.Errorf("revoke refresh token: %w", err)
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		metrics.TokensRevoked.WithLabelValues(RevokeReasonOAuthRevoke).Add(float64(n))
 	}
 	return tag.RowsAffected() > 0, nil
 }

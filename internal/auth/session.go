@@ -110,6 +110,21 @@ const (
 	RevokeReasonSessionRejected = "session_rejected"
 )
 
+// Metric-only revocation reasons (#226): labels on emc_auth_tokens_revoked_total
+// for revocations that have no revoked_reason column to write to — the
+// /oauth/revoke UPDATE only stamps revoked_at, and api_keys /
+// agent_registrations rows carry no reason column at all. Kept beside the set
+// above so the whole bounded vocabulary lives in one place.
+const (
+	// RevokeReasonOAuthRevoke — a client asked RFC 7009 /oauth/revoke to end
+	// this token.
+	RevokeReasonOAuthRevoke = "oauth_revoke"
+	// RevokeReasonAPIKey — an API key was revoked by its tenant.
+	RevokeReasonAPIKey = "api_key_revoked"
+	// RevokeReasonAgent — an agent registration (and its key) was revoked.
+	RevokeReasonAgent = "agent_revoked"
+)
+
 // ---------------------------------------------------------------------------
 // Authentication methods (OIDC "amr")
 // ---------------------------------------------------------------------------
@@ -204,6 +219,7 @@ func (s *AuthService) revokeSession(ctx context.Context, userID, tenantID, sessi
 	}
 
 	metrics.SessionRevocations.WithLabelValues(reason).Add(float64(n))
+	metrics.TokensRevoked.WithLabelValues(reason).Add(float64(n))
 	// After the commit: a Redis entry cannot be rolled back, so denying a session
 	// the transaction then failed to revoke would sign a user out on the strength
 	// of a write that never landed.
@@ -318,6 +334,7 @@ func (s *AuthService) RevokeOtherSessions(ctx context.Context, userID int64, kee
 	revoked := int64(len(ids))
 	if revoked > 0 {
 		metrics.SessionRevocations.WithLabelValues(RevokeReasonUserRevoked).Add(float64(revoked))
+		metrics.TokensRevoked.WithLabelValues(RevokeReasonUserRevoked).Add(float64(revoked))
 	}
 	for _, id := range ids {
 		s.denySession(ctx, id)
@@ -787,6 +804,7 @@ func RevokeAllSessionsTx(ctx context.Context, tx pgx.Tx, userID, tenantID int64,
 
 	if n := ct.RowsAffected(); n > 0 {
 		metrics.SessionRevocations.WithLabelValues(reason).Add(float64(n))
+		metrics.TokensRevoked.WithLabelValues(reason).Add(float64(n))
 	}
 	return nil
 }
@@ -957,6 +975,7 @@ func enforceSessionCap(ctx context.Context, tx pgx.Tx, userID, tenantID int64, m
 			return nil, fmt.Errorf("revoke evicted session tokens: %w", err)
 		}
 		metrics.SessionRevocations.WithLabelValues(RevokeReasonCapEvicted).Add(float64(len(evicted)))
+		metrics.TokensRevoked.WithLabelValues(RevokeReasonCapEvicted).Add(float64(len(evicted)))
 	}
 	return evicted, nil
 }
