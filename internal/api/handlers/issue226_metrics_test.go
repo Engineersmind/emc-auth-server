@@ -329,11 +329,23 @@ func TestMetrics226_PasswordlessVerifyCounts(t *testing.T) {
 	// pwlessReady needs the policy service, Redis, the application service and
 	// the email service wired; a nil mailer is fine because a failed verify
 	// never sends anything.
+	policy := auth.NewPasswordlessPolicyService(f.pool, testhelper.TestLogger())
 	f.authSvc.
 		WithEmailMFA(auth.NewEmailMFAService(f.pool, rdb, nil, testhelper.TestLogger())).
-		WithPasswordless(auth.NewPasswordlessPolicyService(f.pool, testhelper.TestLogger()),
+		WithPasswordless(policy,
 			[]byte("0123456789abcdef0123456789abcdef"), nil)
 	f.authH.WithPasswordless(true)
+
+	// EmailOTP must be ON for the application, the way pwFixture.enable writes
+	// it: a verify refused as disabled never compared a code and is not a
+	// login attempt at all. Enabled, an unknown challenge reaches the code
+	// check and fails it — the failure this test means to count.
+	yes := true
+	if _, err := policy.Put(f.ctx,
+		auth.PasswordlessScope{TenantID: &f.tenantID, ApplicationID: &f.appRowID},
+		auth.PasswordlessWriteInput{Row: auth.PasswordlessPolicyRow{EmailOTPEnabled: &yes}}); err != nil {
+		t.Fatalf("enable EmailOTP for the app: %v", err)
+	}
 
 	before := opCount(t, "login_passwordless", "failure")
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/apps/passwordless/verify",

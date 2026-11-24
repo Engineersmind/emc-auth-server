@@ -79,6 +79,15 @@ var (
 	//                   totp_enroll, totp_activate, totp_disable, totp_verify,
 	//                   api_key_create, api_key_revoke, api_key_auth
 	// outcome values: success, failure
+	//
+	// The login_* operations follow one classification rule (#226): a request
+	// refused before any presented credential could be compared — missing
+	// configuration, failed client authentication, a feature or policy that
+	// is off, a throttle, a malformed assertion body — is not an attempt and
+	// increments neither outcome; a credential compared and refused (or a
+	// lookup with nothing to compare it with) is a failure; and a request
+	// that reached the method's verified anchor is a success whatever
+	// happened after it.
 	AuthOperations = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "emc_auth",

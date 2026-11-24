@@ -1559,29 +1559,50 @@ const (
 	loginOpPasskey      = "login_passkey"
 )
 
-// recordLoginOutcome counts one first-factor login attempt on
+// loginAttempt tracks one first-factor sign-in for
 // emc_auth_operations_total — the series the HighFailedLoginRate alert reads
-// (#226). A nil error means the credentials verified (tokens or a challenge
-// came back); any other error counts as failure, EXCEPT the listed sentinel
-// refusals, which fire before a credential is ever checked: a bad client
-// secret or a closed password flow is client misconfiguration, not a login
-// attempt, and counting it would drown the credential-attack signal in noise.
+// (#226). Every login method creates one and defers record, so each return
+// path is classified exactly once and an early return added later defaults
+// to failure rather than vanishing from the count.
 //
-// Called once per entry point via defer, so every return path is counted
-// exactly once and adding another early return cannot skip the increment.
+// The classification rule:
+//
+//   - not counted (notAttempt set): the method refused before it compared
+//     any presented credential — configuration missing, client
+//     authentication failing for any reason, a feature or policy that is
+//     off, the per-address throttle, a malformed assertion body, or an
+//     infrastructure error raised before the comparison.
+//   - failure (the default for any error): a presented credential was
+//     compared and refused, or there was nothing to compare it with — an
+//     unknown user, challenge, token or credential, a wrong password or
+//     code, a bad signature, a locked account, a cloned passkey.
+//   - success (verified set, or a nil error): the method reached its
+//     verified anchor — where the credential is proven and the account is
+//     not locked. Whatever happens after still counts as success: an MFA
+//     challenge, an MFA-gate error, a role or organisation refusal, an
+//     invalid legacy client_id, a token-issuance error, a cookie-session
+//     refusal.
+//
 // Never labelled by user, email, or failure reason — the reason would be an
 // enumeration oracle and unbounded cardinality.
-func recordLoginOutcome(operation string, err error, skip ...error) {
-	if err == nil {
-		metrics.RecordOp(operation, "success")
+type loginAttempt struct {
+	op         string
+	notAttempt bool
+	verified   bool
+}
+
+// record emits the single outcome for this attempt, in priority order: a
+// refusal before any credential check counts nowhere, a verified credential
+// or a clean return counts success, anything else counts failure.
+func (a *loginAttempt) record(err error) {
+	if a.notAttempt {
 		return
 	}
-	for _, s := range skip {
-		if errors.Is(err, s) {
-			return
-		}
+	if a.verified || err == nil {
+		metrics.RecordOp(a.op, "success")
+		return
 	}
-	metrics.RecordOp(operation, "failure")
+	metrics.RecordOp(a.op, "failure")
 }
 
 // Login authenticates a user by email and password. Without application
@@ -1591,10 +1612,15 @@ func recordLoginOutcome(operation string, err error, skip ...error) {
 // one to find the single tenant it belongs to. With ClientID + ClientSecret
 // the application is authenticated first and the search is pinned to its tenant.
 func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult, err error) {
-	// One counter entry per attempt — deferred so no return path below can skip
-	// it (#226). A bad client secret and a closed password flow are skipped:
-	// both are refused before a user credential is checked.
-	defer func() { recordLoginOutcome(loginOpPassword, err, ErrInvalidClient, ErrPasswordAuthDisabled) }()
+	// One counter entry per attempt — deferred so no return path below can
+	// skip it, and an early return added later defaults to failure rather than
+	// dropping out of the count (#226). Paths mark notAttempt where the method
+	// refuses before a user credential is compared; verified is set at
+	// ResetFailedLogins, where the password is proven and the account is not
+	// locked, so a role refusal, the MFA gate or a mint error after it still
+	// counts as success.
+	att := &loginAttempt{op: loginOpPassword}
+	defer func() { att.record(err) }()
 
 	// Timing-uniformity clock. Every return path below settles against this so
 	// latency does not reveal whether the email exists, how many accounts hold
@@ -1624,6 +1650,10 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult,
 	case in.ClientSecret != "":
 		tid, aid, err := s.authenticateApp(ctx, in.ClientID, in.ClientSecret)
 		if err != nil {
+			// Refused before any user credential was compared — bad client
+			// credentials or a missing app service are client configuration,
+			// not a login attempt.
+			att.notAttempt = true
 			return nil, err
 		}
 		appTenantID, appRowID = tid, aid
@@ -1634,6 +1664,8 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult,
 	// lookup or hash (passwordless plan section 4.9). A no-op unless the feature is
 	// enabled and the application opted in.
 	if appRowID != 0 && s.PasswordFlowClosed(ctx, appTenantID, &appRowID) {
+		// The flow is closed: no credential was checked.
+		att.notAttempt = true
 		return nil, ErrPasswordAuthDisabled
 	}
 
@@ -1715,6 +1747,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult,
 	}
 	rows, err := s.pool.Query(ctx, candidateQuery, args...)
 	if err != nil {
+		att.notAttempt = true // infrastructure failure before any comparison
 		return nil, fmt.Errorf("fetch login candidates: %w", err)
 	}
 
@@ -1723,12 +1756,14 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult,
 		var c loginCandidate
 		if err := rows.Scan(&c.userID, &c.tenantID, &c.email, &c.passwordHash, &c.roleName, &c.isActive); err != nil {
 			rows.Close()
+			att.notAttempt = true
 			return nil, fmt.Errorf("scan login candidate: %w", err)
 		}
 		candidates = append(candidates, c)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		att.notAttempt = true
 		return nil, fmt.Errorf("iterate login candidates: %w", err)
 	}
 

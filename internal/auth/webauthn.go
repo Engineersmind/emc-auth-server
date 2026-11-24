@@ -91,6 +91,14 @@ var (
 	// endpoint cannot be used to probe which credentials or accounts exist.
 	ErrWebAuthnVerification = errors.New("passkey verification failed")
 
+	// errWebAuthnMalformedAssertion marks the one LoginComplete refusal that
+	// is not an authentication attempt: the request body could not be parsed
+	// into an assertion at all, so no credential was ever compared. It wraps
+	// ErrWebAuthnVerification — errors.Is stays true, so the client response
+	// and the audit reason are identical to any other verification failure —
+	// but the login-attempt counter can tell it apart and skip it.
+	errWebAuthnMalformedAssertion = fmt.Errorf("%w: malformed assertion", ErrWebAuthnVerification)
+
 	// ErrUserVerificationRequired is returned when a verified assertion carried no
 	// user-verification gesture under a policy that demands one.
 	//
@@ -1138,7 +1146,7 @@ func (s *WebAuthnService) LoginComplete(ctx context.Context, token string, r *ht
 	parsed, err := protocol.ParseCredentialRequestResponse(r)
 	if err != nil {
 		s.logger.Warn().Err(err).Str("rp_id", st.RPID).Msg("webauthn login: malformed response")
-		return nil, ErrWebAuthnVerification
+		return nil, errWebAuthnMalformedAssertion
 	}
 
 	resolved, storedRow, err := s.resolveByCredential(ctx, parsed.RawID, parsed.Response.UserHandle, st.RPID)
@@ -1489,12 +1497,16 @@ func (s *AuthService) LoginWebAuthnForCookieSession(ctx context.Context, token s
 // verifying the assertion and issuing tokens.
 func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.Request, refuseApplicationScoped bool) (_ *AuthResult, _ *WebAuthnIdentity, err error) {
 	// One counter entry covers both public entry points (#226). A request that
-	// reaches here always carries an assertion, so every error — a bad
-	// signature, an expired challenge, a refused session — is a failed attempt.
-	// ErrWebAuthnNotConfigured is skipped: nothing was presented to check.
-	defer func() { recordLoginOutcome(loginOpPasskey, err, ErrWebAuthnNotConfigured) }()
+	// reaches here always carries an assertion, so an error from LoginComplete
+	// is a failed attempt — except the two refusals made before an assertion
+	// could be compared: no relying party at all, and a body too malformed to
+	// parse. The verified anchor is LoginComplete returning nil: a refused
+	// cookie session or a mint error after it still counts as success.
+	att := &loginAttempt{op: loginOpPasskey}
+	defer func() { att.record(err) }()
 
 	if s.webauthnSvc == nil {
+		att.notAttempt = true
 		return nil, nil, ErrWebAuthnNotConfigured
 	}
 
@@ -1507,6 +1519,11 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 		var cloned *ClonedCredentialError
 		if errors.As(err, &cloned) {
 			s.revokeAllAfterClone(ctx, cloned)
+		}
+		if errors.Is(err, ErrWebAuthnNotConfigured) || errors.Is(err, errWebAuthnMalformedAssertion) {
+			// Refused before any assertion was compared against a stored
+			// credential: not an attempt.
+			att.notAttempt = true
 		}
 		return nil, nil, err
 	}

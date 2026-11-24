@@ -611,20 +611,28 @@ type PasswordlessVerifyMeta struct {
 // result is tokens, an OTP challenge or an enrolment challenge, exactly as for a
 // password login. Every refusal is ErrPasswordlessInvalidCode.
 func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVerifyInput) (_ *LoginResult, _ *PasswordlessVerifyMeta, err error) {
-	// Counted as a login attempt like a password sign-in (#226); a bad client
-	// secret is skipped — the presented code was never checked.
-	defer func() { recordLoginOutcome(loginOpPasswordless, err, ErrInvalidClient) }()
+	// Counted as a login attempt like a password sign-in, on the same rule
+	// (#226): refusals made before the presented code could be compared — the
+	// flow unwired or the policy off, bad client credentials, the per-address
+	// block, a Redis error — are not attempts. The verified anchor lives in
+	// completePasswordlessLogin, where the code is proven and the account is
+	// not locked.
+	att := &loginAttempt{op: loginOpPasswordless}
+	defer func() { att.record(err) }()
 
 	if err := s.pwlessReady(); err != nil {
+		att.notAttempt = true
 		return nil, nil, err
 	}
 	tenantID, appRowID, err := s.authenticateApp(ctx, in.ClientID, in.ClientSecret)
 	if err != nil {
+		att.notAttempt = true
 		return nil, nil, err
 	}
 	settings := s.pwless.policy.Resolve(ctx, tenantID, &appRowID)
 	if !settings.EmailOTPEnabled {
 		metrics.PasswordlessVerifies.WithLabelValues("refused").Inc()
+		att.notAttempt = true
 		return nil, nil, ErrPasswordlessInvalidCode
 	}
 	code := strings.TrimSpace(in.Code)
@@ -642,12 +650,14 @@ func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVer
 			metrics.PasswordlessVerifies.WithLabelValues("invalid").Inc()
 			return nil, nil, ErrPasswordlessInvalidCode
 		}
+		att.notAttempt = true // Redis error, before the code was compared
 		return nil, nil, ErrPasswordlessUnavailable
 	}
 	blockKey := pwlessScoped("block", appRowID, email)
 	if n, bErr := s.redisCli.Exists(ctx, blockKey).Result(); bErr == nil && n > 0 {
 		metrics.PasswordlessVerifies.WithLabelValues("blocked").Inc()
 		metrics.PasswordlessThrottled.WithLabelValues("verify_email").Inc()
+		att.notAttempt = true // throttled: the code was never compared
 		return nil, nil, ErrPasswordlessInvalidCode
 	}
 
@@ -655,6 +665,7 @@ func (s *AuthService) PasswordlessVerify(ctx context.Context, in PasswordlessVer
 		pwlessMAC(s.pwless.key, in.ChallengeID, code),
 		strconv.FormatInt(appRowID, 10), strconv.FormatInt(tenantID, 10)).Slice()
 	if err != nil {
+		att.notAttempt = true // Redis error, before the code was compared
 		return nil, nil, ErrPasswordlessUnavailable
 	}
 	if ok, _ := res[0].(int64); ok != 1 {

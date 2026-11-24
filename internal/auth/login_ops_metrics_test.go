@@ -2,6 +2,9 @@ package auth_test
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -130,4 +133,76 @@ func TestLoginOps_PasskeyFailureAndSuccess(t *testing.T) {
 	if got := loginOpCount(t, "login_passkey", "success") - before; got != 1 {
 		t.Errorf("login_passkey/success delta = %v, want 1", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Not-counted paths: refusals made before any presented credential could be
+// compared (#226). Each asserts BOTH outcomes moved by zero.
+// ---------------------------------------------------------------------------
+
+// A passwordless verify refused because the application's policy disables
+// EmailOTP never compared a code — it is not an attempt.
+func TestLoginOps_PasswordlessPolicyDisabledIsNotAnAttempt(t *testing.T) {
+	f := newPWFixture(t)
+	app, _ := f.createApp(t, "ops-pw-off")
+	// Deliberately NOT calling f.enable: the refusal happens at the policy
+	// check, before a code could be compared.
+
+	sBefore, fBefore := loginOpCounts(t, "login_passwordless")
+	_, _, err := f.verify(app, strings.Repeat("0", 64), "123456")
+	if !errors.Is(err, auth.ErrPasswordlessInvalidCode) {
+		t.Fatalf("verify with EmailOTP disabled = %v, want invalid_or_expired_code", err)
+	}
+	assertNoLoginOpDelta(t, "login_passwordless", sBefore, fBefore)
+}
+
+// A verify refused by the per-address failure block never compared the code it
+// carried — it is not an attempt. The wrong guesses that spent the budget ARE
+// failures, so only the blocked call itself is asserted.
+func TestLoginOps_PasswordlessThrottledAddressIsNotAnAttempt(t *testing.T) {
+	f := newPWFixture(t)
+	app, appID := f.createApp(t, "ops-pw-block")
+	f.enable(t, appID, true)
+	f.setPolicy(t, appID, func(r *auth.PasswordlessPolicyRow) { r.StartsPerHour = ref(10) })
+	email := uniqueEmail("ops-pw-block")
+
+	// Spend the failure budget exactly the way
+	// TestPasswordless_FailureBudgetBlocksAddress does.
+	var chID, code string
+	for round := 0; round < 4; round++ { // 3 wrong guesses x 4 rounds crosses 10
+		chID, code = f.startAndCode(t, app, email)
+		for g := 0; g < 3; g++ {
+			f.verify(app, chID, wrongCode(code)) //nolint:errcheck
+		}
+	}
+	chID, code = f.startAndCode(t, app, email)
+
+	sBefore, fBefore := loginOpCounts(t, "login_passwordless")
+	if _, _, err := f.verify(app, chID, code); !errors.Is(err, auth.ErrPasswordlessInvalidCode) {
+		t.Fatalf("verify while blocked = %v, want invalid_or_expired_code", err)
+	}
+	assertNoLoginOpDelta(t, "login_passwordless", sBefore, fBefore)
+}
+
+// A passkey login body that cannot be parsed into an assertion is refused
+// before any credential is compared — not an attempt. The error must still be
+// indistinguishable from a real verification failure to the caller.
+func TestLoginOps_PasskeyMalformedAssertionIsNotAnAttempt(t *testing.T) {
+	f := newPasskeyFixture(t)
+	f.allowPasskeys(t, true)
+
+	// A real ceremony token, then a body that is not an assertion.
+	_, token, err := f.svc.LoginBegin(f.ctx, testOrigin)
+	if err != nil {
+		t.Fatalf("LoginBegin: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/login/complete", strings.NewReader("this is not an assertion"))
+	req.Header.Set("Content-Type", "application/json")
+
+	sBefore, fBefore := loginOpCounts(t, "login_passkey")
+	_, _, err = f.authSvc.LoginWebAuthn(f.ctx, token, req)
+	if !errors.Is(err, auth.ErrWebAuthnVerification) {
+		t.Fatalf("LoginWebAuthn = %v, want ErrWebAuthnVerification", err)
+	}
+	assertNoLoginOpDelta(t, "login_passkey", sBefore, fBefore)
 }
