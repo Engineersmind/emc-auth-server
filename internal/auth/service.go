@@ -1605,6 +1605,15 @@ func (a *loginAttempt) record(err error) {
 	metrics.RecordOp(a.op, "failure")
 }
 
+// markVerified sets the verified anchor: the credential is proven and the
+// account is not locked, so everything after counts as success. Nil-safe so
+// helpers two calls deep can take an optional tracker.
+func (a *loginAttempt) markVerified() {
+	if a != nil {
+		a.verified = true
+	}
+}
+
 // Login authenticates a user by email and password. Without application
 // credentials the caller never specifies a tenant — the same email may have
 // separate accounts (separate passwords) in multiple tenants, so Login fetches
@@ -1905,6 +1914,10 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (_ *LoginResult,
 	// rather than after the MFA gate: a user who holds the right password should
 	// not accumulate lockout progress while completing a second factor.
 	s.blockSvc.ResetFailedLogins(ctx, tenantID, userID)
+	// The verified anchor for the login_* counter: the credential is proven
+	// and the account is not locked, so a role or organisation refusal, an MFA
+	// gate outcome or a mint error after this still counts as success.
+	att.verified = true
 
 	// Advisory breached-password check (detached; never delays or blocks login).
 	s.brchSvc.Notify(ctx, tenantID, appRowIDFromClaim(appID), userID, email, in.Password)

@@ -206,3 +206,85 @@ func TestLoginOps_PasskeyMalformedAssertionIsNotAnAttempt(t *testing.T) {
 	}
 	assertNoLoginOpDelta(t, "login_passkey", sBefore, fBefore)
 }
+
+// ---------------------------------------------------------------------------
+// Verified anchors: a credential that was proven counts as success whatever
+// happened after (#226). Each asserts success +1 and failure +0.
+// ---------------------------------------------------------------------------
+
+func assertLoginOpSuccess(t *testing.T, operation string, beforeS, beforeF float64) {
+	t.Helper()
+	s, f := loginOpCounts(t, operation)
+	if d := s - beforeS; d != 1 {
+		t.Errorf("%s/success delta = %v, want 1", operation, d)
+	}
+	if d := f - beforeF; d != 0 {
+		t.Errorf("%s/failure delta = %v, want 0", operation, d)
+	}
+}
+
+// A correct password refused at role scoping verified first — the refusal is
+// after the anchor, so it counts as success, not failure.
+func TestLoginOps_PasswordVerifiedThenRoleRefusedCountsSuccess(t *testing.T) {
+	f := newMFAFixture(t)
+	app, _ := f.createApp(t, "ops-role-refused")
+	email := uniqueEmail("ops-role")
+	f.registerAppUser(t, app, email, "Password123!")
+
+	sBefore, fBefore := loginOpCounts(t, "login_password")
+	_, err := f.authSvc.Login(f.ctx, auth.LoginInput{
+		ClientID: app.ClientID, ClientSecret: app.ClientSecret,
+		Email: email, Password: "Password123!",
+		Roles: []string{"no-such-role"},
+	})
+	if err == nil {
+		t.Fatal("login scoped to an unheld role returned nil error")
+	}
+	assertLoginOpSuccess(t, "login_password", sBefore, fBefore)
+}
+
+// A correct code refused at role scoping verified first — same rule, reached
+// through completePasswordlessLogin rather than Login.
+func TestLoginOps_PasswordlessVerifiedThenRoleRefusedCountsSuccess(t *testing.T) {
+	f := newPWFixture(t)
+	app, appID := f.createApp(t, "ops-pw-role")
+	f.enable(t, appID, false)
+	email := uniqueEmail("ops-pw-role")
+	f.registerAppUser(t, app, email, "Password123!")
+
+	chID, code := f.startAndCode(t, app, email)
+	sBefore, fBefore := loginOpCounts(t, "login_passwordless")
+	_, _, err := f.authSvc.PasswordlessVerify(f.ctx, auth.PasswordlessVerifyInput{
+		ClientID: app.ClientID, ClientSecret: app.ClientSecret,
+		ChallengeID: chID, Code: code,
+		Roles: []string{"no-such-role"},
+	})
+	if !errors.Is(err, auth.ErrPasswordlessInvalidCode) {
+		t.Fatalf("verify with an unheld role = %v, want invalid_or_expired_code", err)
+	}
+	assertLoginOpSuccess(t, "login_passwordless", sBefore, fBefore)
+}
+
+// An application-scoped passkey on the cookie-session endpoint verifies, then
+// is refused — the handler itself calls that "not an authentication failure".
+// Same setup as TestLoginWebAuthnForCookieSession_RefusesBeforeMinting.
+func TestLoginOps_PasskeyCookieSessionRefusalCountsSuccess(t *testing.T) {
+	f := newPasskeyFixture(t)
+	f.allowPasskeys(t, true)
+	dev := newVirtualAuthenticator(t)
+
+	_, _, handle := appScopedPasskeyUser(t, f, dev)
+
+	assertion, token, err := f.svc.LoginBegin(f.ctx, testOrigin)
+	if err != nil {
+		t.Fatalf("LoginBegin: %v", err)
+	}
+	req := dev.AssertionRequest(t, testRPID, testOrigin, assertion.Response.Challenge.String(), handle)
+
+	sBefore, fBefore := loginOpCounts(t, "login_passkey")
+	_, _, err = f.authSvc.LoginWebAuthnForCookieSession(f.ctx, token, req)
+	if !errors.Is(err, auth.ErrCookieSessionNotAvailable) {
+		t.Fatalf("error = %v, want ErrCookieSessionNotAvailable", err)
+	}
+	assertLoginOpSuccess(t, "login_passkey", sBefore, fBefore)
+}

@@ -222,6 +222,10 @@ func (s *AuthService) VerifyMagicLink(ctx context.Context, clientID, clientSecre
 		}
 		return nil, fmt.Errorf("load magic link user: %w", err)
 	}
+	// The verified anchor for the login_* counter: the token redeemed to a
+	// live account, so a gate or mint error after this still counts as
+	// success.
+	att.verified = true
 
 	perms, err := s.loadPermissions(ctx, sess.UserID, tenantID)
 	if err != nil {

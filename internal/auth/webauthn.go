@@ -1527,6 +1527,10 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 		}
 		return nil, nil, err
 	}
+	// The verified anchor for the login_* counter: the assertion verified,
+	// so a refused cookie session or a mint error after this still counts as
+	// success.
+	att.verified = true
 
 	// Before any minting, and deliberately before loadPermissions too: there is
 	// nothing to load permissions for.
