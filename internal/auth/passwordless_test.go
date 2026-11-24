@@ -40,8 +40,7 @@ func newPWFixture(t *testing.T) *pwFixture {
 	}
 	policy := auth.NewPasswordlessPolicyService(f.pool, testhelper.TestLogger()).
 		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
-			cfg, err := f.totpSvc.GetAppMFAConfig(ctx, appRowID)
-			return cfg.Mode, cfg.Methods, err
+			return f.totpSvc.GetAppMFAConfig(ctx, appRowID)
 		})
 	f.authSvc.WithPasswordless(policy, pwKey, nil)
 	return &pwFixture{mfaFixture: f, policy: policy, rc: testhelper.NewTestRedis(t)}
