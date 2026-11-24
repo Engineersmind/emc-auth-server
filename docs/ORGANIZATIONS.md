@@ -236,3 +236,9 @@ the route is not registered (404) and discovery does not advertise it.
 | Whole feature | `ORGANIZATIONS_ENABLED=false` + restart |
 | Code | Revert; the additive schema is harmless to the previous release |
 | Schema (last resort) | `goose down` to the version before `00100`, after the code revert |
+
+Since `1ac802f`, either switch **refuses in-flight organisation-bound grants**
+rather than silently dropping the organisation: an authorization code carrying
+one — valid for 60 seconds — gets `invalid_grant` at `/oauth/token`, and a
+pending selection token — valid for 5 minutes — is refused on completion.
+Users caught in either window simply sign in again under the new mode.
