@@ -310,3 +310,271 @@ func TestOrganizations_OrphanedGrantDoesNotCountTowardTheRoleCap(t *testing.T) {
 		t.Errorf("assigned = %v, want [role-20]", res.Assigned)
 	}
 }
+
+// Lock ordering — issue #220, second round.
+//
+// The locks the tests above added can deadlock against each other when two
+// transactions take more than one roles row in different orders: Postgres
+// aborts one side with 40P01, surfacing as a random 500 on a grant, an
+// acceptance, an RBAC import or a SetDefaultRole call. The rule these tests
+// pin is that every multi-row roles lock is taken in ONE statement ordered by
+// id, the order runRBACImport already used. Each test parks a second
+// transaction (X) on the lower-id row — playing the id-ordered locker — while
+// the service call runs, then has X take the higher-id row: on the fix that
+// lock comes straight through because the service is itself waiting on the
+// row X holds; on the old code the pair deadlocks and one side returns 40P01
+// (or X's lock_timeout fires).
+
+// why: #220 — an existing-user acceptance locked the invitation's roles
+// ORDER BY name, so with alpha created after zeta it held alpha's higher-id
+// row while waiting on zeta's lower-id one — the reverse of an id-ordered
+// locker's order, and a deadlock. The fix takes them in ONE statement ordered
+// by id, so acceptance simply waits on the row X holds.
+func TestOrganizations_AcceptInvitationExistingUserLocksRolesInIDOrder(t *testing.T) {
+	f := newOrgFixture(t, "org-acc-id-order", auth.OrganizationsModeOptional)
+	zetaID := orgRole(t, f, "zeta")   // lower id
+	alphaID := orgRole(t, f, "alpha") // higher id — name order inverts id order
+	f.createOrg(t, "acme")
+	email := uniqueEmail("accept-id-order")
+	uid := f.registerUser(t, email)
+	ctx := context.Background()
+
+	inv, err := f.orgs.CreateInvitation(ctx, f.scope, "acme", auth.CreateOrganizationInvitationInput{
+		Email: email, Roles: []string{"alpha", "zeta"},
+	})
+	if err != nil {
+		t.Fatalf("CreateInvitation() error = %v", err)
+	}
+
+	// X plays the id-ordered roles locker (runRBACImport's shape): FOR NO KEY
+	// UPDATE on zeta first, then — once acceptance is parked on it — alpha.
+	txX, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin locker: %v", err)
+	}
+	defer txX.Rollback(ctx) //nolint:errcheck
+	if _, err := txX.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR NO KEY UPDATE`, zetaID); err != nil {
+		t.Fatalf("lock zeta: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.orgs.AcceptInvitation(ctx, auth.AcceptOrganizationInvitationInput{
+			Token: inv.Token, ExistingUserID: &uid, AppRowID: f.scope.AppRowID,
+		})
+		done <- err
+	}()
+	waitForLockWait(t, f.pool, "roles")
+
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR NO KEY UPDATE`, alphaID); err != nil {
+		t.Fatalf("lock alpha: %v; acceptance must not be holding it", err)
+	}
+	if err := txX.Commit(ctx); err != nil {
+		t.Fatalf("commit locker: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("AcceptInvitation() error = %v, want nil once the locker commits", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("AcceptInvitation() did not return after the locker committed")
+	}
+}
+
+// why: #220 — a new-account acceptance locked the application's default role
+// inside createInvitedUser and the invitation's roles afterwards in
+// liveRoleNames: two statements. With a default created later than the
+// invitation's role the transaction held the higher-id row while waiting on
+// the lower-id one an id-ordered locker held — a deadlock ORDER BY on either
+// statement alone could not fix. The fix locks both in ONE statement ordered
+// by id before the account is written.
+func TestOrganizations_AcceptInvitationNewAccountLocksDefaultInIDOrder(t *testing.T) {
+	f := newOrgFixture(t, "org-acc-def-order", auth.OrganizationsModeOptional)
+	approverID := orgRole(t, f, "approver") // lower id: the invitation's role
+	memberID := orgRole(t, f, "member")     // higher id: becomes the default
+	f.createOrg(t, "acme")
+	ctx := context.Background()
+
+	// Make the later-created role the application's default; the fixture's own
+	// default has to yield the one-default-per-app slot first.
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE roles SET is_default = false
+		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
+	`, f.tenantID, f.scope.AppRowID); err != nil {
+		t.Fatalf("clear fixture default: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE roles SET is_default = true WHERE id = $1`, memberID); err != nil {
+		t.Fatalf("set member as default: %v", err)
+	}
+
+	inv, err := f.orgs.CreateInvitation(ctx, f.scope, "acme", auth.CreateOrganizationInvitationInput{
+		Email: uniqueEmail("accept-def-order"), Roles: []string{"approver"},
+	})
+	if err != nil {
+		t.Fatalf("CreateInvitation() error = %v", err)
+	}
+
+	txX, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin locker: %v", err)
+	}
+	defer txX.Rollback(ctx) //nolint:errcheck
+	if _, err := txX.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR NO KEY UPDATE`, approverID); err != nil {
+		t.Fatalf("lock approver: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.orgs.AcceptInvitation(ctx, auth.AcceptOrganizationInvitationInput{
+			Token: inv.Token, Password: "Password123!",
+		})
+		done <- err
+	}()
+	waitForLockWait(t, f.pool, "roles")
+
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR NO KEY UPDATE`, memberID); err != nil {
+		t.Fatalf("lock member: %v; acceptance must not be holding it", err)
+	}
+	if err := txX.Commit(ctx); err != nil {
+		t.Fatalf("commit locker: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("AcceptInvitation() error = %v, want nil once the locker commits", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("AcceptInvitation() did not return after the locker committed")
+	}
+}
+
+// why: #220 — SetDefaultRole's two UPDATEs locked old-default-then-target,
+// which is descending id order whenever the new default's id is lower: a
+// grant path that already held FOR SHARE on the target deadlocked against the
+// clear-UPDATE. The fix locks both rows in ONE statement ordered by id before
+// the lookup.
+func TestOrganizations_SetDefaultRoleDoesNotDeadlockWithIDOrderedGrant(t *testing.T) {
+	f := newOrgFixture(t, "org-setdef-order", auth.OrganizationsModeOptional)
+	aID := orgRole(t, f, "a") // lower id — becomes the default
+	bID := orgRole(t, f, "b") // higher id — the current default
+	ctx := context.Background()
+
+	// b is the current default; the fixture's own default yields its slot.
+	if _, err := f.pool.Exec(ctx, `
+		UPDATE roles SET is_default = false
+		WHERE tenant_id = $1 AND application_id = $2 AND is_default = true
+	`, f.tenantID, f.scope.AppRowID); err != nil {
+		t.Fatalf("clear fixture default: %v", err)
+	}
+	if _, err := f.pool.Exec(ctx, `UPDATE roles SET is_default = true WHERE id = $1`, bID); err != nil {
+		t.Fatalf("set b as default: %v", err)
+	}
+
+	// X plays a grant path holding FOR SHARE in id order: a first, then b.
+	txX, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin locker: %v", err)
+	}
+	defer txX.Rollback(ctx) //nolint:errcheck
+	if _, err := txX.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR SHARE`, aID); err != nil {
+		t.Fatalf("lock a: %v", err)
+	}
+
+	adminSvc := admin.New(f.pool, nil, testhelper.TestLogger())
+	done := make(chan error, 1)
+	go func() {
+		done <- adminSvc.SetDefaultRole(ctx, f.tenantID, f.scope.AppRowID, aID)
+	}()
+	waitForLockWait(t, f.pool, "roles")
+
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR SHARE`, bID); err != nil {
+		t.Fatalf("lock b: %v; SetDefaultRole must not be holding it", err)
+	}
+	if err := txX.Commit(ctx); err != nil {
+		t.Fatalf("commit locker: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("SetDefaultRole() error = %v, want nil once the locker commits", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("SetDefaultRole() did not return after the locker committed")
+	}
+
+	var aDefault, bDefault bool
+	if err := f.pool.QueryRow(ctx, `SELECT is_default FROM roles WHERE id = $1`, aID).Scan(&aDefault); err != nil {
+		t.Fatalf("read a's default flag: %v", err)
+	}
+	if err := f.pool.QueryRow(ctx, `SELECT is_default FROM roles WHERE id = $1`, bID).Scan(&bDefault); err != nil {
+		t.Fatalf("read b's default flag: %v", err)
+	}
+	if !aDefault || bDefault {
+		t.Errorf("after SetDefaultRole(a): a is_default = %v, b is_default = %v; want true/false", aDefault, bDefault)
+	}
+}
+
+// why: #220 — AssignMemberRoles resolves the requested roles through
+// resolveApplicationRoles, which took FOR SHARE on the rows in whatever order
+// the plan returned. Against an id-ordered locker that order is the deadlock
+// coin flip; the fix orders by id so the two sides serialise. (Whether the
+// old query happened to come out in id order depended on the planner, so this
+// test can pass by luck on the old code — the SQL-order unit test is the
+// deterministic guard for it.)
+func TestOrganizations_AssignMemberRolesLocksRolesInIDOrder(t *testing.T) {
+	f := newOrgFixture(t, "org-amr-id-order", auth.OrganizationsModeOptional)
+	zetaID := orgRole(t, f, "zeta")   // lower id
+	alphaID := orgRole(t, f, "alpha") // higher id — name order inverts id order
+	uid := f.registerUser(t, uniqueEmail("amr-order"))
+	acme := f.createOrg(t, "acme")
+	f.addMember(t, acme, uid)
+	ctx := context.Background()
+
+	txX, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin locker: %v", err)
+	}
+	defer txX.Rollback(ctx) //nolint:errcheck
+	if _, err := txX.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR NO KEY UPDATE`, zetaID); err != nil {
+		t.Fatalf("lock zeta: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.orgs.AssignMemberRoles(ctx, f.scope, acme.ID, uid, []string{"alpha", "zeta"}, false, nil)
+		done <- err
+	}()
+	waitForLockWait(t, f.pool, "roles")
+
+	if _, err := txX.Exec(ctx, `SELECT id FROM roles WHERE id = $1 FOR NO KEY UPDATE`, alphaID); err != nil {
+		t.Fatalf("lock alpha: %v; the grant must not be holding it", err)
+	}
+	if err := txX.Commit(ctx); err != nil {
+		t.Fatalf("commit locker: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("AssignMemberRoles() error = %v, want nil once the locker commits", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("AssignMemberRoles() did not return after the locker committed")
+	}
+}
