@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/coreos/go-oidc/v3 v3.17.0
+	github.com/exaring/otelpgx v0.13.0
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/getsentry/sentry-go v0.47.0
 	github.com/go-jose/go-jose/v4 v4.1.4
