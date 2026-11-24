@@ -302,7 +302,8 @@ func TestEnforceSessionCap_DoesNotCountBeforeCommit(t *testing.T) {
 	email := uniqueEmail("ops-cap")
 	userID := f.registerAppUser(t, app, email, "Password123!")
 
-	// Two live sessions, so evicting down to one below has something to evict.
+	// Two live sessions and a cap of 2: the cap keeps room for the next login,
+	// so exactly the older session is evicted.
 	for i := 0; i < 2; i++ {
 		if _, err := f.appLogin(t, app, email, "Password123!"); err != nil {
 			t.Fatalf("login %d: %v", i, err)
@@ -317,7 +318,7 @@ func TestEnforceSessionCap_DoesNotCountBeforeCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	evicted, err := auth.ExportedEnforceSessionCap(f.ctx, tx, userID, f.tenantID, 1)
+	evicted, err := auth.ExportedEnforceSessionCap(f.ctx, tx, userID, f.tenantID, 2)
 	if err != nil {
 		tx.Rollback(f.ctx) //nolint:errcheck
 		t.Fatalf("ExportedEnforceSessionCap: %v", err)
