@@ -405,7 +405,8 @@ func (s *AccountBlockService) blockForFailedAttempts(ctx context.Context, tenant
 		}
 		return false // already blocked, or gone — nothing to notify about
 	}
-	if err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
+	revoked, err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange)
+	if err != nil {
 		s.logger.Warn().Err(err).Int64("user_id", userID).Msg("lockout: session revocation failed")
 		return false
 	}
@@ -432,7 +433,9 @@ func (s *AccountBlockService) blockForFailedAttempts(ctx context.Context, tenant
 	// account keeps working for the remaining life of the token it already holds —
 	// the opposite of a lockout. After the commit because a Redis entry cannot be
 	// rolled back: denying on a block that failed to commit would sign a user out on
-	// the strength of a write that never landed.
+	// the strength of a write that never landed. The counters are recorded on the
+	// same side of the commit.
+	RecordSessionRevocations(RevokeReasonCredentialChange, revoked)
 	DenyAccountSessions(ctx, s.logger, userID, tenantID)
 
 	// The soft-lock key has served its purpose once the account is disabled, and

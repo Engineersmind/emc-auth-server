@@ -218,8 +218,7 @@ func (s *AuthService) revokeSession(ctx context.Context, userID, tenantID, sessi
 		return 0, fmt.Errorf("commit revoke session: %w", err)
 	}
 
-	metrics.SessionRevocations.WithLabelValues(reason).Add(float64(n))
-	metrics.TokensRevoked.WithLabelValues(reason).Add(float64(n))
+	RecordSessionRevocations(reason, n)
 	// After the commit: a Redis entry cannot be rolled back, so denying a session
 	// the transaction then failed to revoke would sign a user out on the strength
 	// of a write that never landed.
@@ -332,10 +331,7 @@ func (s *AuthService) RevokeOtherSessions(ctx context.Context, userID int64, kee
 	}
 
 	revoked := int64(len(ids))
-	if revoked > 0 {
-		metrics.SessionRevocations.WithLabelValues(RevokeReasonUserRevoked).Add(float64(revoked))
-		metrics.TokensRevoked.WithLabelValues(RevokeReasonUserRevoked).Add(float64(revoked))
-	}
+	RecordSessionRevocations(RevokeReasonUserRevoked, revoked)
 	for _, id := range ids {
 		s.denySession(ctx, id)
 	}
@@ -781,17 +777,19 @@ func (s *AuthService) Logout(ctx context.Context, rawRefreshToken string) error 
 // with the credential change itself: the revocation must commit or roll back with
 // it, never separately.
 //
-// Does NOT touch the Redis denylist — that cannot participate in a transaction.
-// Callers must invoke DenyAccountSessions after their commit; see the comment on
-// that function.
-func RevokeAllSessionsTx(ctx context.Context, tx pgx.Tx, userID, tenantID int64, reason string) error {
+// Returns the number of user_sessions rows revoked. Does NOT emit the revocation
+// counters and does NOT touch the Redis denylist — neither can participate in a
+// transaction, and a rollback would undo the revocation while leaving both
+// behind. Callers must invoke RecordSessionRevocations and DenyAccountSessions
+// only after their own Commit returns nil; see the comment on that function.
+func RevokeAllSessionsTx(ctx context.Context, tx pgx.Tx, userID, tenantID int64, reason string) (int64, error) {
 	ct, err := tx.Exec(ctx, `
 		UPDATE user_sessions
 		SET revoked_at = NOW(), revoked_reason = $3, updated_at = NOW()
 		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
 	`, userID, tenantID, reason)
 	if err != nil {
-		return fmt.Errorf("revoke account sessions: %w", err)
+		return 0, fmt.Errorf("revoke account sessions: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -799,14 +797,26 @@ func RevokeAllSessionsTx(ctx context.Context, tx pgx.Tx, userID, tenantID int64,
 		SET revoked_at = NOW(), revoked_reason = $3, updated_at = NOW()
 		WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL
 	`, userID, tenantID, reason); err != nil {
-		return fmt.Errorf("revoke account tokens: %w", err)
+		return 0, fmt.Errorf("revoke account tokens: %w", err)
 	}
 
-	if n := ct.RowsAffected(); n > 0 {
-		metrics.SessionRevocations.WithLabelValues(reason).Add(float64(n))
-		metrics.TokensRevoked.WithLabelValues(reason).Add(float64(n))
+	return ct.RowsAffected(), nil
+}
+
+// RecordSessionRevocations adds n to both revocation counters under reason.
+// n <= 0 does nothing, so no zero-valued series is created for a transaction
+// that matched no rows.
+//
+// Called only after the owning transaction has committed: the counters have no
+// rollback, so counting inside the transaction would report revocations a
+// failed commit then undid. Both counters are written together so the "sessions
+// revoked" and "tokens revoked" panels can never disagree.
+func RecordSessionRevocations(reason string, n int64) {
+	if n <= 0 {
+		return
 	}
-	return nil
+	metrics.SessionRevocations.WithLabelValues(reason).Add(float64(n))
+	metrics.TokensRevoked.WithLabelValues(reason).Add(float64(n))
 }
 
 // ---------------------------------------------------------------------------
@@ -974,9 +984,10 @@ func enforceSessionCap(ctx context.Context, tx pgx.Tx, userID, tenantID int64, m
 		`, evicted, RevokeReasonCapEvicted); err != nil {
 			return nil, fmt.Errorf("revoke evicted session tokens: %w", err)
 		}
-		metrics.SessionRevocations.WithLabelValues(RevokeReasonCapEvicted).Add(float64(len(evicted)))
-		metrics.TokensRevoked.WithLabelValues(RevokeReasonCapEvicted).Add(float64(len(evicted)))
 	}
+	// Like RevokeAllSessionsTx, the caller counts — with
+	// RecordSessionRevocations(RevokeReasonCapEvicted, ...) — only after its own
+	// Commit returns nil.
 	return evicted, nil
 }
 

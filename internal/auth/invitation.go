@@ -432,6 +432,10 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 		return nil, fmt.Errorf("mark invitation used: %w", err)
 	}
 
+	// Revocations inside this transaction are summed so a single
+	// RecordSessionRevocations call after the commit covers both sources: the
+	// password branch here and a pending administrative grant below.
+	var revoked int64
 	if setPassword {
 		hash, hashErr := s.hasher.Hash(ctx, opts.NewPassword)
 		if hashErr != nil {
@@ -452,7 +456,7 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 		// activatePendingAdminGrant. The distinction is what changed: a
 		// confirmation that raises nothing leaves sessions alone, one that raises
 		// authority does not.
-		if err := RevokeAllSessionsTx(ctx, tx, t.UserID, t.TenantID, RevokeReasonCredentialChange); err != nil {
+		if revoked, err = RevokeAllSessionsTx(ctx, tx, t.UserID, t.TenantID, RevokeReasonCredentialChange); err != nil {
 			return nil, fmt.Errorf("revoke sessions on invitation accept: %w", err)
 		}
 	}
@@ -500,9 +504,11 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 		return nil, fmt.Errorf("mark invited user verified: account %d no longer exists", t.UserID)
 	}
 
-	if err := activatePendingAdminGrant(ctx, tx, t.UserID, t.TenantID); err != nil {
+	grantRevoked, err := activatePendingAdminGrant(ctx, tx, t.UserID, t.TenantID)
+	if err != nil {
 		return nil, err
 	}
+	revoked += grantRevoked
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit accept-invitation: %w", err)
@@ -519,7 +525,10 @@ func (s *InvitationService) Accept(ctx context.Context, rawToken string, opts Ac
 	//
 	// Placed here rather than in activatePendingAdminGrant because that helper runs
 	// inside this transaction and cannot know whether it commits; a Redis entry
-	// cannot be rolled back.
+	// cannot be rolled back. The counters are recorded here for the same reason:
+	// a count taken inside the transaction would survive a rollback that undid
+	// the revocation.
+	RecordSessionRevocations(RevokeReasonCredentialChange, revoked)
 	DenyAccountSessions(ctx, s.logger, t.UserID, t.TenantID)
 
 	s.logger.Info().Int64("user_id", t.UserID).Msg("invitation accepted")

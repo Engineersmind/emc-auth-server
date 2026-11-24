@@ -219,7 +219,8 @@ func (s *EmailChangeService) Confirm(ctx context.Context, rawToken string) (*Ema
 		}
 		return nil, fmt.Errorf("apply email change: %w", err)
 	}
-	if err := RevokeAllSessionsTx(ctx, tx, res.UserID, res.TenantID, RevokeReasonCredentialChange); err != nil {
+	revoked, err := RevokeAllSessionsTx(ctx, tx, res.UserID, res.TenantID, RevokeReasonCredentialChange)
+	if err != nil {
 		return nil, fmt.Errorf("revoke sessions on email change: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -230,6 +231,8 @@ func (s *EmailChangeService) Confirm(ctx context.Context, rawToken string) (*Ema
 	// those tokens is now wrong — their email claim names an address the account no
 	// longer owns — and revoking only the refresh rows would leave them accepted
 	// until expiry. After the commit so nothing is denied on a rolled-back change.
+	// The counters are recorded on the same side of it.
+	RecordSessionRevocations(RevokeReasonCredentialChange, revoked)
 	DenyAccountSessions(ctx, s.logger, res.UserID, res.TenantID)
 
 	s.logger.Info().Int64("user_id", res.UserID).Msg("email change confirmed")
@@ -309,12 +312,14 @@ func (s *EmailChangeService) AdminChange(ctx context.Context, tenantID int64, ap
 		}
 		return nil, fmt.Errorf("apply admin email change: %w", err)
 	}
-	if err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange); err != nil {
+	revoked, err := RevokeAllSessionsTx(ctx, tx, userID, tenantID, RevokeReasonCredentialChange)
+	if err != nil {
 		return nil, fmt.Errorf("revoke sessions on email change: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit admin email change: %w", err)
 	}
+	RecordSessionRevocations(RevokeReasonCredentialChange, revoked)
 	DenyAccountSessions(ctx, s.logger, userID, tenantID)
 
 	s.notifyOldAddress(ctx, tenantID, appRowID, res.OldEmail, newEmail)

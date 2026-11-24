@@ -288,3 +288,52 @@ func TestLoginOps_PasskeyCookieSessionRefusalCountsSuccess(t *testing.T) {
 	}
 	assertLoginOpSuccess(t, "login_passkey", sBefore, fBefore)
 }
+
+// ---------------------------------------------------------------------------
+// Post-commit revocation counting (#226): an eviction written inside a
+// transaction that then rolls back must move neither counter — the rollback
+// undoes the revocation, so counting inside the transaction would report
+// sessions that were never actually revoked.
+// ---------------------------------------------------------------------------
+
+func TestEnforceSessionCap_DoesNotCountBeforeCommit(t *testing.T) {
+	f := newMFAFixture(t)
+	app, _ := f.createApp(t, "ops-cap")
+	email := uniqueEmail("ops-cap")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+
+	// Two live sessions, so evicting down to one below has something to evict.
+	for i := 0; i < 2; i++ {
+		if _, err := f.appLogin(t, app, email, "Password123!"); err != nil {
+			t.Fatalf("login %d: %v", i, err)
+		}
+	}
+
+	const reason = auth.RevokeReasonCapEvicted
+	sBefore := testutil.ToFloat64(metrics.SessionRevocations.WithLabelValues(reason))
+	tBefore := testutil.ToFloat64(metrics.TokensRevoked.WithLabelValues(reason))
+
+	tx, err := f.pool.Begin(f.ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	evicted, err := auth.ExportedEnforceSessionCap(f.ctx, tx, userID, f.tenantID, 1)
+	if err != nil {
+		tx.Rollback(f.ctx) //nolint:errcheck
+		t.Fatalf("ExportedEnforceSessionCap: %v", err)
+	}
+	if len(evicted) != 1 {
+		tx.Rollback(f.ctx) //nolint:errcheck
+		t.Fatalf("evicted = %v, want exactly 1 session", evicted)
+	}
+	if err := tx.Rollback(f.ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	if d := testutil.ToFloat64(metrics.SessionRevocations.WithLabelValues(reason)) - sBefore; d != 0 {
+		t.Errorf("session_revocations{cap_evicted} delta = %v, want 0 — counted inside a transaction that rolled back", d)
+	}
+	if d := testutil.ToFloat64(metrics.TokensRevoked.WithLabelValues(reason)) - tBefore; d != 0 {
+		t.Errorf("tokens_revoked{cap_evicted} delta = %v, want 0 — counted inside a transaction that rolled back", d)
+	}
+}

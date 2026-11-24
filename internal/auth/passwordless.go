@@ -876,8 +876,9 @@ func (s *AuthService) pwlessSecureUnverified(ctx context.Context, tenantID, appR
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	var revoked int64
 	if u.hasPassword {
-		if err := RevokeAllSessionsTx(ctx, tx, u.id, tenantID, "preverification_neutralized"); err != nil {
+		if revoked, err = RevokeAllSessionsTx(ctx, tx, u.id, tenantID, "preverification_neutralized"); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE users SET email_verified = true, token_version = token_version + 1, updated_at = NOW() WHERE id = $1`, u.id); err != nil {
@@ -892,6 +893,7 @@ func (s *AuthService) pwlessSecureUnverified(ctx context.Context, tenantID, appR
 	u.emailVerified = true
 
 	if u.hasPassword {
+		RecordSessionRevocations("preverification_neutralized", revoked)
 		DenyAccountSessions(ctx, s.logger, u.id, tenantID)
 		metrics.PasswordlessPreverification.Inc()
 		s.pwlessAudit(ctx, audit.Event{

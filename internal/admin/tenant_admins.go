@@ -419,8 +419,9 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 		return nil, fmt.Errorf("check grant activation: %w", err)
 	}
 
+	var revoked int64
 	if (changed || !existed) && alreadyActive {
-		if err = revokeAdminScopeTokens(ctx, tx, in.TenantID, userID); err != nil {
+		if revoked, err = revokeAdminScopeTokens(ctx, tx, in.TenantID, userID); err != nil {
 			return nil, err
 		}
 	}
@@ -428,6 +429,7 @@ func (s *Service) InviteTenantAdmin(ctx context.Context, in InviteTenantAdminInp
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit invite admin tx: %w", err)
 	}
+	auth.RecordSessionRevocations(auth.RevokeReasonCredentialChange, revoked)
 
 	res := &InviteTenantAdminResult{Action: action}
 
@@ -532,14 +534,16 @@ func (s *Service) SetTenantAdminGrants(ctx context.Context, tenantID, adminID in
 	if err = mirrorAdminGrants(ctx, tx, tenantID, userID); err != nil {
 		return nil, err
 	}
+	var revoked int64
 	if changed {
-		if err = revokeAdminScopeTokens(ctx, tx, tenantID, userID); err != nil {
+		if revoked, err = revokeAdminScopeTokens(ctx, tx, tenantID, userID); err != nil {
 			return nil, err
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit set grants tx: %w", err)
 	}
+	auth.RecordSessionRevocations(auth.RevokeReasonCredentialChange, revoked)
 	return s.getTenantAdmin(ctx, tenantID, adminID)
 }
 
@@ -690,13 +694,15 @@ func (s *Service) removeTenantAdmin(ctx context.Context, tenantID, adminID int64
 		}
 	}
 
-	if err = revokeAdminScopeTokens(ctx, tx, tenantID, userID); err != nil {
+	revoked, err := revokeAdminScopeTokens(ctx, tx, tenantID, userID)
+	if err != nil {
 		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit remove admin tx: %w", err)
 	}
+	auth.RecordSessionRevocations(auth.RevokeReasonCredentialChange, revoked)
 	s.logger.Info().Int64("tenant_id", tenantID).Int64("admin_id", adminID).Msg("admin: tenant administrator removed")
 	return nil
 }
@@ -983,17 +989,18 @@ func replaceGrants(ctx context.Context, tx pgx.Tx, adminID int64, appIDs []int64
 // counter is written by every credential and authority change and read by
 // nobody, so it is currently a marker rather than a revocation. Treat the
 // refresh-token revocation as the mechanism that works.
-func revokeAdminScopeTokens(ctx context.Context, tx pgx.Tx, tenantID, userID int64) error {
+func revokeAdminScopeTokens(ctx context.Context, tx pgx.Tx, tenantID, userID int64) (int64, error) {
 	if _, err := tx.Exec(ctx,
 		`UPDATE users SET token_version = token_version + 1, updated_at = NOW()
 		 WHERE id = $1 AND tenant_id = $2`, userID, tenantID,
 	); err != nil {
-		return fmt.Errorf("bump token version: %w", err)
+		return 0, fmt.Errorf("bump token version: %w", err)
 	}
-	if err := auth.RevokeAllSessionsTx(ctx, tx, userID, tenantID, auth.RevokeReasonCredentialChange); err != nil {
-		return fmt.Errorf("revoke sessions: %w", err)
+	n, err := auth.RevokeAllSessionsTx(ctx, tx, userID, tenantID, auth.RevokeReasonCredentialChange)
+	if err != nil {
+		return 0, fmt.Errorf("revoke sessions: %w", err)
 	}
-	return nil
+	return n, nil
 }
 
 func hasPendingInvitation(ctx context.Context, tx pgx.Tx, userID int64) (bool, error) {

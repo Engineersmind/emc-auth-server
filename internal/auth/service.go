@@ -1133,7 +1133,10 @@ func (s *AuthService) issueTokenPairWithScope(ctx context.Context, userID, tenan
 	// transaction has then rolled back, so the eviction never happened. Denying in
 	// that case would sign users out of sessions that were never actually evicted.
 	// A Redis entry cannot be rolled back, so it must not be written until the
-	// database says the eviction is real.
+	// database says the eviction is real. The counters are recorded here for the
+	// same reason: a count taken inside the transaction survives a rollback that
+	// undid the eviction.
+	RecordSessionRevocations(RevokeReasonCapEvicted, int64(len(evicted)))
 	for _, id := range evicted {
 		s.denySession(ctx, id)
 	}

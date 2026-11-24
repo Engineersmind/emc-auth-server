@@ -1604,7 +1604,8 @@ func (s *AuthService) revokeAllAfterClone(ctx context.Context, cloned *ClonedCre
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	if err := RevokeAllSessionsTx(ctx, tx, cloned.UserID, cloned.TenantID, RevokeReasonPasskeyCloned); err != nil {
+	revoked, err := RevokeAllSessionsTx(ctx, tx, cloned.UserID, cloned.TenantID, RevokeReasonPasskeyCloned)
+	if err != nil {
 		s.logger.Error().Err(err).Int64("user_id", cloned.UserID).
 			Msg("passkey clone: session revocation failed")
 		return
@@ -1627,7 +1628,9 @@ func (s *AuthService) revokeAllAfterClone(ctx context.Context, cloned *ClonedCre
 
 	// After the commit, deliberately: a Redis deny entry cannot be rolled back,
 	// so writing it before the transaction lands would sign a user out on the
-	// strength of a write that then failed. Same ordering as the admin path.
+	// strength of a write that then failed. Same ordering as the admin path, and
+	// the counters are recorded on the same side of it.
+	RecordSessionRevocations(RevokeReasonPasskeyCloned, revoked)
 	s.DenyUserSessions(ctx, cloned.UserID, cloned.TenantID)
 
 	s.logger.Error().
