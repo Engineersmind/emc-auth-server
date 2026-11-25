@@ -217,11 +217,43 @@ POST /api/v1/tenants/{tid}/applications/{appID}/sessions/revoke
   `service_unavailable` when the server cannot deny access tokens.
 - Audited as `admin.application_sessions_revoked` with `revoked` / `failed`.
 
+### 2.3e Step-up at refresh (`refresh_step_up`, #197)
+Off by default. With it off, refresh is never re-checked against the MFA
+policy (exactly the pre-#197 behaviour). Turn it on per application:
+```
+PUT /api/v1/applications/{appID}/mfa                         Bearer <admin>
+{ "refresh_step_up": true }        → 200 { …, "refresh_step_up": true }
+```
+While on, every refresh (`POST /auth/refresh`, `POST /auth/session/refresh`,
+the cookie renewal middleware, and `POST /oauth/token` with
+`grant_type=refresh_token`) of a session whose `amr` lacks `mfa` is refused when
+the application now requires MFA of the user:
+- the switch is on and the mode is `required`, or a role rule (§2.3c) covers
+  the user;
+- social (`fed`) and passkey (`hwk`) sessions only when `federated_mfa` is
+  `enforce` — under `trust` they are not forced, as at login.
+```
+→ 401 { "error": "step_up_required", "message": "…" }
+```
+Nothing is revoked and the refresh token is not rotated: your app sends the
+user through sign-in again, where the login gate challenges or enrols them.
+Sessions that did MFA, tenant-level users (no application), administrators and
+`client_credentials` tokens are never affected. The renewal middleware leaves
+the cookies in place on this refusal.
+
+Cost: the flag is read in the refresh-token lookup the rotation already does,
+so an application with it off pays nothing. With it on, a session without
+`mfa` costs one extra indexed read per refresh.
+
+A real change is audited as `admin.mfa_refresh_step_up_changed`
+(`old_refresh_step_up`, `new_refresh_step_up`).
+
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```
 GET /api/v1/applications/{appID}/mfa            Bearer <admin>
 → 200 {
   "application_id": "149", "mfa_enabled": true, "mode": "required", "federated_mfa": "trust",
+  "refresh_step_up": false,
   "allowed_methods": ["totp","email"],
   "enrolled_users": 1,          // active TOTP
   "pending_enrollments": 0,     // TOTP enrolled, never activated
@@ -329,6 +361,7 @@ Errors: 401 bad code/expired token · 403 method not allowed for this app ·
 ```
 POST /api/v1/auth/refresh   { "refresh_token" }   → 200 new pair in the body (rotation; replay revokes the whole session family)
                                                     409 concurrent_refresh — a sibling request already rotated the family; no pair returned, use its response
+                                                    401 step_up_required — only when the app has refresh_step_up on (§2.3e): sign in again
 GET  /api/v1/auth/me                                Bearer <user>   → profile from claims (user_id, tenant_id, email, role, permissions)
 POST /api/v1/auth/logout    { "refresh_token" }   → 200
 ```

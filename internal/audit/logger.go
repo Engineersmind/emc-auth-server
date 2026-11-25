@@ -317,6 +317,10 @@ const (
 	// rules (#195): the roles whose holders must use MFA. Metadata:
 	// old_role_ids, new_role_ids, old_role_names, new_role_names.
 	ActionAdminMFARoleRulesSet = "admin.mfa_role_rules_set"
+	// ActionAdminMFARefreshStepUpChanged is a real change of an application's
+	// refresh_step_up setting (#197). Metadata: old_refresh_step_up,
+	// new_refresh_step_up. Emitted only when the value actually changed.
+	ActionAdminMFARefreshStepUpChanged = "admin.mfa_refresh_step_up_changed"
 	// ActionAdminAppSessionsRevoked is an administrator ending every live
 	// session of one application at once (#196). Metadata: application_id,
 	// revoked (count ended), failed (count that errored).

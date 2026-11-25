@@ -169,6 +169,16 @@ func JWTRenew(
 						"code":  "service_unavailable",
 					})
 				}
+				if errors.Is(refreshErr, auth.ErrStepUpRequired) {
+					// The application now requires MFA and this session has none
+					// (#197). Nothing was revoked or rotated; the cookies are kept
+					// so the refusal itself has no side effect.
+					logFailure(audit.ActionAuthTokenRefreshFailed, "step_up_required", http.StatusUnauthorized)
+					return c.JSON(http.StatusUnauthorized, map[string]string{
+						"error": "the application now requires two-factor authentication — sign in again",
+						"code":  "step_up_required",
+					})
+				}
 				ClearAuthCookies(c, cookieCfg)
 				if errors.Is(refreshErr, auth.ErrTokenReplay) {
 					logger.Warn().

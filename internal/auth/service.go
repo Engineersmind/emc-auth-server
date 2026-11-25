@@ -2723,17 +2723,21 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	// therefore to "no pin" — the pre-#131 behaviour for a chain in flight
 	// across the deploy.
 	var pinnedAudience *string
+	// stepUp is the owner's application refresh_step_up flag (#197), read in
+	// this same lookup so an application without it pays no extra query.
+	var stepUp bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT rt.id, s.user_id, s.tenant_id, s.id,
-		       s.is_persistent, s.auth_time, s.amr, rt.audience, rt.active_roles
+		       s.is_persistent, s.auth_time, s.amr, rt.audience, rt.active_roles,
+		       `+refreshStepUpSQL+`
 		FROM refresh_tokens rt
-		JOIN user_sessions s ON s.id = rt.session_id
+		JOIN user_sessions s ON s.id = rt.session_id`+refreshStepUpJoin+`
 		WHERE rt.token_hash = $1
 		  AND `+LiveTokenWhere("rt.")+`
 		  AND `+LiveSessionWhere("s."),
 		hash).Scan(&tokenID, &userID, &tenantID, &sessionID,
 		&carried.persistent, &carried.authTime, &carried.amr, &pinnedAudience,
-		&carried.activeRoles)
+		&carried.activeRoles, &stepUp)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken
@@ -2741,6 +2745,14 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("lookup refresh token: %w", err)
 	}
 	carried.sessionID = &sessionID
+
+	// Step-up at refresh (#197), before anything is written: a refused refresh
+	// leaves the presented token and its session exactly as they were.
+	if stepUp {
+		if err := s.checkRefreshStepUp(ctx, userID, tenantID, carried.amr); err != nil {
+			return nil, err
+		}
+	}
 
 	_, err = s.pool.Exec(ctx, `
 		UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = $2, updated_at = NOW()
@@ -2973,6 +2985,8 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	// renewal middleware rotates through here rather than through Refresh, and a
 	// pin enforced on only one of the two rotation paths is not a pin at all.
 	var pinnedAudience *string
+	// The refresh_step_up flag, as in Refresh (#197).
+	var stepUp bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT rt.id, rt.user_id, rt.tenant_id,
 		       COALESCE(rt.session_id, rt.session_family_id),
@@ -2981,14 +2995,15 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		       COALESCE(s.auth_time, rt.created_at),
 		       COALESCE(s.amr, '{}'),
 		       s.revoked_at, s.idle_expires_at, s.absolute_expires_at,
-		       rt.audience, rt.active_roles
+		       rt.audience, rt.active_roles,
+		       `+refreshStepUpSQL+`
 		FROM refresh_tokens rt
-		LEFT JOIN user_sessions s ON s.id = rt.session_id
+		LEFT JOIN user_sessions s ON s.id = rt.session_id`+refreshStepUpJoin+`
 		WHERE rt.token_hash = $1
 	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionID, &revokedAt, &expiresAt,
 		&carried.persistent, &carried.authTime, &carried.amr,
 		&sessionRevokedAt, &sessionIdleExpires, &sessionAbsoluteExpires, &pinnedAudience,
-		&carried.activeRoles)
+		&carried.activeRoles, &stepUp)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, ErrInvalidRefreshToken
@@ -3061,6 +3076,15 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		(sessionAbsoluteExpires != nil && sessionAbsoluteExpires.Before(nowUTC)) ||
 		(sessionIdleExpires != nil && sessionIdleExpires.Before(nowUTC)) {
 		return nil, nil, ErrInvalidRefreshToken
+	}
+
+	// Step-up at refresh (#197): after the replay and lifetime checks (a replay
+	// must still revoke the session; a dead session is still just invalid) and
+	// before the presented token is revoked, so a refusal rotates nothing.
+	if stepUp {
+		if err := s.checkRefreshStepUp(ctx, userID, tenantID, carried.amr); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// Revoke the presented token.

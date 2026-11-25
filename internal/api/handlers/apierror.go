@@ -205,6 +205,7 @@ var errorMessages = map[string]string{
 	"session_expired":       "Your session has expired. Sign in again to continue.",
 	"refresh_token_invalid": "Your session is no longer valid. Sign in again to continue.",
 	"refresh_in_progress":   "Your session is being renewed. Try that again in a moment.",
+	"step_up_required":      "This application now requires two-factor authentication. Sign in again to continue.",
 
 	// --- Authorisation ----------------------------------------------------
 	"unauthorized": "You need to sign in to do that.",

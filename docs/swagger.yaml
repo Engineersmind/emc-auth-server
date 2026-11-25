@@ -1822,6 +1822,12 @@ definitions:
         type: string
       pending_enrollments:
         type: integer
+      refresh_step_up:
+        description: |-
+          RefreshStepUp, when true, refuses a refresh of a session whose amr lacks
+          "mfa" once the application requires MFA of its user (401
+          step_up_required). Default false: refresh is not re-checked. #197.
+        type: boolean
       total_users:
         type: integer
       updated_at:
@@ -3660,6 +3666,13 @@ definitions:
         type: boolean
       mode:
         type: string
+      refresh_step_up:
+        description: |-
+          RefreshStepUp opts the application in to step-up at refresh (#197):
+          true refuses a refresh (401 step_up_required) of a session established
+          without MFA once the application requires MFA of its user. Omitted keeps
+          the stored value (default false).
+        type: boolean
     type: object
   handlers.UpdateApplicationRequest:
     properties:
@@ -4859,8 +4872,9 @@ paths:
       description: Returns the application's MFA mode (disabled|optional|required;
         no explicit policy = optional), master switch (mfa_enabled), federated_mfa
         (trust|enforce — whether social and passkey sign-ins go through the application
-        MFA gate; default trust) plus enrollment stats over the application's own
-        user base.
+        MFA gate; default trust), refresh_step_up (whether a refresh of a session
+        without MFA is refused once MFA is required; default false) plus enrollment
+        stats over the application's own user base.
       parameters:
       - description: Application ID
         in: path
@@ -4912,7 +4926,13 @@ paths:
         "trust" (default) lets social (Google, GitHub) and passkey sign-ins skip the
         application MFA gate; "enforce" runs the same gate as password login before
         tokens are issued (a user-verified passkey satisfies it). A real change of
-        federated_mfa is audited as admin.mfa_federated_changed with old and new values.'
+        federated_mfa is audited as admin.mfa_federated_changed with old and new values.
+        refresh_step_up (default false): true makes every refresh of a session established
+        without MFA fail with 401 step_up_required once the application requires MFA
+        of its user (switch on and mode ''required'', or a role rule covers them;
+        social/passkey sessions only under federated_mfa=enforce) — nothing is revoked,
+        the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed
+        with old and new values.'
       parameters:
       - description: Application ID
         in: path
@@ -8641,7 +8661,9 @@ paths:
               type: string
             type: object
         "401":
-          description: Unauthorized
+          description: refresh_token_invalid | session_terminated | step_up_required
+            (the application now requires MFA and this session was established without
+            it; sign in again — nothing was revoked)
           schema:
             additionalProperties:
               type: string
@@ -8944,7 +8966,7 @@ paths:
               type: string
             type: object
         "401":
-          description: Unauthorized
+          description: refresh_token_invalid | session_terminated | step_up_required
           schema:
             additionalProperties:
               type: string

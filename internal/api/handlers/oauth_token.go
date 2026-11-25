@@ -17,6 +17,7 @@ import (
 const (
 	errInvalidClient        = "invalid_client"
 	errInvalidGrant         = "invalid_grant"
+	errStepUpRequired       = "step_up_required"
 	errUnsupportedGrantType = "unsupported_grant_type"
 )
 
@@ -382,6 +383,15 @@ func (h *OAuthTokenHandler) refreshTokenGrant(c echo.Context) error {
 			metrics.OAuthGrants.WithLabelValues("refresh_token", "invalid_target").Inc()
 			return h.fail(c, http.StatusBadRequest, errInvalidTarget,
 				"the requested audience is not available to this client")
+		}
+		if errors.Is(err, auth.ErrStepUpRequired) {
+			// The application now requires MFA and this session was established
+			// without it (#197). 401 with its own code rather than invalid_grant,
+			// so a client can tell "sign the user in again with MFA" from a dead
+			// token. Nothing was revoked or rotated.
+			metrics.OAuthGrants.WithLabelValues("refresh_token", "step_up_required").Inc()
+			return h.fail(c, http.StatusUnauthorized, errStepUpRequired,
+				"the application now requires two-factor authentication; sign the user in again")
 		}
 		if errors.Is(err, auth.ErrTokenReplay) {
 			metrics.OAuthGrants.WithLabelValues("refresh_token", "replayed").Inc()

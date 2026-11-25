@@ -175,6 +175,10 @@ type MFAPolicy struct {
 	// application MFA gate) or "enforce" (they go through it; a user-verified
 	// passkey satisfies it). #194.
 	FederatedMFA string `json:"federated_mfa"`
+	// RefreshStepUp, when true, refuses a refresh of a session whose amr lacks
+	// "mfa" once the application requires MFA of its user (401
+	// step_up_required). Default false: refresh is not re-checked. #197.
+	RefreshStepUp bool `json:"refresh_step_up"`
 	// Passwordless magic-link sign-in (opt-in; the redirect URL is the
 	// application frontend that receives ?token=…).
 	MagicLinkEnabled     bool   `json:"magic_link_enabled"`
@@ -201,6 +205,8 @@ type AppMFAConfig struct {
 	// FederatedMFA decides whether social and passkey sign-ins are gated
 	// (FederatedMFAEnforce) or trusted (FederatedMFATrust, the default).
 	FederatedMFA string
+	// RefreshStepUp opts the application in to step-up at refresh (#197).
+	RefreshStepUp bool
 }
 
 // GetAppMFAConfig returns the effective MFA configuration for an application.
@@ -218,8 +224,9 @@ func (s *TOTPService) GetAppMFAConfig(ctx context.Context, appRowID int64) (AppM
 func loadAppMFAConfig(ctx context.Context, q mfaSettingsQuerier, appRowID int64) (AppMFAConfig, error) {
 	cfg := AppMFAConfig{}
 	err := q.QueryRow(ctx, `
-		SELECT mfa_enabled, mode, allowed_methods, federated_mfa FROM application_mfa_settings WHERE application_id = $1
-	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods, &cfg.FederatedMFA)
+		SELECT mfa_enabled, mode, allowed_methods, federated_mfa, refresh_step_up
+		FROM application_mfa_settings WHERE application_id = $1
+	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods, &cfg.FederatedMFA, &cfg.RefreshStepUp)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return AppMFAConfig{Enabled: true, Mode: MFAModeOptional, Methods: defaultMFAMethods(), FederatedMFA: FederatedMFATrust}, nil
@@ -253,10 +260,10 @@ func (s *TOTPService) GetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 
 	var updatedAt time.Time
 	err := s.pool.QueryRow(ctx, `
-		SELECT mfa_enabled, mode, allowed_methods, federated_mfa, magic_link_enabled, magic_link_redirect_url, updated_at
+		SELECT mfa_enabled, mode, allowed_methods, federated_mfa, refresh_step_up, magic_link_enabled, magic_link_redirect_url, updated_at
 		FROM application_mfa_settings
 		WHERE application_id = $1 AND tenant_id = $2
-	`, appRowID, tenantID).Scan(&p.MFAEnabled, &p.Mode, &p.AllowedMethods, &p.FederatedMFA, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
+	`, appRowID, tenantID).Scan(&p.MFAEnabled, &p.Mode, &p.AllowedMethods, &p.FederatedMFA, &p.RefreshStepUp, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("load app MFA policy: %w", err)
 	}
@@ -440,16 +447,20 @@ type AppMFAUpdate struct {
 	MagicLinkRedirectURL *string
 	// FederatedMFA, when non-empty, sets the federated_mfa setting (#194).
 	FederatedMFA string
+	// RefreshStepUp, when non-nil, sets the refresh_step_up setting (#197).
+	RefreshStepUp *bool
 }
 
 // AppMFAUpdateResult reports what the master switch and the federated_mfa
 // setting were before and after the update, so the caller audits and notifies
 // only on a real change.
 type AppMFAUpdateResult struct {
-	PrevEnabled      bool
-	NewEnabled       bool
-	PrevFederatedMFA string
-	NewFederatedMFA  string
+	PrevEnabled       bool
+	NewEnabled        bool
+	PrevFederatedMFA  string
+	NewFederatedMFA   string
+	PrevRefreshStepUp bool
+	NewRefreshStepUp  bool
 }
 
 // SwitchChanged reports whether the update flipped the master switch.
@@ -458,6 +469,11 @@ func (r AppMFAUpdateResult) SwitchChanged() bool { return r.PrevEnabled != r.New
 // FederatedMFAChanged reports whether the update changed federated_mfa.
 func (r AppMFAUpdateResult) FederatedMFAChanged() bool {
 	return r.PrevFederatedMFA != r.NewFederatedMFA
+}
+
+// RefreshStepUpChanged reports whether the update changed refresh_step_up.
+func (r AppMFAUpdateResult) RefreshStepUpChanged() bool {
+	return r.PrevRefreshStepUp != r.NewRefreshStepUp
 }
 
 // UpdateAppMFASettings applies an admin MFA update — switch, mode/methods and
@@ -507,12 +523,13 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 	res.PrevEnabled = true
 	res.PrevFederatedMFA = FederatedMFATrust
 	if err = tx.QueryRow(ctx, `
-		SELECT mfa_enabled, federated_mfa FROM application_mfa_settings WHERE application_id = $1 AND tenant_id = $2
-	`, appRowID, tenantID).Scan(&res.PrevEnabled, &res.PrevFederatedMFA); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		SELECT mfa_enabled, federated_mfa, refresh_step_up FROM application_mfa_settings WHERE application_id = $1 AND tenant_id = $2
+	`, appRowID, tenantID).Scan(&res.PrevEnabled, &res.PrevFederatedMFA, &res.PrevRefreshStepUp); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return res, fmt.Errorf("read app MFA switch: %w", err)
 	}
 	res.NewEnabled = res.PrevEnabled
 	res.NewFederatedMFA = res.PrevFederatedMFA
+	res.NewRefreshStepUp = res.PrevRefreshStepUp
 
 	// Re-sending the current value writes nothing: the handler audits only a
 	// real flip, so rewriting updated_by/updated_at here would leave "last
@@ -555,6 +572,26 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 			return res, ErrAppNotFound
 		}
 		res.NewFederatedMFA = u.FederatedMFA
+	}
+
+	if u.RefreshStepUp != nil {
+		tag, execErr := tx.Exec(ctx, `
+			INSERT INTO application_mfa_settings (application_id, tenant_id, refresh_step_up, updated_by, updated_at)
+			VALUES ($1, $2, $3, $4, NOW())
+			ON CONFLICT (application_id) DO UPDATE
+			SET refresh_step_up = EXCLUDED.refresh_step_up,
+			    updated_by      = EXCLUDED.updated_by,
+			    updated_at      = NOW()
+			WHERE application_mfa_settings.tenant_id = EXCLUDED.tenant_id
+		`, appRowID, tenantID, *u.RefreshStepUp, updatedBy)
+		if execErr != nil {
+			return res, fmt.Errorf("upsert app refresh step-up: %w", execErr)
+		}
+		// Tenant-pinned DO UPDATE — see SetAppMFAPolicy.
+		if tag.RowsAffected() == 0 {
+			return res, ErrAppNotFound
+		}
+		res.NewRefreshStepUp = *u.RefreshStepUp
 	}
 
 	if u.Mode != "" {
@@ -744,6 +781,9 @@ type userMFAContext struct {
 	// ruleRole is the name of a role the user holds that the application's
 	// MFA role rules list (#195), "" when none. Read from the database.
 	ruleRole string
+	// federatedMFA is the application's federated_mfa setting ("" for a
+	// tenant-level user), read for the refresh step-up check (#197).
+	federatedMFA string
 }
 
 // roleRuleApplies reports whether an MFA role rule covers this user right now:
@@ -785,10 +825,11 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	var mode *string
 	var methods []string
 	var ruleRole *string
+	var federated *string
 	// The role-rule subquery reads both role sources (users.role_id and
 	// user_roles) — see mfaRuleRoleFor, whose predicate this mirrors.
 	err := pool.QueryRow(ctx, `
-		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods,
+		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods, ams.federated_mfa,
 		       (SELECT r.name
 		        FROM application_mfa_role_rules rr
 		        JOIN roles r ON r.id = rr.role_id AND r.deleted_at IS NULL
@@ -802,7 +843,7 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 		LEFT JOIN oauth_clients oc ON oc.id = u.application_id
 		LEFT JOIN application_mfa_settings ams ON ams.application_id = u.application_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods, &ruleRole)
+	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods, &federated, &ruleRole)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
@@ -823,6 +864,12 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	}
 	if ruleRole != nil {
 		uc.ruleRole = *ruleRole
+	}
+	if uc.appRowID != nil {
+		uc.federatedMFA = FederatedMFATrust
+		if federated != nil {
+			uc.federatedMFA = *federated
+		}
 	}
 	return uc, nil
 }
