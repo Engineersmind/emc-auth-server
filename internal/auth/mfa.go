@@ -715,6 +715,29 @@ func (s *TOTPService) loadUserMFAContext(ctx context.Context, userID, tenantID i
 	return loadUserMFAContext(ctx, s.pool, userID, tenantID)
 }
 
+// refuseIfSwitchedOff re-reads the user's application MFA master switch and
+// returns ErrMFASwitchedOff when it is off (#192). Enrollment start checks the
+// switch, but a self-service enrollment begun BEFORE switch-off must not be
+// able to activate a factor AFTER it, so the activation step re-reads it too —
+// matching refusePendingEnrollmentIfSwitchedOff on the forced-enrollment path.
+// Tenant-level users (no application) are not governed by the switch.
+func refuseIfSwitchedOff(ctx context.Context, pool *pgxpool.Pool, userID, tenantID int64) error {
+	uc, err := loadUserMFAContext(ctx, pool, userID, tenantID)
+	if err != nil {
+		return err
+	}
+	if uc.switchedOff() {
+		return ErrMFASwitchedOff
+	}
+	return nil
+}
+
+// RefuseIfSwitchedOff is the self-service TOTP activation guard; see
+// refuseIfSwitchedOff.
+func (s *TOTPService) RefuseIfSwitchedOff(ctx context.Context, userID, tenantID int64) error {
+	return refuseIfSwitchedOff(ctx, s.pool, userID, tenantID)
+}
+
 // EnrollUser is the user-initiated (JWT-authenticated) TOTP enrollment path.
 // It applies the application policy (mode and method set) and the
 // re-enrollment proof requirement, then generates the secret with the

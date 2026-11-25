@@ -291,6 +291,57 @@ func TestMFASwitch_OffRefusesEnrolment(t *testing.T) {
 	}
 }
 
+// A self-service enrolment begun while the switch was ON must not activate
+// after it is turned OFF (PR #244 review). The activation guard refuses both
+// methods, and — because it runs before the code is checked — leaves the
+// emailed code unspent, so the enrolment completes once the switch is back on.
+func TestMFASwitch_OffRefusesSelfServiceActivation(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.createApp(t, "switch-activate")
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional,
+		[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy: %v", err)
+	}
+	email := uniqueEmail("switch-activate")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+
+	result, err := f.totpSvc.EnrollUser(f.ctx, userID, f.tenantID, email, "")
+	if err != nil {
+		t.Fatalf("EnrollUser(on): %v", err)
+	}
+	secret := secretFromOTPURI(t, result.OTPURI)
+	if err := f.emailSvc.BeginEnrollment(f.ctx, userID, f.tenantID, email); err != nil {
+		t.Fatalf("BeginEnrollment(on): %v", err)
+	}
+	emailCode := f.mail.lastCode(t).Code
+
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	if err := f.totpSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("TOTP RefuseIfSwitchedOff(off) error = %v, want ErrMFASwitchedOff", err)
+	}
+	if err := f.emailSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("email RefuseIfSwitchedOff(off) error = %v, want ErrMFASwitchedOff", err)
+	}
+
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, true, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(true): %v", err)
+	}
+	if err := f.totpSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); err != nil {
+		t.Fatalf("TOTP RefuseIfSwitchedOff(on) error = %v, want nil", err)
+	}
+	if err := f.emailSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); err != nil {
+		t.Fatalf("email RefuseIfSwitchedOff(on) error = %v, want nil", err)
+	}
+	if err := f.totpSvc.VerifyAndActivate(f.ctx, userID, codeFor(t, secret)); err != nil {
+		t.Errorf("VerifyAndActivate(on) error = %v, want nil", err)
+	}
+	if err := f.emailSvc.ActivateEnrollment(f.ctx, userID, emailCode); err != nil {
+		t.Errorf("ActivateEnrollment(on) with the pre-switch-off code error = %v, want nil", err)
+	}
+}
+
 // Under 'required', the last factor cannot normally be removed — but while the
 // switch is off there is no mandate, so it can.
 func TestMFASwitch_OffLiftsLastFactorGuard(t *testing.T) {

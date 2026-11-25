@@ -230,7 +230,14 @@ func (s *EmailMFAService) BeginEnrollment(ctx context.Context, userID, tenantID 
 	return s.mintAndSend(ctx, emailVerifyKey(userID), email, uc.appName, tenantID, uc.appRowID, EmailOTPTTL, "set up email two-factor authentication")
 }
 
+// RefuseIfSwitchedOff is the self-service email-MFA activation guard; see
+// refuseIfSwitchedOff in mfa.go.
+func (s *EmailMFAService) RefuseIfSwitchedOff(ctx context.Context, userID, tenantID int64) error {
+	return refuseIfSwitchedOff(ctx, s.pool, userID, tenantID)
+}
+
 // ActivateEnrollment verifies the emailed code and marks email MFA active.
+// Callers on the self-service path must call RefuseIfSwitchedOff first.
 func (s *EmailMFAService) ActivateEnrollment(ctx context.Context, userID int64, code string) error {
 	if err := s.verifyStoredCode(ctx, emailVerifyKey(userID), code); err != nil {
 		return err
