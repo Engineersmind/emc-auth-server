@@ -248,12 +248,40 @@ so an application with it off pays nothing. With it on, a session without
 A real change is audited as `admin.mfa_refresh_step_up_changed`
 (`old_refresh_step_up`, `new_refresh_step_up`).
 
+### 2.3f Grace date for a `required` rollout (`enforce_from`, #198)
+Turning on `required` forces every unenrolled user to enrol at their next
+login. `enforce_from` spreads that out:
+```
+PUT /api/v1/applications/{appID}/mfa                         Bearer <admin>
+{ "mode": "required", "enforce_from": "2026-12-15T00:00:00Z" }
+{ "enforce_from": null }          # clears the grace date (enforce now)
+```
+- Before `enforce_from`, a user who must use MFA (mode `required`, or covered
+  by a role rule) but has **no** active allowed factor signs in normally. The
+  login response (password, app, magic-link, email-code, social/passkey under
+  `enforce`) carries two extra fields:
+  ```
+  { "access_token": "…", …, "mfa_enrollment_recommended": true,
+    "enforce_from": "2026-12-15T00:00:00Z" }
+  ```
+  Prompt the user to set up MFA (§4). From `enforce_from` on, the login
+  returns the forced-enrolment shape (§3.4) as before.
+- Users who already have a factor are always challenged: the grace covers
+  enrolment only.
+- Step-up at refresh (§2.3e) does not refuse an unenrolled user's refresh
+  before `enforce_from`.
+- `GET .../mfa` and `GET /auth/me/mfa` report `enforce_from` (RFC 3339 UTC;
+  `/auth/me/mfa` omits it when unset). Omitting it on PUT keeps it; a value
+  that is not RFC 3339 or null is a 400.
+- A real change is audited as `admin.mfa_enforce_from_changed`
+  (`old_enforce_from`, `new_enforce_from`).
+
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```
 GET /api/v1/applications/{appID}/mfa            Bearer <admin>
 → 200 {
   "application_id": "149", "mfa_enabled": true, "mode": "required", "federated_mfa": "trust",
-  "refresh_step_up": false,
+  "refresh_step_up": false, "enforce_from": null,
   "allowed_methods": ["totp","email"],
   "enrolled_users": 1,          // active TOTP
   "pending_enrollments": 0,     // TOTP enrolled, never activated

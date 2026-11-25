@@ -1434,12 +1434,21 @@ definitions:
     properties:
       access_token:
         type: string
+      enforce_from:
+        type: string
       expires_at:
         description: UTC unix timestamp when access token expires
         type: integer
       expires_in:
         description: seconds until access token expires
         type: integer
+      mfa_enrollment_recommended:
+        description: |-
+          MFAEnrollmentRecommended is set on a sign-in during an application's
+          required-mode grace period (#198): MFA is required of this user but they
+          have no factor yet, and enrolment becomes mandatory at MFAEnforceFrom.
+          Omitted otherwise (and always on refresh).
+        type: boolean
       refresh_token:
         type: string
       token_type:
@@ -1794,6 +1803,13 @@ definitions:
         type: string
       email_enrolled_users:
         type: integer
+      enforce_from:
+        description: |-
+          EnforceFrom is the grace date of a required-mode rollout (#198): before
+          it, a user who must use MFA but has no factor yet signs in normally and is
+          told enrolment is recommended; from it on, enrolment is forced. null = no
+          grace period.
+        type: string
       enrolled_users:
         description: |-
           Enrollment stats over the application's own isolated user base — for the
@@ -1851,6 +1867,12 @@ definitions:
     type: object
   auth.MFAStatus:
     properties:
+      enforce_from:
+        description: |-
+          EnforceFrom is the application's required-mode grace date (#198): before
+          it a caller who must use MFA but has no factor is not yet forced to enrol.
+          Omitted when the application sets none (and for tenant-level users).
+        type: string
       methods:
         items:
           $ref: '#/definitions/auth.MFAMethodStatus'
@@ -3652,6 +3674,12 @@ definitions:
         items:
           type: string
         type: array
+      enforce_from:
+        description: |-
+          EnforceFrom is the required-mode grace date (#198), RFC 3339. Omitted
+          keeps the stored value; an explicit null clears it.
+        format: date-time
+        type: string
       federated_mfa:
         description: |-
           FederatedMFA is "trust" (default: social and passkey sign-ins skip the
@@ -4932,6 +4960,12 @@ paths:
         of its user (switch on and mode ''required'', or a role rule covers them;
         social/passkey sessions only under federated_mfa=enforce) — nothing is revoked,
         the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed
+        with old and new values. enforce_from (RFC 3339, explicit null clears, omitted
+        keeps): a grace date for a required-mode rollout — before it, a user who must
+        use MFA (mode ''required'' or a role rule) but has NO active factor signs
+        in normally and the login response carries mfa_enrollment_recommended=true
+        plus enforce_from; from it on, enrolment is forced. Users with a factor are
+        always challenged. A real change is audited as admin.mfa_enforce_from_changed
         with old and new values.'
       parameters:
       - description: Application ID

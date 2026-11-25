@@ -867,10 +867,12 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 	// challenge / forced-enrolment shape password login returns, completed
 	// through the same /auth/login/otp and /auth/login/mfa/* endpoints; the
 	// finished session keeps the social grant (FirstFactorSocial).
-	if gate, err := s.authSvc.mfaGateWith(ctx, mfaGateOptions{federated: FirstFactorSocial},
-		userID, tenantID, appRowID, appID, email, roleName, perms, false, nil, orgSessionRequest{}); err != nil {
+	gate, grace, err := s.authSvc.mfaGateWith(ctx, mfaGateOptions{federated: FirstFactorSocial},
+		userID, tenantID, appRowID, appID, email, roleName, perms, false, nil, orgSessionRequest{})
+	if err != nil {
 		return nil, err
-	} else if gate != nil {
+	}
+	if gate != nil {
 		return gate, nil
 	}
 
@@ -880,5 +882,6 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 	if err != nil {
 		return nil, err
 	}
+	grace.annotate(tokens)
 	return &LoginResult{Token: tokens}, nil
 }

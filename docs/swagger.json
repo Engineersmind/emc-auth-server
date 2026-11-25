@@ -1386,7 +1386,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400. federated_mfa: \"trust\" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; \"enforce\" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values. refresh_step_up (default false): true makes every refresh of a session established without MFA fail with 401 step_up_required once the application requires MFA of its user (switch on and mode 'required', or a role rule covers them; social/passkey sessions only under federated_mfa=enforce) — nothing is revoked, the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed with old and new values.",
+                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400. federated_mfa: \"trust\" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; \"enforce\" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values. refresh_step_up (default false): true makes every refresh of a session established without MFA fail with 401 step_up_required once the application requires MFA of its user (switch on and mode 'required', or a role rule covers them; social/passkey sessions only under federated_mfa=enforce) — nothing is revoked, the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed with old and new values. enforce_from (RFC 3339, explicit null clears, omitted keeps): a grace date for a required-mode rollout — before it, a user who must use MFA (mode 'required' or a role rule) but has NO active factor signs in normally and the login response carries mfa_enrollment_recommended=true plus enforce_from; from it on, enrolment is forced. Users with a factor are always challenged. A real change is audited as admin.mfa_enforce_from_changed with old and new values.",
                 "consumes": [
                     "application/json"
                 ],
@@ -16393,6 +16393,9 @@
                 "access_token": {
                     "type": "string"
                 },
+                "enforce_from": {
+                    "type": "string"
+                },
                 "expires_at": {
                     "description": "UTC unix timestamp when access token expires",
                     "type": "integer"
@@ -16400,6 +16403,10 @@
                 "expires_in": {
                     "description": "seconds until access token expires",
                     "type": "integer"
+                },
+                "mfa_enrollment_recommended": {
+                    "description": "MFAEnrollmentRecommended is set on a sign-in during an application's\nrequired-mode grace period (#198): MFA is required of this user but they\nhave no factor yet, and enrolment becomes mandatory at MFAEnforceFrom.\nOmitted otherwise (and always on refresh).",
+                    "type": "boolean"
                 },
                 "refresh_token": {
                     "type": "string"
@@ -16850,6 +16857,10 @@
                 "email_enrolled_users": {
                     "type": "integer"
                 },
+                "enforce_from": {
+                    "description": "EnforceFrom is the grace date of a required-mode rollout (#198): before\nit, a user who must use MFA but has no factor yet signs in normally and is\ntold enrolment is recommended; from it on, enrolment is forced. null = no\ngrace period.",
+                    "type": "string"
+                },
                 "enrolled_users": {
                     "description": "Enrollment stats over the application's own isolated user base — for the\nowner dashboard. Pending = TOTP enrolled but never activated.",
                     "type": "integer"
@@ -16909,6 +16920,10 @@
         "auth.MFAStatus": {
             "type": "object",
             "properties": {
+                "enforce_from": {
+                    "description": "EnforceFrom is the application's required-mode grace date (#198): before\nit a caller who must use MFA but has no factor is not yet forced to enrol.\nOmitted when the application sets none (and for tenant-level users).",
+                    "type": "string"
+                },
                 "methods": {
                     "type": "array",
                     "items": {
@@ -19168,6 +19183,11 @@
                     "items": {
                         "type": "string"
                     }
+                },
+                "enforce_from": {
+                    "description": "EnforceFrom is the required-mode grace date (#198), RFC 3339. Omitted\nkeeps the stored value; an explicit null clears it.",
+                    "type": "string",
+                    "format": "date-time"
                 },
                 "federated_mfa": {
                     "description": "FederatedMFA is \"trust\" (default: social and passkey sign-ins skip the\napplication MFA gate) or \"enforce\" (they go through it; a user-verified\npasskey satisfies it). Omitted or \"\" keeps the stored value. #194.",

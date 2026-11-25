@@ -341,6 +341,12 @@ type AuthResult struct {
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int    `json:"expires_in"` // seconds until access token expires
 	ExpiresAt    int64  `json:"expires_at"` // UTC unix timestamp when access token expires
+	// MFAEnrollmentRecommended is set on a sign-in during an application's
+	// required-mode grace period (#198): MFA is required of this user but they
+	// have no factor yet, and enrolment becomes mandatory at MFAEnforceFrom.
+	// Omitted otherwise (and always on refresh).
+	MFAEnrollmentRecommended bool       `json:"mfa_enrollment_recommended,omitempty"`
+	MFAEnforceFrom           *time.Time `json:"enforce_from,omitempty"`
 	// Clients should schedule a proactive refresh at (ExpiresAt - 60) seconds.
 	// On a 401 with code="token_expired", refresh once then retry the original request.
 	// On a 401 with code="token_invalid" or if refresh fails, redirect to login.
@@ -1860,9 +1866,11 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// checked only at the mint, after every factor has passed.
 	orgReq := orgSessionRequest{requested: strings.TrimSpace(in.Organization), skip: in.VerifiedApp != nil}
 
-	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent, activeRoles, orgReq); err != nil {
+	gate, grace, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent, activeRoles, orgReq)
+	if err != nil {
 		return nil, err
-	} else if gate != nil {
+	}
+	if gate != nil {
 		return gate, nil
 	}
 
@@ -1887,6 +1895,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	if err != nil {
 		return nil, err
 	}
+	grace.annotate(tokens)
 	return &LoginResult{Token: tokens}, nil
 }
 
@@ -1919,8 +1928,32 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // the finally-issued session honours it. Threaded through rather than re-read at the
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
-func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+//
+// The second result is non-nil only when the gate returns no challenge because
+// the application's required-mode grace period is running (#198): the user
+// must use MFA but has no factor yet and enforce_from is still in the future.
+// The caller issues tokens as usual and passes them to its annotate method, so
+// the response tells the user enrolment is recommended and when it becomes
+// mandatory.
+func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, *mfaEnrollmentGrace, error) {
 	return s.mfaGateWith(ctx, mfaGateOptions{}, userID, tenantID, appRowID, appID, email, roleName, perms, persistent, activeRoles, org)
+}
+
+// mfaEnrollmentGrace is the gate's "no challenge, but enrolment is recommended"
+// outcome during a required-mode grace period (#198).
+type mfaEnrollmentGrace struct {
+	enforceFrom time.Time
+}
+
+// annotate marks tokens with the enrolment recommendation. Safe on a nil
+// receiver (no grace) and nil tokens, so callers need no branch.
+func (g *mfaEnrollmentGrace) annotate(tokens *AuthResult) {
+	if g == nil || tokens == nil {
+		return
+	}
+	at := g.enforceFrom
+	tokens.MFAEnrollmentRecommended = true
+	tokens.MFAEnforceFrom = &at
 }
 
 // mfaGateOptions tunes mfaGateWith. The zero value is exactly mfaGate's
@@ -1942,7 +1975,18 @@ type mfaGateOptions struct {
 }
 
 // mfaGateWith is mfaGate with options. See mfaGate for the contract.
-func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, *mfaEnrollmentGrace, error) {
+	var grace *mfaEnrollmentGrace
+	res, err := s.mfaGateCore(ctx, opts, &grace, userID, tenantID, appRowID, appID, email, roleName, perms, persistent, activeRoles, org)
+	if err != nil || res != nil {
+		return res, nil, err
+	}
+	return nil, grace, nil
+}
+
+// mfaGateCore is the gate itself. It writes *grace only when it returns no
+// challenge because of a running grace period (#198).
+func (s *AuthService) mfaGateCore(ctx context.Context, opts mfaGateOptions, grace **mfaEnrollmentGrace, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
 	if opts.inboxFirstFactor {
 		// Carried to the stored challenge so the finished session keeps the email-code
 		// grant and amr. A context value rather than a new parameter on every helper
@@ -1983,6 +2027,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	// policy, so every active factor is honoured.
 	var mode string
 	var allowedMethods []string
+	var enforceFrom *time.Time
 	if appRowID != 0 {
 		cfg, cfgErr := loadAppMFAConfig(ctx, s.pool, appRowID)
 		if cfgErr != nil {
@@ -2001,7 +2046,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		if opts.federated != "" && cfg.FederatedMFA != FederatedMFAEnforce {
 			return nil, nil
 		}
-		mode, allowedMethods = cfg.Mode, cfg.Methods
+		mode, allowedMethods, enforceFrom = cfg.Mode, cfg.Methods, cfg.EnforceFrom
 		// Role rules (#195): a user holding a role the application lists is
 		// treated as 'required'. Only an 'optional' app needs the lookup —
 		// 'required' already is, and rules do not apply under 'disabled'.
@@ -2050,6 +2095,16 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	required := appRowID != 0 && mode == MFAModeRequired
 	if len(active) == 0 && !required {
 		// Nothing is due: no permitted factor to challenge, no mandate to enrol.
+		return nil, nil
+	}
+	// Required-mode grace period (#198): the user must use MFA but has no
+	// permitted factor yet, and enforce_from is still ahead. Tokens are issued
+	// as normal, marked "enrolment recommended". Only enrolment is deferred: a
+	// user with an active factor never reaches here (len(active) > 0) and is
+	// challenged as always. Decided before the service checks below: nothing is
+	// due, so a deployment without Redis/TOTP lets this login through too.
+	if len(active) == 0 && inEnrollmentGrace(enforceFrom, time.Now()) {
+		*grace = &mfaEnrollmentGrace{enforceFrom: *enforceFrom}
 		return nil, nil
 	}
 

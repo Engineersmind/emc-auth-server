@@ -321,6 +321,10 @@ const (
 	// refresh_step_up setting (#197). Metadata: old_refresh_step_up,
 	// new_refresh_step_up. Emitted only when the value actually changed.
 	ActionAdminMFARefreshStepUpChanged = "admin.mfa_refresh_step_up_changed"
+	// ActionAdminMFAEnforceFromChanged is a real change of an application's
+	// required-mode grace date (#198). Metadata: old_enforce_from,
+	// new_enforce_from (RFC 3339 or null).
+	ActionAdminMFAEnforceFromChanged = "admin.mfa_enforce_from_changed"
 	// ActionAdminAppSessionsRevoked is an administrator ending every live
 	// session of one application at once (#196). Metadata: application_id,
 	// revoked (count ended), failed (count that errored).

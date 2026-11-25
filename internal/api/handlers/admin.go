@@ -3403,7 +3403,39 @@ type UpdateApplicationMFARequest struct {
 	// without MFA once the application requires MFA of its user. Omitted keeps
 	// the stored value (default false).
 	RefreshStepUp *bool `json:"refresh_step_up"`
+	// EnforceFrom is the required-mode grace date (#198), RFC 3339. Omitted
+	// keeps the stored value; an explicit null clears it.
+	EnforceFrom optionalTime `json:"enforce_from" swaggertype:"string" format:"date-time"`
 }
+
+// optionalTime is a JSON timestamp that distinguishes "absent" (Set false)
+// from an explicit null (Set true, Time nil) and a value (RFC 3339).
+type optionalTime struct {
+	Set  bool
+	Time *time.Time
+}
+
+// UnmarshalJSON is called only when the key is present, null included.
+func (o *optionalTime) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	if string(b) == "null" {
+		o.Time = nil
+		return nil
+	}
+	var raw string
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return errInvalidEnforceFrom
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return errInvalidEnforceFrom
+	}
+	o.Time = &t
+	return nil
+}
+
+// errInvalidEnforceFrom rejects an enforce_from that is not RFC 3339 or null.
+var errInvalidEnforceFrom = errors.New("enforce_from must be an RFC 3339 timestamp or null")
 
 // GetApplicationMFA handles GET /api/v1/applications/:appID/mfa and
 // GET /api/v1/tenants/:tid/applications/:appID/mfa.
@@ -3440,7 +3472,7 @@ func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
 // PUT /api/v1/tenants/:tid/applications/:appID/mfa.
 //
 // @Summary      Set application MFA policy
-// @Description  Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default ["totp"]); allowed_methods sent without mode is a 400. federated_mfa: "trust" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; "enforce" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values. refresh_step_up (default false): true makes every refresh of a session established without MFA fail with 401 step_up_required once the application requires MFA of its user (switch on and mode 'required', or a role rule covers them; social/passkey sessions only under federated_mfa=enforce) — nothing is revoked, the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed with old and new values.
+// @Description  Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default ["totp"]); allowed_methods sent without mode is a 400. federated_mfa: "trust" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; "enforce" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values. refresh_step_up (default false): true makes every refresh of a session established without MFA fail with 401 step_up_required once the application requires MFA of its user (switch on and mode 'required', or a role rule covers them; social/passkey sessions only under federated_mfa=enforce) — nothing is revoked, the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed with old and new values. enforce_from (RFC 3339, explicit null clears, omitted keeps): a grace date for a required-mode rollout — before it, a user who must use MFA (mode 'required' or a role rule) but has NO active factor signs in normally and the login response carries mfa_enrollment_recommended=true plus enforce_from; from it on, enrolment is forced. Users with a factor are always challenged. A real change is audited as admin.mfa_enforce_from_changed with old and new values.
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
@@ -3464,12 +3496,15 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 
 	var req UpdateApplicationMFARequest
 	if err := c.Bind(&req); err != nil {
+		if errors.Is(err, errInvalidEnforceFrom) {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": errInvalidEnforceFrom.Error()})
+		}
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 	}
 	// mode stays mandatory unless the body carries something else to change,
 	// so an empty body is still the 400 it always was.
 	magicLink := req.MagicLinkEnabled != nil || req.MagicLinkRedirectURL != nil
-	if req.Mode == "" && req.MFAEnabled == nil && !magicLink && req.FederatedMFA == "" && req.RefreshStepUp == nil {
+	if req.Mode == "" && req.MFAEnabled == nil && !magicLink && req.FederatedMFA == "" && req.RefreshStepUp == nil && !req.EnforceFrom.Set {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": auth.ErrInvalidMFAMode.Error()})
 	}
 
@@ -3516,6 +3551,8 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		MagicLinkRedirectURL: req.MagicLinkRedirectURL,
 		FederatedMFA:         req.FederatedMFA,
 		RefreshStepUp:        req.RefreshStepUp,
+		SetEnforceFrom:       req.EnforceFrom.Set,
+		EnforceFrom:          req.EnforceFrom.Time,
 	}, updatedBy)
 	if err != nil {
 		switch {
@@ -3556,6 +3593,11 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 	if res.RefreshStepUpChanged() {
 		h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminMFARefreshStepUpChanged, "application", appIDStr, &appID,
 			map[string]any{"old_refresh_step_up": res.PrevRefreshStepUp, "new_refresh_step_up": res.NewRefreshStepUp})
+	}
+	// And for enforce_from (#198); null renders as JSON null.
+	if res.EnforceFromChanged() {
+		h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminMFAEnforceFromChanged, "application", appIDStr, &appID,
+			map[string]any{"old_enforce_from": rfc3339OrNil(res.PrevEnforceFrom), "new_enforce_from": rfc3339OrNil(res.NewEnforceFrom)})
 	}
 
 	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
@@ -4758,4 +4800,12 @@ func (h *AdminHandler) CancelUserImportJob(c echo.Context) error {
 	h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminUsersImportCancelled, "import_job",
 		c.Param("jobID"), appScope, nil)
 	return c.NoContent(http.StatusNoContent)
+}
+
+// rfc3339OrNil renders t for audit metadata: RFC 3339 UTC, or nil (JSON null).
+func rfc3339OrNil(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UTC().Format(time.RFC3339)
 }

@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -78,5 +80,33 @@ func (s *AuthService) checkRefreshStepUp(ctx context.Context, userID, tenantID i
 	if federated && uc.federatedMFA != FederatedMFAEnforce {
 		return nil
 	}
+	// Required-mode grace period (#198): a user with no permitted factor yet
+	// would get tokens at login right now, so refusing their refresh would only
+	// send them round to the same result. A user who HAS a factor is stepped up
+	// as always — the grace covers enrolment, not challenges.
+	if uc.inEnrollmentGrace(time.Now()) {
+		has, err := s.hasPermittedFactor(ctx, userID, uc.allowedMethods)
+		if err != nil {
+			return err
+		}
+		if !has {
+			return nil
+		}
+	}
 	return ErrStepUpRequired
+}
+
+// hasPermittedFactor reports whether the user has any of methods active. A
+// read error is returned, never read as "none".
+func (s *AuthService) hasPermittedFactor(ctx context.Context, userID int64, methods []string) (bool, error) {
+	for _, m := range methods {
+		on, err := s.appFactorActive(ctx, userID, m)
+		if err != nil {
+			return false, fmt.Errorf("check %s MFA status: %w", m, err)
+		}
+		if on {
+			return true, nil
+		}
+	}
+	return false, nil
 }
