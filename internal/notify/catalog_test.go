@@ -25,16 +25,22 @@ func TestLookup_UncataloguedActionIsNotNotable(t *testing.T) {
 	}
 }
 
-// Exactly two actions notify, each to its own scope, and both reach the
-// platform tier: a secret rotation or a tenant deactivation is precisely the
-// kind of event platform oversight exists to hear about.
-func TestLookup_CatalogueIsSecretRotationAndTenantDeactivation(t *testing.T) {
-	if len(notableActions) != 2 {
-		t.Errorf("catalogue has %d entries, want 2: %v", len(notableActions), notableActions)
+// Exactly three actions notify, each to its own scope. A secret rotation and a
+// tenant deactivation also reach the platform tier — precisely the kind of
+// event platform oversight exists to hear about. The MFA master switch (#192)
+// does not: it is the tenant's own security decision, told to the
+// application's administrators.
+func TestLookup_CatalogueIsTheThreeChosenActions(t *testing.T) {
+	if len(notableActions) != 3 {
+		t.Errorf("catalogue has %d entries, want 3: %v", len(notableActions), notableActions)
 	}
-	cases := map[string]scope{
-		audit.ActionAdminApplicationSecretRotated: scopeApplication,
-		audit.ActionAdminTenantDeactivated:        scopeTenantOwners,
+	cases := map[string]struct {
+		scope     scope
+		oversight bool
+	}{
+		audit.ActionAdminApplicationSecretRotated: {scopeApplication, true},
+		audit.ActionAdminTenantDeactivated:        {scopeTenantOwners, true},
+		audit.ActionAdminMFASwitchChanged:         {scopeApplication, false},
 	}
 	for action, want := range cases {
 		n, ok := lookup(action)
@@ -42,11 +48,11 @@ func TestLookup_CatalogueIsSecretRotationAndTenantDeactivation(t *testing.T) {
 			t.Errorf("%s is not notable", action)
 			continue
 		}
-		if n.scope != want {
-			t.Errorf("%s scope = %d, want %d", action, n.scope, want)
+		if n.scope != want.scope {
+			t.Errorf("%s scope = %d, want %d", action, n.scope, want.scope)
 		}
-		if !n.oversight {
-			t.Errorf("%s is missing the platform oversight tier", action)
+		if n.oversight != want.oversight {
+			t.Errorf("%s oversight = %v, want %v", action, n.oversight, want.oversight)
 		}
 		if n.phrase == "" {
 			t.Errorf("%s has empty phrasing; the subject line would read blank", action)
