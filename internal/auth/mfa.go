@@ -439,7 +439,10 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 	}
 	res.NewEnabled = res.PrevEnabled
 
-	if u.Enabled != nil {
+	// Re-sending the current value writes nothing: the handler audits only a
+	// real flip, so rewriting updated_by/updated_at here would leave "last
+	// updated by" pointing at a change nobody can find in the audit log.
+	if u.Enabled != nil && *u.Enabled != res.PrevEnabled {
 		tag, execErr := tx.Exec(ctx, `
 			INSERT INTO application_mfa_settings (application_id, tenant_id, mfa_enabled, updated_by, updated_at)
 			VALUES ($1, $2, $3, $4, NOW())
@@ -475,14 +478,6 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 		return res, fmt.Errorf("commit app MFA update: %w", err)
 	}
 	return res, nil
-}
-
-// SetAppMFAEnabled turns the application's MFA master switch on or off and
-// returns the value it replaced. Tenant-pinned like SetAppMFAPolicy. It does no
-// caller authorisation: AuthorizeMFASwitchOff is the HTTP layer's job.
-func (s *TOTPService) SetAppMFAEnabled(ctx context.Context, tenantID, appRowID int64, enabled bool, updatedBy *int64) (prev bool, err error) {
-	res, err := s.UpdateAppMFASettings(ctx, tenantID, appRowID, AppMFAUpdate{Enabled: &enabled}, updatedBy)
-	return res.PrevEnabled, err
 }
 
 // MFASwitchOffMaxAuthAge is how recently the caller must have signed in WITH
@@ -715,27 +710,74 @@ func (s *TOTPService) loadUserMFAContext(ctx context.Context, userID, tenantID i
 	return loadUserMFAContext(ctx, s.pool, userID, tenantID)
 }
 
-// refuseIfSwitchedOff re-reads the user's application MFA master switch and
-// returns ErrMFASwitchedOff when it is off (#192). Enrollment start checks the
-// switch, but a self-service enrollment begun BEFORE switch-off must not be
-// able to activate a factor AFTER it, so the activation step re-reads it too —
-// matching refusePendingEnrollmentIfSwitchedOff on the forced-enrollment path.
-// Tenant-level users (no application) are not governed by the switch.
-func refuseIfSwitchedOff(ctx context.Context, pool *pgxpool.Pool, userID, tenantID int64) error {
-	uc, err := loadUserMFAContext(ctx, pool, userID, tenantID)
-	if err != nil {
-		return err
+// checkActivationPolicyTx re-applies the application's MFA policy at the moment
+// a factor is ACTIVATED, inside the caller's activating transaction (#192, PR
+// #244 review). Enrolment start checks the policy too, but an enrolment begun
+// before the admin turned the switch off, set mode 'disabled' or removed the
+// method must not complete after it:
+//
+//   - switch off → ErrMFASwitchedOff;
+//   - mode 'disabled' → ErrMFAEnrollmentDisabled;
+//   - method not in allowed_methods → ErrMFAMethodNotAllowed.
+//
+// The application row is locked FOR SHARE, which conflicts with the FOR NO KEY
+// UPDATE taken by UpdateAppMFASettings: an admin change in flight finishes
+// first and is seen here, and one arriving later waits until this activation
+// commits. There is no window between the check and the activating UPDATE.
+//
+// The user is looked up by id alone, NOT by the token's tenant: a tenant-
+// switched administrator's token names a tenant their user row does not live
+// in, and they are no application's user, so no policy governs them (the same
+// answer AppMFAEnabledForUser gives). Tenant-level users always pass.
+func checkActivationPolicyTx(ctx context.Context, tx pgx.Tx, userID int64, method string) error {
+	uc := &userMFAContext{enabled: true, mode: MFAModeOptional, allowedMethods: defaultMFAMethods()}
+	if err := tx.QueryRow(ctx, `
+		SELECT application_id FROM users WHERE id = $1 AND deleted_at IS NULL
+	`, userID).Scan(&uc.appRowID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("load user application: %w", err)
 	}
-	if uc.switchedOff() {
+	if uc.appRowID == nil {
+		return nil
+	}
+
+	var one int
+	if err := tx.QueryRow(ctx, `
+		SELECT 1 FROM oauth_clients WHERE id = $1 FOR SHARE
+	`, *uc.appRowID).Scan(&one); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("lock application for MFA activation: %w", err)
+	}
+
+	var enabled *bool
+	var mode *string
+	var methods []string
+	err := tx.QueryRow(ctx, `
+		SELECT mfa_enabled, mode, allowed_methods FROM application_mfa_settings WHERE application_id = $1
+	`, *uc.appRowID).Scan(&enabled, &mode, &methods)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("load app MFA policy for activation: %w", err)
+	}
+	if enabled != nil {
+		uc.enabled = *enabled
+	}
+	if mode != nil {
+		uc.mode = *mode
+	}
+	if len(methods) > 0 {
+		uc.allowedMethods = methods
+	}
+
+	switch {
+	case uc.switchedOff():
 		return ErrMFASwitchedOff
+	case uc.mode == MFAModeDisabled:
+		return ErrMFAEnrollmentDisabled
+	case !uc.methodPermitted(method):
+		return ErrMFAMethodNotAllowed
 	}
 	return nil
-}
-
-// RefuseIfSwitchedOff is the self-service TOTP activation guard; see
-// refuseIfSwitchedOff.
-func (s *TOTPService) RefuseIfSwitchedOff(ctx context.Context, userID, tenantID int64) error {
-	return refuseIfSwitchedOff(ctx, s.pool, userID, tenantID)
 }
 
 // EnrollUser is the user-initiated (JWT-authenticated) TOTP enrollment path.

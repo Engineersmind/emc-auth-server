@@ -230,19 +230,24 @@ func (s *EmailMFAService) BeginEnrollment(ctx context.Context, userID, tenantID 
 	return s.mintAndSend(ctx, emailVerifyKey(userID), email, uc.appName, tenantID, uc.appRowID, EmailOTPTTL, "set up email two-factor authentication")
 }
 
-// RefuseIfSwitchedOff is the self-service email-MFA activation guard; see
-// refuseIfSwitchedOff in mfa.go.
-func (s *EmailMFAService) RefuseIfSwitchedOff(ctx context.Context, userID, tenantID int64) error {
-	return refuseIfSwitchedOff(ctx, s.pool, userID, tenantID)
-}
-
-// ActivateEnrollment verifies the emailed code and marks email MFA active.
-// Callers on the self-service path must call RefuseIfSwitchedOff first.
+// ActivateEnrollment verifies the emailed code and marks email MFA active. The
+// application's MFA policy is re-checked in the same transaction as the
+// activating UPDATE (checkActivationPolicyTx) and BEFORE the code is checked,
+// so a refusal leaves the code unspent.
 func (s *EmailMFAService) ActivateEnrollment(ctx context.Context, userID int64, code string) error {
-	if err := s.verifyStoredCode(ctx, emailVerifyKey(userID), code); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin email MFA activation: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = checkActivationPolicyTx(ctx, tx, userID, MFAMethodEmail); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `
+	if err = s.verifyStoredCode(ctx, emailVerifyKey(userID), code); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
 		UPDATE email_mfa_settings SET is_active = true, updated_at = NOW()
 		WHERE user_id = $1
 	`, userID)
@@ -251,6 +256,9 @@ func (s *EmailMFAService) ActivateEnrollment(ctx context.Context, userID int64, 
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrEmailCodeInvalid
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit email MFA activation: %w", err)
 	}
 	return nil
 }

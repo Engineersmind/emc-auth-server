@@ -185,7 +185,8 @@ func TestUpdateApplicationMFA_Switch(t *testing.T) {
 	}
 
 	// Atomic: switch-on + valid mode + bad magic-link URL changes nothing.
-	if _, err := totpSvc.SetAppMFAEnabled(ctx, tenantID, appID, false, nil); err != nil {
+	off := false
+	if _, err := totpSvc.UpdateAppMFASettings(ctx, tenantID, appID, auth.AppMFAUpdate{Enabled: &off}, nil); err != nil {
 		t.Fatalf("reset switch: %v", err)
 	}
 	code, out = put(management, `{"mfa_enabled":true,"mode":"required","magic_link_enabled":true,"magic_link_redirect_url":"http://public.example.com/cb"}`)

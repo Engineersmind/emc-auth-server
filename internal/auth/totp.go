@@ -138,8 +138,20 @@ func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID int64, email,
 	}, nil
 }
 
-// VerifyAndActivate validates the user's first TOTP code and marks the secret active.
+// VerifyAndActivate validates the user's first TOTP code and marks the secret
+// active. The application's MFA policy is re-checked in the same transaction
+// as the activating UPDATE (checkActivationPolicyTx), so every caller gets it.
 func (s *TOTPService) VerifyAndActivate(ctx context.Context, userID int64, code string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin TOTP activation: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = checkActivationPolicyTx(ctx, tx, userID, MFAMethodTOTP); err != nil {
+		return err
+	}
+
 	secret, isActive, err := s.loadSecret(ctx, userID)
 	if err != nil {
 		return err
@@ -152,12 +164,15 @@ func (s *TOTPService) VerifyAndActivate(ctx context.Context, userID int64, code 
 		return fmt.Errorf("invalid TOTP code")
 	}
 
-	_, err = s.pool.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		UPDATE totp_secrets SET is_active = true, updated_at = NOW()
 		WHERE user_id = $1
 	`, userID)
 	if err != nil {
 		return fmt.Errorf("activate totp_secrets: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit TOTP activation: %w", err)
 	}
 	return nil
 }

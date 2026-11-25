@@ -1125,6 +1125,13 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodTOTP, "", ""); handled {
 			return resp
 		}
+		// The switch being turned off mid-enrolment is an admin decision, not a
+		// failed MFA challenge: answer before auditFailure so a switch-off with
+		// users part-way through forced enrolment does not show up as a
+		// brute-force-looking spike of auth.mfa_challenge_failed.
+		if errors.Is(err, auth.ErrMFASwitchedOff) {
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		}
 		h.logger.Warn().Err(err).Msg("pending MFA activate failed")
 		event := audit.Event{
 			Action:       audit.ActionAuthMFAChallengeFailed,
@@ -1140,9 +1147,6 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 		}
 		h.auditFailure(c, event, err)
 
-		if errors.Is(err, auth.ErrMFASwitchedOff) {
-			return fail(c, http.StatusForbidden, "mfa_switched_off")
-		}
 		if errors.Is(err, auth.ErrTooManyOTPAttempts) {
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 		}
@@ -1934,19 +1938,18 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
 	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
-	// #192: an enrollment started before the switch was turned off must not
-	// activate after it. Checked before the code is consumed.
-	if err := h.totpSvc.RefuseIfSwitchedOff(c.Request().Context(), userID, tenantID); err != nil {
+	// VerifyAndActivate re-checks the application's MFA policy in the same
+	// transaction as the activation (#192): an enrolment begun before the
+	// switch went off, the mode went 'disabled' or TOTP was removed is refused.
+	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
 		switch {
 		case errors.Is(err, auth.ErrMFASwitchedOff):
 			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrMFAMethodNotAllowed):
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 		case errors.Is(err, auth.ErrUserNotFound):
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
 		}
-		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("TOTP activate: MFA switch check failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "TOTP activation failed"})
-	}
-	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
 		if containsMsg(err, "invalid TOTP") {
 			return fail(c, http.StatusBadRequest, "mfa_code_invalid")
 		}
@@ -2200,14 +2203,8 @@ func (h *AuthHandler) EmailMFAActivate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required"})
 	}
 
-	// #192: re-read the switch before the code is consumed — see TOTPActivate.
-	if err := h.emailSvc.RefuseIfSwitchedOff(c.Request().Context(), userID, tenantID); err != nil {
-		if handled, resp := emailMFAErrorResponse(c, err); handled {
-			return resp
-		}
-		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA activate: MFA switch check failed")
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "email MFA activation failed"})
-	}
+	// ActivateEnrollment re-checks the application's MFA policy before the code
+	// is consumed and in the activating transaction (#192) — see TOTPActivate.
 	if err := h.emailSvc.ActivateEnrollment(c.Request().Context(), userID, req.Code); err != nil {
 		if handled, resp := emailMFAErrorResponse(c, err); handled {
 			return resp

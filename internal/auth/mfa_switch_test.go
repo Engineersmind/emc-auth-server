@@ -291,54 +291,119 @@ func TestMFASwitch_OffRefusesEnrolment(t *testing.T) {
 	}
 }
 
-// A self-service enrolment begun while the switch was ON must not activate
-// after it is turned OFF (PR #244 review). The activation guard refuses both
-// methods, and — because it runs before the code is checked — leaves the
-// emailed code unspent, so the enrolment completes once the switch is back on.
-func TestMFASwitch_OffRefusesSelfServiceActivation(t *testing.T) {
+// Re-sending the current switch value writes nothing (PR #244 review): the
+// handler audits only a real flip, so updated_by must keep naming whoever made
+// the last real change, and an app with no settings row gets none.
+func TestMFASwitch_NoOpLeavesUpdatedByAlone(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-noop")
+	someone := int64(424242)
+
+	// No row yet: "on" is the default, so re-sending it inserts nothing.
+	if _, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{Enabled: boolPtr(true)}, &someone); err != nil {
+		t.Fatalf("UpdateAppMFASettings(on, no row): %v", err)
+	}
+	var rows int
+	if err := f.pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM application_mfa_settings WHERE application_id = $1`, appID).Scan(&rows); err != nil {
+		t.Fatalf("count settings rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("no-op on an app without settings inserted %d row(s), want 0", rows)
+	}
+
+	// A real flip records the updater; re-sending it does not overwrite them.
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	var before time.Time
+	if err := f.pool.QueryRow(f.ctx, `SELECT updated_at FROM application_mfa_settings WHERE application_id = $1`, appID).Scan(&before); err != nil {
+		t.Fatalf("read updated_at: %v", err)
+	}
+	if _, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{Enabled: boolPtr(false)}, &someone); err != nil {
+		t.Fatalf("UpdateAppMFASettings(off again): %v", err)
+	}
+	var after time.Time
+	var updatedBy *int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT updated_at, updated_by FROM application_mfa_settings WHERE application_id = $1`, appID).Scan(&after, &updatedBy); err != nil {
+		t.Fatalf("read updated_at/updated_by: %v", err)
+	}
+	if !after.Equal(before) || updatedBy != nil {
+		t.Errorf("no-op rewrote the row: updated_at %v -> %v, updated_by = %v, want unchanged / nil", before, after, updatedBy)
+	}
+}
+
+// A self-service enrolment begun while the policy allowed it must not activate
+// after the admin turns the switch off, sets mode 'disabled', or removes the
+// method (PR #244 review). VerifyAndActivate / ActivateEnrollment re-check the
+// policy in the activating transaction, before the code is checked — so the
+// emailed code survives every refusal and completes the enrolment at the end.
+func TestMFASwitch_ActivationRechecksPolicy(t *testing.T) {
 	f := newMFAFixture(t)
 	app, appID := f.createApp(t, "switch-activate")
-	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional,
-		[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
-		t.Fatalf("SetAppMFAPolicy: %v", err)
+	both := []string{auth.MFAMethodTOTP, auth.MFAMethodEmail}
+	setPolicy := func(mode string, methods []string) {
+		t.Helper()
+		if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, mode, methods, nil); err != nil {
+			t.Fatalf("SetAppMFAPolicy(%s, %v): %v", mode, methods, err)
+		}
 	}
+	setPolicy(auth.MFAModeOptional, both)
 	email := uniqueEmail("switch-activate")
 	userID := f.registerAppUser(t, app, email, "Password123!")
 
 	result, err := f.totpSvc.EnrollUser(f.ctx, userID, f.tenantID, email, "")
 	if err != nil {
-		t.Fatalf("EnrollUser(on): %v", err)
+		t.Fatalf("EnrollUser: %v", err)
 	}
 	secret := secretFromOTPURI(t, result.OTPURI)
 	if err := f.emailSvc.BeginEnrollment(f.ctx, userID, f.tenantID, email); err != nil {
-		t.Fatalf("BeginEnrollment(on): %v", err)
+		t.Fatalf("BeginEnrollment: %v", err)
 	}
 	emailCode := f.mail.lastCode(t).Code
 
+	activateTOTP := func() error { return f.totpSvc.VerifyAndActivate(f.ctx, userID, codeFor(t, secret)) }
+	activateEmail := func() error { return f.emailSvc.ActivateEnrollment(f.ctx, userID, emailCode) }
+
+	// Switch off.
 	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
 		t.Fatalf("SetAppMFAEnabled(false): %v", err)
 	}
-	if err := f.totpSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); !errors.Is(err, auth.ErrMFASwitchedOff) {
-		t.Errorf("TOTP RefuseIfSwitchedOff(off) error = %v, want ErrMFASwitchedOff", err)
+	if err := activateTOTP(); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("TOTP activate (switch off) error = %v, want ErrMFASwitchedOff", err)
 	}
-	if err := f.emailSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); !errors.Is(err, auth.ErrMFASwitchedOff) {
-		t.Errorf("email RefuseIfSwitchedOff(off) error = %v, want ErrMFASwitchedOff", err)
+	if err := activateEmail(); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("email activate (switch off) error = %v, want ErrMFASwitchedOff", err)
 	}
-
 	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, true, nil); err != nil {
 		t.Fatalf("SetAppMFAEnabled(true): %v", err)
 	}
-	if err := f.totpSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); err != nil {
-		t.Fatalf("TOTP RefuseIfSwitchedOff(on) error = %v, want nil", err)
+
+	// Mode 'disabled'.
+	setPolicy(auth.MFAModeDisabled, both)
+	if err := activateTOTP(); !errors.Is(err, auth.ErrMFAEnrollmentDisabled) {
+		t.Errorf("TOTP activate (mode disabled) error = %v, want ErrMFAEnrollmentDisabled", err)
 	}
-	if err := f.emailSvc.RefuseIfSwitchedOff(f.ctx, userID, f.tenantID); err != nil {
-		t.Fatalf("email RefuseIfSwitchedOff(on) error = %v, want nil", err)
+	if err := activateEmail(); !errors.Is(err, auth.ErrMFAEnrollmentDisabled) {
+		t.Errorf("email activate (mode disabled) error = %v, want ErrMFAEnrollmentDisabled", err)
 	}
-	if err := f.totpSvc.VerifyAndActivate(f.ctx, userID, codeFor(t, secret)); err != nil {
-		t.Errorf("VerifyAndActivate(on) error = %v, want nil", err)
+
+	// Method removed from allowed_methods.
+	setPolicy(auth.MFAModeOptional, []string{auth.MFAMethodEmail})
+	if err := activateTOTP(); !errors.Is(err, auth.ErrMFAMethodNotAllowed) {
+		t.Errorf("TOTP activate (totp not allowed) error = %v, want ErrMFAMethodNotAllowed", err)
 	}
-	if err := f.emailSvc.ActivateEnrollment(f.ctx, userID, emailCode); err != nil {
-		t.Errorf("ActivateEnrollment(on) with the pre-switch-off code error = %v, want nil", err)
+	setPolicy(auth.MFAModeOptional, []string{auth.MFAMethodTOTP})
+	if err := activateEmail(); !errors.Is(err, auth.ErrMFAMethodNotAllowed) {
+		t.Errorf("email activate (email not allowed) error = %v, want ErrMFAMethodNotAllowed", err)
+	}
+
+	// Policy allows both again: both complete, the email code still unspent.
+	setPolicy(auth.MFAModeOptional, both)
+	if err := activateTOTP(); err != nil {
+		t.Errorf("TOTP activate (allowed) error = %v, want nil", err)
+	}
+	if err := activateEmail(); err != nil {
+		t.Errorf("email activate (allowed) with the original code error = %v, want nil", err)
 	}
 }
 

@@ -3514,13 +3514,15 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 	}
 
 	appIDStr := strconv.FormatInt(appID, 10)
+	// Both events are filed under the tenant that was acted on, not the
+	// caller's own, so a platform operator's change via /tenants/:tid/... lands
+	// in — and notifies — the right tenant, and the policy change and switch
+	// flip from one request end up in the same tenant's log.
 	if req.Mode != "" || magicLink {
-		h.auditAdminApp(c, claims, audit.ActionAdminMFAPolicyUpdated, "application", appIDStr, &appID)
+		h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminMFAPolicyUpdated, "application", appIDStr, &appID, nil)
 	}
 	// Only a real flip is audited (and so mailed): re-sending the current
 	// value is a no-op and must not page every administrator of the app.
-	// Filed under the tenant that was acted on, not the caller's own, so a
-	// platform operator's change lands in — and notifies — the right tenant.
 	if res.SwitchChanged() {
 		h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminMFASwitchChanged, "application", appIDStr, &appID,
 			map[string]any{"old_mfa_enabled": res.PrevEnabled, "new_mfa_enabled": res.NewEnabled})

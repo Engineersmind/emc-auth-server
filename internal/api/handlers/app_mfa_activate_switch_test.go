@@ -67,8 +67,9 @@ func TestSelfServiceActivate_RefusedWhileSwitchedOff(t *testing.T) {
 	})
 	h := NewAuthHandler(nil, nil, auditLog, logger).WithTOTP(totpSvc).WithEmailMFA(emailSvc)
 
-	if _, err := totpSvc.SetAppMFAEnabled(ctx, tenantID, appID, false, nil); err != nil {
-		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	off := false
+	if _, err := totpSvc.UpdateAppMFASettings(ctx, tenantID, appID, auth.AppMFAUpdate{Enabled: &off}, nil); err != nil {
+		t.Fatalf("UpdateAppMFASettings(off): %v", err)
 	}
 
 	claims := &auth.Claims{
