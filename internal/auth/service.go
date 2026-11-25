@@ -1999,6 +1999,19 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 			return nil, nil
 		}
 		mode, allowedMethods = cfg.Mode, cfg.Methods
+		// Role rules (#195): a user holding a role the application lists is
+		// treated as 'required'. Only an 'optional' app needs the lookup —
+		// 'required' already is, and rules do not apply under 'disabled'.
+		// Read from the database, never the token; a read error fails closed.
+		if mode == MFAModeOptional {
+			ruleRole, ruleErr := mfaRuleRoleFor(ctx, s.pool, userID, tenantID, appRowID)
+			if ruleErr != nil {
+				return nil, ruleErr
+			}
+			if ruleRole != "" {
+				mode = MFAModeRequired
+			}
+		}
 	}
 
 	// The application policy is authoritative: a factor is only challenged/sent
@@ -2075,6 +2088,14 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		// Fail loudly rather than hand the user an enrollment challenge they
 		// cannot complete: the policy needs a non-email method to be allowed.
 		return nil, ErrPasswordlessMFAConflict
+	}
+	// Offer only methods this deployment can run (#195): an email enrolment
+	// on a server without the email MFA service is a dead end, not a choice.
+	enrollmentMethods = s.runnableMFAMethods(enrollmentMethods)
+	if len(enrollmentMethods) == 0 {
+		s.logger.Error().Int64("tenant_id", tenantID).Int64("application_id", appRowID).Strs("allowed", allowedMethods).
+			Msg("app MFA: enrolment is required but no allowed method is configured on this deployment — sign-in refused")
+		return nil, ErrAppMFAUnavailable
 	}
 	challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
 	if err != nil {

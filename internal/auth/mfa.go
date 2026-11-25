@@ -729,6 +729,16 @@ type userMFAContext struct {
 	enabled        bool
 	mode           string
 	allowedMethods []string
+	// ruleRole is the name of a role the user holds that the application's
+	// MFA role rules list (#195), "" when none. Read from the database.
+	ruleRole string
+}
+
+// roleRuleApplies reports whether an MFA role rule covers this user right now:
+// the user holds a listed role, the switch is on and the mode is not
+// 'disabled' (#195).
+func (uc *userMFAContext) roleRuleApplies() bool {
+	return uc.appRowID != nil && uc.enabled && uc.mode != MFAModeDisabled && uc.ruleRole != ""
 }
 
 // switchedOff reports whether the user belongs to an application whose MFA
@@ -738,10 +748,11 @@ func (uc *userMFAContext) switchedOff() bool {
 }
 
 // requiredByPolicy reports whether the application mandates MFA for this
-// user right now: mode 'required' AND the switch on. While the switch is off
-// nothing is required, so the last-factor removal guard stands down.
+// user right now: the switch on AND (mode 'required' OR an MFA role rule covers
+// the user, #195). While the switch is off nothing is required, so the
+// last-factor removal guard stands down.
 func (uc *userMFAContext) requiredByPolicy() bool {
-	return uc.appRowID != nil && uc.enabled && uc.mode == MFAModeRequired
+	return (uc.appRowID != nil && uc.enabled && uc.mode == MFAModeRequired) || uc.roleRuleApplies()
 }
 
 // methodPermitted reports whether the user may use the given MFA method:
@@ -761,13 +772,25 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	var enabled *bool
 	var mode *string
 	var methods []string
+	var ruleRole *string
+	// The role-rule subquery reads both role sources (users.role_id and
+	// user_roles) — see mfaRuleRoleFor, whose predicate this mirrors.
 	err := pool.QueryRow(ctx, `
-		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods
+		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods,
+		       (SELECT r.name
+		        FROM application_mfa_role_rules rr
+		        JOIN roles r ON r.id = rr.role_id AND r.deleted_at IS NULL
+		        WHERE rr.application_id = u.application_id AND rr.tenant_id = u.tenant_id
+		          AND (rr.role_id = u.role_id
+		               OR EXISTS (SELECT 1 FROM user_roles ur
+		                          WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id AND ur.role_id = rr.role_id))
+		        ORDER BY r.name
+		        LIMIT 1)
 		FROM users u
 		LEFT JOIN oauth_clients oc ON oc.id = u.application_id
 		LEFT JOIN application_mfa_settings ams ON ams.application_id = u.application_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods)
+	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods, &ruleRole)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
@@ -785,6 +808,9 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	}
 	if len(methods) > 0 {
 		uc.allowedMethods = methods
+	}
+	if ruleRole != nil {
+		uc.ruleRole = *ruleRole
 	}
 	return uc, nil
 }
@@ -929,7 +955,8 @@ func emailMFAActive(ctx context.Context, pool *pgxpool.Pool, userID int64) (bool
 }
 
 // DisableUser is the user-initiated TOTP disable path: policy-checked, then
-// code-verified via Disable. Users of a 'required' application may only
+// code-verified via Disable. Users of a 'required' application, or covered by an
+// MFA role rule (#195), may only
 // remove TOTP while another active second factor (email MFA) remains — the
 // last factor cannot be removed under a mandate. While the application's MFA
 // master switch is off there is no mandate, so the guard does not apply.

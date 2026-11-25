@@ -109,6 +109,9 @@ Notes:
   come back; it cannot be exchanged again to skip the challenge.
 - The completed session still carries `gty: "social"`; its `amr` adds
   `otp` and `mfa` to `fed`.
+- MFA role rules (`/mfa/role-rules`, `APP_MFA_INTEGRATION.md` §2.3c) cover social
+  sign-ins **only** under `enforce`; with `trust` a role-covered user signing
+  in with Google is not challenged.
 - The switch (`mfa_enabled`), `mode` and `allowed_methods` apply exactly as for
   password login. With `trust`, none of them apply to social sign-in.
 - Enable `enforce` only after your callback handler understands the challenge

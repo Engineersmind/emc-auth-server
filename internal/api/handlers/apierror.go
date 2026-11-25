@@ -158,6 +158,12 @@ var errorMessages = map[string]string{
 	// Application MFA gate cannot run a due challenge (#193).
 	"app_mfa_unavailable": "This application requires two-factor authentication, which isn't available on this server right now. Try again later or contact the application's administrator.",
 
+	// Application MFA role rules (#195).
+	"mfa_role_rules_inactive":    "Role rules can only be set while two-factor authentication is on for this application and its mode isn't disabled. Turn it on first, then add the rules.",
+	"mfa_role_rule_invalid_role": "Every role in a two-factor rule must be one of this application's own roles. Check the role list and try again.",
+	"mfa_role_rules_too_many":    "That's more role rules than one application can have. Remove some roles and try again.",
+	"role_in_mfa_rule":           "This role is named by a two-factor authentication rule. Remove it from the application's role rules before deleting the role.",
+
 	// --- Passwords -------------------------------------------------------
 	"password_too_short":    "Choose a password of at least 8 characters.",
 	"password_incorrect":    "That isn't your current password.",

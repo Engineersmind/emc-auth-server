@@ -1455,6 +1455,132 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/mfa/role-rules": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the roles whose holders must use MFA on this application, as if its mode were 'required'. Rules apply only while the application's MFA switch (mfa_enabled) is on and its mode is not 'disabled'. They cover password, magic-link and email-code sign-ins, and social / unverified-passkey sign-ins only when federated_mfa is 'enforce'.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "List application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Replace application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "The complete new list of role ids",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateMFARoleRulesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "mfa_role_rules_inactive",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/passkey-policy": {
             "get": {
                 "security": [
@@ -8474,6 +8600,12 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "409": {
+                        "description": "role_in_mfa_rule - an application MFA role rule lists this role; remove the rule first",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
                     }
                 }
             }
@@ -10325,6 +10457,132 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/mfa/role-rules": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the roles whose holders must use MFA on this application, as if its mode were 'required'. Rules apply only while the application's MFA switch (mfa_enabled) is on and its mode is not 'disabled'. They cover password, magic-link and email-code sign-ins, and social / unverified-passkey sign-ins only when federated_mfa is 'enforce'.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "List application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Replace application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "The complete new list of role ids",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateMFARoleRulesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "mfa_role_rules_inactive",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -12292,6 +12550,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "409": {
+                        "description": "role_in_mfa_rule - an application MFA role rule lists this role; remove the rule first",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -16510,6 +16774,24 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.MFARoleRule": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "created_by": {
+                    "description": "CreatedBy is the users.id of the administrator who added the rule; empty\nfor a service token or an account since deleted.",
+                    "type": "string"
+                },
+                "role_id": {
+                    "type": "string"
+                },
+                "role_name": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.MFAStatus": {
             "type": "object",
             "properties": {
@@ -16526,6 +16808,10 @@ const docTemplate = `{
                 "mfa_required": {
                     "description": "MFARequired is true when the caller is an administrator and MFA is\ntherefore mandatory for them.",
                     "type": "boolean"
+                },
+                "mfa_required_by": {
+                    "description": "MFARequiredBy is \"role:\u003cname\u003e\" when an application MFA role rule covers\nthe caller (#195): they hold that role, the switch is on and the mode is\nnot 'disabled', so MFA is required of them whatever Mode says and they\ncannot remove their last factor. Omitted otherwise.",
+                    "type": "string"
                 },
                 "mode": {
                     "description": "Mode is the caller's effective MFA mode: the application's mode for an\napplication user, \"required\" for an administrator, \"optional\" for a\ntenant-level user.",
@@ -18029,6 +18315,20 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.MFARoleRulesResponse": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string"
+                },
+                "rules": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.MFARoleRule"
+                    }
+                }
+            }
+        },
         "handlers.MagicLinkRequest": {
             "type": "object",
             "properties": {
@@ -18801,6 +19101,17 @@ const docTemplate = `{
             "properties": {
                 "origins": {
                     "description": "e.g. [\"https://app.example.com\"]",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "handlers.UpdateMFARoleRulesRequest": {
+            "type": "object",
+            "properties": {
+                "role_ids": {
                     "type": "array",
                     "items": {
                         "type": "string"

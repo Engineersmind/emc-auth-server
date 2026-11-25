@@ -502,6 +502,11 @@ type MFAStatus struct {
 	// tenant-level user.
 	Mode    string            `json:"mode"`
 	Methods []MFAMethodStatus `json:"methods"`
+	// MFARequiredBy is "role:<name>" when an application MFA role rule covers
+	// the caller (#195): they hold that role, the switch is on and the mode is
+	// not 'disabled', so MFA is required of them whatever Mode says and they
+	// cannot remove their last factor. Omitted otherwise.
+	MFARequiredBy string `json:"mfa_required_by,omitempty"`
 }
 
 // MyMFAStatus reports the caller's MFA state across every method.
@@ -550,6 +555,9 @@ func (s *AuthService) MyMFAStatus(ctx context.Context, userID, tenantID int64, p
 	case uc.appRowID != nil:
 		out.MFAEnabled = uc.enabled
 		out.Mode = uc.mode
+		if uc.roleRuleApplies() {
+			out.MFARequiredBy = "role:" + uc.ruleRole
+		}
 		allowed = func(m string) bool {
 			return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.allowedMethods, m)
 		}

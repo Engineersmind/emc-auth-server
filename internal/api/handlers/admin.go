@@ -1149,6 +1149,7 @@ func (h *AdminHandler) UpdateRolePermissions(c echo.Context) error {
 // @Param        id   path      string  true  "Role ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
+// @Failure      409  {object}  APIError  "role_in_mfa_rule - an application MFA role rule lists this role; remove the rule first"
 // @Router       /api/v1/roles/{id} [delete]
 func (h *AdminHandler) DeleteRole(c echo.Context) error {
 	tenantID, claims, err := h.tenantFromClaimsOrPath(c)
@@ -1165,6 +1166,9 @@ func (h *AdminHandler) DeleteRole(c echo.Context) error {
 	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found or is a system role"})
+		}
+		if errors.Is(err, admin.ErrRoleInMFARule) {
+			return fail(c, http.StatusConflict, "role_in_mfa_rule")
 		}
 		h.logger.Error().Err(err).Msg("admin: delete role failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})
@@ -2930,6 +2934,7 @@ func (h *AdminHandler) TenantUpdateRolePermissions(c echo.Context) error {
 // @Param        rid  path      string  true  "Role ID"
 // @Success      200  {object}  map[string]string
 // @Failure      404  {object}  map[string]string
+// @Failure      409  {object}  APIError  "role_in_mfa_rule - an application MFA role rule lists this role; remove the rule first"
 // @Router       /api/v1/tenants/{tid}/roles/{rid} [delete]
 func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 	tid, err := targetTenantID(c)
@@ -2944,6 +2949,9 @@ func (h *AdminHandler) TenantDeleteRole(c echo.Context) error {
 	if err != nil {
 		if errors.Is(err, admin.ErrNotFound) {
 			return c.JSON(http.StatusNotFound, map[string]string{"error": "role not found or is a system role"})
+		}
+		if errors.Is(err, admin.ErrRoleInMFARule) {
+			return fail(c, http.StatusConflict, "role_in_mfa_rule")
 		}
 		h.logger.Error().Err(err).Msg("admin: tenant delete role failed")
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to delete role"})

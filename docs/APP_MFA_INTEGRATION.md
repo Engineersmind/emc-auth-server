@@ -145,7 +145,7 @@ application only**. Where a second factor is due they answer exactly like
 The `login_code` is spent at the exchange either way; the challenge token
 replaces it. The finished session keeps the original grant (`gty: "social"` /
 `"passkey"`) and its `amr` records the extra factor (`fed`/`hwk` + `otp`,
-`mfa`). Everything else — switch off, `mode`, `allowed_methods` —
+`mfa`). Everything else — switch off, `mode`, `allowed_methods`, role rules (§2.3c) —
 applies to these sign-ins exactly as to password login. Tenant-level (console)
 social and passkey sign-ins are not affected.
 
@@ -153,6 +153,45 @@ Every real change writes an `admin.mfa_federated_changed` audit event
 (`old_federated_mfa`, `new_federated_mfa`). Turn `enforce` on only once your
 social-callback and passkey code handles the challenge responses above — a
 client that only knows the token shape will treat them as a failure.
+
+### 2.3c Role-based MFA rules (`/mfa/role-rules`)
+Require MFA only of users holding certain roles, on an otherwise `optional`
+application.
+```
+GET /api/v1/applications/{appID}/mfa/role-rules            Bearer <admin>
+→ 200 { "application_id": "149",
+        "rules": [ { "role_id": "12", "role_name": "finance", "created_at": "…", "created_by": "7" } ] }
+
+PUT /api/v1/applications/{appID}/mfa/role-rules            Bearer <admin>
+{ "role_ids": ["12", "15"] }                                # the WHOLE new list; [] clears
+→ 200 (same shape as GET)
+```
+Also under `/api/v1/tenants/{tid}/applications/{appID}/mfa/role-rules`, with
+the same permissions as the `/mfa` routes.
+
+- A user holding **any** listed role — as their primary role or any
+  additional grant — is treated as `required`: challenged if enrolled, forced
+  to enrol otherwise, and unable to remove their last factor. Roles are read
+  from the database at each login, never from the token.
+- Rules apply only while `mfa_enabled` is true and `mode` is not `disabled`.
+  Under `required` they add nothing (everyone is already covered).
+- **Rules cover social and passkey sign-ins only when `federated_mfa` is
+  `enforce`** (§2.3b). With `trust`, a covered user signing in with Google or
+  a passkey is not challenged.
+- Only the application's own live roles are accepted → otherwise
+  **400 `mfa_role_rule_invalid_role`**. At most 100 roles → **400
+  `mfa_role_rules_too_many`**.
+- A non-empty list while the switch is off or the mode is `disabled` →
+  **409 `mfa_role_rules_inactive`**. Clearing (`[]`) is always accepted.
+- A role listed by a rule cannot be deleted → `DELETE /roles/{id}` answers
+  **409 `role_in_mfa_rule`**; remove the rule first.
+- Forced enrolment offers only allowed methods this server can run; if none
+  can run, sign-in is refused with **503 `app_mfa_unavailable`**.
+- Every real change writes `admin.mfa_role_rules_set` (`old_role_ids`,
+  `new_role_ids`, `old_role_names`, `new_role_names`). Changes apply at the
+  next login.
+- `GET /auth/me/mfa` for a covered user reports
+  `"mfa_required_by": "role:<name>"`.
 
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```
@@ -279,11 +318,11 @@ matches your application.
 | Purpose | Endpoint | Notes |
 |---|---|---|
 | My MFA state | `GET /api/v1/auth/otp/status` | `{ enrolled, active, backup_codes_remaining, email_active, mfa_enabled }` — warn user when codes run low; hide MFA settings when `mfa_enabled` is false |
-| Which methods I may use | `GET /api/v1/auth/me/mfa` | `{ mfa_required, mfa_enabled, mode, methods: [{ method, allowed, available, active }] }`. For an app user `allowed` = `mfa_enabled` **and** `mode != "disabled"` **and** method in the app's `allowed_methods` — only offer methods with `allowed: true` |
+| Which methods I may use | `GET /api/v1/auth/me/mfa` | `{ mfa_required, mfa_enabled, mode, mfa_required_by?, methods: [{ method, allowed, available, active }] }`. `mfa_required_by` is `"role:<name>"` when an MFA role rule covers the user (§2.3c). For an app user `allowed` = `mfa_enabled` **and** `mode != "disabled"` **and** method in the app's `allowed_methods` — only offer methods with `allowed: true` |
 | Enroll TOTP | `POST /api/v1/auth/otp/enroll` body `{}` or `{ "code" }` | 403 `mfa_switched_off` if the app's switch is off; 403 if app mode `disabled` or `totp` not allowed. **Re-enroll while active (new phone) requires current TOTP/backup code in `code`** |
 | Activate TOTP | `POST /api/v1/auth/otp/activate` `{ "code" }` | first authenticator code |
 | Regenerate backup codes | `POST /api/v1/auth/otp/backup-codes` `{ "code" }` | → `{ "backup_codes": [×8] }`; TOTP secret unchanged; all old codes die |
-| Disable TOTP | `DELETE /api/v1/auth/otp` `{ "code" }` | 403 under `required` unless email MFA remains active (last-factor guard; lifted while the switch is off) |
+| Disable TOTP | `DELETE /api/v1/auth/otp` `{ "code" }` | 403 under `required` or an MFA role rule unless email MFA remains active (last-factor guard; lifted while the switch is off) |
 | Enroll email MFA | `POST /api/v1/auth/otp/email/enroll` | sends verification code; 403 `mfa_switched_off` if the switch is off; 403 if `disabled`/method not allowed |
 | Activate email MFA | `POST /api/v1/auth/otp/email/activate` `{ "code" }` | inbox proven before it becomes a factor |
 | Send proof code | `POST /api/v1/auth/otp/email/send` | fresh code for the disable action below |
