@@ -113,7 +113,7 @@ value is a no-op: no audit, no email.
 **Changes apply at the next login.** Existing sessions are not re-checked:
 a session issued while MFA was off stays valid until its refresh token expires
 (up to 30 days), and turning MFA off does not end sessions that did MFA.
-App-wide session revoke is tracked in #196.
+To apply a tightened policy now, revoke the application's sessions (§2.3d).
 
 Social and passkey sign-ins follow the switch and `mode` only when the
 application opts in with `federated_mfa: "enforce"` (§2.3b).
@@ -198,6 +198,24 @@ the same permissions as the `/mfa` routes.
   next login.
 - `GET /auth/me/mfa` for a covered user reports
   `"mfa_required_by": "role:<name>"`.
+
+### 2.3d Revoke every session of the application (#196)
+Policy changes never end sessions by themselves. After turning MFA on or
+tightening it, an administrator can sign every user of the application out so
+each one meets the new policy at their next login:
+```
+POST /api/v1/applications/{appID}/sessions/revoke          Bearer <admin>
+POST /api/v1/tenants/{tid}/applications/{appID}/sessions/revoke
+→ 200 { "application_id": "149", "revoked": 42, "failed": 0 }
+```
+- Same permission as `PUT .../mfa` (`apps:write`).
+- Ends every live session bound to the application in this tenant (its own
+  users and tenant-level users who signed in through it). Refresh tokens are
+  revoked (`revoked_reason = admin_app_revoke_all`) and outstanding access
+  tokens are denied immediately.
+- Idempotent; `failed > 0` (logged server-side) is worth a retry. 503
+  `service_unavailable` when the server cannot deny access tokens.
+- Audited as `admin.application_sessions_revoked` with `revoked` / `failed`.
 
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```

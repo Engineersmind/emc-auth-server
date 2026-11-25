@@ -3375,6 +3375,19 @@ definitions:
       token:
         type: string
     type: object
+  handlers.RevokeApplicationSessionsResponse:
+    properties:
+      application_id:
+        type: string
+      failed:
+        description: |-
+          Failed is how many sessions could not be revoked (logged server-side).
+          Non-zero is worth a retry; the call is idempotent.
+        type: integer
+      revoked:
+        description: Revoked is how many live sessions this call ended.
+        type: integer
+    type: object
   handlers.SelectOrganizationRequest:
     properties:
       organization:
@@ -5511,6 +5524,49 @@ paths:
       summary: Suggest an application's server addresses
       tags:
       - admin-rate-limits
+  /api/v1/applications/{appID}/sessions/revoke:
+    post:
+      description: 'Ends every live session bound to this application inside the tenant
+        — its own users and tenant-level users who signed in through it. Each session''s
+        refresh tokens are revoked and its outstanding access tokens are denied immediately,
+        so every user must sign in again and meets the application''s CURRENT MFA
+        policy. MFA policy changes never revoke sessions by themselves; this is the
+        manual action to apply a tightened policy now. Idempotent: a second call revokes
+        nothing more. Audited as admin.application_sessions_revoked with the count.'
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.RevokeApplicationSessionsResponse'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: service_unavailable
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      security:
+      - BearerAuth: []
+      summary: Revoke every session of an application
+      tags:
+      - admin-applications
   /api/v1/applications/{appID}/user-limits:
     get:
       description: Lists every per-user limit on the application end-user routes (sign
@@ -12272,6 +12328,49 @@ paths:
       summary: Suggest an application's server addresses
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/sessions/revoke:
+    post:
+      description: 'Ends every live session bound to this application inside the tenant
+        — its own users and tenant-level users who signed in through it. Each session''s
+        refresh tokens are revoked and its outstanding access tokens are denied immediately,
+        so every user must sign in again and meets the application''s CURRENT MFA
+        policy. MFA policy changes never revoke sessions by themselves; this is the
+        manual action to apply a tightened policy now. Idempotent: a second call revokes
+        nothing more. Audited as admin.application_sessions_revoked with the count.'
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.RevokeApplicationSessionsResponse'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: service_unavailable
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      security:
+      - BearerAuth: []
+      summary: Revoke every session of an application
+      tags:
+      - admin-applications
   /api/v1/tenants/{tid}/applications/{appID}/user-limits:
     get:
       description: Lists every per-user limit on the application end-user routes (sign

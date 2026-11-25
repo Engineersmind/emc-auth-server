@@ -1782,6 +1782,9 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appAppsWrite)
 	adminGroup.GET("/tenants/:tid/applications/:appID/mfa/role-rules", adminHandler.GetApplicationMFARoleRules, appAppsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa/role-rules", adminHandler.UpdateApplicationMFARoleRules, appAppsWrite)
+	// Revoke every live session of the application (#196): the manual lever
+	// to apply a tightened MFA policy now. Same permission as the MFA PUT.
+	adminGroup.POST("/tenants/:tid/applications/:appID/sessions/revoke", adminHandler.RevokeApplicationSessions, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, appUsersWrite)
 
 	// Per-scope passkey policy under the canonical family (issue #112).
@@ -2064,6 +2067,7 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	adminGroup.PUT("/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appsWrite)
 	adminGroup.GET("/applications/:appID/mfa/role-rules", adminHandler.GetApplicationMFARoleRules, appsRead)
 	adminGroup.PUT("/applications/:appID/mfa/role-rules", adminHandler.UpdateApplicationMFARoleRules, appsWrite)
+	adminGroup.POST("/applications/:appID/sessions/revoke", adminHandler.RevokeApplicationSessions, appsWrite)
 	adminGroup.DELETE("/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, usersWrite)
 
 	// Per-scope passkey policy — flat aliases of the canonical

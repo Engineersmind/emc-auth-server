@@ -317,6 +317,10 @@ const (
 	// rules (#195): the roles whose holders must use MFA. Metadata:
 	// old_role_ids, new_role_ids, old_role_names, new_role_names.
 	ActionAdminMFARoleRulesSet = "admin.mfa_role_rules_set"
+	// ActionAdminAppSessionsRevoked is an administrator ending every live
+	// session of one application at once (#196). Metadata: application_id,
+	// revoked (count ended), failed (count that errored).
+	ActionAdminAppSessionsRevoked = "admin.application_sessions_revoked"
 
 	// Admin — mandatory administrator MFA policy (migration 00094): which
 	// methods satisfy the requirement, per tenant and for the platform.

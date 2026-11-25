@@ -2280,6 +2280,64 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/applications/{appID}/sessions/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. Idempotent: a second call revokes nothing more. Audited as admin.application_sessions_revoked with the count.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Revoke every session of an application",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RevokeApplicationSessionsResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "service_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/applications/{appID}/user-limits": {
             "get": {
                 "security": [
@@ -12072,6 +12130,64 @@ const docTemplate = `{
                 }
             }
         },
+        "/api/v1/tenants/{tid}/applications/{appID}/sessions/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. Idempotent: a second call revokes nothing more. Audited as admin.application_sessions_revoked with the count.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Revoke every session of an application",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RevokeApplicationSessionsResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "service_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/tenants/{tid}/applications/{appID}/user-limits": {
             "get": {
                 "security": [
@@ -18738,6 +18854,22 @@ const docTemplate = `{
                 },
                 "token": {
                     "type": "string"
+                }
+            }
+        },
+        "handlers.RevokeApplicationSessionsResponse": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string"
+                },
+                "failed": {
+                    "description": "Failed is how many sessions could not be revoked (logged server-side).\nNon-zero is worth a retry; the call is idempotent.",
+                    "type": "integer"
+                },
+                "revoked": {
+                    "description": "Revoked is how many live sessions this call ended.",
+                    "type": "integer"
                 }
             }
         },
