@@ -40,7 +40,13 @@
 //     not "principal" but "account".
 package handlers
 
-import "github.com/labstack/echo/v4"
+import (
+	"errors"
+	"net/http"
+
+	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/labstack/echo/v4"
+)
 
 // APIError is the body of every failed response.
 type APIError struct {
@@ -149,6 +155,9 @@ var errorMessages = map[string]string{
 	"mfa_switch_off_service_token": "Turning two-factor authentication off needs a signed-in administrator. Service and API-key tokens can only turn it on.",
 	"mfa_switch_off_stale_session": "To turn two-factor authentication off, sign in again with two-factor authentication and retry within 10 minutes.",
 
+	// Application MFA gate cannot run a due challenge (#193).
+	"app_mfa_unavailable": "This application requires two-factor authentication, which isn't available on this server right now. Try again later or contact the application's administrator.",
+
 	// --- Passwords -------------------------------------------------------
 	"password_too_short":    "Choose a password of at least 8 characters.",
 	"password_incorrect":    "That isn't your current password.",
@@ -215,4 +224,16 @@ var errorMessages = map[string]string{
 	"import_job_missing": "We couldn't find that import. It may have finished and been cleared.",
 	"import_job_invalid": "That import reference isn't valid.",
 	"import_failed":      "We couldn't run that import. Try again — if it keeps happening, contact your administrator.",
+}
+
+// appMFAUnavailableResponse answers a sign-in the application MFA gate refused
+// because a second factor is due and this deployment cannot run the challenge
+// (#193). 503, not 401: the credentials were right, and telling the user they
+// were wrong would send them to reset a password that works. Reports false when
+// err is anything else, so callers fall through to their own mapping.
+func appMFAUnavailableResponse(c echo.Context, err error) (bool, error) {
+	if !errors.Is(err, auth.ErrAppMFAUnavailable) {
+		return false, nil
+	}
+	return true, fail(c, http.StatusServiceUnavailable, "app_mfa_unavailable")
 }

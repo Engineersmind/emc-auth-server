@@ -3055,6 +3055,12 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
                     }
                 }
             }
@@ -3214,6 +3220,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -4255,6 +4267,12 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
                     }
                 }
             }
@@ -4847,6 +4865,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -6772,6 +6796,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -16220,6 +16250,20 @@ const docTemplate = `{
                 },
                 "updated_at": {
                     "type": "string"
+                },
+                "variables": {
+                    "description": "Variables lists every variable a template of this type may reference, so\nthe editor shows what the server really renders. Read-only.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/mailer.TemplateVariable"
+                    }
+                },
+                "warnings": {
+                    "description": "Warnings is set only on a save response: problems found in the template just\nstored (for example an unknown variable, which would make every send fall\nback to the built-in). The save itself still succeeded.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },
@@ -19030,6 +19074,22 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "publicKey": {}
+            }
+        },
+        "mailer.TemplateVariable": {
+            "type": "object",
+            "properties": {
+                "availability": {
+                    "description": "Availability is VarAlways when every send fills it, or VarOptional when it\ncan be empty — in which case the template should wrap it in {{if}} so the\nsurrounding row disappears instead of rendering blank.",
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "name": {
+                    "description": "Name is the reference as written in a template, e.g. \"{{.Link}}\".",
+                    "type": "string"
+                }
             }
         },
         "saml.SAMLConfig": {

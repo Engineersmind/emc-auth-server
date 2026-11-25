@@ -180,6 +180,7 @@ POST /api/v1/auth/apps/login                    Basic <app credentials>
 | 200 | `requires_otp: true, otp_session_token, methods[], expires_in: 300` | second factor needed → §3.3. If `methods` includes `"email"`, a code was already emailed |
 | 403 | `mfa_enrollment_required: true, enrollment_token, allowed_methods[], expires_in: 600` | `required` app + not enrolled → §3.4 |
 | 401 | `error` | bad user or app credentials |
+| 503 | `error: "app_mfa_unavailable"` | a second factor is due (user has an active permitted factor, or the app is `required`) but this server cannot run the challenge (no Redis / TOTP service, or none of the user's methods is configured). **No tokens.** Not a credential failure — do not tell the user their password is wrong |
 | 429 | `error, retry_after` | rate limited (5/min/IP, 10/min/client) |
 
 ### 3.3 Complete the OTP challenge (enrolled user)
@@ -263,6 +264,7 @@ switch on `error`, never parse `message`. MFA switch codes:
 | `mfa_switched_off` | 403 | enrolment attempted while the app's MFA switch is off — self-service enrolment, or a forced-enrolment token (`/auth/login/mfa/enroll`, `/email`, `/activate`) minted before the switch was turned off. The enrolment token is invalidated; sign in again |
 | `mfa_switch_off_service_token` | 403 | a service/API-key token tried to turn MFA off |
 | `mfa_switch_off_stale_session` | 403 | turning MFA off without an MFA sign-in in the last 10 minutes |
+| `app_mfa_unavailable` | 503 | sign-in refused: the application requires a second factor at this login and the server cannot run it. Returned by every first factor that goes through the app MFA gate (password, magic link, email code). Fail-closed since #193: before it, such a server issued tokens without MFA |
 
 ---
 

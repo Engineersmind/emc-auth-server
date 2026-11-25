@@ -1624,6 +1624,21 @@ definitions:
         type: string
       updated_at:
         type: string
+      variables:
+        description: |-
+          Variables lists every variable a template of this type may reference, so
+          the editor shows what the server really renders. Read-only.
+        items:
+          $ref: '#/definitions/mailer.TemplateVariable'
+        type: array
+      warnings:
+        description: |-
+          Warnings is set only on a save response: problems found in the template just
+          stored (for example an unknown variable, which would make every send fall
+          back to the built-in). The save itself still succeeded.
+        items:
+          type: string
+        type: array
     type: object
   auth.EnrollResult:
     properties:
@@ -3859,6 +3874,20 @@ definitions:
         type: string
       publicKey: {}
     type: object
+  mailer.TemplateVariable:
+    properties:
+      availability:
+        description: |-
+          Availability is VarAlways when every send fills it, or VarOptional when it
+          can be empty — in which case the template should wrap it in {{if}} so the
+          surrounding row disappears instead of rendering blank.
+        type: string
+      description:
+        type: string
+      name:
+        description: Name is the reference as written in a template, e.g. "{{.Link}}".
+        type: string
+    type: object
   saml.SAMLConfig:
     properties:
       certificate:
@@ -5920,6 +5949,11 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "503":
+          description: app_mfa_unavailable - the application requires a second factor
+            this server cannot run; no tokens issued
+          schema:
+            $ref: '#/definitions/handlers.APIError'
       summary: Login an end user via application credentials
       tags:
       - AUTH
@@ -6036,6 +6070,11 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "503":
+          description: app_mfa_unavailable - the application requires a second factor
+            this server cannot run; no tokens issued
+          schema:
+            $ref: '#/definitions/handlers.APIError'
       summary: Verify a magic sign-in link
       tags:
       - AUTH
@@ -6766,6 +6805,11 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "503":
+          description: app_mfa_unavailable - the application requires a second factor
+            this server cannot run; no tokens issued
+          schema:
+            $ref: '#/definitions/handlers.APIError'
       summary: Verify a code to sign in or sign up
       tags:
       - AUTH
@@ -7200,6 +7244,11 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "503":
+          description: app_mfa_unavailable - the application requires a second factor
+            this server cannot run; no tokens issued
+          schema:
+            $ref: '#/definitions/handlers.APIError'
       summary: Login
       tags:
       - AUTH
@@ -8549,6 +8598,11 @@ paths:
             additionalProperties:
               type: string
             type: object
+        "503":
+          description: app_mfa_unavailable - the application requires a second factor
+            this server cannot run; no tokens issued
+          schema:
+            $ref: '#/definitions/handlers.APIError'
       summary: Cookie-based login
       tags:
       - auth-session

@@ -108,6 +108,16 @@ var ErrMFAMethodNotAllowed = errors.New("this MFA method is not allowed for this
 // administrator set.
 var ErrMFASwitchedOff = errors.New("MFA is switched off for this application")
 
+// ErrAppMFAUnavailable is returned by the application MFA gate when the
+// application's policy requires a second factor at this login — the user has an
+// active factor the application permits, or the mode is 'required' — but this
+// deployment cannot run the challenge: no Redis to hold it, no TOTP service to
+// complete it, or none of the methods the user could use is configured here.
+// The login is refused and no tokens are issued (#193). The application-level
+// twin of ErrAdminMFAUnavailable: failing open on a configuration gap would make
+// the requirement optional in exactly the deployments least likely to notice.
+var ErrAppMFAUnavailable = errors.New("the application requires two-factor authentication, which is not available on this server")
+
 // ErrMFARequiredByPolicy is returned when a user attempts to remove their last
 // active second factor while their application's MFA mode is 'required'.
 var ErrMFARequiredByPolicy = errors.New("MFA is required by this application's policy and cannot be disabled")
@@ -169,8 +179,17 @@ type AppMFAConfig struct {
 // Absence of a policy row means switch on + 'optional' + TOTP-only
 // (pre-feature behaviour). This is the login hot-path read — one PK lookup.
 func (s *TOTPService) GetAppMFAConfig(ctx context.Context, appRowID int64) (AppMFAConfig, error) {
+	return loadAppMFAConfig(ctx, s.pool, appRowID)
+}
+
+// loadAppMFAConfig is GetAppMFAConfig over any querier. Package-level so the
+// login gate can read the policy with only the database pool: whether a
+// challenge is due must be decidable even on a deployment that has no TOTP
+// service or Redis, which is exactly when the gate has to refuse rather than
+// wave the login through (#193).
+func loadAppMFAConfig(ctx context.Context, q mfaSettingsQuerier, appRowID int64) (AppMFAConfig, error) {
 	cfg := AppMFAConfig{}
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT mfa_enabled, mode, allowed_methods FROM application_mfa_settings WHERE application_id = $1
 	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods)
 	if err != nil {

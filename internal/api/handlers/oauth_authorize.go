@@ -440,6 +440,14 @@ func (h *OAuthAuthorizeHandler) LoginSubmit(c echo.Context) error {
 			countAuthorize(authzOutcomeMFAEnrollment)
 			return h.renderEnrollmentDeadEnd(c)
 		}
+		// A second factor is due and this deployment cannot run it (#193). The
+		// password was right, so "incorrect email or password" would be a lie
+		// that sends the user to reset a password that works.
+		if errors.Is(err, auth.ErrAppMFAUnavailable) {
+			countAuthorize(authzOutcomeError)
+			return h.renderError(c, http.StatusServiceUnavailable, "Two-factor sign-in unavailable",
+				"This application requires two-factor authentication, which isn't available right now. Please try again later or contact the application's administrator.", "")
+		}
 		h.logger.Warn().Str("email", email).Str("client_id", req.ClientID).
 			Msg("authorize: hosted login failed")
 		countAuthorize(authzOutcomeLoginFailed)

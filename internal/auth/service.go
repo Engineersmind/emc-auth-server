@@ -1905,7 +1905,12 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 //   - application mode 'required' and no active factor → forced-enrollment
 //     challenge. Fails closed on a policy read error — issuing tokens when we
 //     cannot prove the app does NOT require MFA would turn a transient DB
-//     error into a silent policy bypass.
+//     error into a silent policy bypass;
+//   - a challenge is due but this deployment cannot run it (no Redis, no TOTP
+//     service, or none of the user's active methods is configured) →
+//     ErrAppMFAUnavailable, never tokens (#193). A factor-status read error
+//     fails closed the same way. When nothing is due the missing services do
+//     not matter and the login proceeds as before.
 //
 // persistent carries the caller's "remember me" choice into the challenge state so
 // the finally-issued session honours it. Threaded through rather than re-read at the
@@ -1948,19 +1953,18 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		}
 	}
 
-	if s.totpSvc == nil || s.redisCli == nil {
-		return nil, nil
-	}
-
 	// Load the application's policy first so it governs which active factors are
-	// offered. Fail closed on a read error — issuing tokens when we cannot read
-	// the policy would turn a transient DB error into a silent MFA bypass.
-	// appRowID 0 is a non-app-scoped login (tenant admin): no app policy, so
-	// every active factor is honoured.
+	// offered — and before asking which services this deployment runs, so an
+	// application whose switch is off, or that requires nothing of this user,
+	// behaves exactly the same with or without Redis and TOTP (#193). It needs
+	// only the database. Fail closed on a read error — issuing tokens when we
+	// cannot read the policy would turn a transient DB error into a silent MFA
+	// bypass. appRowID 0 is a non-app-scoped login (tenant admin): no app
+	// policy, so every active factor is honoured.
 	var mode string
 	var allowedMethods []string
 	if appRowID != 0 {
-		cfg, cfgErr := s.totpSvc.GetAppMFAConfig(ctx, appRowID)
+		cfg, cfgErr := loadAppMFAConfig(ctx, s.pool, appRowID)
 		if cfgErr != nil {
 			return nil, fmt.Errorf("load app MFA policy: %w", cfgErr)
 		}
@@ -1975,19 +1979,6 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		mode, allowedMethods = cfg.Mode, cfg.Methods
 	}
 
-	totpActive, err := s.totpSvc.IsActive(ctx, userID)
-	if err != nil {
-		s.logger.Warn().Err(err).Msg("login: failed to check TOTP status, skipping TOTP step")
-	}
-	emailActive := false
-	if s.emailSvc != nil {
-		emailActive, err = s.emailSvc.IsActive(ctx, userID)
-		if err != nil {
-			s.logger.Warn().Err(err).Msg("login: failed to check email MFA status, skipping email step")
-			emailActive = false
-		}
-	}
-
 	// The application policy is authoritative: a factor is only challenged/sent
 	// when it is BOTH active for the user AND still in the app's allowed_methods.
 	// Removing a method from the policy therefore stops it being offered even to
@@ -1999,15 +1990,51 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		}
 		return appRowID == 0 || methodAllowed(allowedMethods, method)
 	}
-	var methods []string
-	if totpActive && permitted(MFAMethodTOTP) {
-		methods = append(methods, MFAMethodTOTP)
+
+	// Which permitted factors does the user have active? Read from the database
+	// whether or not this deployment runs the matching service, and a read error
+	// fails closed (#193). Before, an error was logged and read as "not
+	// enrolled", so a transient database error skipped the challenge for a user
+	// who had set one up.
+	var active []string
+	for _, m := range []string{MFAMethodTOTP, MFAMethodEmail} {
+		if !permitted(m) {
+			continue
+		}
+		on, err := s.appFactorActive(ctx, userID, m)
+		if err != nil {
+			return nil, fmt.Errorf("check %s MFA status: %w", m, err)
+		}
+		if on {
+			active = append(active, m)
+		}
 	}
-	if emailActive && permitted(MFAMethodEmail) {
-		methods = append(methods, MFAMethodEmail)
+	required := appRowID != 0 && mode == MFAModeRequired
+	if len(active) == 0 && !required {
+		// Nothing is due: no permitted factor to challenge, no mandate to enrol.
+		return nil, nil
 	}
 
-	if len(methods) > 0 {
+	// A challenge is due. Redis holds it and the TOTP service completes it
+	// (LoginOTP and every pending-enrolment endpoint need both), so without
+	// either the login is refused rather than let through (#193) — the
+	// application-level twin of ErrAdminMFAUnavailable.
+	if s.totpSvc == nil || s.redisCli == nil {
+		s.logger.Error().Int64("tenant_id", tenantID).Int64("application_id", appRowID).
+			Msg("app MFA: a challenge is due but this deployment has no TOTP service or Redis — sign-in refused")
+		return nil, ErrAppMFAUnavailable
+	}
+
+	if len(active) > 0 {
+		// Only methods this deployment can deliver: an emailed code needs the
+		// email MFA service. If none is left the user cannot complete the
+		// challenge, and skipping it would bypass a factor they set up.
+		methods := s.runnableMFAMethods(active)
+		if len(methods) == 0 {
+			s.logger.Error().Int64("tenant_id", tenantID).Int64("application_id", appRowID).Strs("active", active).
+				Msg("app MFA: none of the user's active methods is configured on this deployment — sign-in refused")
+			return nil, ErrAppMFAUnavailable
+		}
 		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, org)
 		if err != nil {
 			return nil, fmt.Errorf("create OTP session: %w", err)
@@ -2015,26 +2042,57 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		return &LoginResult{OTPChallenge: challenge}, nil
 	}
 
-	// No policy-permitted active factor remains. Under 'required' the user must
-	// (re)enroll a permitted method before finishing login; otherwise the login
-	// proceeds (the app does not enforce MFA).
-	if appRowID != 0 && mode == MFAModeRequired {
-		enrollmentMethods := allowedMethods
-		if opts.inboxFirstFactor {
-			enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
-		}
-		if opts.inboxFirstFactor && len(enrollmentMethods) == 0 {
-			// Fail loudly rather than hand the user an enrollment challenge they
-			// cannot complete: the policy needs a non-email method to be allowed.
-			return nil, ErrPasswordlessMFAConflict
-		}
-		challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
-		if err != nil {
-			return nil, fmt.Errorf("create MFA enrollment session: %w", err)
-		}
-		return &LoginResult{MFAEnrollment: challenge}, nil
+	// No policy-permitted active factor remains, and the early return above
+	// means the mode is 'required': the user must (re)enroll a permitted method
+	// before finishing login.
+	enrollmentMethods := allowedMethods
+	if opts.inboxFirstFactor {
+		enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
 	}
-	return nil, nil
+	if opts.inboxFirstFactor && len(enrollmentMethods) == 0 {
+		// Fail loudly rather than hand the user an enrollment challenge they
+		// cannot complete: the policy needs a non-email method to be allowed.
+		return nil, ErrPasswordlessMFAConflict
+	}
+	challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
+	if err != nil {
+		return nil, fmt.Errorf("create MFA enrollment session: %w", err)
+	}
+	return &LoginResult{MFAEnrollment: challenge}, nil
+}
+
+// appFactorActive reports whether the user has the given second factor active,
+// for the application MFA gate. It reads through the matching service when this
+// deployment runs one and straight from the database when it does not, so the
+// gate learns about an enrolled factor even on a deployment that cannot
+// challenge it — and refuses, instead of skipping it (#193).
+func (s *AuthService) appFactorActive(ctx context.Context, userID int64, method string) (bool, error) {
+	switch method {
+	case MFAMethodTOTP:
+		if s.totpSvc != nil {
+			return s.totpSvc.IsActive(ctx, userID)
+		}
+		return totpFactorActive(ctx, s.pool, userID)
+	case MFAMethodEmail:
+		if s.emailSvc != nil {
+			return s.emailSvc.IsActive(ctx, userID)
+		}
+		return emailMFAActive(ctx, s.pool, userID)
+	}
+	return false, nil
+}
+
+// runnableMFAMethods keeps the methods this deployment can deliver at login:
+// TOTP needs the TOTP service, an emailed code needs the email MFA service.
+func (s *AuthService) runnableMFAMethods(methods []string) []string {
+	out := make([]string, 0, len(methods))
+	for _, m := range methods {
+		switch {
+		case m == MFAMethodTOTP && s.totpSvc != nil, m == MFAMethodEmail && s.emailSvc != nil:
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // LoginOTPInput is the payload for completing a TOTP-gated login.

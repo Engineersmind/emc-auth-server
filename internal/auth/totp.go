@@ -335,8 +335,15 @@ func (s *TOTPService) RegenerateBackupCodes(ctx context.Context, userID int64, c
 
 // IsActive returns true if the user has an active TOTP enrollment.
 func (s *TOTPService) IsActive(ctx context.Context, userID int64) (bool, error) {
+	return totpFactorActive(ctx, s.pool, userID)
+}
+
+// totpFactorActive is IsActive over the pool alone, so the login gate can tell
+// whether a user has an active authenticator even on a deployment that runs
+// without a TOTP service — the case where it must refuse, not skip (#193).
+func totpFactorActive(ctx context.Context, pool *pgxpool.Pool, userID int64) (bool, error) {
 	var active bool
-	err := s.pool.QueryRow(ctx, `
+	err := pool.QueryRow(ctx, `
 		SELECT is_active FROM totp_secrets WHERE user_id = $1
 	`, userID).Scan(&active)
 	if err != nil {
