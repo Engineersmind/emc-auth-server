@@ -846,6 +846,9 @@ type userMFAContext struct {
 	// ruleRole is the name of a role the user holds that the application's
 	// MFA role rules list (#195), "" when none. Read from the database.
 	ruleRole string
+	// ruleMethods is the intersection of the method lists of the covering
+	// rules that restrict methods (#199); nil when none does.
+	ruleMethods []string
 	// federatedMFA is the application's federated_mfa setting ("" for a
 	// tenant-level user), read for the refresh step-up check (#197).
 	federatedMFA string
@@ -881,14 +884,25 @@ func (uc *userMFAContext) requiredByPolicy() bool {
 	return (uc.appRowID != nil && uc.enabled && uc.mode == MFAModeRequired) || uc.roleRuleApplies()
 }
 
+// effectiveMethods is the narrowest method set the user may use: the
+// application's allowed_methods, intersected with the lists of every role rule
+// covering the user while rules apply (#199). Empty means no method satisfies
+// every rule — nothing is permitted.
+func (uc *userMFAContext) effectiveMethods() []string {
+	if !uc.roleRuleApplies() {
+		return uc.allowedMethods
+	}
+	return mfaRuleCoverage{role: uc.ruleRole, methods: uc.ruleMethods}.effectiveMethods(uc.allowedMethods)
+}
+
 // methodPermitted reports whether the user may use the given MFA method:
 // tenant-level users may use everything; application users are bound to the
-// application's allowed_methods.
+// application's allowed_methods, narrowed by any covering role rule (#199).
 func (uc *userMFAContext) methodPermitted(method string) bool {
 	if uc.appRowID == nil {
 		return true
 	}
-	return methodAllowed(uc.allowedMethods, method)
+	return methodAllowed(uc.effectiveMethods(), method)
 }
 
 // loadUserMFAContext is shared by the TOTP and email MFA services.
@@ -898,31 +912,28 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	var enabled *bool
 	var mode *string
 	var methods []string
-	var ruleRole *string
 	var federated *string
-	// The role-rule subquery reads both role sources (users.role_id and
-	// user_roles) — see mfaRuleRoleFor, whose predicate this mirrors.
 	err := pool.QueryRow(ctx, `
-		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods, ams.federated_mfa, ams.enforce_from,
-		       (SELECT r.name
-		        FROM application_mfa_role_rules rr
-		        JOIN roles r ON r.id = rr.role_id AND r.deleted_at IS NULL
-		        WHERE rr.application_id = u.application_id AND rr.tenant_id = u.tenant_id
-		          AND (rr.role_id = u.role_id
-		               OR EXISTS (SELECT 1 FROM user_roles ur
-		                          WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id AND ur.role_id = rr.role_id))
-		        ORDER BY r.name
-		        LIMIT 1)
+		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods, ams.federated_mfa, ams.enforce_from
 		FROM users u
 		LEFT JOIN oauth_clients oc ON oc.id = u.application_id
 		LEFT JOIN application_mfa_settings ams ON ams.application_id = u.application_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods, &federated, &uc.enforceFrom, &ruleRole)
+	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods, &federated, &uc.enforceFrom)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
 		}
 		return nil, fmt.Errorf("load user MFA context: %w", err)
+	}
+	// Role rules (#195, #199): which cover the user, and the methods they
+	// narrow to. Same predicate as the login gate (loadMFARuleCoverage).
+	if uc.appRowID != nil {
+		cov, covErr := loadMFARuleCoverage(ctx, pool, userID, tenantID, *uc.appRowID)
+		if covErr != nil {
+			return nil, covErr
+		}
+		uc.ruleRole, uc.ruleMethods = cov.role, cov.methods
 	}
 	if appName != nil {
 		uc.appName = *appName
@@ -935,9 +946,6 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	}
 	if len(methods) > 0 {
 		uc.allowedMethods = methods
-	}
-	if ruleRole != nil {
-		uc.ruleRole = *ruleRole
 	}
 	uc.enforceFrom = utcPtr(uc.enforceFrom)
 	if uc.appRowID != nil {
@@ -1104,7 +1112,9 @@ func (s *TOTPService) DisableUser(ctx context.Context, userID, tenantID int64, c
 		if err != nil {
 			return err
 		}
-		if !emailActive {
+		// Email counts as the remaining factor only if the user may still use
+		// it — a role rule can narrow the methods (#199).
+		if !emailActive || !uc.methodPermitted(MFAMethodEmail) {
 			return ErrMFARequiredByPolicy
 		}
 	}

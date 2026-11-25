@@ -1853,6 +1853,13 @@ definitions:
     type: object
   auth.MFARoleRule:
     properties:
+      allowed_methods:
+        description: |-
+          AllowedMethods restricts which methods satisfy this rule (#199). null =
+          the application's allowed_methods.
+        items:
+          type: string
+        type: array
       created_at:
         type: string
       created_by:
@@ -3089,6 +3096,15 @@ definitions:
       enrollment_token:
         type: string
     type: object
+  handlers.MFARoleRuleRequest:
+    properties:
+      allowed_methods:
+        items:
+          type: string
+        type: array
+      role_id:
+        type: string
+    type: object
   handlers.MFARoleRulesResponse:
     properties:
       application_id:
@@ -3746,6 +3762,10 @@ definitions:
       role_ids:
         items:
           type: string
+        type: array
+      rules:
+        items:
+          $ref: '#/definitions/handlers.MFARoleRuleRequest'
         type: array
     type: object
   handlers.UpdateOrganizationMemberRequest:
@@ -5059,9 +5079,15 @@ paths:
         on for the application (409 mfa_role_rules_passwordless_conflict: covered
         users could no longer sign in by email code); an empty list (clear) is always
         accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by
-        a rule cannot be deleted until the rule is removed. A real change is audited
-        as admin.mfa_role_rules_set with the old and new lists. Applies at each user''s
-        NEXT login.'
+        a rule cannot be deleted until the rule is removed. Send either role_ids (every
+        rule uses the application''s methods) or rules: [{role_id, allowed_methods}]
+        where allowed_methods (null/omitted = the application''s list) restricts which
+        methods satisfy that rule and must be a non-empty subset of the application''s
+        allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several
+        rules may use only the methods every rule allows; if the application''s list
+        later shrinks so none is left, that user''s sign-in is refused with 503 app_mfa_unavailable.
+        A real change (roles or methods) is audited as admin.mfa_role_rules_set with
+        the old and new lists. Applies at each user''s NEXT login.'
       parameters:
       - description: Application ID
         in: path
@@ -5082,7 +5108,8 @@ paths:
           schema:
             $ref: '#/definitions/handlers.MFARoleRulesResponse'
         "400":
-          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many
+          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods
+            | mfa_role_rules_too_many
           schema:
             $ref: '#/definitions/handlers.APIError'
         "403":
@@ -11302,9 +11329,15 @@ paths:
         on for the application (409 mfa_role_rules_passwordless_conflict: covered
         users could no longer sign in by email code); an empty list (clear) is always
         accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by
-        a rule cannot be deleted until the rule is removed. A real change is audited
-        as admin.mfa_role_rules_set with the old and new lists. Applies at each user''s
-        NEXT login.'
+        a rule cannot be deleted until the rule is removed. Send either role_ids (every
+        rule uses the application''s methods) or rules: [{role_id, allowed_methods}]
+        where allowed_methods (null/omitted = the application''s list) restricts which
+        methods satisfy that rule and must be a non-empty subset of the application''s
+        allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several
+        rules may use only the methods every rule allows; if the application''s list
+        later shrinks so none is left, that user''s sign-in is refused with 503 app_mfa_unavailable.
+        A real change (roles or methods) is audited as admin.mfa_role_rules_set with
+        the old and new lists. Applies at each user''s NEXT login.'
       parameters:
       - description: Application ID
         in: path
@@ -11325,7 +11358,8 @@ paths:
           schema:
             $ref: '#/definitions/handlers.MFARoleRulesResponse'
         "400":
-          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many
+          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods
+            | mfa_role_rules_too_many
           schema:
             $ref: '#/definitions/handlers.APIError'
         "403":

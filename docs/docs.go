@@ -1512,7 +1512,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. Send either role_ids (every rule uses the application's methods) or rules: [{role_id, allowed_methods}] where allowed_methods (null/omitted = the application's list) restricts which methods satisfy that rule and must be a non-empty subset of the application's allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several rules may use only the methods every rule allows; if the application's list later shrinks so none is left, that user's sign-in is refused with 503 app_mfa_unavailable. A real change (roles or methods) is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1549,7 +1549,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods | mfa_role_rules_too_many",
                         "schema": {
                             "$ref": "#/definitions/handlers.APIError"
                         }
@@ -10577,7 +10577,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. Send either role_ids (every rule uses the application's methods) or rules: [{role_id, allowed_methods}] where allowed_methods (null/omitted = the application's list) restricts which methods satisfy that rule and must be a non-empty subset of the application's allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several rules may use only the methods every rule allows; if the application's list later shrinks so none is left, that user's sign-in is refused with 503 app_mfa_unavailable. A real change (roles or methods) is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
                 "consumes": [
                     "application/json"
                 ],
@@ -10614,7 +10614,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods | mfa_role_rules_too_many",
                         "schema": {
                             "$ref": "#/definitions/handlers.APIError"
                         }
@@ -16908,6 +16908,13 @@ const docTemplate = `{
         "auth.MFARoleRule": {
             "type": "object",
             "properties": {
+                "allowed_methods": {
+                    "description": "AllowedMethods restricts which methods satisfy this rule (#199). null =\nthe application's allowed_methods.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "created_at": {
                     "type": "string"
                 },
@@ -18450,6 +18457,20 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.MFARoleRuleRequest": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "role_id": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.MFARoleRulesResponse": {
             "type": "object",
             "properties": {
@@ -19275,6 +19296,12 @@ const docTemplate = `{
                     "type": "array",
                     "items": {
                         "type": "string"
+                    }
+                },
+                "rules": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.MFARoleRuleRequest"
                     }
                 }
             }

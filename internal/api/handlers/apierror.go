@@ -161,6 +161,7 @@ var errorMessages = map[string]string{
 	// Application MFA role rules (#195).
 	"mfa_role_rules_inactive":              "Role rules can only be set while two-factor authentication is on for this application and its mode isn't disabled. Turn it on first, then add the rules.",
 	"mfa_role_rule_invalid_role":           "Every role in a two-factor rule must be one of this application's own roles. Check the role list and try again.",
+	"mfa_role_rule_invalid_methods":        "A role rule's methods must be some of the methods this application allows. Check the application's two-factor settings and try again.",
 	"mfa_role_rules_too_many":              "That's more role rules than one application can have. Remove some roles and try again.",
 	"mfa_role_rules_passwordless_conflict": "Role rules can't be set while email is the only two-factor method and email-code sign-in is on, or those users could not sign in. Allow another method or turn off email-code sign-in first.",
 	"role_in_mfa_rule":                     "This role is named by a two-factor authentication rule. Remove it from the application's role rules before deleting the role.",

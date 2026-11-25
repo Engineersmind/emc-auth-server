@@ -564,7 +564,7 @@ func (s *AuthService) MyMFAStatus(ctx context.Context, userID, tenantID int64, p
 		}
 		out.EnforceFrom = uc.enforceFrom
 		allowed = func(m string) bool {
-			return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.allowedMethods, m)
+			return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.effectiveMethods(), m)
 		}
 	}
 

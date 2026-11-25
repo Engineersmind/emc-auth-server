@@ -21,7 +21,8 @@ import (
 // Cost: the flag is read in the refresh-token lookup the rotation already runs
 // (a LEFT JOIN on application_mfa_settings by PK), so an application with the
 // flag off pays no extra round trip. Only a flagged application whose session
-// lacks "mfa" in its amr pays one more read (loadUserMFAContext).
+// lacks "mfa" in its amr pays the user-MFA-context reads (loadUserMFAContext:
+// the user and policy row, then the role rules covering the user).
 // ---------------------------------------------------------------------------
 
 // ErrStepUpRequired refuses a refresh because the session's application now
@@ -85,7 +86,7 @@ func (s *AuthService) checkRefreshStepUp(ctx context.Context, userID, tenantID i
 	// send them round to the same result. A user who HAS a factor is stepped up
 	// as always — the grace covers enrolment, not challenges.
 	if uc.inEnrollmentGrace(time.Now()) {
-		has, err := s.hasPermittedFactor(ctx, userID, uc.allowedMethods)
+		has, err := s.hasPermittedFactor(ctx, userID, uc.effectiveMethods())
 		if err != nil {
 			return err
 		}

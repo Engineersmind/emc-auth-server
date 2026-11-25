@@ -174,7 +174,8 @@ the same permissions as the `/mfa` routes.
   to enrol otherwise, and unable to remove their last factor. Roles are read
   from the database at each login, never from the token.
 - Rules apply only while `mfa_enabled` is true and `mode` is not `disabled`.
-  Under `required` they add nothing (everyone is already covered).
+  Under `required` they add nothing to *who* is covered, but a rule's method
+  restriction (below) still narrows what a covered user may use.
 - **Rules cover social and passkey sign-ins only when `federated_mfa` is
   `enforce`** (§2.3b). With `trust`, a covered user signing in with Google or
   a passkey is not challenged.
@@ -198,6 +199,29 @@ the same permissions as the `/mfa` routes.
   next login.
 - `GET /auth/me/mfa` for a covered user reports
   `"mfa_required_by": "role:<name>"`.
+
+**Per-role allowed methods (#199).** A rule can restrict which methods satisfy
+it, e.g. `finance` must use TOTP, not an emailed code:
+```
+PUT /api/v1/applications/{appID}/mfa/role-rules            Bearer <admin>
+{ "rules": [ { "role_id": "12", "allowed_methods": ["totp"] },
+             { "role_id": "15" } ] }                        # null/omitted = the app's methods
+→ 200 { "rules": [ { "role_id": "12", …, "allowed_methods": ["totp"] },
+                   { "role_id": "15", …, "allowed_methods": null } ] }
+```
+- Send exactly one of `role_ids` (every rule uses the application's methods)
+  or `rules`. A rule's list must be a non-empty subset of the application's
+  `allowed_methods` → otherwise **400 `mfa_role_rule_invalid_methods`**.
+- A covered user may use only methods **every** covering rule allows (the
+  intersection with the application's list). That set drives the login
+  challenge (an enrolled factor outside it is not offered), forced enrolment,
+  self-service enrolment (403 method not allowed), the last-factor guard and
+  `/auth/me/mfa` `allowed`.
+- If the application's list later shrinks, or two rules exclude each other, so
+  that a covered user has no method left, their sign-in is refused with
+  **503 `app_mfa_unavailable`** (fail closed) — fix the rules or the list.
+- The audit event also carries `old_rules` / `new_rules` with each rule's
+  `allowed_methods`; a change of methods alone is a real change.
 
 ### 2.3d Revoke every session of the application (#196)
 Policy changes never end sessions by themselves. After turning MFA on or
@@ -243,7 +267,8 @@ the cookies in place on this refusal.
 
 Cost: the flag is read in the refresh-token lookup the rotation already does,
 so an application with it off pays nothing. With it on, a session without
-`mfa` costs one extra indexed read per refresh.
+`mfa` costs the user-MFA-context reads (user + policy row, role rules) per
+refresh.
 
 A real change is audited as `admin.mfa_refresh_step_up_changed`
 (`old_refresh_step_up`, `new_refresh_step_up`).

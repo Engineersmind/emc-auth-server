@@ -298,7 +298,9 @@ func (s *EmailMFAService) Disable(ctx context.Context, userID, tenantID int64, c
 		if err != nil {
 			return fmt.Errorf("check TOTP active: %w", err)
 		}
-		if !totpActive {
+		// TOTP counts as the remaining factor only if the user may still use
+		// it — a role rule can narrow the methods (#199).
+		if !totpActive || !uc.methodPermitted(MFAMethodTOTP) {
 			return ErrMFARequiredByPolicy
 		}
 	}

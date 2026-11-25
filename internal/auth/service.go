@@ -2048,16 +2048,26 @@ func (s *AuthService) mfaGateCore(ctx context.Context, opts mfaGateOptions, grac
 		}
 		mode, allowedMethods, enforceFrom = cfg.Mode, cfg.Methods, cfg.EnforceFrom
 		// Role rules (#195): a user holding a role the application lists is
-		// treated as 'required'. Only an 'optional' app needs the lookup —
-		// 'required' already is, and rules do not apply under 'disabled'.
-		// Read from the database, never the token; a read error fails closed.
-		if mode == MFAModeOptional {
-			ruleRole, ruleErr := mfaRuleRoleFor(ctx, s.pool, userID, tenantID, appRowID)
+		// treated as 'required', and a rule may narrow the methods that satisfy
+		// it (#199) — so both 'optional' and 'required' apps need the lookup;
+		// rules do not apply under 'disabled'. Read from the database, never the
+		// token; a read error fails closed.
+		if mode != MFAModeDisabled {
+			cov, ruleErr := loadMFARuleCoverage(ctx, s.pool, userID, tenantID, appRowID)
 			if ruleErr != nil {
 				return nil, fmt.Errorf("%w: %w", ErrAppMFAUnavailable, ruleErr)
 			}
-			if ruleRole != "" {
+			if cov.role != "" {
 				mode = MFAModeRequired
+				allowedMethods = cov.effectiveMethods(allowedMethods)
+				if len(allowedMethods) == 0 {
+					// The rules covering this user (or the rules and a since-shrunk
+					// application list) leave no method that satisfies them all.
+					// Fail closed: allowing any method would ignore a rule.
+					s.logger.Error().Int64("tenant_id", tenantID).Int64("application_id", appRowID).Str("rule_role", cov.role).
+						Msg("app MFA: the role rules covering this user leave no allowed method — sign-in refused")
+					return nil, ErrAppMFAUnavailable
+				}
 			}
 		}
 	}
