@@ -115,16 +115,50 @@ a session issued while MFA was off stays valid until its refresh token expires
 (up to 30 days), and turning MFA off does not end sessions that did MFA.
 App-wide session revoke is tracked in #196.
 
-**Known gap — social and passkey sign-ins.** Google (and other social) and
-passkey sign-ins do not go through the application MFA gate at all, whatever
-`mfa_enabled` and `mode` say. This predates the switch and is fixed by the
-opt-in `federated_mfa = enforce` setting (#194).
+Social and passkey sign-ins follow the switch and `mode` only when the
+application opts in with `federated_mfa: "enforce"` (§2.3b).
+
+### 2.3b Social and passkey sign-ins (`federated_mfa`)
+```
+PUT /api/v1/applications/{appID}/mfa            Bearer <admin>
+{ "federated_mfa": "enforce" }                   # mode may be omitted
+→ 200 (policy incl. "federated_mfa": "enforce")
+```
+
+| | `federated_mfa: "trust"` (default) | `federated_mfa: "enforce"` |
+|---|---|---|
+| Social sign-in (Google, GitHub) | tokens at `/auth/oauth/exchange`, no app MFA step — unchanged | the **same app MFA gate as password login** runs at `/auth/oauth/exchange` |
+| Passkey **with** user verification (biometric / PIN) | tokens | tokens — a user-verified passkey is already two factors and **satisfies** app MFA |
+| Passkey **without** user verification | tokens, no app MFA step | the same app MFA gate as password login runs at `/auth/passkey/login/complete` |
+
+`enforce` changes the response contract of those two endpoints **for this
+application only**. Where a second factor is due they answer exactly like
+`/auth/apps/login` (§3.2):
+
+| Status | Body | Next step |
+|---|---|---|
+| 200 | `access_token` … | done (nothing due) |
+| 200 | `requires_otp: true, otp_session_token, methods[], expires_in` | §3.3 (`POST /auth/login/otp`) |
+| 403 | `mfa_enrollment_required: true, enrollment_token, allowed_methods[], expires_in` | §3.4 (`/auth/login/mfa/*`) |
+| 503 | `error: "app_mfa_unavailable"` | the server cannot run the challenge; no tokens |
+
+The `login_code` is spent at the exchange either way; the challenge token
+replaces it. The finished session keeps the original grant (`gty: "social"` /
+`"passkey"`) and its `amr` records the extra factor (`fed`/`hwk` + `otp`,
+`mfa`). Everything else — switch off, `mode`, `allowed_methods` —
+applies to these sign-ins exactly as to password login. Tenant-level (console)
+social and passkey sign-ins are not affected.
+
+Every real change writes an `admin.mfa_federated_changed` audit event
+(`old_federated_mfa`, `new_federated_mfa`). Turn `enforce` on only once your
+social-callback and passkey code handles the challenge responses above — a
+client that only knows the token shape will treat them as a failure.
 
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```
 GET /api/v1/applications/{appID}/mfa            Bearer <admin>
 → 200 {
-  "application_id": "149", "mfa_enabled": true, "mode": "required",
+  "application_id": "149", "mfa_enabled": true, "mode": "required", "federated_mfa": "trust",
   "allowed_methods": ["totp","email"],
   "enrolled_users": 1,          // active TOTP
   "pending_enrollments": 0,     // TOTP enrolled, never activated
@@ -264,7 +298,7 @@ switch on `error`, never parse `message`. MFA switch codes:
 | `mfa_switched_off` | 403 | enrolment attempted while the app's MFA switch is off — self-service enrolment, or a forced-enrolment token (`/auth/login/mfa/enroll`, `/email`, `/activate`) minted before the switch was turned off. The enrolment token is invalidated; sign in again |
 | `mfa_switch_off_service_token` | 403 | a service/API-key token tried to turn MFA off |
 | `mfa_switch_off_stale_session` | 403 | turning MFA off without an MFA sign-in in the last 10 minutes |
-| `app_mfa_unavailable` | 503 | sign-in refused: the application requires a second factor at this login and the server cannot run it. Returned by every first factor that goes through the app MFA gate (password, magic link, email code). Fail-closed since #193: before it, such a server issued tokens without MFA |
+| `app_mfa_unavailable` | 503 | sign-in refused: the application requires a second factor at this login and the server cannot run it. Returned by every first factor that goes through the app MFA gate (password, magic link, email code, and social / unverified-passkey sign-ins under `federated_mfa: "enforce"`). Fail-closed since #193: before it, such a server issued tokens without MFA |
 
 ---
 

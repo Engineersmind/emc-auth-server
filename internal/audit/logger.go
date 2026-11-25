@@ -308,6 +308,11 @@ const (
 	// switch (#192). Metadata: old_mfa_enabled, new_mfa_enabled. Emitted only
 	// when the value actually changed, and mailed to the app's administrators.
 	ActionAdminMFASwitchChanged = "admin.mfa_switch_changed"
+	// ActionAdminMFAFederatedChanged is a real change of an application's
+	// federated_mfa setting (#194): whether social and passkey sign-ins go
+	// through the application MFA gate. Metadata: old_federated_mfa,
+	// new_federated_mfa. Emitted only when the value actually changed.
+	ActionAdminMFAFederatedChanged = "admin.mfa_federated_changed"
 
 	// Admin — mandatory administrator MFA policy (migration 00094): which
 	// methods satisfy the requirement, per tenant and for the platform.

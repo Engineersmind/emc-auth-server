@@ -1336,7 +1336,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional) plus enrollment stats over the application's own user base.",
+                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional), master switch (mfa_enabled), federated_mfa (trust|enforce — whether social and passkey sign-ins go through the application MFA gate; default trust) plus enrollment stats over the application's own user base.",
                 "produces": [
                     "application/json"
                 ],
@@ -1386,7 +1386,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400.",
+                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400. federated_mfa: \"trust\" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; \"enforce\" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values.",
                 "consumes": [
                     "application/json"
                 ],
@@ -5608,7 +5608,7 @@
         },
         "/api/v1/auth/oauth/exchange": {
             "post": {
-                "description": "Consumes the single-use login_code issued by the social login callback and returns the standard access + refresh token pair.",
+                "description": "Consumes the single-use login_code issued by the social login callback and returns the standard access + refresh token pair. When the application has federated_mfa=enforce and its MFA policy requires a second factor at this sign-in, the response is instead the same challenge password login returns: 200 {requires_otp, otp_session_token, methods, expires_in} (finish at POST /api/v1/auth/login/otp) or 403 {mfa_enrollment_required, enrollment_token, allowed_methods, expires_in} (finish via /api/v1/auth/login/mfa/*). Applications on federated_mfa=trust (the default) always receive the token pair.",
                 "consumes": [
                     "application/json"
                 ],
@@ -5667,6 +5667,12 @@
                             }
                         }
                     },
+                    "403": {
+                        "description": "federated_mfa=enforce and the user must enrol a second factor first",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MFAEnrollmentChallenge"
+                        }
+                    },
                     "429": {
                         "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
@@ -5674,6 +5680,12 @@
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - a second factor is due and this server cannot run it; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -6213,7 +6225,7 @@
         },
         "/api/v1/auth/passkey/login/complete": {
             "post": {
-                "description": "Verifies the assertion and returns a token pair. The request body is the raw PublicKeyCredential from the browser.",
+                "description": "Verifies the assertion and returns a token pair. The request body is the raw PublicKeyCredential from the browser. A user-verified passkey satisfies application MFA. A passkey WITHOUT user verification on an application with federated_mfa=enforce goes through the application MFA gate and may return 200 {requires_otp, otp_session_token, methods, expires_in} or 403 {mfa_enrollment_required, enrollment_token, allowed_methods, expires_in} instead of tokens, finished at /api/v1/auth/login/otp or /api/v1/auth/login/mfa/*.",
                 "produces": [
                     "application/json"
                 ],
@@ -6274,6 +6286,12 @@
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - a second factor is due and this server cannot run it; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -16393,6 +16411,26 @@
                 }
             }
         },
+        "auth.MFAEnrollmentChallenge": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "enrollment_token": {
+                    "type": "string"
+                },
+                "expires_in": {
+                    "type": "integer"
+                },
+                "mfa_enrollment_required": {
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.MFAMethodStatus": {
             "type": "object",
             "properties": {
@@ -16435,6 +16473,10 @@
                 "enrolled_users": {
                     "description": "Enrollment stats over the application's own isolated user base — for the\nowner dashboard. Pending = TOTP enrolled but never activated.",
                     "type": "integer"
+                },
+                "federated_mfa": {
+                    "description": "FederatedMFA is \"trust\" (social and passkey sign-ins skip the\napplication MFA gate) or \"enforce\" (they go through it; a user-verified\npasskey satisfies it). #194.",
+                    "type": "string"
                 },
                 "magic_link_enabled": {
                     "description": "Passwordless magic-link sign-in (opt-in; the redirect URL is the\napplication frontend that receives ?token=…).",
@@ -18690,6 +18732,10 @@
                     "items": {
                         "type": "string"
                     }
+                },
+                "federated_mfa": {
+                    "description": "FederatedMFA is \"trust\" (default: social and passkey sign-ins skip the\napplication MFA gate) or \"enforce\" (they go through it; a user-verified\npasskey satisfies it). Omitted or \"\" keeps the stored value. #194.",
+                    "type": "string"
                 },
                 "magic_link_enabled": {
                     "type": "boolean"

@@ -526,6 +526,16 @@ const MaxOTPAttempts = 5
 // FirstFactorEmailOTP marks a sign-in that began with a passwordless emailed code.
 const FirstFactorEmailOTP = "email_otp"
 
+// FirstFactorSocial marks a sign-in that began with a social identity provider
+// (Google, GitHub) and was held for the application MFA gate under
+// federated_mfa = enforce (#194).
+const FirstFactorSocial = "social"
+
+// FirstFactorPasskey marks a sign-in that began with a passkey assertion WITHOUT
+// user verification and was held for the application MFA gate under
+// federated_mfa = enforce (#194). A user-verified passkey is never held.
+const FirstFactorPasskey = "passkey"
+
 type firstFactorKey struct{}
 
 // withFirstFactor returns ctx carrying the first factor for the pre-auth session
@@ -552,9 +562,16 @@ func completionSessionContext(session *OTPSession) sessionContext {
 		amr:         []string{AMRPassword, AMROTP, AMRMFA},
 		grant:       GrantPassword,
 	}
-	if session.FirstFactor == FirstFactorEmailOTP {
+	switch session.FirstFactor {
+	case FirstFactorEmailOTP:
 		sc.amr = []string{AMREmailOTP, AMROTP, AMRMFA}
 		sc.grant = GrantEmailOTP
+	case FirstFactorSocial:
+		sc.amr = []string{AMRFederated, AMROTP, AMRMFA}
+		sc.grant = GrantSocial
+	case FirstFactorPasskey:
+		sc.amr = []string{AMRWebAuthn, AMROTP, AMRMFA}
+		sc.grant = GrantPasskey
 	}
 	return sc
 }

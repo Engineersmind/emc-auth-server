@@ -38,6 +38,23 @@ const (
 	MFAMethodEmail = "email"
 )
 
+// Federated MFA settings (#194). Stored in application_mfa_settings.federated_mfa;
+// the CHECK constraint mirrors this set. They decide whether social (Google,
+// GitHub) and passkey sign-ins go through the application MFA gate.
+const (
+	// FederatedMFATrust accepts the identity provider / passkey as is: no
+	// application MFA step (the default, and the pre-#194 behaviour).
+	FederatedMFATrust = "trust"
+	// FederatedMFAEnforce runs the same application MFA gate as password login
+	// before tokens are issued. A user-verified passkey satisfies it.
+	FederatedMFAEnforce = "enforce"
+)
+
+// ValidFederatedMFA reports whether v is one of the accepted federated_mfa values.
+func ValidFederatedMFA(v string) bool {
+	return v == FederatedMFATrust || v == FederatedMFAEnforce
+}
+
 // ValidMFAMode reports whether mode is one of the accepted policy values.
 func ValidMFAMode(mode string) bool {
 	return mode == MFAModeDisabled || mode == MFAModeOptional || mode == MFAModeRequired
@@ -88,6 +105,10 @@ var ErrInvalidMFAMode = errors.New("mode must be one of: disabled, optional, req
 // ErrInvalidMFAMethods is returned when a policy update carries an unknown or
 // empty method set.
 var ErrInvalidMFAMethods = errors.New("allowed_methods must be a non-empty subset of: totp, email")
+
+// ErrInvalidFederatedMFA is returned when a policy update carries an unknown
+// federated_mfa value.
+var ErrInvalidFederatedMFA = errors.New("federated_mfa must be one of: trust, enforce")
 
 // ErrMFAMethodsNeedMode is returned when an update carries allowed_methods
 // without a mode. Methods are only ever written together with the mode, so
@@ -150,6 +171,10 @@ type MFAPolicy struct {
 	MFAEnabled     bool     `json:"mfa_enabled"`
 	Mode           string   `json:"mode"`
 	AllowedMethods []string `json:"allowed_methods"`
+	// FederatedMFA is "trust" (social and passkey sign-ins skip the
+	// application MFA gate) or "enforce" (they go through it; a user-verified
+	// passkey satisfies it). #194.
+	FederatedMFA string `json:"federated_mfa"`
 	// Passwordless magic-link sign-in (opt-in; the redirect URL is the
 	// application frontend that receives ?token=…).
 	MagicLinkEnabled     bool   `json:"magic_link_enabled"`
@@ -173,6 +198,9 @@ type AppMFAConfig struct {
 	Enabled bool
 	Mode    string
 	Methods []string
+	// FederatedMFA decides whether social and passkey sign-ins are gated
+	// (FederatedMFAEnforce) or trusted (FederatedMFATrust, the default).
+	FederatedMFA string
 }
 
 // GetAppMFAConfig returns the effective MFA configuration for an application.
@@ -190,11 +218,11 @@ func (s *TOTPService) GetAppMFAConfig(ctx context.Context, appRowID int64) (AppM
 func loadAppMFAConfig(ctx context.Context, q mfaSettingsQuerier, appRowID int64) (AppMFAConfig, error) {
 	cfg := AppMFAConfig{}
 	err := q.QueryRow(ctx, `
-		SELECT mfa_enabled, mode, allowed_methods FROM application_mfa_settings WHERE application_id = $1
-	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods)
+		SELECT mfa_enabled, mode, allowed_methods, federated_mfa FROM application_mfa_settings WHERE application_id = $1
+	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods, &cfg.FederatedMFA)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return AppMFAConfig{Enabled: true, Mode: MFAModeOptional, Methods: defaultMFAMethods()}, nil
+			return AppMFAConfig{Enabled: true, Mode: MFAModeOptional, Methods: defaultMFAMethods(), FederatedMFA: FederatedMFATrust}, nil
 		}
 		return AppMFAConfig{}, fmt.Errorf("load app MFA config: %w", err)
 	}
@@ -220,14 +248,15 @@ func (s *TOTPService) GetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 		MFAEnabled:     true,
 		Mode:           MFAModeOptional,
 		AllowedMethods: defaultMFAMethods(),
+		FederatedMFA:   FederatedMFATrust,
 	}
 
 	var updatedAt time.Time
 	err := s.pool.QueryRow(ctx, `
-		SELECT mfa_enabled, mode, allowed_methods, magic_link_enabled, magic_link_redirect_url, updated_at
+		SELECT mfa_enabled, mode, allowed_methods, federated_mfa, magic_link_enabled, magic_link_redirect_url, updated_at
 		FROM application_mfa_settings
 		WHERE application_id = $1 AND tenant_id = $2
-	`, appRowID, tenantID).Scan(&p.MFAEnabled, &p.Mode, &p.AllowedMethods, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
+	`, appRowID, tenantID).Scan(&p.MFAEnabled, &p.Mode, &p.AllowedMethods, &p.FederatedMFA, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("load app MFA policy: %w", err)
 	}
@@ -397,17 +426,27 @@ type AppMFAUpdate struct {
 	Methods              []string
 	MagicLinkEnabled     *bool
 	MagicLinkRedirectURL *string
+	// FederatedMFA, when non-empty, sets the federated_mfa setting (#194).
+	FederatedMFA string
 }
 
-// AppMFAUpdateResult reports what the master switch was before and after the
-// update, so the caller audits and notifies only on a real change.
+// AppMFAUpdateResult reports what the master switch and the federated_mfa
+// setting were before and after the update, so the caller audits and notifies
+// only on a real change.
 type AppMFAUpdateResult struct {
-	PrevEnabled bool
-	NewEnabled  bool
+	PrevEnabled      bool
+	NewEnabled       bool
+	PrevFederatedMFA string
+	NewFederatedMFA  string
 }
 
 // SwitchChanged reports whether the update flipped the master switch.
 func (r AppMFAUpdateResult) SwitchChanged() bool { return r.PrevEnabled != r.NewEnabled }
+
+// FederatedMFAChanged reports whether the update changed federated_mfa.
+func (r AppMFAUpdateResult) FederatedMFAChanged() bool {
+	return r.PrevFederatedMFA != r.NewFederatedMFA
+}
 
 // UpdateAppMFASettings applies an admin MFA update — switch, mode/methods and
 // magic-link — in ONE transaction, so a failure part-way (say an invalid
@@ -431,6 +470,9 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 	if u.Methods != nil && !ValidMFAMethods(u.Methods) {
 		return res, ErrInvalidMFAMethods
 	}
+	if u.FederatedMFA != "" && !ValidFederatedMFA(u.FederatedMFA) {
+		return res, ErrInvalidFederatedMFA
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -448,15 +490,17 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 		return res, fmt.Errorf("lock application for MFA update: %w", err)
 	}
 
-	// No settings row means the switch is on (the column default and the
-	// login-path default agree).
+	// No settings row means the switch is on and federated_mfa is 'trust' (the
+	// column defaults and the login-path defaults agree).
 	res.PrevEnabled = true
+	res.PrevFederatedMFA = FederatedMFATrust
 	if err = tx.QueryRow(ctx, `
-		SELECT mfa_enabled FROM application_mfa_settings WHERE application_id = $1 AND tenant_id = $2
-	`, appRowID, tenantID).Scan(&res.PrevEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		SELECT mfa_enabled, federated_mfa FROM application_mfa_settings WHERE application_id = $1 AND tenant_id = $2
+	`, appRowID, tenantID).Scan(&res.PrevEnabled, &res.PrevFederatedMFA); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return res, fmt.Errorf("read app MFA switch: %w", err)
 	}
 	res.NewEnabled = res.PrevEnabled
+	res.NewFederatedMFA = res.PrevFederatedMFA
 
 	// Re-sending the current value writes nothing: the handler audits only a
 	// real flip, so rewriting updated_by/updated_at here would leave "last
@@ -479,6 +523,26 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 			return res, ErrAppNotFound
 		}
 		res.NewEnabled = *u.Enabled
+	}
+
+	if u.FederatedMFA != "" {
+		tag, execErr := tx.Exec(ctx, `
+			INSERT INTO application_mfa_settings (application_id, tenant_id, federated_mfa, updated_by, updated_at)
+			VALUES ($1, $2, $3, $4, NOW())
+			ON CONFLICT (application_id) DO UPDATE
+			SET federated_mfa = EXCLUDED.federated_mfa,
+			    updated_by    = EXCLUDED.updated_by,
+			    updated_at    = NOW()
+			WHERE application_mfa_settings.tenant_id = EXCLUDED.tenant_id
+		`, appRowID, tenantID, u.FederatedMFA, updatedBy)
+		if execErr != nil {
+			return res, fmt.Errorf("upsert app federated MFA: %w", execErr)
+		}
+		// Tenant-pinned DO UPDATE — see SetAppMFAPolicy.
+		if tag.RowsAffected() == 0 {
+			return res, ErrAppNotFound
+		}
+		res.NewFederatedMFA = u.FederatedMFA
 	}
 
 	if u.Mode != "" {

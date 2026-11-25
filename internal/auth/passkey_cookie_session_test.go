@@ -202,7 +202,11 @@ func TestLoginWebAuthn_TenantLevelUnaffected(t *testing.T) {
 		call func(token string, req *http.Request) (*auth.AuthResult, *auth.WebAuthnIdentity, error)
 	}{
 		{"bearer endpoint", func(token string, req *http.Request) (*auth.AuthResult, *auth.WebAuthnIdentity, error) {
-			return f.authSvc.LoginWebAuthn(f.ctx, token, req)
+			res, id, err := f.authSvc.LoginWebAuthn(f.ctx, token, req)
+			if res == nil {
+				return nil, id, err
+			}
+			return res.Token, id, err
 		}},
 		{"cookie endpoint", func(token string, req *http.Request) (*auth.AuthResult, *auth.WebAuthnIdentity, error) {
 			return f.authSvc.LoginWebAuthnForCookieSession(f.ctx, token, req)

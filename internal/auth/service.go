@@ -1928,6 +1928,14 @@ type mfaGateOptions struct {
 	// method is then neither offered nor emailed: the same inbox twice is
 	// ceremony, not a second factor. TOTP and passkeys are unaffected.
 	inboxFirstFactor bool
+	// federated is FirstFactorSocial or FirstFactorPasskey when the first factor
+	// was a social identity provider or a passkey without user verification
+	// (#194). Such a sign-in is gated only when its application has
+	// federated_mfa = enforce; otherwise, and always for a tenant-level login
+	// (no application, no setting), the gate returns nil exactly as before #194,
+	// when these flows never called it. The value is carried into any challenge
+	// so the finished session keeps the social/passkey grant.
+	federated string
 }
 
 // mfaGateWith is mfaGate with options. See mfaGate for the contract.
@@ -1938,6 +1946,15 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		// between here and storePreAuthSession keeps those signatures, and so every
 		// existing caller, untouched.
 		ctx = withFirstFactor(ctx, FirstFactorEmailOTP)
+	}
+	if opts.federated != "" {
+		// A tenant-level social/passkey login has no application policy to
+		// enforce, and the administrator gate below never governed these flows
+		// (the cookie-session passkey path has its own requireAdminPasskeyMFA).
+		if appRowID == 0 {
+			return nil, nil
+		}
+		ctx = withFirstFactor(ctx, opts.federated)
 	}
 	// Administrators first: for them MFA is mandatory, so this branch runs even
 	// on a deployment where the per-application gate below would return early.
@@ -1974,6 +1991,11 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		// the user's next login. Administrators never reach this line: their
 		// gate ran above and the switch does not govern it.
 		if !cfg.Enabled {
+			return nil, nil
+		}
+		// Social and unverified-passkey sign-ins are gated only by opt-in
+		// (#194). 'trust' — the default — keeps them exactly as they were.
+		if opts.federated != "" && cfg.FederatedMFA != FederatedMFAEnforce {
 			return nil, nil
 		}
 		mode, allowedMethods = cfg.Mode, cfg.Methods

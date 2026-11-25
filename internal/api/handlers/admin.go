@@ -3386,13 +3386,17 @@ type UpdateApplicationMFARequest struct {
 	AllowedMethods       []string `json:"allowed_methods"`
 	MagicLinkEnabled     *bool    `json:"magic_link_enabled"`
 	MagicLinkRedirectURL *string  `json:"magic_link_redirect_url"`
+	// FederatedMFA is "trust" (default: social and passkey sign-ins skip the
+	// application MFA gate) or "enforce" (they go through it; a user-verified
+	// passkey satisfies it). Omitted or "" keeps the stored value. #194.
+	FederatedMFA string `json:"federated_mfa"`
 }
 
 // GetApplicationMFA handles GET /api/v1/applications/:appID/mfa and
 // GET /api/v1/tenants/:tid/applications/:appID/mfa.
 //
 // @Summary      Get application MFA policy
-// @Description  Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional) plus enrollment stats over the application's own user base.
+// @Description  Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional), master switch (mfa_enabled), federated_mfa (trust|enforce — whether social and passkey sign-ins go through the application MFA gate; default trust) plus enrollment stats over the application's own user base.
 // @Tags         admin-applications
 // @Produce      json
 // @Security     BearerAuth
@@ -3423,7 +3427,7 @@ func (h *AdminHandler) GetApplicationMFA(c echo.Context) error {
 // PUT /api/v1/tenants/:tid/applications/:appID/mfa.
 //
 // @Summary      Set application MFA policy
-// @Description  Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default ["totp"]); allowed_methods sent without mode is a 400.
+// @Description  Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default ["totp"]); allowed_methods sent without mode is a 400. federated_mfa: "trust" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; "enforce" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values.
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
@@ -3452,7 +3456,7 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 	// mode stays mandatory unless the body carries something else to change,
 	// so an empty body is still the 400 it always was.
 	magicLink := req.MagicLinkEnabled != nil || req.MagicLinkRedirectURL != nil
-	if req.Mode == "" && req.MFAEnabled == nil && !magicLink {
+	if req.Mode == "" && req.MFAEnabled == nil && !magicLink && req.FederatedMFA == "" {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": auth.ErrInvalidMFAMode.Error()})
 	}
 
@@ -3497,11 +3501,13 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 		Methods:              req.AllowedMethods,
 		MagicLinkEnabled:     req.MagicLinkEnabled,
 		MagicLinkRedirectURL: req.MagicLinkRedirectURL,
+		FederatedMFA:         req.FederatedMFA,
 	}, updatedBy)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrInvalidMFAMode), errors.Is(err, auth.ErrInvalidMFAMethods),
-			errors.Is(err, auth.ErrMFAMethodsNeedMode), errors.Is(err, auth.ErrMagicLinkNotConfigured):
+			errors.Is(err, auth.ErrMFAMethodsNeedMode), errors.Is(err, auth.ErrMagicLinkNotConfigured),
+			errors.Is(err, auth.ErrInvalidFederatedMFA):
 			return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 		case errors.Is(err, auth.ErrAppNotFound):
 			return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
@@ -3526,6 +3532,11 @@ func (h *AdminHandler) UpdateApplicationMFA(c echo.Context) error {
 	if res.SwitchChanged() {
 		h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminMFASwitchChanged, "application", appIDStr, &appID,
 			map[string]any{"old_mfa_enabled": res.PrevEnabled, "new_mfa_enabled": res.NewEnabled})
+	}
+	// Same rule for federated_mfa: only a real change is audited.
+	if res.FederatedMFAChanged() {
+		h.auditAdminTenantMeta(c, claims, &tenantID, audit.ActionAdminMFAFederatedChanged, "application", appIDStr, &appID,
+			map[string]any{"old_federated_mfa": res.PrevFederatedMFA, "new_federated_mfa": res.NewFederatedMFA})
 	}
 
 	policy, err := h.totpSvc.GetAppMFAPolicy(c.Request().Context(), tenantID, appID)
