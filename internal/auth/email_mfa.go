@@ -208,6 +208,9 @@ func (s *EmailMFAService) BeginEnrollment(ctx context.Context, userID, tenantID 
 	if err != nil {
 		return err
 	}
+	if uc.switchedOff() {
+		return ErrMFASwitchedOff
+	}
 	if uc.appRowID != nil && uc.mode == MFAModeDisabled {
 		return ErrMFAEnrollmentDisabled
 	}
@@ -227,12 +230,24 @@ func (s *EmailMFAService) BeginEnrollment(ctx context.Context, userID, tenantID 
 	return s.mintAndSend(ctx, emailVerifyKey(userID), email, uc.appName, tenantID, uc.appRowID, EmailOTPTTL, "set up email two-factor authentication")
 }
 
-// ActivateEnrollment verifies the emailed code and marks email MFA active.
+// ActivateEnrollment verifies the emailed code and marks email MFA active. The
+// application's MFA policy is re-checked in the same transaction as the
+// activating UPDATE (checkActivationPolicyTx) and BEFORE the code is checked,
+// so a refusal leaves the code unspent.
 func (s *EmailMFAService) ActivateEnrollment(ctx context.Context, userID int64, code string) error {
-	if err := s.verifyStoredCode(ctx, emailVerifyKey(userID), code); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin email MFA activation: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = checkActivationPolicyTx(ctx, tx, userID, MFAMethodEmail); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `
+	if err = s.verifyStoredCode(ctx, emailVerifyKey(userID), code); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
 		UPDATE email_mfa_settings SET is_active = true, updated_at = NOW()
 		WHERE user_id = $1
 	`, userID)
@@ -241,6 +256,9 @@ func (s *EmailMFAService) ActivateEnrollment(ctx context.Context, userID int64, 
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrEmailCodeInvalid
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit email MFA activation: %w", err)
 	}
 	return nil
 }
@@ -264,13 +282,14 @@ func (s *EmailMFAService) SendVerificationCode(ctx context.Context, userID, tena
 
 // Disable removes email MFA after verifying an emailed code (requested via
 // SendVerificationCode). Users of a 'required' application may only remove
-// email MFA while another active second factor (TOTP) remains.
+// email MFA while another active second factor (TOTP) remains. While the
+// application's MFA master switch is off there is no mandate to enforce.
 func (s *EmailMFAService) Disable(ctx context.Context, userID, tenantID int64, code string) error {
 	uc, err := loadUserMFAContext(ctx, s.pool, userID, tenantID)
 	if err != nil {
 		return err
 	}
-	if uc.appRowID != nil && uc.mode == MFAModeRequired {
+	if uc.requiredByPolicy() {
 		var totpActive bool
 		err := s.pool.QueryRow(ctx,
 			`SELECT COALESCE((SELECT is_active FROM totp_secrets WHERE user_id = $1), false)`,

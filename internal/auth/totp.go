@@ -138,8 +138,20 @@ func (s *TOTPService) Enroll(ctx context.Context, userID, tenantID int64, email,
 	}, nil
 }
 
-// VerifyAndActivate validates the user's first TOTP code and marks the secret active.
+// VerifyAndActivate validates the user's first TOTP code and marks the secret
+// active. The application's MFA policy is re-checked in the same transaction
+// as the activating UPDATE (checkActivationPolicyTx), so every caller gets it.
 func (s *TOTPService) VerifyAndActivate(ctx context.Context, userID int64, code string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin TOTP activation: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err = checkActivationPolicyTx(ctx, tx, userID, MFAMethodTOTP); err != nil {
+		return err
+	}
+
 	secret, isActive, err := s.loadSecret(ctx, userID)
 	if err != nil {
 		return err
@@ -152,12 +164,15 @@ func (s *TOTPService) VerifyAndActivate(ctx context.Context, userID int64, code 
 		return fmt.Errorf("invalid TOTP code")
 	}
 
-	_, err = s.pool.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		UPDATE totp_secrets SET is_active = true, updated_at = NOW()
 		WHERE user_id = $1
 	`, userID)
 	if err != nil {
 		return fmt.Errorf("activate totp_secrets: %w", err)
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit TOTP activation: %w", err)
 	}
 	return nil
 }
@@ -245,6 +260,26 @@ type TOTPStatus struct {
 	Active               bool `json:"active"`
 	BackupCodesRemaining int  `json:"backup_codes_remaining"`
 	EmailActive          bool `json:"email_active"`
+	// MFAEnabled is the caller's application MFA master switch, populated by
+	// the handler. false = the application runs without MFA: enrolled factors
+	// are kept but not challenged. Always true for a tenant-level user.
+	MFAEnabled bool `json:"mfa_enabled"`
+}
+
+// AppMFAEnabledForUser reports the MFA master switch of the application the
+// user belongs to — true for a tenant-level user, who has no application.
+func (s *TOTPService) AppMFAEnabledForUser(ctx context.Context, userID, tenantID int64) (bool, error) {
+	uc, err := s.loadUserMFAContext(ctx, userID, tenantID)
+	if err != nil {
+		// A tenant-switched administrator's token names a tenant their user row
+		// does not live in. They are no application's user, so no switch
+		// governs them.
+		if errors.Is(err, ErrUserNotFound) {
+			return true, nil
+		}
+		return false, err
+	}
+	return !uc.switchedOff(), nil
 }
 
 // Status reports the user's TOTP enrollment state and remaining backup codes.

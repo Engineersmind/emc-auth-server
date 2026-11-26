@@ -1065,6 +1065,9 @@ func (h *AuthHandler) MFAEnrollPending(c echo.Context) error {
 	result, session, err := h.svc.EnrollPending(c.Request().Context(), req.EnrollmentToken)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("pending MFA enroll failed")
+		if errors.Is(err, auth.ErrMFASwitchedOff) {
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		}
 		if containsMsg(err, "not configured") {
 			return c.JSON(http.StatusNotImplemented, map[string]string{"error": "TOTP not configured on this server"})
 		}
@@ -1121,6 +1124,13 @@ func (h *AuthHandler) MFAActivatePending(c echo.Context) error {
 	if err != nil {
 		if handled, resp := h.organizationOutcome(c, err, audit.AuthMethodTOTP, "", ""); handled {
 			return resp
+		}
+		// The switch being turned off mid-enrolment is an admin decision, not a
+		// failed MFA challenge: answer before auditFailure so a switch-off with
+		// users part-way through forced enrolment does not show up as a
+		// brute-force-looking spike of auth.mfa_challenge_failed.
+		if errors.Is(err, auth.ErrMFASwitchedOff) {
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
 		}
 		h.logger.Warn().Err(err).Msg("pending MFA activate failed")
 		event := audit.Event{
@@ -1871,6 +1881,8 @@ func (h *AuthHandler) TOTPEnroll(c echo.Context) error {
 	result, err := h.totpSvc.EnrollUser(c.Request().Context(), userID, tenantID, claims.Email, req.Code)
 	if err != nil {
 		switch {
+		case errors.Is(err, auth.ErrMFASwitchedOff):
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
 		case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrTOTPReenrollProof):
 			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 		case errors.Is(err, auth.ErrUserNotFound):
@@ -1925,14 +1937,25 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 	}
 
 	userID, _ := strconv.ParseInt(claims.UserID, 10, 64)
+	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
+	// VerifyAndActivate re-checks the application's MFA policy in the same
+	// transaction as the activation (#192): an enrolment begun before the
+	// switch went off, the mode went 'disabled' or TOTP was removed is refused.
 	if err := h.totpSvc.VerifyAndActivate(c.Request().Context(), userID, req.Code); err != nil {
+		switch {
+		case errors.Is(err, auth.ErrMFASwitchedOff):
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrMFAMethodNotAllowed):
+			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		case errors.Is(err, auth.ErrUserNotFound):
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		}
 		if containsMsg(err, "invalid TOTP") {
 			return fail(c, http.StatusBadRequest, "mfa_code_invalid")
 		}
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	}
 
-	tenantID, _ := strconv.ParseInt(claims.TenantID, 10, 64)
 	h.auditEvent(c, audit.Event{
 		TenantID:     &tenantID,
 		UserID:       &userID,
@@ -1949,7 +1972,7 @@ func (h *AuthHandler) TOTPActivate(c echo.Context) error {
 // TOTPStatus handles GET /api/v1/auth/otp/status.
 //
 // @Summary      Get own MFA status
-// @Description  Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low.
+// @Description  Returns the authenticated user's TOTP enrollment state and how many single-use backup codes remain — clients should prompt regeneration when the count runs low. mfa_enabled is the user's application MFA master switch: when false the application runs without MFA (enrolled factors are kept but not challenged, and new enrolment is refused).
 // @Tags         AUTH
 // @Produce      json
 // @Security     BearerAuth
@@ -1984,6 +2007,17 @@ func (h *AuthHandler) TOTPStatus(c echo.Context) error {
 		}
 		status.EmailActive = emailActive
 	}
+
+	tenantID, err := strconv.ParseInt(claims.TenantID, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, map[string]string{"error": "invalid tenant_id in token"})
+	}
+	enabled, err := h.totpSvc.AppMFAEnabledForUser(c.Request().Context(), userID, tenantID)
+	if err != nil {
+		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("MFA switch status failed")
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to load MFA status"})
+	}
+	status.MFAEnabled = enabled
 	return c.JSON(http.StatusOK, status)
 }
 
@@ -2079,20 +2113,25 @@ func (h *AuthHandler) auditMFA(c echo.Context, tenantID, userID int64, email, ac
 }
 
 // emailMFAErrorResponse maps EmailMFAService errors onto HTTP responses.
-func emailMFAErrorResponse(c echo.Context, err error) error {
+// handled reports whether a response was written: c.JSON returns nil on
+// success, so the error value alone cannot signal it (callers used to test
+// resp != nil, fall through, and append a second 500 body to the response).
+func emailMFAErrorResponse(c echo.Context, err error) (handled bool, resp error) {
 	switch {
+	case errors.Is(err, auth.ErrMFASwitchedOff):
+		return true, fail(c, http.StatusForbidden, "mfa_switched_off")
 	case errors.Is(err, auth.ErrMFAEnrollmentDisabled), errors.Is(err, auth.ErrMFAMethodNotAllowed), errors.Is(err, auth.ErrMFARequiredByPolicy):
-		return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
+		return true, c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 	case errors.Is(err, auth.ErrTooManyOTPAttempts), errors.Is(err, auth.ErrTooManyResends):
-		return c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
+		return true, c.JSON(http.StatusTooManyRequests, map[string]string{"error": err.Error()})
 	case errors.Is(err, auth.ErrEmailCodeInvalid):
-		return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return true, c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
 	case errors.Is(err, auth.ErrEmailMFANotActive):
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return true, c.JSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 	case errors.Is(err, auth.ErrUserNotFound):
-		return c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
+		return true, c.JSON(http.StatusNotFound, map[string]string{"error": "user not found"})
 	}
-	return nil
+	return false, nil
 }
 
 // EmailMFAEnroll handles POST /api/v1/auth/otp/email/enroll.
@@ -2120,7 +2159,7 @@ func (h *AuthHandler) EmailMFAEnroll(c echo.Context) error {
 	}
 
 	if err := h.emailSvc.BeginEnrollment(c.Request().Context(), userID, tenantID, claims.Email); err != nil {
-		if resp := emailMFAErrorResponse(c, err); resp != nil {
+		if handled, resp := emailMFAErrorResponse(c, err); handled {
 			return resp
 		}
 		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA enroll failed")
@@ -2164,8 +2203,10 @@ func (h *AuthHandler) EmailMFAActivate(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "code is required"})
 	}
 
+	// ActivateEnrollment re-checks the application's MFA policy before the code
+	// is consumed and in the activating transaction (#192) — see TOTPActivate.
 	if err := h.emailSvc.ActivateEnrollment(c.Request().Context(), userID, req.Code); err != nil {
-		if resp := emailMFAErrorResponse(c, err); resp != nil {
+		if handled, resp := emailMFAErrorResponse(c, err); handled {
 			return resp
 		}
 		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA activate failed")
@@ -2197,7 +2238,7 @@ func (h *AuthHandler) EmailMFASendCode(c echo.Context) error {
 	}
 
 	if err := h.emailSvc.SendVerificationCode(c.Request().Context(), userID, tenantID, claims.Email); err != nil {
-		if resp := emailMFAErrorResponse(c, err); resp != nil {
+		if handled, resp := emailMFAErrorResponse(c, err); handled {
 			return resp
 		}
 		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA send failed")
@@ -2249,7 +2290,7 @@ func (h *AuthHandler) EmailMFADisable(c echo.Context) error {
 	}
 
 	if err := h.emailSvc.Disable(c.Request().Context(), userID, tenantID, req.Code); err != nil {
-		if resp := emailMFAErrorResponse(c, err); resp != nil {
+		if handled, resp := emailMFAErrorResponse(c, err); handled {
 			return resp
 		}
 		h.logger.Error().Err(err).Str("user_id", claims.UserID).Msg("email MFA disable failed")
@@ -2338,6 +2379,9 @@ func (h *AuthHandler) MFAEmailPending(c echo.Context) error {
 	_, err := h.svc.SendPendingEnrollmentCode(c.Request().Context(), req.EnrollmentToken)
 	if err != nil {
 		h.logger.Warn().Err(err).Msg("pending email MFA send failed")
+		if errors.Is(err, auth.ErrMFASwitchedOff) {
+			return fail(c, http.StatusForbidden, "mfa_switched_off")
+		}
 		if errors.Is(err, auth.ErrMFAMethodNotAllowed) {
 			return c.JSON(http.StatusForbidden, map[string]string{"error": err.Error()})
 		}

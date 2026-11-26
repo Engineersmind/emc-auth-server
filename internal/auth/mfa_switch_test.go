@@ -1,0 +1,665 @@
+package auth_test
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/engineersmind/emc-auth-server/internal/auth"
+)
+
+// ---------------------------------------------------------------------------
+// Per-application MFA master switch (#192, stage 1 of #189)
+// ---------------------------------------------------------------------------
+
+func boolPtr(b bool) *bool { return &b }
+
+// An application with no settings row is ON, and the switch round-trips
+// through UpdateAppMFASettings, reporting the value it replaced.
+func TestMFASwitch_DefaultOnAndRoundTrip(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-roundtrip")
+
+	cfg, err := f.totpSvc.GetAppMFAConfig(f.ctx, appID)
+	if err != nil {
+		t.Fatalf("GetAppMFAConfig: %v", err)
+	}
+	if !cfg.Enabled || cfg.Mode != auth.MFAModeOptional {
+		t.Fatalf("no-row config = %+v, want enabled + optional", cfg)
+	}
+	policy, err := f.totpSvc.GetAppMFAPolicy(f.ctx, f.tenantID, appID)
+	if err != nil {
+		t.Fatalf("GetAppMFAPolicy: %v", err)
+	}
+	if !policy.MFAEnabled {
+		t.Error("no-row policy reports mfa_enabled = false")
+	}
+
+	prev, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil)
+	if err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	if !prev {
+		t.Error("prev = false on first switch-off, want true (no row = on)")
+	}
+	if cfg, _ = f.totpSvc.GetAppMFAConfig(f.ctx, appID); cfg.Enabled {
+		t.Error("switch still on after turning it off")
+	}
+
+	// Re-sending the current value is not a change.
+	res, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{Enabled: boolPtr(false)}, nil)
+	if err != nil {
+		t.Fatalf("UpdateAppMFASettings(false again): %v", err)
+	}
+	if res.SwitchChanged() {
+		t.Errorf("redundant off reported as a change: %+v", res)
+	}
+
+	res, err = f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{Enabled: boolPtr(true)}, nil)
+	if err != nil {
+		t.Fatalf("UpdateAppMFASettings(true): %v", err)
+	}
+	if !res.SwitchChanged() || res.PrevEnabled || !res.NewEnabled {
+		t.Errorf("switch-on result = %+v, want false → true", res)
+	}
+}
+
+// Turning the switch off keeps mode and allowed methods; turning it back on
+// restores them untouched.
+func TestMFASwitch_OffKeepsModeAndMethods(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-keeps")
+
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired,
+		[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy: %v", err)
+	}
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	cfg, err := f.totpSvc.GetAppMFAConfig(f.ctx, appID)
+	if err != nil {
+		t.Fatalf("GetAppMFAConfig: %v", err)
+	}
+	if cfg.Enabled || cfg.Mode != auth.MFAModeRequired || len(cfg.Methods) != 2 {
+		t.Errorf("config after switch-off = %+v, want disabled switch with required + both methods kept", cfg)
+	}
+}
+
+// A tenant can never flip another tenant's application.
+func TestMFASwitch_TenantIsolation(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-isolation")
+
+	var other int64
+	slug := fmt.Sprintf("mfa-switch-other-%d", time.Now().UnixNano())
+	if err := f.pool.QueryRow(f.ctx,
+		`INSERT INTO tenants (name, slug, jwt_secret) VALUES ($1, $1, 'secret') RETURNING id`, slug,
+	).Scan(&other); err != nil {
+		t.Fatalf("create other tenant: %v", err)
+	}
+
+	_, err := f.totpSvc.UpdateAppMFASettings(f.ctx, other, appID, auth.AppMFAUpdate{Enabled: boolPtr(false)}, nil)
+	if !errors.Is(err, auth.ErrAppNotFound) {
+		t.Fatalf("cross-tenant switch-off error = %v, want ErrAppNotFound", err)
+	}
+	if cfg, _ := f.totpSvc.GetAppMFAConfig(f.ctx, appID); !cfg.Enabled {
+		t.Fatal("cross-tenant call turned the switch off")
+	}
+}
+
+// The admin PUT is atomic: a magic-link error after a valid switch/mode change
+// rolls the whole update back.
+func TestMFASwitch_UpdateIsAtomic(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-atomic")
+
+	bad := "http://not-loopback.example.com/cb" // cleartext to a public host — rejected
+	_, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{
+		Enabled:              boolPtr(false),
+		Mode:                 auth.MFAModeRequired,
+		MagicLinkEnabled:     boolPtr(true),
+		MagicLinkRedirectURL: &bad,
+	}, nil)
+	if !errors.Is(err, auth.ErrMagicLinkNotConfigured) {
+		t.Fatalf("error = %v, want ErrMagicLinkNotConfigured", err)
+	}
+	cfg, err := f.totpSvc.GetAppMFAConfig(f.ctx, appID)
+	if err != nil {
+		t.Fatalf("GetAppMFAConfig: %v", err)
+	}
+	if !cfg.Enabled || cfg.Mode != auth.MFAModeOptional {
+		t.Errorf("config after failed update = %+v, want untouched (enabled, optional)", cfg)
+	}
+}
+
+// allowed_methods without mode is refused, not silently dropped, and the
+// switch sent alongside it is not applied either.
+func TestMFASwitch_MethodsWithoutModeRefused(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-methods-no-mode")
+
+	_, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{
+		Enabled: boolPtr(false),
+		Methods: []string{auth.MFAMethodEmail},
+	}, nil)
+	if !errors.Is(err, auth.ErrMFAMethodsNeedMode) {
+		t.Fatalf("error = %v, want ErrMFAMethodsNeedMode", err)
+	}
+	cfg, err := f.totpSvc.GetAppMFAConfig(f.ctx, appID)
+	if err != nil {
+		t.Fatalf("GetAppMFAConfig: %v", err)
+	}
+	if !cfg.Enabled || len(cfg.Methods) != 1 || cfg.Methods[0] != auth.MFAMethodTOTP {
+		t.Errorf("config after refused update = %+v, want untouched (enabled, [totp])", cfg)
+	}
+}
+
+// Switch off: a user with an active TOTP is not challenged; the factor stays
+// enrolled. Switch back on: the challenge returns at the next login.
+func TestMFASwitch_OffSkipsChallengeForEnrolledUser(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.createApp(t, "switch-enrolled")
+	email := uniqueEmail("switch-enrolled")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+	f.enrollAndActivate(t, userID, email)
+
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	res, err := f.appLogin(t, app, email, "Password123!")
+	if err != nil {
+		t.Fatalf("Login(off): %v", err)
+	}
+	if res.Token == nil || res.OTPChallenge != nil {
+		t.Fatalf("Login(off) = %+v, want tokens and no challenge", res)
+	}
+	if active, _ := f.totpSvc.IsActive(f.ctx, userID); !active {
+		t.Error("switch-off removed the user's TOTP enrolment")
+	}
+
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, true, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(true): %v", err)
+	}
+	res, err = f.appLogin(t, app, email, "Password123!")
+	if err != nil {
+		t.Fatalf("Login(on): %v", err)
+	}
+	if res.OTPChallenge == nil {
+		t.Fatalf("Login(on) = %+v, want OTP challenge again", res)
+	}
+}
+
+// Switch off under 'required': an unenrolled user is not forced to enrol.
+func TestMFASwitch_OffSkipsForcedEnrolmentUnderRequired(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.createApp(t, "switch-required")
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy(required): %v", err)
+	}
+	email := uniqueEmail("switch-required")
+	f.registerAppUser(t, app, email, "Password123!")
+
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	res, err := f.appLogin(t, app, email, "Password123!")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if res.Token == nil || res.MFAEnrollment != nil {
+		t.Fatalf("Login = %+v, want tokens and no forced enrolment", res)
+	}
+}
+
+// An enrolment token minted while MFA was on is refused by every pending path
+// once the switch is turned off, and is dead afterwards: turning the switch
+// back on does not revive it.
+func TestMFASwitch_OffRefusesPendingEnrolment(t *testing.T) {
+	cases := map[string]func(f *mfaFixture, token string) error{
+		"EnrollPending": func(f *mfaFixture, token string) error {
+			_, _, err := f.authSvc.EnrollPending(f.ctx, token)
+			return err
+		},
+		"SendPendingEnrollmentCode": func(f *mfaFixture, token string) error {
+			_, err := f.authSvc.SendPendingEnrollmentCode(f.ctx, token)
+			return err
+		},
+		"ActivatePending": func(f *mfaFixture, token string) error {
+			_, _, err := f.authSvc.ActivatePending(f.ctx, token, "123456")
+			return err
+		},
+	}
+	for name, call := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newMFAFixture(t)
+			app, appID := f.createApp(t, "switch-pending-"+name)
+			if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired,
+				[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
+				t.Fatalf("SetAppMFAPolicy(required): %v", err)
+			}
+			email := uniqueEmail("switch-pending")
+			userID := f.registerAppUser(t, app, email, "Password123!")
+
+			res, err := f.appLogin(t, app, email, "Password123!")
+			if err != nil || res.MFAEnrollment == nil {
+				t.Fatalf("Login = %+v, %v; want forced enrolment", res, err)
+			}
+			token := res.MFAEnrollment.EnrollmentToken
+
+			if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+				t.Fatalf("SetAppMFAEnabled(false): %v", err)
+			}
+			if err := call(f, token); !errors.Is(err, auth.ErrMFASwitchedOff) {
+				t.Fatalf("%s with switch off: error = %v, want ErrMFASwitchedOff", name, err)
+			}
+			if active, err := f.totpSvc.IsActive(f.ctx, userID); err != nil || active {
+				t.Fatalf("TOTP active = %v, %v; want no enrolment created", active, err)
+			}
+
+			if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, true, nil); err != nil {
+				t.Fatalf("SetAppMFAEnabled(true): %v", err)
+			}
+			if _, _, err := f.authSvc.EnrollPending(f.ctx, token); err == nil || errors.Is(err, auth.ErrMFASwitchedOff) {
+				t.Fatalf("EnrollPending after switch back on: error = %v, want invalid or expired session", err)
+			}
+		})
+	}
+}
+
+// Enrolment is refused with ErrMFASwitchedOff for both methods while the
+// switch is off — distinct from mode 'disabled'.
+func TestMFASwitch_OffRefusesEnrolment(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.createApp(t, "switch-enrol")
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional,
+		[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy: %v", err)
+	}
+	email := uniqueEmail("switch-enrol")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	if _, err := f.totpSvc.EnrollUser(f.ctx, userID, f.tenantID, email, ""); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("TOTP EnrollUser error = %v, want ErrMFASwitchedOff", err)
+	}
+	if err := f.emailSvc.BeginEnrollment(f.ctx, userID, f.tenantID, email); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("email BeginEnrollment error = %v, want ErrMFASwitchedOff", err)
+	}
+}
+
+// Re-sending the current switch value writes nothing (PR #244 review): the
+// handler audits only a real flip, so updated_by must keep naming whoever made
+// the last real change, and an app with no settings row gets none.
+func TestMFASwitch_NoOpLeavesUpdatedByAlone(t *testing.T) {
+	f := newMFAFixture(t)
+	_, appID := f.createApp(t, "switch-noop")
+	someone := int64(424242)
+
+	// No row yet: "on" is the default, so re-sending it inserts nothing.
+	if _, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{Enabled: boolPtr(true)}, &someone); err != nil {
+		t.Fatalf("UpdateAppMFASettings(on, no row): %v", err)
+	}
+	var rows int
+	if err := f.pool.QueryRow(f.ctx, `SELECT COUNT(*) FROM application_mfa_settings WHERE application_id = $1`, appID).Scan(&rows); err != nil {
+		t.Fatalf("count settings rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("no-op on an app without settings inserted %d row(s), want 0", rows)
+	}
+
+	// A real flip records the updater; re-sending it does not overwrite them.
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	var before time.Time
+	if err := f.pool.QueryRow(f.ctx, `SELECT updated_at FROM application_mfa_settings WHERE application_id = $1`, appID).Scan(&before); err != nil {
+		t.Fatalf("read updated_at: %v", err)
+	}
+	if _, err := f.totpSvc.UpdateAppMFASettings(f.ctx, f.tenantID, appID, auth.AppMFAUpdate{Enabled: boolPtr(false)}, &someone); err != nil {
+		t.Fatalf("UpdateAppMFASettings(off again): %v", err)
+	}
+	var after time.Time
+	var updatedBy *int64
+	if err := f.pool.QueryRow(f.ctx, `SELECT updated_at, updated_by FROM application_mfa_settings WHERE application_id = $1`, appID).Scan(&after, &updatedBy); err != nil {
+		t.Fatalf("read updated_at/updated_by: %v", err)
+	}
+	if !after.Equal(before) || updatedBy != nil {
+		t.Errorf("no-op rewrote the row: updated_at %v -> %v, updated_by = %v, want unchanged / nil", before, after, updatedBy)
+	}
+}
+
+// A self-service enrolment begun while the policy allowed it must not activate
+// after the admin turns the switch off, sets mode 'disabled', or removes the
+// method (PR #244 review). VerifyAndActivate / ActivateEnrollment re-check the
+// policy in the activating transaction, before the code is checked — so the
+// emailed code survives every refusal and completes the enrolment at the end.
+func TestMFASwitch_ActivationRechecksPolicy(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.createApp(t, "switch-activate")
+	both := []string{auth.MFAMethodTOTP, auth.MFAMethodEmail}
+	setPolicy := func(mode string, methods []string) {
+		t.Helper()
+		if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, mode, methods, nil); err != nil {
+			t.Fatalf("SetAppMFAPolicy(%s, %v): %v", mode, methods, err)
+		}
+	}
+	setPolicy(auth.MFAModeOptional, both)
+	email := uniqueEmail("switch-activate")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+
+	result, err := f.totpSvc.EnrollUser(f.ctx, userID, f.tenantID, email, "")
+	if err != nil {
+		t.Fatalf("EnrollUser: %v", err)
+	}
+	secret := secretFromOTPURI(t, result.OTPURI)
+	if err := f.emailSvc.BeginEnrollment(f.ctx, userID, f.tenantID, email); err != nil {
+		t.Fatalf("BeginEnrollment: %v", err)
+	}
+	emailCode := f.mail.lastCode(t).Code
+
+	activateTOTP := func() error { return f.totpSvc.VerifyAndActivate(f.ctx, userID, codeFor(t, secret)) }
+	activateEmail := func() error { return f.emailSvc.ActivateEnrollment(f.ctx, userID, emailCode) }
+
+	// Switch off.
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	if err := activateTOTP(); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("TOTP activate (switch off) error = %v, want ErrMFASwitchedOff", err)
+	}
+	if err := activateEmail(); !errors.Is(err, auth.ErrMFASwitchedOff) {
+		t.Errorf("email activate (switch off) error = %v, want ErrMFASwitchedOff", err)
+	}
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, true, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(true): %v", err)
+	}
+
+	// Mode 'disabled'.
+	setPolicy(auth.MFAModeDisabled, both)
+	if err := activateTOTP(); !errors.Is(err, auth.ErrMFAEnrollmentDisabled) {
+		t.Errorf("TOTP activate (mode disabled) error = %v, want ErrMFAEnrollmentDisabled", err)
+	}
+	if err := activateEmail(); !errors.Is(err, auth.ErrMFAEnrollmentDisabled) {
+		t.Errorf("email activate (mode disabled) error = %v, want ErrMFAEnrollmentDisabled", err)
+	}
+
+	// Method removed from allowed_methods.
+	setPolicy(auth.MFAModeOptional, []string{auth.MFAMethodEmail})
+	if err := activateTOTP(); !errors.Is(err, auth.ErrMFAMethodNotAllowed) {
+		t.Errorf("TOTP activate (totp not allowed) error = %v, want ErrMFAMethodNotAllowed", err)
+	}
+	setPolicy(auth.MFAModeOptional, []string{auth.MFAMethodTOTP})
+	if err := activateEmail(); !errors.Is(err, auth.ErrMFAMethodNotAllowed) {
+		t.Errorf("email activate (email not allowed) error = %v, want ErrMFAMethodNotAllowed", err)
+	}
+
+	// Policy allows both again: both complete, the email code still unspent.
+	setPolicy(auth.MFAModeOptional, both)
+	if err := activateTOTP(); err != nil {
+		t.Errorf("TOTP activate (allowed) error = %v, want nil", err)
+	}
+	if err := activateEmail(); err != nil {
+		t.Errorf("email activate (allowed) with the original code error = %v, want nil", err)
+	}
+}
+
+// Under 'required', the last factor cannot normally be removed — but while the
+// switch is off there is no mandate, so it can.
+func TestMFASwitch_OffLiftsLastFactorGuard(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.createApp(t, "switch-lastfactor")
+	email := uniqueEmail("switch-lastfactor")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+	secret := f.enrollAndActivate(t, userID, email)
+
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy(required): %v", err)
+	}
+	if err := f.totpSvc.DisableUser(f.ctx, userID, f.tenantID, codeFor(t, secret)); !errors.Is(err, auth.ErrMFARequiredByPolicy) {
+		t.Fatalf("DisableUser(on, required) error = %v, want ErrMFARequiredByPolicy", err)
+	}
+
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	if err := f.totpSvc.DisableUser(f.ctx, userID, f.tenantID, codeFor(t, secret)); err != nil {
+		t.Fatalf("DisableUser(off) error = %v, want nil", err)
+	}
+}
+
+// /auth/me/mfa for an application user follows the application's policy
+// (#189): allowed = switch on && mode != disabled && method allowed.
+func TestMFASwitch_MyMFAStatusForAppUser(t *testing.T) {
+	f := newMFAFixture(t)
+	f.withAdminMFA(t)
+	app, appID := f.createApp(t, "switch-status")
+	email := uniqueEmail("switch-status")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+
+	allowed := func(t *testing.T) (map[string]bool, *auth.MFAStatus) {
+		t.Helper()
+		st, err := f.authSvc.MyMFAStatus(f.ctx, userID, f.tenantID, nil)
+		if err != nil {
+			t.Fatalf("MyMFAStatus: %v", err)
+		}
+		out := map[string]bool{}
+		for _, m := range st.Methods {
+			out[m.Method] = m.Allowed
+		}
+		return out, st
+	}
+
+	// Default: TOTP only.
+	got, st := allowed(t)
+	if !st.MFAEnabled || st.Mode != auth.MFAModeOptional || st.MFARequired {
+		t.Errorf("default status = %+v, want enabled, optional, not admin-required", st)
+	}
+	if !got[auth.MFAMethodTOTP] || got[auth.MFAMethodEmail] {
+		t.Errorf("default allowed = %v, want totp only (the #189 bug reported email allowed)", got)
+	}
+
+	// Mode disabled: nothing allowed.
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeDisabled,
+		[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy(disabled): %v", err)
+	}
+	if got, st = allowed(t); got[auth.MFAMethodTOTP] || got[auth.MFAMethodEmail] || st.Mode != auth.MFAModeDisabled {
+		t.Errorf("disabled: allowed = %v mode = %q, want nothing allowed", got, st.Mode)
+	}
+
+	// Optional with both methods, switch off: nothing allowed, mfa_enabled false.
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional, nil, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy(optional): %v", err)
+	}
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+	if got, st = allowed(t); got[auth.MFAMethodTOTP] || got[auth.MFAMethodEmail] || st.MFAEnabled {
+		t.Errorf("switch off: allowed = %v mfa_enabled = %v, want nothing allowed and false", got, st.MFAEnabled)
+	}
+
+	// Switch back on: both allowed.
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, true, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(true): %v", err)
+	}
+	if got, st = allowed(t); !got[auth.MFAMethodTOTP] || !got[auth.MFAMethodEmail] || !st.MFAEnabled {
+		t.Errorf("switch on: allowed = %v, want both", got)
+	}
+
+	if on, err := f.totpSvc.AppMFAEnabledForUser(f.ctx, userID, f.tenantID); err != nil || !on {
+		t.Errorf("AppMFAEnabledForUser = %v, %v; want true", on, err)
+	}
+}
+
+// Administrators keep the administrator-policy logic and are never governed by
+// any application's switch.
+// An application user whose permissions happen to be named like the console's
+// administrator permissions is still judged by the application's policy: the
+// switch being off must show as off, not as administrator-required.
+func TestMFASwitch_MyMFAStatusAppUserWithAdminNamedPerms(t *testing.T) {
+	f := newMFAFixture(t)
+	svc := f.withAdminMFA(t)
+	f.setAdminPolicy(t, svc, auth.MFAMethodTOTP)
+	app, appID := f.createApp(t, "switch-status-adminperm")
+	userID := f.registerAppUser(t, app, uniqueEmail("switch-status-adminperm"), "Password123!")
+	if _, err := f.totpSvc.SetAppMFAEnabled(f.ctx, f.tenantID, appID, false, nil); err != nil {
+		t.Fatalf("SetAppMFAEnabled(false): %v", err)
+	}
+
+	for _, perm := range []string{"admin:access", "tenant:manage"} {
+		st, err := f.authSvc.MyMFAStatus(f.ctx, userID, f.tenantID, []string{perm})
+		if err != nil {
+			t.Fatalf("MyMFAStatus(%s): %v", perm, err)
+		}
+		if st.MFAEnabled || st.MFARequired || st.Mode != auth.MFAModeOptional {
+			t.Errorf("%s: status = %+v, want the app's policy (switch off, optional, not required)", perm, st)
+		}
+		for _, m := range st.Methods {
+			if m.Allowed {
+				t.Errorf("%s: %s allowed = true, want false while the app switch is off", perm, m.Method)
+			}
+		}
+	}
+}
+
+func TestMFASwitch_MyMFAStatusForAdmin(t *testing.T) {
+	f := newMFAFixture(t)
+	svc := f.withAdminMFA(t)
+	f.setAdminPolicy(t, svc, auth.MFAMethodTOTP)
+	id, _ := f.registerOwner(t, "switch-admin-status")
+
+	st, err := f.authSvc.MyMFAStatus(f.ctx, id, f.tenantID, nil)
+	if err != nil {
+		t.Fatalf("MyMFAStatus: %v", err)
+	}
+	if !st.MFARequired || !st.MFAEnabled || st.Mode != auth.MFAModeRequired {
+		t.Errorf("admin status = %+v, want required, enabled, mode required", st)
+	}
+	for _, m := range st.Methods {
+		if want := m.Method == auth.MFAMethodTOTP; m.Allowed != want {
+			t.Errorf("admin %s allowed = %v, want %v (admin policy)", m.Method, m.Allowed, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// AuthorizeMFASwitchOff
+// ---------------------------------------------------------------------------
+
+// mfaSession signs an app user in with TOTP and returns the verified claims of
+// the resulting access token — a session whose amr records MFA.
+func (f *mfaFixture) mfaSession(t *testing.T, prefix string) *auth.Claims {
+	t.Helper()
+	app, _ := f.createApp(t, prefix)
+	email := uniqueEmail(prefix)
+	userID := f.registerAppUser(t, app, email, "Password123!")
+	secret := f.enrollAndActivate(t, userID, email)
+
+	res, err := f.appLogin(t, app, email, "Password123!")
+	if err != nil || res.OTPChallenge == nil {
+		t.Fatalf("Login = %+v, %v; want OTP challenge", res, err)
+	}
+	tok, err := f.authSvc.LoginOTP(f.ctx, auth.LoginOTPInput{
+		OTPSessionToken: res.OTPChallenge.OTPSessionToken,
+		Code:            codeFor(t, secret),
+	})
+	if err != nil {
+		t.Fatalf("LoginOTP: %v", err)
+	}
+	claims, err := f.jwtSvc.Verify(f.ctx, tok.AccessToken)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	return claims
+}
+
+func TestMFASwitchOff_RecentMFASessionAllowed(t *testing.T) {
+	f := newMFAFixture(t)
+	c := f.mfaSession(t, "switchoff-fresh")
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); err != nil {
+		t.Fatalf("fresh MFA session refused: %v", err)
+	}
+}
+
+func TestMFASwitchOff_StaleSessionRefused(t *testing.T) {
+	f := newMFAFixture(t)
+	c := f.mfaSession(t, "switchoff-stale")
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE user_sessions SET auth_time = NOW() - INTERVAL '11 minutes' WHERE id::TEXT = $1`, c.SessionID,
+	); err != nil {
+		t.Fatalf("age session: %v", err)
+	}
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); !errors.Is(err, auth.ErrMFASwitchOffStaleSession) {
+		t.Fatalf("stale session error = %v, want ErrMFASwitchOffStaleSession", err)
+	}
+}
+
+// The age is judged on the application clock that wrote auth_time: a sign-in
+// eleven minutes old by time.Now() is refused whatever the database clock says.
+func TestMFASwitchOff_AgeJudgedOnApplicationClock(t *testing.T) {
+	f := newMFAFixture(t)
+	c := f.mfaSession(t, "switchoff-appclock")
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE user_sessions SET auth_time = $2 WHERE id::TEXT = $1`, c.SessionID, time.Now().UTC().Add(-11*time.Minute),
+	); err != nil {
+		t.Fatalf("age session: %v", err)
+	}
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); !errors.Is(err, auth.ErrMFASwitchOffStaleSession) {
+		t.Fatalf("stale session error = %v, want ErrMFASwitchOffStaleSession", err)
+	}
+}
+
+// A session past its deadline cannot turn MFA off, even with a fresh MFA
+// sign-in and an access token that is still valid. Only the idle deadline is
+// moved: CHECK (idle_expires_at <= absolute_expires_at) means a past absolute
+// deadline always comes with a past idle one.
+func TestMFASwitchOff_ExpiredSessionRefused(t *testing.T) {
+	f := newMFAFixture(t)
+	c := f.mfaSession(t, "switchoff-expired")
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); err != nil {
+		t.Fatalf("live session refused: %v", err)
+	}
+	if _, err := f.pool.Exec(f.ctx,
+		`UPDATE user_sessions SET idle_expires_at = NOW() - INTERVAL '1 second' WHERE id::TEXT = $1`, c.SessionID,
+	); err != nil {
+		t.Fatalf("expire session: %v", err)
+	}
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); !errors.Is(err, auth.ErrMFASwitchOffStaleSession) {
+		t.Fatalf("expired session error = %v, want ErrMFASwitchOffStaleSession", err)
+	}
+}
+
+func TestMFASwitchOff_SessionWithoutMFARefused(t *testing.T) {
+	f := newMFAFixture(t)
+	app, _ := f.createApp(t, "switchoff-nomfa")
+	email := uniqueEmail("switchoff-nomfa")
+	f.registerAppUser(t, app, email, "Password123!")
+	res, err := f.appLogin(t, app, email, "Password123!")
+	if err != nil || res.Token == nil {
+		t.Fatalf("Login = %+v, %v; want tokens", res, err)
+	}
+	c, err := f.jwtSvc.Verify(f.ctx, res.Token.AccessToken)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, c.Gty, c.SessionID, c.UserID); !errors.Is(err, auth.ErrMFASwitchOffStaleSession) {
+		t.Fatalf("password-only session error = %v, want ErrMFASwitchOffStaleSession", err)
+	}
+}
+
+func TestMFASwitchOff_ServiceTokensRefused(t *testing.T) {
+	f := newMFAFixture(t)
+	for _, gty := range []string{auth.GrantAPIKey, auth.GrantClientCredentials} {
+		if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, gty, "", "client-id"); !errors.Is(err, auth.ErrMFASwitchOffServiceToken) {
+			t.Errorf("gty=%s error = %v, want ErrMFASwitchOffServiceToken", gty, err)
+		}
+	}
+	// A human grant without a session cannot prove a recent MFA.
+	if err := f.totpSvc.AuthorizeMFASwitchOff(f.ctx, auth.GrantPassword, "", "1"); !errors.Is(err, auth.ErrMFASwitchOffStaleSession) {
+		t.Errorf("sessionless human token error = %v, want ErrMFASwitchOffStaleSession", err)
+	}
+}

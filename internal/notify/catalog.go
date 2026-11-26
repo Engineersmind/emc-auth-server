@@ -42,18 +42,27 @@ type notable struct {
 // about every new action anyone adds, and the channel is only useful while
 // everything in it is worth reading.
 //
-// Deliberately two entries. Each is a change every administrator of the
+// Deliberately three entries. Each is a change every administrator of the
 // affected scope must know about at once: a rotated secret breaks every
-// integration still holding the old one, and a deactivated tenant stops all of
-// its sign-ins. Everything else an administrator does — applications, roles,
-// permissions, MFA policy, administrator grants — was catalogued once and
+// integration still holding the old one, a deactivated tenant stops all of
+// its sign-ins, and flipping an application's MFA master switch (#192) removes
+// or restores two-factor sign-in for every one of its users in one call.
+// Everything else an administrator does — applications, roles, permissions,
+// MFA mode and methods, administrator grants — was catalogued once and
 // withdrawn as noise. It remains in the audit log and in Monitoring.
+//
+// The MFA switch phrase is direction-neutral on purpose. Repeats of one
+// action on one resource by one actor collapse into a single email (see
+// collapseKey), so an "off" quickly followed by an "on" arrives as one notice;
+// a phrase naming a direction would then state the wrong final state. The
+// audit row carries old_mfa_enabled / new_mfa_enabled, one click away.
 //
 // The actor is not special-cased. They are an administrator of the scope, so
 // they receive the same email, which is how a stolen session is discovered.
 var notableActions = map[string]notable{
 	audit.ActionAdminApplicationSecretRotated: {phrase: "rotated a client secret", scope: scopeApplication, oversight: true},
 	audit.ActionAdminTenantDeactivated:        {phrase: "deactivated the tenant", scope: scopeTenantOwners, oversight: true},
+	audit.ActionAdminMFASwitchChanged:         {phrase: "turned two-factor authentication on or off for an application", scope: scopeApplication},
 }
 
 // Notifications are sent only for actions that SUCCEEDED.
