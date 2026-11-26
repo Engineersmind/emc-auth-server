@@ -95,6 +95,20 @@ func withoutMethod(methods []string, method string) []string {
 	return out
 }
 
+// secondFactorMethods returns the methods of methods that can serve as a
+// second factor after a first factor. When the first factor itself proved
+// control of the user's inbox (the passwordless email code, amr "email_otp"),
+// the email method is dropped: the same inbox twice is ceremony, not a second
+// factor. The single rule both the login gate (mfaGateWith) and the refresh
+// step-up check (checkRefreshStepUp) apply, so they agree on whether a usable
+// second factor exists.
+func secondFactorMethods(methods []string, inboxFirstFactor bool) []string {
+	if !inboxFirstFactor {
+		return methods
+	}
+	return withoutMethod(methods, MFAMethodEmail)
+}
+
 // defaultMFAMethods is the implicit method set when no policy row exists and
 // the pre-00047 default for existing rows.
 func defaultMFAMethods() []string { return []string{MFAMethodTOTP} }
@@ -332,6 +346,7 @@ func (s *TOTPService) SetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 type mfaSettingsQuerier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier, tenantID, appRowID int64, mode string, methods []string, updatedBy *int64) error {
@@ -343,10 +358,11 @@ func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier,
 	}
 	// Required MFA with email as the only method cannot be satisfied by a user who
 	// signed in with an emailed code, so refuse it while email codes are on (#203).
-	// An 'optional' application with active role rules is 'required' for every
-	// covered user (#195), so it is refused the same way. The stored methods and
-	// rules are read through q, so inside the admin PUT's transaction this sees
-	// the same rows the upsert below replaces.
+	// Role rules make covered users 'required' (#195) and a rule's own method
+	// list can narrow them to email alone (#199), in either mode, so a rule
+	// leaving email as the only method is refused the same way. The stored
+	// methods and rules are read through q, so inside the admin PUT's
+	// transaction this sees the same rows the upsert below replaces.
 	if (mode == MFAModeRequired || mode == MFAModeOptional) && s.emailCodeEnabled != nil {
 		eff := methods
 		if eff == nil {
@@ -356,18 +372,16 @@ func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier,
 			}
 			eff = cur
 		}
-		if emailOnlyMFAMethods(eff) {
-			effectivelyRequired := mode == MFAModeRequired
-			if !effectivelyRequired {
-				has, hErr := appHasMFARoleRules(ctx, q, appRowID)
-				if hErr != nil {
-					return hErr
-				}
-				effectivelyRequired = has
+		conflict := mode == MFAModeRequired && emailOnlyMFAMethods(eff)
+		if !conflict {
+			rules, rErr := loadMFARuleEmailOnly(ctx, q, appRowID, eff)
+			if rErr != nil {
+				return rErr
 			}
-			if effectivelyRequired && s.emailCodeEnabled(ctx, tenantID, appRowID) {
-				return ErrPasswordlessMFAConflict
-			}
+			conflict = rules.emailOnly
+		}
+		if conflict && s.emailCodeEnabled(ctx, tenantID, appRowID) {
+			return ErrPasswordlessMFAConflict
 		}
 	}
 	tag, err := q.Exec(ctx, `

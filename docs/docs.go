@@ -2287,7 +2287,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. Idempotent: a second call revokes nothing more. Audited as admin.application_sessions_revoked with the count.",
+                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. One call ends at most 1000 sessions (the revocations run inside the request); remaining reports how many are still live, so repeat the call until complete is true. Each call also re-denies the access tokens of every session this action revoked in the last access-token lifetime, so deny_failed \u003e 0 is repaired by repeating the call too. Idempotent. Refused with 503 session_denial_unavailable on a server without Redis, where outstanding access tokens could not be denied. Audited as admin.application_sessions_revoked with the counts.",
                 "produces": [
                     "application/json"
                 ],
@@ -2330,7 +2330,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "service_unavailable",
+                        "description": "service_unavailable | session_denial_unavailable",
                         "schema": {
                             "$ref": "#/definitions/handlers.APIError"
                         }
@@ -6733,7 +6733,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "session store unavailable — retry",
+                        "description": "session store unavailable — retry | app_mfa_unavailable (the refresh step-up check could not run, or the role rules covering the user leave no allowed MFA method; nothing was revoked or rotated)",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -7159,7 +7159,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "session store unavailable — retry",
+                        "description": "session store unavailable — retry | app_mfa_unavailable (nothing was revoked or rotated)",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -12137,7 +12137,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. Idempotent: a second call revokes nothing more. Audited as admin.application_sessions_revoked with the count.",
+                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. One call ends at most 1000 sessions (the revocations run inside the request); remaining reports how many are still live, so repeat the call until complete is true. Each call also re-denies the access tokens of every session this action revoked in the last access-token lifetime, so deny_failed \u003e 0 is repaired by repeating the call too. Idempotent. Refused with 503 session_denial_unavailable on a server without Redis, where outstanding access tokens could not be denied. Audited as admin.application_sessions_revoked with the counts.",
                 "produces": [
                     "application/json"
                 ],
@@ -12180,7 +12180,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "service_unavailable",
+                        "description": "service_unavailable | session_denial_unavailable",
                         "schema": {
                             "$ref": "#/definitions/handlers.APIError"
                         }
@@ -14250,6 +14250,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable (refresh_token grant: the step-up check could not run, or the role rules covering the user leave no allowed MFA method; the refresh token is untouched)",
                         "schema": {
                             "$ref": "#/definitions/handlers.tokenError"
                         }
@@ -18903,8 +18909,20 @@ const docTemplate = `{
                 "application_id": {
                     "type": "string"
                 },
+                "complete": {
+                    "description": "Complete is true only when every session is signed out: remaining,\nfailed and deny_failed are all 0. Anything else: repeat the call.",
+                    "type": "boolean"
+                },
+                "deny_failed": {
+                    "description": "DenyFailed is how many sessions revoked by this action within the last\naccess-token lifetime could not have their access tokens denied. Their\nrefresh is stopped but an access token may work until it expires; the\nnext call re-denies them.",
+                    "type": "integer"
+                },
                 "failed": {
-                    "description": "Failed is how many sessions could not be revoked (logged server-side).\nNon-zero is worth a retry; the call is idempotent.",
+                    "description": "Failed is how many sessions could not be revoked (logged server-side).\nThey stay live and are counted in Remaining; repeat the call.",
+                    "type": "integer"
+                },
+                "remaining": {
+                    "description": "Remaining is how many of the application's sessions are still live after\nthis call. One call ends at most 1000; repeat until it reaches 0.",
                     "type": "integer"
                 },
                 "revoked": {

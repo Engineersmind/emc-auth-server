@@ -213,9 +213,10 @@ var errorMessages = map[string]string{
 	"forbidden":    "You don't have permission to do that. Contact your administrator if you think you should.",
 
 	// --- Rate limiting and availability -----------------------------------
-	"rate_limited":        "Too many attempts. Wait a moment and try again.",
-	"service_unavailable": "That service is temporarily unavailable. Try again shortly.",
-	"internal_error":      "Something went wrong on our side. Try again — if it keeps happening, contact your administrator.",
+	"rate_limited":               "Too many attempts. Wait a moment and try again.",
+	"service_unavailable":        "That service is temporarily unavailable. Try again shortly.",
+	"session_denial_unavailable": "Signing out every session of an application isn't available on this server: it can't cancel sessions' current access tokens. Contact your platform operator.",
+	"internal_error":             "Something went wrong on our side. Try again — if it keeps happening, contact your administrator.",
 
 	// --- Request shape ----------------------------------------------------
 	//

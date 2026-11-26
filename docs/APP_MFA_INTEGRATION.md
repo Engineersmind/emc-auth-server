@@ -230,16 +230,33 @@ each one meets the new policy at their next login:
 ```
 POST /api/v1/applications/{appID}/sessions/revoke          Bearer <admin>
 POST /api/v1/tenants/{tid}/applications/{appID}/sessions/revoke
-→ 200 { "application_id": "149", "revoked": 42, "failed": 0 }
+→ 200 { "application_id": "149", "revoked": 42, "failed": 0,
+        "deny_failed": 0, "remaining": 0, "complete": true }
 ```
 - Same permission as `PUT .../mfa` (`apps:write`).
-- Ends every live session bound to the application in this tenant (its own
-  users and tenant-level users who signed in through it). Refresh tokens are
-  revoked (`revoked_reason = admin_app_revoke_all`) and outstanding access
-  tokens are denied immediately.
-- Idempotent; `failed > 0` (logged server-side) is worth a retry. 503
-  `service_unavailable` when the server cannot deny access tokens.
-- Audited as `admin.application_sessions_revoked` with `revoked` / `failed`.
+- Ends live sessions bound to the application in this tenant (its own users
+  and tenant-level users who signed in through it). Refresh tokens are revoked
+  (`revoked_reason = admin_app_revoke_all`) and outstanding access tokens are
+  denied immediately.
+- **Upper bound: one call ends at most 1000 sessions.** The revocations run
+  inside the request, so an unbounded call on an application with many
+  thousands of sessions could hit an HTTP or proxy timeout partway through.
+  `remaining` is how many sessions are still live after the call — **repeat
+  the call until `complete` is `true`**.
+- `failed` — sessions whose revocation errored (logged server-side); they stay
+  live, are counted in `remaining`, and the next call retries them.
+- `deny_failed` — sessions whose refresh is already stopped but whose
+  access-token denial (Redis) did not land, so an access token they hold may
+  work until it expires (at most 15 minutes). Each call re-denies every
+  session this action revoked within the last access-token lifetime, so
+  repeating the call repairs them.
+- `complete` is `true` only when `remaining`, `failed` and `deny_failed` are
+  all 0. Never treat a 200 with `complete: false` as a finished sign-out.
+- Idempotent. 503 `service_unavailable` when session revocation is not wired;
+  503 `session_denial_unavailable` on a server without Redis (outstanding
+  access tokens could not be denied) — nothing is revoked.
+- Audited as `admin.application_sessions_revoked` with `revoked`, `failed`,
+  `deny_failed`, `remaining` and `complete`.
 
 ### 2.3e Step-up at refresh (`refresh_step_up`, #197)
 Off by default. With it off, refresh is never re-checked against the MFA
@@ -264,6 +281,18 @@ user through sign-in again, where the login gate challenges or enrols them.
 Sessions that did MFA, tenant-level users (no application), administrators and
 `client_credentials` tokens are never affected. The renewal middleware leaves
 the cookies in place on this refusal.
+
+Refresh and login agree on what counts:
+- If the role rules covering the user leave no allowed method (§2.3c, #199),
+  the refresh is refused with **503 `app_mfa_unavailable`** (OAuth: `error:
+  "app_mfa_unavailable"`) — even inside an `enforce_from` grace period, exactly
+  as login refuses that user. The same 503 is returned when the check cannot
+  read the policy or the user's factors. Nothing is revoked or rotated: keep
+  the refresh token and retry later.
+- During a grace period, a session signed in with a passwordless email code
+  (`amr` contains `email_otp`) does not count an enrolled `email` factor as a
+  usable second factor — the same rule as at login — so a user whose only
+  factor is email keeps refreshing that session until the grace date.
 
 Cost: the flag is read in the refresh-token lookup the rotation already does,
 so an application with it off pays nothing. With it on, a session without

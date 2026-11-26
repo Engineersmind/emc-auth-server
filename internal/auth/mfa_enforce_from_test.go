@@ -175,3 +175,68 @@ func TestEnforceFrom_ReportedInStatus(t *testing.T) {
 		t.Errorf("status enforce_from = %v, want %v", st.EnforceFrom, at)
 	}
 }
+
+// During a grace period, role rules that leave a covered user no allowed method
+// refuse the refresh with ErrAppMFAUnavailable — as login refuses that user —
+// instead of the grace exception keeping the session alive. Nothing is rotated:
+// the same refresh token works once the rules no longer conflict (PR #247).
+func TestEnforceFrom_StepUpEmptyMethodSetUnavailableInGrace(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.appWithMethods(t, "ef-empty", auth.MFAMethodTOTP, auth.MFAMethodEmail)
+	email := uniqueEmail("ef-empty")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+	tok := f.passwordSession(t, app, email)
+
+	totpRole := f.appRole(t, &appID, "ef-empty-totp")
+	emailRole := f.appRole(t, &appID, "ef-empty-email")
+	f.grantRole(t, userID, totpRole)
+	f.grantRole(t, userID, emailRole)
+	f.setRuleSpecs(t, appID,
+		auth.MFARoleRuleSpec{RoleID: totpRole, AllowedMethods: []string{auth.MFAMethodTOTP}},
+		auth.MFARoleRuleSpec{RoleID: emailRole, AllowedMethods: []string{auth.MFAMethodEmail}})
+	f.setRefreshStepUp(t, appID, true)
+	future := time.Now().Add(72 * time.Hour)
+	f.setEnforceFrom(t, appID, &future)
+
+	if _, err := f.appLogin(t, app, email, "Password123!"); !errors.Is(err, auth.ErrAppMFAUnavailable) {
+		t.Fatalf("login = %v, want ErrAppMFAUnavailable", err)
+	}
+	if _, err := f.authSvc.Refresh(f.ctx, tok.RefreshToken); !errors.Is(err, auth.ErrAppMFAUnavailable) {
+		t.Fatalf("Refresh in grace with no allowed method = %v, want ErrAppMFAUnavailable", err)
+	}
+	if _, _, err := f.authSvc.RefreshWithLock(f.ctx, tok.RefreshToken, nil); !errors.Is(err, auth.ErrAppMFAUnavailable) {
+		t.Fatalf("RefreshWithLock in grace with no allowed method = %v, want ErrAppMFAUnavailable", err)
+	}
+
+	f.setRules(t, appID)
+	if _, err := f.authSvc.Refresh(f.ctx, tok.RefreshToken); err != nil {
+		t.Fatalf("Refresh after clearing the rules: %v; the refused refresh must not have rotated the token", err)
+	}
+}
+
+// During a grace period, a session signed in by passwordless email code does
+// not count an enrolled email factor as a usable second factor — the login
+// gate's rule — so a user whose only factor is email keeps refreshing, while
+// the same user's password session is stepped up (PR #247).
+func TestEnforceFrom_StepUpExcludesEmailAfterEmailCodeSignIn(t *testing.T) {
+	f := newMFAFixture(t)
+	app, appID := f.appWithMethods(t, "ef-inbox", auth.MFAMethodTOTP, auth.MFAMethodEmail)
+	email := uniqueEmail("ef-inbox")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+	tok := f.passwordSession(t, app, email)
+	f.enrollEmail(t, userID)
+	f.requireMFA(t, appID)
+	f.setRefreshStepUp(t, appID, true)
+	future := time.Now().Add(72 * time.Hour)
+	f.setEnforceFrom(t, appID, &future)
+
+	f.setSessionAMR(t, tok.AccessToken, auth.AMRPassword)
+	if _, err := f.authSvc.Refresh(f.ctx, tok.RefreshToken); !errors.Is(err, auth.ErrStepUpRequired) {
+		t.Fatalf("password session with an email factor = %v, want ErrStepUpRequired", err)
+	}
+
+	f.setSessionAMR(t, tok.AccessToken, auth.AMREmailOTP)
+	if _, err := f.authSvc.Refresh(f.ctx, tok.RefreshToken); err != nil {
+		t.Fatalf("email-code session in grace = %v, want a refresh (email is the first factor, not a second)", err)
+	}
+}

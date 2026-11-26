@@ -39,6 +39,12 @@ func TestRevokeApplicationSessionsHandler(t *testing.T) {
 		WithApplications(e.appSvc).
 		WithTOTP(e.totpSvc)
 
+	// Without Redis the access tokens could not be denied: refused, distinctly.
+	if code, out := e.call(t, e.h.RevokeApplicationSessions, http.MethodPost, ""); code != http.StatusServiceUnavailable || out["error"] != "session_denial_unavailable" {
+		t.Fatalf("no redis: %d %v, want 503 session_denial_unavailable", code, out)
+	}
+	authSvc.WithTOTP(e.totpSvc, testhelper.NewTestRedis(t))
+
 	refresh := make([]string, 0, 2)
 	for i := 0; i < 2; i++ {
 		email := fmt.Sprintf("revoke-h-%d-%d@test.example.com", i, time.Now().UnixNano())
@@ -57,8 +63,9 @@ func TestRevokeApplicationSessionsHandler(t *testing.T) {
 	}
 
 	code, out := e.call(t, e.h.RevokeApplicationSessions, http.MethodPost, "")
-	if code != http.StatusOK || out["revoked"] != float64(2) || out["application_id"] != e.app.ID {
-		t.Fatalf("revoke: %d %v, want 200 revoked=2", code, out)
+	if code != http.StatusOK || out["revoked"] != float64(2) || out["application_id"] != e.app.ID ||
+		out["remaining"] != float64(0) || out["deny_failed"] != float64(0) || out["complete"] != true {
+		t.Fatalf("revoke: %d %v, want 200 revoked=2 remaining=0 deny_failed=0 complete=true", code, out)
 	}
 	for _, rt := range refresh {
 		if _, err := authSvc.Refresh(e.ctx, rt); err == nil {

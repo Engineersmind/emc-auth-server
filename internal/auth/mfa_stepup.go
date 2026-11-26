@@ -57,12 +57,21 @@ const refreshStepUpJoin = `
 //   - a social (fed) or passkey (hwk) session on an application whose
 //     federated_mfa is 'trust' → nil, consistent with login, where such
 //     sign-ins skip the gate. Under 'enforce' they are stepped up;
+//   - the role rules covering the user leave no allowed method at all →
+//     ErrAppMFAUnavailable, before the grace exception below: login refuses
+//     the same user with app_mfa_unavailable whatever the grace date, so the
+//     refresh must not keep a session alive that login would not start;
+//   - inside the required-mode grace period (#198), a user with no usable
+//     second factor → nil. "Usable" is decided by the login gate's own rule
+//     (secondFactorMethods): after a passwordless email-code first factor
+//     (amr "email_otp") the email method does not count;
 //   - otherwise → ErrStepUpRequired.
 //
 // A user not found in the session's tenant (a tenant-switched administrator,
 // who is never application-scoped, or a user deleted since) returns nil here:
 // the rotation's own user load decides those. Any other read error fails
-// closed — the refresh is refused rather than waved through.
+// closed — the refresh is refused (wrapping ErrAppMFAUnavailable, so callers
+// answer 503 and keep the session) rather than waved through.
 func (s *AuthService) checkRefreshStepUp(ctx context.Context, userID, tenantID int64, amr []string) error {
 	if slices.Contains(amr, AMRMFA) {
 		return nil
@@ -72,7 +81,7 @@ func (s *AuthService) checkRefreshStepUp(ctx context.Context, userID, tenantID i
 		if errors.Is(err, ErrUserNotFound) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("refresh step-up: %w: %w", ErrAppMFAUnavailable, err)
 	}
 	if uc.appRowID == nil || !uc.requiredByPolicy() {
 		return nil
@@ -81,14 +90,24 @@ func (s *AuthService) checkRefreshStepUp(ctx context.Context, userID, tenantID i
 	if federated && uc.federatedMFA != FederatedMFAEnforce {
 		return nil
 	}
+	methods := uc.effectiveMethods()
+	if len(methods) == 0 {
+		// Same refusal as the login gate's (#199): no method satisfies every
+		// rule covering the user. Checked before the grace exception, which
+		// would otherwise keep refreshing a session login refuses to start.
+		s.logger.Error().Int64("tenant_id", tenantID).Int64("application_id", *uc.appRowID).Str("rule_role", uc.ruleRole).
+			Msg("refresh step-up: the role rules covering this user leave no allowed method — refresh refused")
+		return ErrAppMFAUnavailable
+	}
 	// Required-mode grace period (#198): a user with no permitted factor yet
 	// would get tokens at login right now, so refusing their refresh would only
 	// send them round to the same result. A user who HAS a factor is stepped up
 	// as always — the grace covers enrolment, not challenges.
 	if uc.inEnrollmentGrace(time.Now()) {
-		has, err := s.hasPermittedFactor(ctx, userID, uc.effectiveMethods())
+		usable := secondFactorMethods(methods, slices.Contains(amr, AMREmailOTP))
+		has, err := s.hasPermittedFactor(ctx, userID, usable)
 		if err != nil {
-			return err
+			return fmt.Errorf("refresh step-up: %w: %w", ErrAppMFAUnavailable, err)
 		}
 		if !has {
 			return nil

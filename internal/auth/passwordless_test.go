@@ -804,6 +804,32 @@ func TestPasswordlessPolicy_MFARoleRulesConflict(t *testing.T) {
 	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional, []string{auth.MFAMethodEmail}, nil); !errors.Is(err, auth.ErrPasswordlessMFAConflict) {
 		t.Errorf("narrow to email-only with role rules and codes on = %v, want ErrPasswordlessMFAConflict", err)
 	}
+
+	// 4. Per-role methods (#199): with the application allowing TOTP and email,
+	// a rule narrowed to email alone holds its users to email-only MFA.
+	if _, err := f.totpSvc.SetAppMFARoleRuleSpecs(f.ctx, f.tenantID, appID,
+		[]auth.MFARoleRuleSpec{{RoleID: role, AllowedMethods: []string{auth.MFAMethodEmail}}}, nil); !errors.Is(err, auth.ErrMFARoleRulesPasswordlessConflict) {
+		t.Errorf("email-only rule with codes on = %v, want ErrMFARoleRulesPasswordlessConflict", err)
+	}
+	if err := setCodes(false); err != nil {
+		t.Fatalf("disable codes: %v", err)
+	}
+	f.setRuleSpecs(t, appID, auth.MFARoleRuleSpec{RoleID: role, AllowedMethods: []string{auth.MFAMethodEmail}})
+	if err := setCodes(true); !errors.Is(err, auth.ErrPasswordlessMFAConflict) {
+		t.Errorf("enable codes with an email-only rule = %v, want ErrPasswordlessMFAConflict", err)
+	}
+	// Required mode: the application's list alone is fine, the rule is not.
+	f.setRules(t, appID)
+	if err := setCodes(true); err != nil {
+		t.Fatalf("enable codes without rules: %v", err)
+	}
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeRequired, nil, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy(required, totp+email): %v", err)
+	}
+	if _, err := f.totpSvc.SetAppMFARoleRuleSpecs(f.ctx, f.tenantID, appID,
+		[]auth.MFARoleRuleSpec{{RoleID: role, AllowedMethods: []string{auth.MFAMethodEmail}}}, nil); !errors.Is(err, auth.ErrMFARoleRulesPasswordlessConflict) {
+		t.Errorf("email-only rule on a required app with codes on = %v, want ErrMFARoleRulesPasswordlessConflict", err)
+	}
 }
 
 func TestPasswordlessSettings_DomainPermitted(t *testing.T) {

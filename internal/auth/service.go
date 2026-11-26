@@ -2076,12 +2076,16 @@ func (s *AuthService) mfaGateCore(ctx context.Context, opts mfaGateOptions, grac
 	// when it is BOTH active for the user AND still in the app's allowed_methods.
 	// Removing a method from the policy therefore stops it being offered even to
 	// users who had already enrolled it. A non-app login (appRowID 0) has no
-	// policy and honours every active factor.
+	// policy and honours every active factor. After an inbox first factor the
+	// email method never counts (secondFactorMethods — shared with the refresh
+	// step-up check, #197).
+	gateMethods := allowedMethods
+	if appRowID == 0 {
+		gateMethods = []string{MFAMethodTOTP, MFAMethodEmail}
+	}
+	gateMethods = secondFactorMethods(gateMethods, opts.inboxFirstFactor)
 	permitted := func(method string) bool {
-		if opts.inboxFirstFactor && method == MFAMethodEmail {
-			return false
-		}
-		return appRowID == 0 || methodAllowed(allowedMethods, method)
+		return methodAllowed(gateMethods, method)
 	}
 
 	// Which permitted factors does the user have active? Read from the database
@@ -2148,10 +2152,7 @@ func (s *AuthService) mfaGateCore(ctx context.Context, opts mfaGateOptions, grac
 	// No policy-permitted active factor remains, and the early return above
 	// means the mode is 'required': the user must (re)enroll a permitted method
 	// before finishing login.
-	enrollmentMethods := allowedMethods
-	if opts.inboxFirstFactor {
-		enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
-	}
+	enrollmentMethods := secondFactorMethods(allowedMethods, opts.inboxFirstFactor)
 	if opts.inboxFirstFactor && len(enrollmentMethods) == 0 {
 		// Fail loudly rather than hand the user an enrollment challenge they
 		// cannot complete: the policy needs a non-email method to be allowed.

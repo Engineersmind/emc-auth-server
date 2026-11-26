@@ -18,6 +18,7 @@ const (
 	errInvalidClient        = "invalid_client"
 	errInvalidGrant         = "invalid_grant"
 	errStepUpRequired       = "step_up_required"
+	errAppMFAUnavailable    = "app_mfa_unavailable"
 	errUnsupportedGrantType = "unsupported_grant_type"
 )
 
@@ -96,6 +97,7 @@ func NewOAuthTokenHandler(
 // @Success      200  {object}  TokenResponse
 // @Failure      400  {object}  tokenError
 // @Failure      401  {object}  tokenError
+// @Failure      503  {object}  tokenError  "app_mfa_unavailable (refresh_token grant: the step-up check could not run, or the role rules covering the user leave no allowed MFA method; the refresh token is untouched)"
 // @Router       /oauth/token [post]
 func (h *OAuthTokenHandler) Token(c echo.Context) error {
 	// RFC 6749 §5.1 requires no-store on every token response, successful or
@@ -392,6 +394,15 @@ func (h *OAuthTokenHandler) refreshTokenGrant(c echo.Context) error {
 			metrics.OAuthGrants.WithLabelValues("refresh_token", "step_up_required").Inc()
 			return h.fail(c, http.StatusUnauthorized, errStepUpRequired,
 				"the application now requires two-factor authentication; sign the user in again")
+		}
+		if errors.Is(err, auth.ErrAppMFAUnavailable) {
+			// The step-up check could not decide, or the role rules covering
+			// the user leave no allowed method — login refuses them with the
+			// same code. 503, not invalid_grant: the token is still good and
+			// nothing was revoked or rotated, so the client must keep it.
+			metrics.OAuthGrants.WithLabelValues("refresh_token", "app_mfa_unavailable").Inc()
+			return h.fail(c, http.StatusServiceUnavailable, errAppMFAUnavailable,
+				"the application requires two-factor authentication, which is not available right now; retry later")
 		}
 		if errors.Is(err, auth.ErrTokenReplay) {
 			metrics.OAuthGrants.WithLabelValues("refresh_token", "replayed").Inc()
