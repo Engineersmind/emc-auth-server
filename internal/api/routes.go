@@ -567,10 +567,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// set, so with the switch off every application is password only and the
 	// password endpoints never consult the policy.
 	pwlessPolicySvc := auth.NewPasswordlessPolicyService(deps.Pool, deps.Logger).
-		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
-			cfg, err := totpSvc.GetAppMFAConfig(ctx, appRowID)
-			return cfg.Mode, cfg.Methods, err
-		}).
+		// Active MFA role rules count as 'required' here (#195), so turning
+		// email codes on for an email-only application with rules is refused
+		// just as it is for one whose mode is 'required'.
+		WithMFAConfig(totpSvc.EffectiveAppMFAModeForConflict).
 		WithTemplateEnabled(func(ctx context.Context, tenantID int64, appRowID *int64) bool {
 			return tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordlessCode)
 		})

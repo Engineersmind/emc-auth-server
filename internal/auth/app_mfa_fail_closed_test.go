@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/engineersmind/emc-auth-server/internal/auth"
 	"github.com/engineersmind/emc-auth-server/internal/testhelper"
@@ -192,9 +193,7 @@ func TestAppMFAFailClosed_TOTPStatusErrorRefused(t *testing.T) {
 	}
 	svc := f.bareAuthService().WithTOTP(broken, testhelper.NewTestRedis(t)).WithEmailMFA(f.emailSvc)
 	res, err := f.bareLogin(svc, app, email)
-	if err == nil || res != nil {
-		t.Fatalf("Login = %+v, %v; want an error and no result", res, err)
-	}
+	requireRefused(t, res, err, auth.ErrAppMFAUnavailable)
 }
 
 // An email MFA status read error fails closed the same way.
@@ -211,9 +210,7 @@ func TestAppMFAFailClosed_EmailStatusErrorRefused(t *testing.T) {
 	broken := auth.NewEmailMFAService(closedPool(t), testhelper.NewTestRedis(t), f.mail, testhelper.TestLogger())
 	svc := f.bareAuthService().WithTOTP(f.totpSvc, testhelper.NewTestRedis(t)).WithEmailMFA(broken)
 	res, err := f.bareLogin(svc, app, email)
-	if err == nil || res != nil {
-		t.Fatalf("Login = %+v, %v; want an error and no result", res, err)
-	}
+	requireRefused(t, res, err, auth.ErrAppMFAUnavailable)
 }
 
 // With every service present the gate behaves as before: an enrolled user is
@@ -238,5 +235,27 @@ func TestAppMFAFailClosed_FullDeploymentUnchanged(t *testing.T) {
 	res, err = f.appLogin(t, app, fresh, "Password123!")
 	if err != nil || res.MFAEnrollment == nil {
 		t.Fatalf("Login(unenrolled, required) = %+v, %v; want forced enrolment", res, err)
+	}
+}
+
+// A Redis failure while storing the challenge fails closed as
+// ErrAppMFAUnavailable — 503 at the handlers, not 500 login_failed or
+// "incorrect password" — and the cause stays in the chain for the logs.
+func TestAppMFAFailClosed_ChallengeStoreErrorIsUnavailable(t *testing.T) {
+	f := newMFAFixture(t)
+	app, _ := f.createApp(t, "fc-redisdown")
+	email := uniqueEmail("fc-redisdown")
+	userID := f.registerAppUser(t, app, email, "Password123!")
+	f.enrollAndActivate(t, userID, email)
+
+	down := testhelper.NewTestRedis(t)
+	if err := down.Close(); err != nil {
+		t.Fatalf("close redis: %v", err)
+	}
+	svc := f.bareAuthService().WithTOTP(f.totpSvc, down)
+	res, err := f.bareLogin(svc, app, email)
+	requireRefused(t, res, err, auth.ErrAppMFAUnavailable)
+	if !errors.Is(err, redis.ErrClosed) {
+		t.Fatalf("error = %v, want the Redis cause preserved", err)
 	}
 }

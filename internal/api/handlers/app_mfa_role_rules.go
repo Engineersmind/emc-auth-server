@@ -64,7 +64,7 @@ func (h *AdminHandler) GetApplicationMFARoleRules(c echo.Context) error {
 // and PUT /api/v1/tenants/:tid/applications/:appID/mfa/role-rules.
 //
 // @Summary      Replace application MFA role rules
-// @Description  Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.
+// @Description  Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
@@ -75,7 +75,7 @@ func (h *AdminHandler) GetApplicationMFARoleRules(c echo.Context) error {
 // @Failure      400    {object}  APIError  "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many"
 // @Failure      403    {object}  map[string]string
 // @Failure      404    {object}  map[string]string  "Application not found"
-// @Failure      409    {object}  APIError  "mfa_role_rules_inactive"
+// @Failure      409    {object}  APIError  "mfa_role_rules_inactive | mfa_role_rules_passwordless_conflict"
 // @Router       /api/v1/applications/{appID}/mfa/role-rules [put]
 // @Router       /api/v1/tenants/{tid}/applications/{appID}/mfa/role-rules [put]
 func (h *AdminHandler) UpdateApplicationMFARoleRules(c echo.Context) error {
@@ -115,6 +115,8 @@ func (h *AdminHandler) UpdateApplicationMFARoleRules(c echo.Context) error {
 		switch {
 		case errors.Is(err, auth.ErrMFARoleRulesInactive):
 			return fail(c, http.StatusConflict, "mfa_role_rules_inactive")
+		case errors.Is(err, auth.ErrMFARoleRulesPasswordlessConflict):
+			return fail(c, http.StatusConflict, "mfa_role_rules_passwordless_conflict")
 		case errors.Is(err, auth.ErrMFARoleRuleInvalidRole):
 			return fail(c, http.StatusBadRequest, "mfa_role_rule_invalid_role")
 		case errors.Is(err, auth.ErrTooManyMFARoleRules):

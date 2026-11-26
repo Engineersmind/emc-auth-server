@@ -183,6 +183,12 @@ the same permissions as the `/mfa` routes.
   `mfa_role_rules_too_many`**.
 - A non-empty list while the switch is off or the mode is `disabled` →
   **409 `mfa_role_rules_inactive`**. Clearing (`[]`) is always accepted.
+- A non-empty list while `email` is the only allowed method and passwordless
+  email-code sign-in is on for the application → **409
+  `mfa_role_rules_passwordless_conflict`** (covered users could no longer sign
+  in by email code). Conversely, while rules exist, turning email codes on or
+  narrowing the methods to `email` only is refused with
+  `passwordless_mfa_conflict` — rules count as `required` for that check.
 - A role listed by a rule cannot be deleted → `DELETE /roles/{id}` answers
   **409 `role_in_mfa_rule`**; remove the rule first.
 - Forced enrolment offers only allowed methods this server can run; if none

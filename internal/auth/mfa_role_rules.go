@@ -40,6 +40,15 @@ var ErrMFARoleRuleInvalidRole = errors.New("every MFA role rule must name a live
 // ErrTooManyMFARoleRules refuses a rule list longer than MaxMFARoleRules.
 var ErrTooManyMFARoleRules = errors.New("too many MFA role rules for one application")
 
+// ErrMFARoleRulesPasswordlessConflict refuses a non-empty rule list on an
+// application whose only allowed MFA method is email while passwordless
+// email-code sign-in is on for it. Every covered user would be treated as
+// 'required', and an email-code sign-in cannot satisfy an email-only second
+// factor (the same inbox twice), so each of their email-code logins would fail
+// with ErrPasswordlessMFAConflict — locking out users who have no password. It
+// is the role-rule twin of the check setAppMFAPolicy makes for mode 'required'.
+var ErrMFARoleRulesPasswordlessConflict = errors.New("MFA role rules cannot be set while email is the application's only allowed MFA method and passwordless email-code sign-in is on")
+
 // MFARoleRule is one role whose holders must use MFA on the application.
 type MFARoleRule struct {
 	RoleID    string    `json:"role_id"`
@@ -169,6 +178,12 @@ func (s *TOTPService) SetAppMFARoleRules(ctx context.Context, tenantID, appRowID
 		if !cfg.Enabled || cfg.Mode == MFAModeDisabled {
 			return res, ErrMFARoleRulesInactive
 		}
+		// Rules make covered users 'required'; refuse them exactly where
+		// setAppMFAPolicy refuses mode 'required' (email-only methods while
+		// email codes are on), so neither path reaches the locked-out state.
+		if emailOnlyMFAMethods(cfg.Methods) && s.emailCodeEnabled != nil && s.emailCodeEnabled(ctx, tenantID, appRowID) {
+			return res, ErrMFARoleRulesPasswordlessConflict
+		}
 		rows, qErr := tx.Query(ctx, `
 			SELECT id FROM roles
 			WHERE id = ANY($1) AND tenant_id = $2 AND application_id = $3 AND deleted_at IS NULL
@@ -217,6 +232,54 @@ func (s *TOTPService) SetAppMFARoleRules(ctx context.Context, tenantID, appRowID
 		return res, fmt.Errorf("commit MFA role rules: %w", err)
 	}
 	return res, nil
+}
+
+// emailOnlyMFAMethods reports whether email is the application's only allowed
+// MFA method — the method set an email-code sign-in cannot satisfy.
+func emailOnlyMFAMethods(methods []string) bool {
+	return len(methods) == 1 && methods[0] == MFAMethodEmail
+}
+
+// appHasMFARoleRules reports whether the application has at least one role
+// rule naming a live role. Such an application treats covered users as
+// 'required' even while its mode is 'optional', so the passwordless-conflict
+// checks count it as 'required' (see EffectiveAppMFAModeForConflict).
+func appHasMFARoleRules(ctx context.Context, q mfaSettingsQuerier, appRowID int64) (bool, error) {
+	var has bool
+	if err := q.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM application_mfa_role_rules rr
+			JOIN roles r ON r.id = rr.role_id AND r.deleted_at IS NULL
+			WHERE rr.application_id = $1
+		)
+	`, appRowID).Scan(&has); err != nil {
+		return false, fmt.Errorf("check MFA role rules: %w", err)
+	}
+	return has, nil
+}
+
+// EffectiveAppMFAModeForConflict returns the application's MFA mode and allowed
+// methods as the passwordless-conflict checks must see them: an 'optional'
+// application with active role rules is reported as 'required', because its
+// covered users are (#195). The passwordless policy write path uses this, so
+// turning email-code sign-in on for an email-only application with role rules
+// is refused just as it is for a 'required' one — the reciprocal of
+// ErrMFARoleRulesPasswordlessConflict.
+func (s *TOTPService) EffectiveAppMFAModeForConflict(ctx context.Context, appRowID int64) (string, []string, error) {
+	cfg, err := s.GetAppMFAConfig(ctx, appRowID)
+	if err != nil {
+		return "", nil, err
+	}
+	if cfg.Mode == MFAModeOptional {
+		has, hErr := appHasMFARoleRules(ctx, s.pool, appRowID)
+		if hErr != nil {
+			return "", nil, hErr
+		}
+		if has {
+			return MFAModeRequired, cfg.Methods, nil
+		}
+	}
+	return cfg.Mode, cfg.Methods, nil
 }
 
 // mfaRuleRoleFor returns the name of a role the user holds that the

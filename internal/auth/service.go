@@ -1908,8 +1908,11 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 //     error into a silent policy bypass;
 //   - a challenge is due but this deployment cannot run it (no Redis, no TOTP
 //     service, or none of the user's active methods is configured) →
-//     ErrAppMFAUnavailable, never tokens (#193). A factor-status read error
-//     fails closed the same way. When nothing is due the missing services do
+//     ErrAppMFAUnavailable, never tokens (#193). Every other failure after the
+//     first factor succeeded — a policy, role-rule or factor-status read
+//     error, or a Redis failure storing the challenge — fails closed the same
+//     way: the error wraps ErrAppMFAUnavailable (cause preserved), so callers
+//     answer 503 rather than 500 or "incorrect password". When nothing is due the missing services do
 //     not matter and the login proceeds as before.
 //
 // persistent carries the caller's "remember me" choice into the challenge state so
@@ -1983,7 +1986,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	if appRowID != 0 {
 		cfg, cfgErr := loadAppMFAConfig(ctx, s.pool, appRowID)
 		if cfgErr != nil {
-			return nil, fmt.Errorf("load app MFA policy: %w", cfgErr)
+			return nil, fmt.Errorf("load app MFA policy: %w: %w", ErrAppMFAUnavailable, cfgErr)
 		}
 		// Master switch off (issue #192): the application runs without MFA —
 		// no challenge for enrolled users and no forced enrolment under
@@ -2006,7 +2009,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		if mode == MFAModeOptional {
 			ruleRole, ruleErr := mfaRuleRoleFor(ctx, s.pool, userID, tenantID, appRowID)
 			if ruleErr != nil {
-				return nil, ruleErr
+				return nil, fmt.Errorf("%w: %w", ErrAppMFAUnavailable, ruleErr)
 			}
 			if ruleRole != "" {
 				mode = MFAModeRequired
@@ -2038,7 +2041,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		}
 		on, err := s.appFactorActive(ctx, userID, m)
 		if err != nil {
-			return nil, fmt.Errorf("check %s MFA status: %w", m, err)
+			return nil, fmt.Errorf("check %s MFA status: %w: %w", m, ErrAppMFAUnavailable, err)
 		}
 		if on {
 			active = append(active, m)
@@ -2072,7 +2075,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		}
 		challenge, err := s.createOTPSession(ctx, userID, tenantID, email, roleName, perms, appID, methods, persistent, activeRoles, org)
 		if err != nil {
-			return nil, fmt.Errorf("create OTP session: %w", err)
+			return nil, fmt.Errorf("create OTP session: %w: %w", ErrAppMFAUnavailable, err)
 		}
 		return &LoginResult{OTPChallenge: challenge}, nil
 	}
@@ -2099,7 +2102,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	}
 	challenge, err := s.createMFAEnrollmentSession(ctx, userID, tenantID, email, roleName, perms, appID, enrollmentMethods, persistent, activeRoles, org)
 	if err != nil {
-		return nil, fmt.Errorf("create MFA enrollment session: %w", err)
+		return nil, fmt.Errorf("create MFA enrollment session: %w: %w", ErrAppMFAUnavailable, err)
 	}
 	return &LoginResult{MFAEnrollment: challenge}, nil
 }

@@ -226,8 +226,9 @@ tenant).
 
 * `PUT` carries the `version` you read; a mismatch is `409 version_conflict` with the
   current policy, never a silent overwrite.
-* Enabling email codes is refused where the application requires MFA and allows only
-  the `email` method (`passwordless_mfa_conflict`), where the **Sign-in code** email
+* Enabling email codes is refused where the application requires MFA (mode `required`,
+  or `optional` with MFA role rules) and allows only the `email` method
+  (`passwordless_mfa_conflict`), where the **Sign-in code** email
   template is disabled, and where no first factor would remain.
 * Opening sign-up, closing the password flow, restoring a version and editing tenant
   defaults need a tenant owner or platform operator; an application administrator

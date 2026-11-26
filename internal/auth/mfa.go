@@ -311,9 +311,11 @@ func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier,
 	}
 	// Required MFA with email as the only method cannot be satisfied by a user who
 	// signed in with an emailed code, so refuse it while email codes are on (#203).
-	// The stored methods are read through q, so inside the admin PUT's
-	// transaction this sees the same row the upsert below replaces.
-	if mode == MFAModeRequired && s.emailCodeEnabled != nil {
+	// An 'optional' application with active role rules is 'required' for every
+	// covered user (#195), so it is refused the same way. The stored methods and
+	// rules are read through q, so inside the admin PUT's transaction this sees
+	// the same rows the upsert below replaces.
+	if (mode == MFAModeRequired || mode == MFAModeOptional) && s.emailCodeEnabled != nil {
 		eff := methods
 		if eff == nil {
 			cur, cErr := storedAppMFAMethods(ctx, q, appRowID)
@@ -322,8 +324,18 @@ func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier,
 			}
 			eff = cur
 		}
-		if len(eff) == 1 && eff[0] == MFAMethodEmail && s.emailCodeEnabled(ctx, tenantID, appRowID) {
-			return ErrPasswordlessMFAConflict
+		if emailOnlyMFAMethods(eff) {
+			effectivelyRequired := mode == MFAModeRequired
+			if !effectivelyRequired {
+				has, hErr := appHasMFARoleRules(ctx, q, appRowID)
+				if hErr != nil {
+					return hErr
+				}
+				effectivelyRequired = has
+			}
+			if effectivelyRequired && s.emailCodeEnabled(ctx, tenantID, appRowID) {
+				return ErrPasswordlessMFAConflict
+			}
 		}
 	}
 	tag, err := q.Exec(ctx, `
