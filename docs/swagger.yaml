@@ -1434,12 +1434,21 @@ definitions:
     properties:
       access_token:
         type: string
+      enforce_from:
+        type: string
       expires_at:
         description: UTC unix timestamp when access token expires
         type: integer
       expires_in:
         description: seconds until access token expires
         type: integer
+      mfa_enrollment_recommended:
+        description: |-
+          MFAEnrollmentRecommended is set on a sign-in during an application's
+          required-mode grace period (#198): MFA is required of this user but they
+          have no factor yet, and enrolment becomes mandatory at MFAEnforceFrom.
+          Omitted otherwise (and always on refresh).
+        type: boolean
       refresh_token:
         type: string
       token_type:
@@ -1794,6 +1803,13 @@ definitions:
         type: string
       email_enrolled_users:
         type: integer
+      enforce_from:
+        description: |-
+          EnforceFrom is the grace date of a required-mode rollout (#198): before
+          it, a user who must use MFA but has no factor yet signs in normally and is
+          told enrolment is recommended; from it on, enrolment is forced. null = no
+          grace period.
+        type: string
       enrolled_users:
         description: |-
           Enrollment stats over the application's own isolated user base — for the
@@ -1822,6 +1838,12 @@ definitions:
         type: string
       pending_enrollments:
         type: integer
+      refresh_step_up:
+        description: |-
+          RefreshStepUp, when true, refuses a refresh of a session whose amr lacks
+          "mfa" once the application requires MFA of its user (401
+          step_up_required). Default false: refresh is not re-checked. #197.
+        type: boolean
       total_users:
         type: integer
       updated_at:
@@ -1831,6 +1853,13 @@ definitions:
     type: object
   auth.MFARoleRule:
     properties:
+      allowed_methods:
+        description: |-
+          AllowedMethods restricts which methods satisfy this rule (#199). null =
+          the application's allowed_methods.
+        items:
+          type: string
+        type: array
       created_at:
         type: string
       created_by:
@@ -1845,6 +1874,12 @@ definitions:
     type: object
   auth.MFAStatus:
     properties:
+      enforce_from:
+        description: |-
+          EnforceFrom is the application's required-mode grace date (#198): before
+          it a caller who must use MFA but has no factor is not yet forced to enrol.
+          Omitted when the application sets none (and for tenant-level users).
+        type: string
       methods:
         items:
           $ref: '#/definitions/auth.MFAMethodStatus'
@@ -3061,6 +3096,15 @@ definitions:
       enrollment_token:
         type: string
     type: object
+  handlers.MFARoleRuleRequest:
+    properties:
+      allowed_methods:
+        items:
+          type: string
+        type: array
+      role_id:
+        type: string
+    type: object
   handlers.MFARoleRulesResponse:
     properties:
       application_id:
@@ -3375,6 +3419,36 @@ definitions:
       token:
         type: string
     type: object
+  handlers.RevokeApplicationSessionsResponse:
+    properties:
+      application_id:
+        type: string
+      complete:
+        description: |-
+          Complete is true only when every session is signed out: remaining,
+          failed and deny_failed are all 0. Anything else: repeat the call.
+        type: boolean
+      deny_failed:
+        description: |-
+          DenyFailed is how many sessions revoked by this action within the last
+          access-token lifetime could not have their access tokens denied. Their
+          refresh is stopped but an access token may work until it expires; the
+          next call re-denies them.
+        type: integer
+      failed:
+        description: |-
+          Failed is how many sessions could not be revoked (logged server-side).
+          They stay live and are counted in Remaining; repeat the call.
+        type: integer
+      remaining:
+        description: |-
+          Remaining is how many of the application's sessions are still live after
+          this call. One call ends at most 1000; repeat until it reaches 0.
+        type: integer
+      revoked:
+        description: Revoked is how many live sessions this call ended.
+        type: integer
+    type: object
   handlers.SelectOrganizationRequest:
     properties:
       organization:
@@ -3633,6 +3707,12 @@ definitions:
         items:
           type: string
         type: array
+      enforce_from:
+        description: |-
+          EnforceFrom is the required-mode grace date (#198), RFC 3339. Omitted
+          keeps the stored value; an explicit null clears it.
+        format: date-time
+        type: string
       federated_mfa:
         description: |-
           FederatedMFA is "trust" (default: social and passkey sign-ins skip the
@@ -3647,6 +3727,13 @@ definitions:
         type: boolean
       mode:
         type: string
+      refresh_step_up:
+        description: |-
+          RefreshStepUp opts the application in to step-up at refresh (#197):
+          true refuses a refresh (401 step_up_required) of a session established
+          without MFA once the application requires MFA of its user. Omitted keeps
+          the stored value (default false).
+        type: boolean
     type: object
   handlers.UpdateApplicationRequest:
     properties:
@@ -3692,6 +3779,10 @@ definitions:
       role_ids:
         items:
           type: string
+        type: array
+      rules:
+        items:
+          $ref: '#/definitions/handlers.MFARoleRuleRequest'
         type: array
     type: object
   handlers.UpdateOrganizationMemberRequest:
@@ -4846,8 +4937,9 @@ paths:
       description: Returns the application's MFA mode (disabled|optional|required;
         no explicit policy = optional), master switch (mfa_enabled), federated_mfa
         (trust|enforce — whether social and passkey sign-ins go through the application
-        MFA gate; default trust) plus enrollment stats over the application's own
-        user base.
+        MFA gate; default trust), refresh_step_up (whether a refresh of a session
+        without MFA is refused once MFA is required; default false) plus enrollment
+        stats over the application's own user base.
       parameters:
       - description: Application ID
         in: path
@@ -4899,7 +4991,19 @@ paths:
         "trust" (default) lets social (Google, GitHub) and passkey sign-ins skip the
         application MFA gate; "enforce" runs the same gate as password login before
         tokens are issued (a user-verified passkey satisfies it). A real change of
-        federated_mfa is audited as admin.mfa_federated_changed with old and new values.'
+        federated_mfa is audited as admin.mfa_federated_changed with old and new values.
+        refresh_step_up (default false): true makes every refresh of a session established
+        without MFA fail with 401 step_up_required once the application requires MFA
+        of its user (switch on and mode ''required'', or a role rule covers them;
+        social/passkey sessions only under federated_mfa=enforce) — nothing is revoked,
+        the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed
+        with old and new values. enforce_from (RFC 3339, explicit null clears, omitted
+        keeps): a grace date for a required-mode rollout — before it, a user who must
+        use MFA (mode ''required'' or a role rule) but has NO active factor signs
+        in normally and the login response carries mfa_enrollment_recommended=true
+        plus enforce_from; from it on, enrolment is forced. Users with a factor are
+        always challenged. A real change is audited as admin.mfa_enforce_from_changed
+        with old and new values.'
       parameters:
       - description: Application ID
         in: path
@@ -4992,9 +5096,15 @@ paths:
         on for the application (409 mfa_role_rules_passwordless_conflict: covered
         users could no longer sign in by email code); an empty list (clear) is always
         accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by
-        a rule cannot be deleted until the rule is removed. A real change is audited
-        as admin.mfa_role_rules_set with the old and new lists. Applies at each user''s
-        NEXT login.'
+        a rule cannot be deleted until the rule is removed. Send either role_ids (every
+        rule uses the application''s methods) or rules: [{role_id, allowed_methods}]
+        where allowed_methods (null/omitted = the application''s list) restricts which
+        methods satisfy that rule and must be a non-empty subset of the application''s
+        allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several
+        rules may use only the methods every rule allows; if the application''s list
+        later shrinks so none is left, that user''s sign-in is refused with 503 app_mfa_unavailable.
+        A real change (roles or methods) is audited as admin.mfa_role_rules_set with
+        the old and new lists. Applies at each user''s NEXT login.'
       parameters:
       - description: Application ID
         in: path
@@ -5015,7 +5125,8 @@ paths:
           schema:
             $ref: '#/definitions/handlers.MFARoleRulesResponse'
         "400":
-          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many
+          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods
+            | mfa_role_rules_too_many
           schema:
             $ref: '#/definitions/handlers.APIError'
         "403":
@@ -5511,6 +5622,55 @@ paths:
       summary: Suggest an application's server addresses
       tags:
       - admin-rate-limits
+  /api/v1/applications/{appID}/sessions/revoke:
+    post:
+      description: Ends every live session bound to this application inside the tenant
+        — its own users and tenant-level users who signed in through it. Each session's
+        refresh tokens are revoked and its outstanding access tokens are denied immediately,
+        so every user must sign in again and meets the application's CURRENT MFA policy.
+        MFA policy changes never revoke sessions by themselves; this is the manual
+        action to apply a tightened policy now. One call ends at most 1000 sessions
+        (the revocations run inside the request); remaining reports how many are still
+        live, so repeat the call until complete is true. Each call also re-denies
+        the access tokens of every session this action revoked in the last access-token
+        lifetime, so deny_failed > 0 is repaired by repeating the call too. Idempotent.
+        Refused with 503 session_denial_unavailable on a server without Redis, where
+        outstanding access tokens could not be denied. Audited as admin.application_sessions_revoked
+        with the counts.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.RevokeApplicationSessionsResponse'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: service_unavailable | session_denial_unavailable
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      security:
+      - BearerAuth: []
+      summary: Revoke every session of an application
+      tags:
+      - admin-applications
   /api/v1/applications/{appID}/user-limits:
     get:
       description: Lists every per-user limit on the application end-user routes (sign
@@ -8585,7 +8745,9 @@ paths:
               type: string
             type: object
         "401":
-          description: Unauthorized
+          description: refresh_token_invalid | session_terminated | step_up_required
+            (the application now requires MFA and this session was established without
+            it; sign in again — nothing was revoked)
           schema:
             additionalProperties:
               type: string
@@ -8598,7 +8760,9 @@ paths:
               type: string
             type: object
         "503":
-          description: session store unavailable — retry
+          description: session store unavailable — retry | app_mfa_unavailable (the
+            refresh step-up check could not run, or the role rules covering the user
+            leave no allowed MFA method; nothing was revoked or rotated)
           schema:
             additionalProperties:
               type: string
@@ -8888,7 +9052,7 @@ paths:
               type: string
             type: object
         "401":
-          description: Unauthorized
+          description: refresh_token_invalid | session_terminated | step_up_required
           schema:
             additionalProperties:
               type: string
@@ -8900,7 +9064,8 @@ paths:
               type: string
             type: object
         "503":
-          description: session store unavailable — retry
+          description: session store unavailable — retry | app_mfa_unavailable (nothing
+            was revoked or rotated)
           schema:
             additionalProperties:
               type: string
@@ -11190,9 +11355,15 @@ paths:
         on for the application (409 mfa_role_rules_passwordless_conflict: covered
         users could no longer sign in by email code); an empty list (clear) is always
         accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by
-        a rule cannot be deleted until the rule is removed. A real change is audited
-        as admin.mfa_role_rules_set with the old and new lists. Applies at each user''s
-        NEXT login.'
+        a rule cannot be deleted until the rule is removed. Send either role_ids (every
+        rule uses the application''s methods) or rules: [{role_id, allowed_methods}]
+        where allowed_methods (null/omitted = the application''s list) restricts which
+        methods satisfy that rule and must be a non-empty subset of the application''s
+        allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several
+        rules may use only the methods every rule allows; if the application''s list
+        later shrinks so none is left, that user''s sign-in is refused with 503 app_mfa_unavailable.
+        A real change (roles or methods) is audited as admin.mfa_role_rules_set with
+        the old and new lists. Applies at each user''s NEXT login.'
       parameters:
       - description: Application ID
         in: path
@@ -11213,7 +11384,8 @@ paths:
           schema:
             $ref: '#/definitions/handlers.MFARoleRulesResponse'
         "400":
-          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many
+          description: invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods
+            | mfa_role_rules_too_many
           schema:
             $ref: '#/definitions/handlers.APIError'
         "403":
@@ -12272,6 +12444,55 @@ paths:
       summary: Suggest an application's server addresses
       tags:
       - admin-rate-limits
+  /api/v1/tenants/{tid}/applications/{appID}/sessions/revoke:
+    post:
+      description: Ends every live session bound to this application inside the tenant
+        — its own users and tenant-level users who signed in through it. Each session's
+        refresh tokens are revoked and its outstanding access tokens are denied immediately,
+        so every user must sign in again and meets the application's CURRENT MFA policy.
+        MFA policy changes never revoke sessions by themselves; this is the manual
+        action to apply a tightened policy now. One call ends at most 1000 sessions
+        (the revocations run inside the request); remaining reports how many are still
+        live, so repeat the call until complete is true. Each call also re-denies
+        the access tokens of every session this action revoked in the last access-token
+        lifetime, so deny_failed > 0 is repaired by repeating the call too. Idempotent.
+        Refused with 503 session_denial_unavailable on a server without Redis, where
+        outstanding access tokens could not be denied. Audited as admin.application_sessions_revoked
+        with the counts.
+      parameters:
+      - description: Application ID
+        in: path
+        name: appID
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/handlers.RevokeApplicationSessionsResponse'
+        "403":
+          description: Forbidden
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "404":
+          description: Application not found
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "503":
+          description: service_unavailable | session_denial_unavailable
+          schema:
+            $ref: '#/definitions/handlers.APIError'
+      security:
+      - BearerAuth: []
+      summary: Revoke every session of an application
+      tags:
+      - admin-applications
   /api/v1/tenants/{tid}/applications/{appID}/user-limits:
     get:
       description: Lists every per-user limit on the application end-user routes (sign
@@ -13811,6 +14032,12 @@ paths:
             $ref: '#/definitions/handlers.tokenError'
         "401":
           description: Unauthorized
+          schema:
+            $ref: '#/definitions/handlers.tokenError'
+        "503":
+          description: 'app_mfa_unavailable (refresh_token grant: the step-up check
+            could not run, or the role rules covering the user leave no allowed MFA
+            method; the refresh token is untouched)'
           schema:
             $ref: '#/definitions/handlers.tokenError'
       summary: OAuth 2.0 token endpoint

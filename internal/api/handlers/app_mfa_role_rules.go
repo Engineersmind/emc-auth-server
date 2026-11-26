@@ -22,11 +22,24 @@ type MFARoleRulesResponse struct {
 	Rules         []auth.MFARoleRule `json:"rules"`
 }
 
-// UpdateMFARoleRulesRequest is the body of PUT .../mfa/role-rules. RoleIDs is
-// the WHOLE new list: roles not in it lose their rule, [] clears every rule.
-// Each id must be a live role of this application.
+// UpdateMFARoleRulesRequest is the body of PUT .../mfa/role-rules. Send
+// exactly one of RoleIDs or Rules; either is the WHOLE new list: roles not in
+// it lose their rule, [] clears every rule. Each id must be a live role of this
+// application.
+//
+// RoleIDs gives every rule the application's own methods. Rules lets a rule
+// restrict the methods that satisfy it (#199).
 type UpdateMFARoleRulesRequest struct {
-	RoleIDs []string `json:"role_ids"`
+	RoleIDs []string             `json:"role_ids"`
+	Rules   []MFARoleRuleRequest `json:"rules"`
+}
+
+// MFARoleRuleRequest is one rule of UpdateMFARoleRulesRequest.Rules.
+// AllowedMethods omitted or null = the application's allowed_methods;
+// otherwise a non-empty subset of them (#199).
+type MFARoleRuleRequest struct {
+	RoleID         string   `json:"role_id"`
+	AllowedMethods []string `json:"allowed_methods"`
 }
 
 // GetApplicationMFARoleRules handles GET /api/v1/applications/:appID/mfa/role-rules
@@ -64,7 +77,7 @@ func (h *AdminHandler) GetApplicationMFARoleRules(c echo.Context) error {
 // and PUT /api/v1/tenants/:tid/applications/:appID/mfa/role-rules.
 //
 // @Summary      Replace application MFA role rules
-// @Description  Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.
+// @Description  Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. Send either role_ids (every rule uses the application's methods) or rules: [{role_id, allowed_methods}] where allowed_methods (null/omitted = the application's list) restricts which methods satisfy that rule and must be a non-empty subset of the application's allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several rules may use only the methods every rule allows; if the application's list later shrinks so none is left, that user's sign-in is refused with 503 app_mfa_unavailable. A real change (roles or methods) is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.
 // @Tags         admin-applications
 // @Accept       json
 // @Produce      json
@@ -72,7 +85,7 @@ func (h *AdminHandler) GetApplicationMFARoleRules(c echo.Context) error {
 // @Param        appID  path      string                     true  "Application ID"
 // @Param        body   body      UpdateMFARoleRulesRequest  true  "The complete new list of role ids"
 // @Success      200    {object}  MFARoleRulesResponse
-// @Failure      400    {object}  APIError  "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many"
+// @Failure      400    {object}  APIError  "invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods | mfa_role_rules_too_many"
 // @Failure      403    {object}  map[string]string
 // @Failure      404    {object}  map[string]string  "Application not found"
 // @Failure      409    {object}  APIError  "mfa_role_rules_inactive | mfa_role_rules_passwordless_conflict"
@@ -89,16 +102,19 @@ func (h *AdminHandler) UpdateApplicationMFARoleRules(c echo.Context) error {
 	}
 
 	var req UpdateMFARoleRulesRequest
-	if err := c.Bind(&req); err != nil || req.RoleIDs == nil {
-		return c.JSON(http.StatusBadRequest, map[string]string{"error": "role_ids is required (send [] to clear every rule)"})
+	if err := c.Bind(&req); err != nil || (req.RoleIDs == nil) == (req.Rules == nil) {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "send exactly one of role_ids or rules (send [] to clear every rule)"})
 	}
-	roleIDs := make([]int64, 0, len(req.RoleIDs))
+	specs := make([]auth.MFARoleRuleSpec, 0, len(req.RoleIDs)+len(req.Rules))
 	for _, raw := range req.RoleIDs {
-		id, perr := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+		req.Rules = append(req.Rules, MFARoleRuleRequest{RoleID: raw})
+	}
+	for _, r := range req.Rules {
+		id, perr := strconv.ParseInt(strings.TrimSpace(r.RoleID), 10, 64)
 		if perr != nil || id <= 0 {
 			return fail(c, http.StatusBadRequest, "mfa_role_rule_invalid_role")
 		}
-		roleIDs = append(roleIDs, id)
+		specs = append(specs, auth.MFARoleRuleSpec{RoleID: id, AllowedMethods: r.AllowedMethods})
 	}
 
 	// Service tokens carry the public client_id in UserID — record no creator
@@ -110,7 +126,7 @@ func (h *AdminHandler) UpdateApplicationMFARoleRules(c echo.Context) error {
 		}
 	}
 
-	res, err := h.totpSvc.SetAppMFARoleRules(c.Request().Context(), tenantID, appID, roleIDs, createdBy)
+	res, err := h.totpSvc.SetAppMFARoleRuleSpecs(c.Request().Context(), tenantID, appID, specs, createdBy)
 	if err != nil {
 		switch {
 		case errors.Is(err, auth.ErrMFARoleRulesInactive):
@@ -119,6 +135,8 @@ func (h *AdminHandler) UpdateApplicationMFARoleRules(c echo.Context) error {
 			return fail(c, http.StatusConflict, "mfa_role_rules_passwordless_conflict")
 		case errors.Is(err, auth.ErrMFARoleRuleInvalidRole):
 			return fail(c, http.StatusBadRequest, "mfa_role_rule_invalid_role")
+		case errors.Is(err, auth.ErrMFARoleRuleInvalidMethods):
+			return fail(c, http.StatusBadRequest, "mfa_role_rule_invalid_methods")
 		case errors.Is(err, auth.ErrTooManyMFARoleRules):
 			return fail(c, http.StatusBadRequest, "mfa_role_rules_too_many")
 		case errors.Is(err, auth.ErrAppNotFound):
@@ -138,6 +156,9 @@ func (h *AdminHandler) UpdateApplicationMFARoleRules(c echo.Context) error {
 				"new_role_ids":   auth.RoleIDs(res.New),
 				"old_role_names": roleNames(res.Old),
 				"new_role_names": roleNames(res.New),
+				// Per-rule methods (#199): null = the application's list.
+				"old_rules": ruleAuditRows(res.Old),
+				"new_rules": ruleAuditRows(res.New),
 			})
 	}
 	return c.JSON(http.StatusOK, MFARoleRulesResponse{ApplicationID: strconv.FormatInt(appID, 10), Rules: res.New})
@@ -147,6 +168,15 @@ func roleNames(rules []auth.MFARoleRule) []string {
 	out := make([]string, 0, len(rules))
 	for _, r := range rules {
 		out = append(out, r.RoleName)
+	}
+	return out
+}
+
+// ruleAuditRows renders rules for audit metadata with their methods (#199).
+func ruleAuditRows(rules []auth.MFARoleRule) []map[string]any {
+	out := make([]map[string]any, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, map[string]any{"role_id": r.RoleID, "role_name": r.RoleName, "allowed_methods": r.AllowedMethods})
 	}
 	return out
 }

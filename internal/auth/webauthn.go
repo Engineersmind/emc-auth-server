@@ -1563,12 +1563,13 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 	// through the same gate as password login — OTP challenge or forced
 	// enrolment — and the finished session keeps the passkey grant. 'trust'
 	// (the default) and tenant-level logins are unchanged: the gate returns nil.
+	var grace *mfaEnrollmentGrace
 	if !id.UserVerified && id.AppID != "" {
 		appRowID, perr := strconv.ParseInt(id.AppID, 10, 64)
 		if perr != nil {
 			return nil, id, fmt.Errorf("passkey login: invalid application id %q: %w", id.AppID, perr)
 		}
-		gate, err := s.mfaGateWith(ctx, mfaGateOptions{federated: FirstFactorPasskey},
+		gate, g, err := s.mfaGateWith(ctx, mfaGateOptions{federated: FirstFactorPasskey},
 			id.UserID, id.TenantID, appRowID, id.AppID, id.Email, id.Role, perms, false, nil, orgSessionRequest{})
 		if err != nil {
 			return nil, id, err
@@ -1576,6 +1577,7 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 		if gate != nil {
 			return gate, id, nil
 		}
+		grace = g
 	}
 
 	result, err := s.issueTokenPair(ctx, id.UserID, id.TenantID, id.Email, id.Role, perms,
@@ -1583,6 +1585,7 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 	if err != nil {
 		return nil, nil, err
 	}
+	grace.annotate(result)
 	return &LoginResult{Token: result}, id, nil
 }
 

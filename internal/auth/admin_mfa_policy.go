@@ -507,6 +507,10 @@ type MFAStatus struct {
 	// not 'disabled', so MFA is required of them whatever Mode says and they
 	// cannot remove their last factor. Omitted otherwise.
 	MFARequiredBy string `json:"mfa_required_by,omitempty"`
+	// EnforceFrom is the application's required-mode grace date (#198): before
+	// it a caller who must use MFA but has no factor is not yet forced to enrol.
+	// Omitted when the application sets none (and for tenant-level users).
+	EnforceFrom *time.Time `json:"enforce_from,omitempty"`
 }
 
 // MyMFAStatus reports the caller's MFA state across every method.
@@ -558,8 +562,9 @@ func (s *AuthService) MyMFAStatus(ctx context.Context, userID, tenantID int64, p
 		if uc.roleRuleApplies() {
 			out.MFARequiredBy = "role:" + uc.ruleRole
 		}
+		out.EnforceFrom = uc.enforceFrom
 		allowed = func(m string) bool {
-			return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.allowedMethods, m)
+			return uc.enabled && uc.mode != MFAModeDisabled && methodAllowed(uc.effectiveMethods(), m)
 		}
 	}
 

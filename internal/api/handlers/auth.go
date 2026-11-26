@@ -1435,9 +1435,9 @@ type LogoutRequest struct {
 // @Param        body  body      RefreshRequest  true  "Refresh token"
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
-// @Failure      401   {object}  map[string]string
+// @Failure      401   {object}  map[string]string  "refresh_token_invalid | session_terminated | step_up_required (the application now requires MFA and this session was established without it; sign in again — nothing was revoked)"
 // @Failure      409   {object}  map[string]string  "concurrent_refresh — sibling request already rotated the family; no token pair returned"
-// @Failure      503   {object}  map[string]string  "session store unavailable — retry"
+// @Failure      503   {object}  map[string]string  "session store unavailable — retry | app_mfa_unavailable (the refresh step-up check could not run, or the role rules covering the user leave no allowed MFA method; nothing was revoked or rotated)"
 // @Router       /api/v1/auth/refresh [post]
 func (h *AuthHandler) Refresh(c echo.Context) error {
 	var req RefreshRequest
@@ -1475,6 +1475,18 @@ func (h *AuthHandler) Refresh(c echo.Context) error {
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return fail(c, http.StatusUnauthorized, "refresh_token_invalid")
+		}
+		if errors.Is(err, auth.ErrStepUpRequired) {
+			// The application now requires MFA and this session has none (#197).
+			// Nothing was revoked or rotated, and the cookies are left alone:
+			// the client sends the user through sign-in again.
+			return fail(c, http.StatusUnauthorized, "step_up_required")
+		}
+		// The step-up check could not decide, or the role rules covering the
+		// user leave no allowed method (login refuses them the same way).
+		// Nothing was revoked or rotated, and the cookies are left alone.
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
 		}
 		if errors.Is(err, auth.ErrServiceUnavailable) {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})
@@ -2985,9 +2997,9 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 // @Tags         auth-session
 // @Produce      json
 // @Success      200  {object}  map[string]string
-// @Failure      401  {object}  map[string]string
+// @Failure      401  {object}  map[string]string  "refresh_token_invalid | session_terminated | step_up_required"
 // @Failure      409  {object}  map[string]string  "concurrent_refresh — sibling request already rotated the family"
-// @Failure      503  {object}  map[string]string  "session store unavailable — retry"
+// @Failure      503  {object}  map[string]string  "session store unavailable — retry | app_mfa_unavailable (nothing was revoked or rotated)"
 // @Router       /api/v1/auth/session/refresh [post]
 func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 	cookie, err := c.Cookie(mw.RefreshTokenCookie)
@@ -3018,6 +3030,18 @@ func (h *AuthHandler) SessionRefresh(c echo.Context) error {
 		}
 		if errors.Is(err, auth.ErrInvalidRefreshToken) {
 			return fail(c, http.StatusUnauthorized, "refresh_token_invalid")
+		}
+		if errors.Is(err, auth.ErrStepUpRequired) {
+			// The application now requires MFA and this session has none (#197).
+			// Nothing was revoked or rotated, and the cookies are left alone:
+			// the client sends the user through sign-in again.
+			return fail(c, http.StatusUnauthorized, "step_up_required")
+		}
+		// The step-up check could not decide, or the role rules covering the
+		// user leave no allowed method (login refuses them the same way).
+		// Nothing was revoked or rotated, and the cookies are left alone.
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
 		}
 		if errors.Is(err, auth.ErrServiceUnavailable) {
 			return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "service temporarily unavailable — please retry"})

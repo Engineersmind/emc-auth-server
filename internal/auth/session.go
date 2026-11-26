@@ -168,6 +168,22 @@ const (
 // Returns 1 when a live session was ended, 0 when there was nothing to end —
 // callers distinguish "revoked" from "not found" on that.
 func (s *AuthService) revokeSession(ctx context.Context, userID, tenantID, sessionID int64, reason string) (int64, error) {
+	n, err := s.revokeSessionDB(ctx, userID, tenantID, sessionID, reason)
+	if err != nil || n == 0 {
+		return n, err
+	}
+	// After the commit: a Redis entry cannot be rolled back, so denying a session
+	// the transaction then failed to revoke would sign a user out on the strength
+	// of a write that never landed.
+	s.denySession(ctx, sessionID)
+	return n, nil
+}
+
+// revokeSessionDB is revokeSession's database half: it revokes the session
+// row and its refresh tokens in one transaction and does NOT touch the Redis
+// denylist. Only for a caller that denies the session itself afterwards and
+// must know whether that write landed (the bulk application revoke, #196).
+func (s *AuthService) revokeSessionDB(ctx context.Context, userID, tenantID, sessionID int64, reason string) (int64, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin revoke session: %w", err)
@@ -204,10 +220,6 @@ func (s *AuthService) revokeSession(ctx context.Context, userID, tenantID, sessi
 	}
 
 	metrics.SessionRevocations.WithLabelValues(reason).Add(float64(n))
-	// After the commit: a Redis entry cannot be rolled back, so denying a session
-	// the transaction then failed to revoke would sign a user out on the strength
-	// of a write that never landed.
-	s.denySession(ctx, sessionID)
 	return n, nil
 }
 

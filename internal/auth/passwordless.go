@@ -976,10 +976,12 @@ func (s *AuthService) completePasswordlessLogin(ctx context.Context, tenantID, a
 	orgReq := orgSessionRequest{requested: strings.TrimSpace(in.Organization)}
 	appID := strconv.FormatInt(appRowID, 10)
 
-	if gate, err := s.mfaGateWith(ctx, mfaGateOptions{inboxFirstFactor: true},
-		u.id, tenantID, appRowID, appID, email, u.roleName, perms, persistent, activeRoles, orgReq); err != nil {
+	gate, grace, err := s.mfaGateWith(ctx, mfaGateOptions{inboxFirstFactor: true},
+		u.id, tenantID, appRowID, appID, email, u.roleName, perms, persistent, activeRoles, orgReq)
+	if err != nil {
 		return nil, err
-	} else if gate != nil {
+	}
+	if gate != nil {
 		return gate, nil
 	}
 
@@ -994,6 +996,7 @@ func (s *AuthService) completePasswordlessLogin(ctx context.Context, tenantID, a
 	if err != nil {
 		return nil, err
 	}
+	grace.annotate(tokens)
 	return &LoginResult{Token: tokens}, nil
 }
 

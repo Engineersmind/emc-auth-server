@@ -1342,7 +1342,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional), master switch (mfa_enabled), federated_mfa (trust|enforce — whether social and passkey sign-ins go through the application MFA gate; default trust) plus enrollment stats over the application's own user base.",
+                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional), master switch (mfa_enabled), federated_mfa (trust|enforce — whether social and passkey sign-ins go through the application MFA gate; default trust), refresh_step_up (whether a refresh of a session without MFA is refused once MFA is required; default false) plus enrollment stats over the application's own user base.",
                 "produces": [
                     "application/json"
                 ],
@@ -1392,7 +1392,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400. federated_mfa: \"trust\" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; \"enforce\" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values.",
+                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400. federated_mfa: \"trust\" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; \"enforce\" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values. refresh_step_up (default false): true makes every refresh of a session established without MFA fail with 401 step_up_required once the application requires MFA of its user (switch on and mode 'required', or a role rule covers them; social/passkey sessions only under federated_mfa=enforce) — nothing is revoked, the user signs in again; a real change is audited as admin.mfa_refresh_step_up_changed with old and new values. enforce_from (RFC 3339, explicit null clears, omitted keeps): a grace date for a required-mode rollout — before it, a user who must use MFA (mode 'required' or a role rule) but has NO active factor signs in normally and the login response carries mfa_enrollment_recommended=true plus enforce_from; from it on, enrolment is forced. Users with a factor are always challenged. A real change is audited as admin.mfa_enforce_from_changed with old and new values.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1512,7 +1512,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. Send either role_ids (every rule uses the application's methods) or rules: [{role_id, allowed_methods}] where allowed_methods (null/omitted = the application's list) restricts which methods satisfy that rule and must be a non-empty subset of the application's allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several rules may use only the methods every rule allows; if the application's list later shrinks so none is left, that user's sign-in is refused with 503 app_mfa_unavailable. A real change (roles or methods) is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1549,7 +1549,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods | mfa_role_rules_too_many",
                         "schema": {
                             "$ref": "#/definitions/handlers.APIError"
                         }
@@ -2275,6 +2275,64 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/sessions/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. One call ends at most 1000 sessions (the revocations run inside the request); remaining reports how many are still live, so repeat the call until complete is true. Each call also re-denies the access tokens of every session this action revoked in the last access-token lifetime, so deny_failed \u003e 0 is repaired by repeating the call too. Idempotent. Refused with 503 session_denial_unavailable on a server without Redis, where outstanding access tokens could not be denied. Audited as admin.application_sessions_revoked with the counts.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Revoke every session of an application",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RevokeApplicationSessionsResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "service_unavailable | session_denial_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -6657,7 +6715,7 @@ const docTemplate = `{
                         }
                     },
                     "401": {
-                        "description": "Unauthorized",
+                        "description": "refresh_token_invalid | session_terminated | step_up_required (the application now requires MFA and this session was established without it; sign in again — nothing was revoked)",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -6675,7 +6733,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "session store unavailable — retry",
+                        "description": "session store unavailable — retry | app_mfa_unavailable (the refresh step-up check could not run, or the role rules covering the user leave no allowed MFA method; nothing was revoked or rotated)",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -7083,7 +7141,7 @@ const docTemplate = `{
                         }
                     },
                     "401": {
-                        "description": "Unauthorized",
+                        "description": "refresh_token_invalid | session_terminated | step_up_required",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -7101,7 +7159,7 @@ const docTemplate = `{
                         }
                     },
                     "503": {
-                        "description": "session store unavailable — retry",
+                        "description": "session store unavailable — retry | app_mfa_unavailable (nothing was revoked or rotated)",
                         "schema": {
                             "type": "object",
                             "additionalProperties": {
@@ -10519,7 +10577,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. Send either role_ids (every rule uses the application's methods) or rules: [{role_id, allowed_methods}] where allowed_methods (null/omitted = the application's list) restricts which methods satisfy that rule and must be a non-empty subset of the application's allowed_methods (400 mfa_role_rule_invalid_methods). A user covered by several rules may use only the methods every rule allows; if the application's list later shrinks so none is left, that user's sign-in is refused with 503 app_mfa_unavailable. A real change (roles or methods) is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
                 "consumes": [
                     "application/json"
                 ],
@@ -10556,7 +10614,7 @@ const docTemplate = `{
                         }
                     },
                     "400": {
-                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rule_invalid_methods | mfa_role_rules_too_many",
                         "schema": {
                             "$ref": "#/definitions/handlers.APIError"
                         }
@@ -12067,6 +12125,64 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/sessions/revoke": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Ends every live session bound to this application inside the tenant — its own users and tenant-level users who signed in through it. Each session's refresh tokens are revoked and its outstanding access tokens are denied immediately, so every user must sign in again and meets the application's CURRENT MFA policy. MFA policy changes never revoke sessions by themselves; this is the manual action to apply a tightened policy now. One call ends at most 1000 sessions (the revocations run inside the request); remaining reports how many are still live, so repeat the call until complete is true. Each call also re-denies the access tokens of every session this action revoked in the last access-token lifetime, so deny_failed \u003e 0 is repaired by repeating the call too. Idempotent. Refused with 503 session_denial_unavailable on a server without Redis, where outstanding access tokens could not be denied. Audited as admin.application_sessions_revoked with the counts.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Revoke every session of an application",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.RevokeApplicationSessionsResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "503": {
+                        "description": "service_unavailable | session_denial_unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -14134,6 +14250,12 @@ const docTemplate = `{
                     },
                     "401": {
                         "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.tokenError"
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable (refresh_token grant: the step-up check could not run, or the role rules covering the user leave no allowed MFA method; the refresh token is untouched)",
                         "schema": {
                             "$ref": "#/definitions/handlers.tokenError"
                         }
@@ -16283,6 +16405,9 @@ const docTemplate = `{
                 "access_token": {
                     "type": "string"
                 },
+                "enforce_from": {
+                    "type": "string"
+                },
                 "expires_at": {
                     "description": "UTC unix timestamp when access token expires",
                     "type": "integer"
@@ -16290,6 +16415,10 @@ const docTemplate = `{
                 "expires_in": {
                     "description": "seconds until access token expires",
                     "type": "integer"
+                },
+                "mfa_enrollment_recommended": {
+                    "description": "MFAEnrollmentRecommended is set on a sign-in during an application's\nrequired-mode grace period (#198): MFA is required of this user but they\nhave no factor yet, and enrolment becomes mandatory at MFAEnforceFrom.\nOmitted otherwise (and always on refresh).",
+                    "type": "boolean"
                 },
                 "refresh_token": {
                     "type": "string"
@@ -16740,6 +16869,10 @@ const docTemplate = `{
                 "email_enrolled_users": {
                     "type": "integer"
                 },
+                "enforce_from": {
+                    "description": "EnforceFrom is the grace date of a required-mode rollout (#198): before\nit, a user who must use MFA but has no factor yet signs in normally and is\ntold enrolment is recommended; from it on, enrolment is forced. null = no\ngrace period.",
+                    "type": "string"
+                },
                 "enrolled_users": {
                     "description": "Enrollment stats over the application's own isolated user base — for the\nowner dashboard. Pending = TOTP enrolled but never activated.",
                     "type": "integer"
@@ -16765,6 +16898,10 @@ const docTemplate = `{
                 "pending_enrollments": {
                     "type": "integer"
                 },
+                "refresh_step_up": {
+                    "description": "RefreshStepUp, when true, refuses a refresh of a session whose amr lacks\n\"mfa\" once the application requires MFA of its user (401\nstep_up_required). Default false: refresh is not re-checked. #197.",
+                    "type": "boolean"
+                },
                 "total_users": {
                     "type": "integer"
                 },
@@ -16777,6 +16914,13 @@ const docTemplate = `{
         "auth.MFARoleRule": {
             "type": "object",
             "properties": {
+                "allowed_methods": {
+                    "description": "AllowedMethods restricts which methods satisfy this rule (#199). null =\nthe application's allowed_methods.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "created_at": {
                     "type": "string"
                 },
@@ -16795,6 +16939,10 @@ const docTemplate = `{
         "auth.MFAStatus": {
             "type": "object",
             "properties": {
+                "enforce_from": {
+                    "description": "EnforceFrom is the application's required-mode grace date (#198): before\nit a caller who must use MFA but has no factor is not yet forced to enrol.\nOmitted when the application sets none (and for tenant-level users).",
+                    "type": "string"
+                },
                 "methods": {
                     "type": "array",
                     "items": {
@@ -18315,6 +18463,20 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.MFARoleRuleRequest": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "role_id": {
+                    "type": "string"
+                }
+            }
+        },
         "handlers.MFARoleRulesResponse": {
             "type": "object",
             "properties": {
@@ -18741,6 +18903,34 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.RevokeApplicationSessionsResponse": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string"
+                },
+                "complete": {
+                    "description": "Complete is true only when every session is signed out: remaining,\nfailed and deny_failed are all 0. Anything else: repeat the call.",
+                    "type": "boolean"
+                },
+                "deny_failed": {
+                    "description": "DenyFailed is how many sessions revoked by this action within the last\naccess-token lifetime could not have their access tokens denied. Their\nrefresh is stopped but an access token may work until it expires; the\nnext call re-denies them.",
+                    "type": "integer"
+                },
+                "failed": {
+                    "description": "Failed is how many sessions could not be revoked (logged server-side).\nThey stay live and are counted in Remaining; repeat the call.",
+                    "type": "integer"
+                },
+                "remaining": {
+                    "description": "Remaining is how many of the application's sessions are still live after\nthis call. One call ends at most 1000; repeat until it reaches 0.",
+                    "type": "integer"
+                },
+                "revoked": {
+                    "description": "Revoked is how many live sessions this call ended.",
+                    "type": "integer"
+                }
+            }
+        },
         "handlers.SelectOrganizationRequest": {
             "type": "object",
             "properties": {
@@ -19039,6 +19229,11 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "enforce_from": {
+                    "description": "EnforceFrom is the required-mode grace date (#198), RFC 3339. Omitted\nkeeps the stored value; an explicit null clears it.",
+                    "type": "string",
+                    "format": "date-time"
+                },
                 "federated_mfa": {
                     "description": "FederatedMFA is \"trust\" (default: social and passkey sign-ins skip the\napplication MFA gate) or \"enforce\" (they go through it; a user-verified\npasskey satisfies it). Omitted or \"\" keeps the stored value. #194.",
                     "type": "string"
@@ -19054,6 +19249,10 @@ const docTemplate = `{
                 },
                 "mode": {
                     "type": "string"
+                },
+                "refresh_step_up": {
+                    "description": "RefreshStepUp opts the application in to step-up at refresh (#197):\ntrue refuses a refresh (401 step_up_required) of a session established\nwithout MFA once the application requires MFA of its user. Omitted keeps\nthe stored value (default false).",
+                    "type": "boolean"
                 }
             }
         },
@@ -19115,6 +19314,12 @@ const docTemplate = `{
                     "type": "array",
                     "items": {
                         "type": "string"
+                    }
+                },
+                "rules": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/handlers.MFARoleRuleRequest"
                     }
                 }
             }

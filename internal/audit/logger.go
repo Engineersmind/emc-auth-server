@@ -317,6 +317,18 @@ const (
 	// rules (#195): the roles whose holders must use MFA. Metadata:
 	// old_role_ids, new_role_ids, old_role_names, new_role_names.
 	ActionAdminMFARoleRulesSet = "admin.mfa_role_rules_set"
+	// ActionAdminMFARefreshStepUpChanged is a real change of an application's
+	// refresh_step_up setting (#197). Metadata: old_refresh_step_up,
+	// new_refresh_step_up. Emitted only when the value actually changed.
+	ActionAdminMFARefreshStepUpChanged = "admin.mfa_refresh_step_up_changed"
+	// ActionAdminMFAEnforceFromChanged is a real change of an application's
+	// required-mode grace date (#198). Metadata: old_enforce_from,
+	// new_enforce_from (RFC 3339 or null).
+	ActionAdminMFAEnforceFromChanged = "admin.mfa_enforce_from_changed"
+	// ActionAdminAppSessionsRevoked is an administrator ending every live
+	// session of one application at once (#196). Metadata: application_id,
+	// revoked (count ended), failed (count that errored).
+	ActionAdminAppSessionsRevoked = "admin.application_sessions_revoked"
 
 	// Admin — mandatory administrator MFA policy (migration 00094): which
 	// methods satisfy the requirement, per tenant and for the platform.

@@ -113,7 +113,7 @@ value is a no-op: no audit, no email.
 **Changes apply at the next login.** Existing sessions are not re-checked:
 a session issued while MFA was off stays valid until its refresh token expires
 (up to 30 days), and turning MFA off does not end sessions that did MFA.
-App-wide session revoke is tracked in #196.
+To apply a tightened policy now, revoke the application's sessions (§2.3d).
 
 Social and passkey sign-ins follow the switch and `mode` only when the
 application opts in with `federated_mfa: "enforce"` (§2.3b).
@@ -174,7 +174,8 @@ the same permissions as the `/mfa` routes.
   to enrol otherwise, and unable to remove their last factor. Roles are read
   from the database at each login, never from the token.
 - Rules apply only while `mfa_enabled` is true and `mode` is not `disabled`.
-  Under `required` they add nothing (everyone is already covered).
+  Under `required` they add nothing to *who* is covered, but a rule's method
+  restriction (below) still narrows what a covered user may use.
 - **Rules cover social and passkey sign-ins only when `federated_mfa` is
   `enforce`** (§2.3b). With `trust`, a covered user signing in with Google or
   a passkey is not challenged.
@@ -199,11 +200,142 @@ the same permissions as the `/mfa` routes.
 - `GET /auth/me/mfa` for a covered user reports
   `"mfa_required_by": "role:<name>"`.
 
+**Per-role allowed methods (#199).** A rule can restrict which methods satisfy
+it, e.g. `finance` must use TOTP, not an emailed code:
+```
+PUT /api/v1/applications/{appID}/mfa/role-rules            Bearer <admin>
+{ "rules": [ { "role_id": "12", "allowed_methods": ["totp"] },
+             { "role_id": "15" } ] }                        # null/omitted = the app's methods
+→ 200 { "rules": [ { "role_id": "12", …, "allowed_methods": ["totp"] },
+                   { "role_id": "15", …, "allowed_methods": null } ] }
+```
+- Send exactly one of `role_ids` (every rule uses the application's methods)
+  or `rules`. A rule's list must be a non-empty subset of the application's
+  `allowed_methods` → otherwise **400 `mfa_role_rule_invalid_methods`**.
+- A covered user may use only methods **every** covering rule allows (the
+  intersection with the application's list). That set drives the login
+  challenge (an enrolled factor outside it is not offered), forced enrolment,
+  self-service enrolment (403 method not allowed), the last-factor guard and
+  `/auth/me/mfa` `allowed`.
+- If the application's list later shrinks, or two rules exclude each other, so
+  that a covered user has no method left, their sign-in is refused with
+  **503 `app_mfa_unavailable`** (fail closed) — fix the rules or the list.
+- The audit event also carries `old_rules` / `new_rules` with each rule's
+  `allowed_methods`; a change of methods alone is a real change.
+
+### 2.3d Revoke every session of the application (#196)
+Policy changes never end sessions by themselves. After turning MFA on or
+tightening it, an administrator can sign every user of the application out so
+each one meets the new policy at their next login:
+```
+POST /api/v1/applications/{appID}/sessions/revoke          Bearer <admin>
+POST /api/v1/tenants/{tid}/applications/{appID}/sessions/revoke
+→ 200 { "application_id": "149", "revoked": 42, "failed": 0,
+        "deny_failed": 0, "remaining": 0, "complete": true }
+```
+- Same permission as `PUT .../mfa` (`apps:write`).
+- Ends live sessions bound to the application in this tenant (its own users
+  and tenant-level users who signed in through it). Refresh tokens are revoked
+  (`revoked_reason = admin_app_revoke_all`) and outstanding access tokens are
+  denied immediately.
+- **Upper bound: one call ends at most 1000 sessions.** The revocations run
+  inside the request, so an unbounded call on an application with many
+  thousands of sessions could hit an HTTP or proxy timeout partway through.
+  `remaining` is how many sessions are still live after the call — **repeat
+  the call until `complete` is `true`**.
+- `failed` — sessions whose revocation errored (logged server-side); they stay
+  live, are counted in `remaining`, and the next call retries them.
+- `deny_failed` — sessions whose refresh is already stopped but whose
+  access-token denial (Redis) did not land, so an access token they hold may
+  work until it expires (at most 15 minutes). Each call re-denies every
+  session this action revoked within the last access-token lifetime, so
+  repeating the call repairs them.
+- `complete` is `true` only when `remaining`, `failed` and `deny_failed` are
+  all 0. Never treat a 200 with `complete: false` as a finished sign-out.
+- Idempotent. 503 `service_unavailable` when session revocation is not wired;
+  503 `session_denial_unavailable` on a server without Redis (outstanding
+  access tokens could not be denied) — nothing is revoked.
+- Audited as `admin.application_sessions_revoked` with `revoked`, `failed`,
+  `deny_failed`, `remaining` and `complete`.
+
+### 2.3e Step-up at refresh (`refresh_step_up`, #197)
+Off by default. With it off, refresh is never re-checked against the MFA
+policy (exactly the pre-#197 behaviour). Turn it on per application:
+```
+PUT /api/v1/applications/{appID}/mfa                         Bearer <admin>
+{ "refresh_step_up": true }        → 200 { …, "refresh_step_up": true }
+```
+While on, every refresh (`POST /auth/refresh`, `POST /auth/session/refresh`,
+the cookie renewal middleware, and `POST /oauth/token` with
+`grant_type=refresh_token`) of a session whose `amr` lacks `mfa` is refused when
+the application now requires MFA of the user:
+- the switch is on and the mode is `required`, or a role rule (§2.3c) covers
+  the user;
+- social (`fed`) and passkey (`hwk`) sessions only when `federated_mfa` is
+  `enforce` — under `trust` they are not forced, as at login.
+```
+→ 401 { "error": "step_up_required", "message": "…" }
+```
+Nothing is revoked and the refresh token is not rotated: your app sends the
+user through sign-in again, where the login gate challenges or enrols them.
+Sessions that did MFA, tenant-level users (no application), administrators and
+`client_credentials` tokens are never affected. The renewal middleware leaves
+the cookies in place on this refusal.
+
+Refresh and login agree on what counts:
+- If the role rules covering the user leave no allowed method (§2.3c, #199),
+  the refresh is refused with **503 `app_mfa_unavailable`** (OAuth: `error:
+  "app_mfa_unavailable"`) — even inside an `enforce_from` grace period, exactly
+  as login refuses that user. The same 503 is returned when the check cannot
+  read the policy or the user's factors. Nothing is revoked or rotated: keep
+  the refresh token and retry later.
+- During a grace period, a session signed in with a passwordless email code
+  (`amr` contains `email_otp`) does not count an enrolled `email` factor as a
+  usable second factor — the same rule as at login — so a user whose only
+  factor is email keeps refreshing that session until the grace date.
+
+Cost: the flag is read in the refresh-token lookup the rotation already does,
+so an application with it off pays nothing. With it on, a session without
+`mfa` costs the user-MFA-context reads (user + policy row, role rules) per
+refresh.
+
+A real change is audited as `admin.mfa_refresh_step_up_changed`
+(`old_refresh_step_up`, `new_refresh_step_up`).
+
+### 2.3f Grace date for a `required` rollout (`enforce_from`, #198)
+Turning on `required` forces every unenrolled user to enrol at their next
+login. `enforce_from` spreads that out:
+```
+PUT /api/v1/applications/{appID}/mfa                         Bearer <admin>
+{ "mode": "required", "enforce_from": "2026-12-15T00:00:00Z" }
+{ "enforce_from": null }          # clears the grace date (enforce now)
+```
+- Before `enforce_from`, a user who must use MFA (mode `required`, or covered
+  by a role rule) but has **no** active allowed factor signs in normally. The
+  login response (password, app, magic-link, email-code, social/passkey under
+  `enforce`) carries two extra fields:
+  ```
+  { "access_token": "…", …, "mfa_enrollment_recommended": true,
+    "enforce_from": "2026-12-15T00:00:00Z" }
+  ```
+  Prompt the user to set up MFA (§4). From `enforce_from` on, the login
+  returns the forced-enrolment shape (§3.4) as before.
+- Users who already have a factor are always challenged: the grace covers
+  enrolment only.
+- Step-up at refresh (§2.3e) does not refuse an unenrolled user's refresh
+  before `enforce_from`.
+- `GET .../mfa` and `GET /auth/me/mfa` report `enforce_from` (RFC 3339 UTC;
+  `/auth/me/mfa` omits it when unset). Omitting it on PUT keeps it; a value
+  that is not RFC 3339 or null is a 400.
+- A real change is audited as `admin.mfa_enforce_from_changed`
+  (`old_enforce_from`, `new_enforce_from`).
+
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```
 GET /api/v1/applications/{appID}/mfa            Bearer <admin>
 → 200 {
   "application_id": "149", "mfa_enabled": true, "mode": "required", "federated_mfa": "trust",
+  "refresh_step_up": false, "enforce_from": null,
   "allowed_methods": ["totp","email"],
   "enrolled_users": 1,          // active TOTP
   "pending_enrollments": 0,     // TOTP enrolled, never activated
@@ -311,6 +443,7 @@ Errors: 401 bad code/expired token · 403 method not allowed for this app ·
 ```
 POST /api/v1/auth/refresh   { "refresh_token" }   → 200 new pair in the body (rotation; replay revokes the whole session family)
                                                     409 concurrent_refresh — a sibling request already rotated the family; no pair returned, use its response
+                                                    401 step_up_required — only when the app has refresh_step_up on (§2.3e): sign in again
 GET  /api/v1/auth/me                                Bearer <user>   → profile from claims (user_id, tenant_id, email, role, permissions)
 POST /api/v1/auth/logout    { "refresh_token" }   → 200
 ```

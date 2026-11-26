@@ -548,36 +548,59 @@ func (s *AuthService) SwitchOrganization(ctx context.Context, in SwitchOrganizat
 type sessionRow struct{ id, userID, tenantID int64 }
 
 func (s *AuthService) collectSessions(ctx context.Context, sql string, args ...any) []sessionRow {
-	rows, err := s.pool.Query(ctx, sql, args...)
+	out, err := s.listSessionRows(ctx, sql, args...)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("organization: could not list sessions to revoke")
-		return nil
+	}
+	return out
+}
+
+// listSessionRows runs sql, which must select (id, user_id, tenant_id) from
+// user_sessions, and returns the rows. Unlike collectSessions it reports a read
+// error instead of logging it, for callers that must not mistake "could not
+// list" for "nothing to revoke" (the admin app-wide revoke, #196). On a scan
+// error the rows read so far are returned with the error.
+func (s *AuthService) listSessionRows(ctx context.Context, sql string, args ...any) ([]sessionRow, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
 	}
 	defer rows.Close()
 	var out []sessionRow
 	for rows.Next() {
 		var r sessionRow
 		if err := rows.Scan(&r.id, &r.userID, &r.tenantID); err != nil {
-			s.logger.Error().Err(err).Msg("organization: could not scan session to revoke")
-			return out
+			return out, fmt.Errorf("scan session: %w", err)
 		}
 		out = append(out, r)
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return out, fmt.Errorf("iterate sessions: %w", err)
+	}
+	return out, nil
 }
 
 func (s *AuthService) revokeSessionRows(ctx context.Context, rows []sessionRow) int {
-	n := 0
+	n, _ := s.revokeSessionRowsReason(ctx, rows, RevokeReasonOrganization)
+	return n
+}
+
+// revokeSessionRowsReason revokes each session through revokeSession (which
+// also denies its outstanding access tokens) under reason. A failure on one
+// session is logged and counted, never fatal to the rest: that session still
+// ends at its next refresh. Returns how many were revoked and how many failed.
+func (s *AuthService) revokeSessionRowsReason(ctx context.Context, rows []sessionRow, reason string) (revoked, failed int) {
 	for _, r := range rows {
-		k, err := s.revokeSession(ctx, r.userID, r.tenantID, r.id, RevokeReasonOrganization)
+		k, err := s.revokeSession(ctx, r.userID, r.tenantID, r.id, reason)
 		if err != nil {
-			s.logger.Error().Err(err).Int64("session_id", r.id).
-				Msg("organization: session revocation failed; it ends at its next refresh instead")
+			failed++
+			s.logger.Error().Err(err).Int64("session_id", r.id).Str("reason", reason).
+				Msg("session revocation failed; it ends at its next refresh instead")
 			continue
 		}
-		n += int(k)
+		revoked += int(k)
 	}
-	return n
+	return revoked, failed
 }
 
 // revokeOrganizationSessions revokes every live session signed in to an

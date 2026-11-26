@@ -341,6 +341,12 @@ type AuthResult struct {
 	TokenType    string `json:"token_type"`
 	ExpiresIn    int    `json:"expires_in"` // seconds until access token expires
 	ExpiresAt    int64  `json:"expires_at"` // UTC unix timestamp when access token expires
+	// MFAEnrollmentRecommended is set on a sign-in during an application's
+	// required-mode grace period (#198): MFA is required of this user but they
+	// have no factor yet, and enrolment becomes mandatory at MFAEnforceFrom.
+	// Omitted otherwise (and always on refresh).
+	MFAEnrollmentRecommended bool       `json:"mfa_enrollment_recommended,omitempty"`
+	MFAEnforceFrom           *time.Time `json:"enforce_from,omitempty"`
 	// Clients should schedule a proactive refresh at (ExpiresAt - 60) seconds.
 	// On a 401 with code="token_expired", refresh once then retry the original request.
 	// On a 401 with code="token_invalid" or if refresh fails, redirect to login.
@@ -1860,9 +1866,11 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	// checked only at the mint, after every factor has passed.
 	orgReq := orgSessionRequest{requested: strings.TrimSpace(in.Organization), skip: in.VerifiedApp != nil}
 
-	if gate, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent, activeRoles, orgReq); err != nil {
+	gate, grace, err := s.mfaGate(ctx, userID, tenantID, appRowID, appID, email, roleName, perms, in.Persistent, activeRoles, orgReq)
+	if err != nil {
 		return nil, err
-	} else if gate != nil {
+	}
+	if gate != nil {
 		return gate, nil
 	}
 
@@ -1887,6 +1895,7 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 	if err != nil {
 		return nil, err
 	}
+	grace.annotate(tokens)
 	return &LoginResult{Token: tokens}, nil
 }
 
@@ -1919,8 +1928,32 @@ func (s *AuthService) Login(ctx context.Context, in LoginInput) (*LoginResult, e
 // the finally-issued session honours it. Threaded through rather than re-read at the
 // completion step because the completion request has no access to it: the user
 // ticked the box on the password form, one or more requests ago.
-func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+//
+// The second result is non-nil only when the gate returns no challenge because
+// the application's required-mode grace period is running (#198): the user
+// must use MFA but has no factor yet and enforce_from is still in the future.
+// The caller issues tokens as usual and passes them to its annotate method, so
+// the response tells the user enrolment is recommended and when it becomes
+// mandatory.
+func (s *AuthService) mfaGate(ctx context.Context, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, *mfaEnrollmentGrace, error) {
 	return s.mfaGateWith(ctx, mfaGateOptions{}, userID, tenantID, appRowID, appID, email, roleName, perms, persistent, activeRoles, org)
+}
+
+// mfaEnrollmentGrace is the gate's "no challenge, but enrolment is recommended"
+// outcome during a required-mode grace period (#198).
+type mfaEnrollmentGrace struct {
+	enforceFrom time.Time
+}
+
+// annotate marks tokens with the enrolment recommendation. Safe on a nil
+// receiver (no grace) and nil tokens, so callers need no branch.
+func (g *mfaEnrollmentGrace) annotate(tokens *AuthResult) {
+	if g == nil || tokens == nil {
+		return
+	}
+	at := g.enforceFrom
+	tokens.MFAEnrollmentRecommended = true
+	tokens.MFAEnforceFrom = &at
 }
 
 // mfaGateOptions tunes mfaGateWith. The zero value is exactly mfaGate's
@@ -1942,7 +1975,18 @@ type mfaGateOptions struct {
 }
 
 // mfaGateWith is mfaGate with options. See mfaGate for the contract.
-func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
+func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, *mfaEnrollmentGrace, error) {
+	var grace *mfaEnrollmentGrace
+	res, err := s.mfaGateCore(ctx, opts, &grace, userID, tenantID, appRowID, appID, email, roleName, perms, persistent, activeRoles, org)
+	if err != nil || res != nil {
+		return res, nil, err
+	}
+	return nil, grace, nil
+}
+
+// mfaGateCore is the gate itself. It writes *grace only when it returns no
+// challenge because of a running grace period (#198).
+func (s *AuthService) mfaGateCore(ctx context.Context, opts mfaGateOptions, grace **mfaEnrollmentGrace, userID, tenantID, appRowID int64, appID, email, roleName string, perms []string, persistent bool, activeRoles []string, org orgSessionRequest) (*LoginResult, error) {
 	if opts.inboxFirstFactor {
 		// Carried to the stored challenge so the finished session keeps the email-code
 		// grant and amr. A context value rather than a new parameter on every helper
@@ -1983,6 +2027,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	// policy, so every active factor is honoured.
 	var mode string
 	var allowedMethods []string
+	var enforceFrom *time.Time
 	if appRowID != 0 {
 		cfg, cfgErr := loadAppMFAConfig(ctx, s.pool, appRowID)
 		if cfgErr != nil {
@@ -2001,18 +2046,28 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 		if opts.federated != "" && cfg.FederatedMFA != FederatedMFAEnforce {
 			return nil, nil
 		}
-		mode, allowedMethods = cfg.Mode, cfg.Methods
+		mode, allowedMethods, enforceFrom = cfg.Mode, cfg.Methods, cfg.EnforceFrom
 		// Role rules (#195): a user holding a role the application lists is
-		// treated as 'required'. Only an 'optional' app needs the lookup —
-		// 'required' already is, and rules do not apply under 'disabled'.
-		// Read from the database, never the token; a read error fails closed.
-		if mode == MFAModeOptional {
-			ruleRole, ruleErr := mfaRuleRoleFor(ctx, s.pool, userID, tenantID, appRowID)
+		// treated as 'required', and a rule may narrow the methods that satisfy
+		// it (#199) — so both 'optional' and 'required' apps need the lookup;
+		// rules do not apply under 'disabled'. Read from the database, never the
+		// token; a read error fails closed.
+		if mode != MFAModeDisabled {
+			cov, ruleErr := loadMFARuleCoverage(ctx, s.pool, userID, tenantID, appRowID)
 			if ruleErr != nil {
 				return nil, fmt.Errorf("%w: %w", ErrAppMFAUnavailable, ruleErr)
 			}
-			if ruleRole != "" {
+			if cov.role != "" {
 				mode = MFAModeRequired
+				allowedMethods = cov.effectiveMethods(allowedMethods)
+				if len(allowedMethods) == 0 {
+					// The rules covering this user (or the rules and a since-shrunk
+					// application list) leave no method that satisfies them all.
+					// Fail closed: allowing any method would ignore a rule.
+					s.logger.Error().Int64("tenant_id", tenantID).Int64("application_id", appRowID).Str("rule_role", cov.role).
+						Msg("app MFA: the role rules covering this user leave no allowed method — sign-in refused")
+					return nil, ErrAppMFAUnavailable
+				}
 			}
 		}
 	}
@@ -2021,12 +2076,16 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	// when it is BOTH active for the user AND still in the app's allowed_methods.
 	// Removing a method from the policy therefore stops it being offered even to
 	// users who had already enrolled it. A non-app login (appRowID 0) has no
-	// policy and honours every active factor.
+	// policy and honours every active factor. After an inbox first factor the
+	// email method never counts (secondFactorMethods — shared with the refresh
+	// step-up check, #197).
+	gateMethods := allowedMethods
+	if appRowID == 0 {
+		gateMethods = []string{MFAMethodTOTP, MFAMethodEmail}
+	}
+	gateMethods = secondFactorMethods(gateMethods, opts.inboxFirstFactor)
 	permitted := func(method string) bool {
-		if opts.inboxFirstFactor && method == MFAMethodEmail {
-			return false
-		}
-		return appRowID == 0 || methodAllowed(allowedMethods, method)
+		return methodAllowed(gateMethods, method)
 	}
 
 	// Which permitted factors does the user have active? Read from the database
@@ -2050,6 +2109,16 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	required := appRowID != 0 && mode == MFAModeRequired
 	if len(active) == 0 && !required {
 		// Nothing is due: no permitted factor to challenge, no mandate to enrol.
+		return nil, nil
+	}
+	// Required-mode grace period (#198): the user must use MFA but has no
+	// permitted factor yet, and enforce_from is still ahead. Tokens are issued
+	// as normal, marked "enrolment recommended". Only enrolment is deferred: a
+	// user with an active factor never reaches here (len(active) > 0) and is
+	// challenged as always. Decided before the service checks below: nothing is
+	// due, so a deployment without Redis/TOTP lets this login through too.
+	if len(active) == 0 && inEnrollmentGrace(enforceFrom, time.Now()) {
+		*grace = &mfaEnrollmentGrace{enforceFrom: *enforceFrom}
 		return nil, nil
 	}
 
@@ -2083,10 +2152,7 @@ func (s *AuthService) mfaGateWith(ctx context.Context, opts mfaGateOptions, user
 	// No policy-permitted active factor remains, and the early return above
 	// means the mode is 'required': the user must (re)enroll a permitted method
 	// before finishing login.
-	enrollmentMethods := allowedMethods
-	if opts.inboxFirstFactor {
-		enrollmentMethods = withoutMethod(allowedMethods, MFAMethodEmail)
-	}
+	enrollmentMethods := secondFactorMethods(allowedMethods, opts.inboxFirstFactor)
 	if opts.inboxFirstFactor && len(enrollmentMethods) == 0 {
 		// Fail loudly rather than hand the user an enrollment challenge they
 		// cannot complete: the policy needs a non-email method to be allowed.
@@ -2723,17 +2789,21 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 	// therefore to "no pin" — the pre-#131 behaviour for a chain in flight
 	// across the deploy.
 	var pinnedAudience *string
+	// stepUp is the owner's application refresh_step_up flag (#197), read in
+	// this same lookup so an application without it pays no extra query.
+	var stepUp bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT rt.id, s.user_id, s.tenant_id, s.id,
-		       s.is_persistent, s.auth_time, s.amr, rt.audience, rt.active_roles
+		       s.is_persistent, s.auth_time, s.amr, rt.audience, rt.active_roles,
+		       `+refreshStepUpSQL+`
 		FROM refresh_tokens rt
-		JOIN user_sessions s ON s.id = rt.session_id
+		JOIN user_sessions s ON s.id = rt.session_id`+refreshStepUpJoin+`
 		WHERE rt.token_hash = $1
 		  AND `+LiveTokenWhere("rt.")+`
 		  AND `+LiveSessionWhere("s."),
 		hash).Scan(&tokenID, &userID, &tenantID, &sessionID,
 		&carried.persistent, &carried.authTime, &carried.amr, &pinnedAudience,
-		&carried.activeRoles)
+		&carried.activeRoles, &stepUp)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrInvalidRefreshToken
@@ -2741,6 +2811,14 @@ func (s *AuthService) Refresh(ctx context.Context, rawRefreshToken string) (*Aut
 		return nil, fmt.Errorf("lookup refresh token: %w", err)
 	}
 	carried.sessionID = &sessionID
+
+	// Step-up at refresh (#197), before anything is written: a refused refresh
+	// leaves the presented token and its session exactly as they were.
+	if stepUp {
+		if err := s.checkRefreshStepUp(ctx, userID, tenantID, carried.amr); err != nil {
+			return nil, err
+		}
+	}
 
 	_, err = s.pool.Exec(ctx, `
 		UPDATE refresh_tokens SET revoked_at = NOW(), revoked_reason = $2, updated_at = NOW()
@@ -2973,6 +3051,8 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 	// renewal middleware rotates through here rather than through Refresh, and a
 	// pin enforced on only one of the two rotation paths is not a pin at all.
 	var pinnedAudience *string
+	// The refresh_step_up flag, as in Refresh (#197).
+	var stepUp bool
 	err := s.pool.QueryRow(ctx, `
 		SELECT rt.id, rt.user_id, rt.tenant_id,
 		       COALESCE(rt.session_id, rt.session_family_id),
@@ -2981,14 +3061,15 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		       COALESCE(s.auth_time, rt.created_at),
 		       COALESCE(s.amr, '{}'),
 		       s.revoked_at, s.idle_expires_at, s.absolute_expires_at,
-		       rt.audience, rt.active_roles
+		       rt.audience, rt.active_roles,
+		       `+refreshStepUpSQL+`
 		FROM refresh_tokens rt
-		LEFT JOIN user_sessions s ON s.id = rt.session_id
+		LEFT JOIN user_sessions s ON s.id = rt.session_id`+refreshStepUpJoin+`
 		WHERE rt.token_hash = $1
 	`, hash).Scan(&tokenID, &userID, &tenantID, &sessionID, &revokedAt, &expiresAt,
 		&carried.persistent, &carried.authTime, &carried.amr,
 		&sessionRevokedAt, &sessionIdleExpires, &sessionAbsoluteExpires, &pinnedAudience,
-		&carried.activeRoles)
+		&carried.activeRoles, &stepUp)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, ErrInvalidRefreshToken
@@ -3061,6 +3142,15 @@ func (s *AuthService) RefreshWithLock(ctx context.Context, rawToken string, redi
 		(sessionAbsoluteExpires != nil && sessionAbsoluteExpires.Before(nowUTC)) ||
 		(sessionIdleExpires != nil && sessionIdleExpires.Before(nowUTC)) {
 		return nil, nil, ErrInvalidRefreshToken
+	}
+
+	// Step-up at refresh (#197): after the replay and lifetime checks (a replay
+	// must still revoke the session; a dead session is still just invalid) and
+	// before the presented token is revoked, so a refusal rotates nothing.
+	if stepUp {
+		if err := s.checkRefreshStepUp(ctx, userID, tenantID, carried.amr); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// Revoke the presented token.
