@@ -192,7 +192,7 @@ type OAuthExchangeRequest struct {
 // login_code for the standard access + refresh token pair.
 //
 // @Summary      Exchange social login code for tokens
-// @Description  Consumes the single-use login_code issued by the social login callback and returns the standard access + refresh token pair.
+// @Description  Consumes the single-use login_code issued by the social login callback and returns the standard access + refresh token pair. When the application has federated_mfa=enforce and its MFA policy requires a second factor at this sign-in, the response is instead the same challenge password login returns: 200 {requires_otp, otp_session_token, methods, expires_in} (finish at POST /api/v1/auth/login/otp) or 403 {mfa_enrollment_required, enrollment_token, allowed_methods, expires_in} (finish via /api/v1/auth/login/mfa/*). Applications on federated_mfa=trust (the default) always receive the token pair.
 // @Tags         oauth
 // @Accept       json
 // @Produce      json
@@ -200,6 +200,8 @@ type OAuthExchangeRequest struct {
 // @Success      200   {object}  auth.AuthResult
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
+// @Failure      403   {object}  auth.MFAEnrollmentChallenge  "federated_mfa=enforce and the user must enrol a second factor first"
+// @Failure      503   {object}  APIError  "app_mfa_unavailable - a second factor is due and this server cannot run it; no tokens issued"
 // @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
 // @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
 // @Failure      429  {object}  map[string]string  "Rate limited; wait Retry-After seconds"
@@ -213,7 +215,7 @@ func (h *OAuthHandler) Exchange(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "client_id and login_code are required")
 	}
 
-	tokens, err := h.svc.ExchangeLoginCode(c.Request().Context(), req.ClientID, req.LoginCode, req.CodeVerifier)
+	result, err := h.svc.ExchangeLoginCode(c.Request().Context(), req.ClientID, req.LoginCode, req.CodeVerifier)
 	if err != nil {
 		// Social sign-in mints at this exchange, so an organisation outcome
 		// (choose one, or no access) surfaces here, after the provider
@@ -224,10 +226,22 @@ func (h *OAuthHandler) Exchange(c echo.Context) error {
 		if errors.Is(err, auth.ErrInvalidLoginCode) {
 			return echo.NewHTTPError(http.StatusUnauthorized, "invalid or expired login code")
 		}
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
+		}
 		h.logger.Error().Err(err).Msg("oauth: login code exchange failed")
 		return echo.NewHTTPError(http.StatusInternalServerError, "failed to exchange login code")
 	}
-	return c.JSON(http.StatusOK, tokens)
+	// federated_mfa = enforce (#194): the same branching shapes password login
+	// returns. Only reachable for an application that opted in; 'trust'
+	// applications always get the token pair, byte-identical to before.
+	if result.OTPChallenge != nil {
+		return c.JSON(http.StatusOK, result.OTPChallenge)
+	}
+	if result.MFAEnrollment != nil {
+		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
+	}
+	return c.JSON(http.StatusOK, result.Token)
 }
 
 // ─── Admin: identity provider configuration ─────────────────────────────────

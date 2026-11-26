@@ -777,7 +777,11 @@ func AppendLoginError(redirect, errCode string) string {
 // refresh token pair. The code must be unused, unexpired, and bound to the
 // presented client_id. Consumption is a single atomic UPDATE — two concurrent
 // exchanges of the same code cannot both succeed.
-func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, rawCode, codeVerifier string) (*AuthResult, error) {
+//
+// Exactly one field of the result is set: Token normally; OTPChallenge or
+// MFAEnrollment when the application has federated_mfa = enforce and its MFA
+// gate requires a second factor (#194).
+func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, rawCode, codeVerifier string) (*LoginResult, error) {
 	if clientID == "" || rawCode == "" {
 		return nil, ErrInvalidLoginCode
 	}
@@ -854,7 +858,27 @@ func (s *OAuthLoginService) ExchangeLoginCode(ctx context.Context, clientID, raw
 		perms = []string{}
 	}
 
+	appID := strconv.FormatInt(appRowID, 10)
+
+	// Application MFA for social sign-in (#194). Only an application with
+	// federated_mfa = enforce is gated; for 'trust' — the default — the gate
+	// returns nil and this is exactly the pre-#194 mint. When a challenge is
+	// due the login code is already spent and the caller gets the same OTP
+	// challenge / forced-enrolment shape password login returns, completed
+	// through the same /auth/login/otp and /auth/login/mfa/* endpoints; the
+	// finished session keeps the social grant (FirstFactorSocial).
+	if gate, err := s.authSvc.mfaGateWith(ctx, mfaGateOptions{federated: FirstFactorSocial},
+		userID, tenantID, appRowID, appID, email, roleName, perms, false, nil, orgSessionRequest{}); err != nil {
+		return nil, err
+	} else if gate != nil {
+		return gate, nil
+	}
+
 	// Same choke point as password/OTP login — no parallel token minting.
-	return s.authSvc.issueTokenPair(ctx, userID, tenantID, email, roleName, perms,
-		sessionContext{amr: []string{AMRFederated}, grant: GrantSocial}, strconv.FormatInt(appRowID, 10))
+	tokens, err := s.authSvc.issueTokenPair(ctx, userID, tenantID, email, roleName, perms,
+		sessionContext{amr: []string{AMRFederated}, grant: GrantSocial}, appID)
+	if err != nil {
+		return nil, err
+	}
+	return &LoginResult{Token: tokens}, nil
 }

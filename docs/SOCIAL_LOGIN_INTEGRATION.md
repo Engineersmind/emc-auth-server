@@ -81,3 +81,38 @@ different origin than your session cookie, or when you want defence in depth.
 - On the platform side, sending `state` (and ideally `code_challenge`) is not
   enough on its own: the callback handler must verify them, otherwise the
   login CSRF remains open in your application.
+
+## Application MFA on social sign-in (`federated_mfa`, issue #194)
+
+By default (`federated_mfa: "trust"`) a social sign-in is accepted as is: the
+exchange returns the token pair and the application's MFA policy is not
+applied. That is unchanged for every existing application.
+
+An application can opt in with `federated_mfa: "enforce"`
+(`PUT /api/v1/applications/{appID}/mfa`, see `APP_MFA_INTEGRATION.md` §2.3b).
+The same application MFA gate as password login then runs at the exchange,
+and **`POST /api/v1/auth/oauth/exchange` can answer with a challenge instead of
+tokens** — for opted-in applications only:
+
+| Status | Body | Meaning → next step |
+|---|---|---|
+| 200 | `access_token`, `refresh_token`, … | signed in (nothing due) |
+| 200 | `requires_otp: true, otp_session_token, methods[], expires_in` | user has a second factor → `POST /api/v1/auth/login/otp` |
+| 403 | `mfa_enrollment_required: true, enrollment_token, allowed_methods[], expires_in` | app requires MFA, user has none → `/api/v1/auth/login/mfa/enroll` or `/email`, then `/activate` |
+| 503 | `error: "app_mfa_unavailable"` | a second factor is due but the server cannot run it; no tokens |
+
+Notes:
+
+- Branch on `requires_otp` / `mfa_enrollment_required`, exactly as for
+  `/auth/apps/login`. Do not treat the 200 challenge as a token response.
+- The `login_code` is consumed by the exchange whether tokens or a challenge
+  come back; it cannot be exchanged again to skip the challenge.
+- The completed session still carries `gty: "social"`; its `amr` adds
+  `otp` and `mfa` to `fed`.
+- MFA role rules (`/mfa/role-rules`, `APP_MFA_INTEGRATION.md` §2.3c) cover social
+  sign-ins **only** under `enforce`; with `trust` a role-covered user signing
+  in with Google is not challenged.
+- The switch (`mfa_enabled`), `mode` and `allowed_methods` apply exactly as for
+  password login. With `trust`, none of them apply to social sign-in.
+- Enable `enforce` only after your callback handler understands the challenge
+  responses above.

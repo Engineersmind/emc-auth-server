@@ -1442,22 +1442,25 @@ func (s *AuthService) PasskeyPolicyFor(ctx context.Context, tenantID int64, appI
 	return s.webauthnSvc.policy.Resolve(ctx, tenantID, appID)
 }
 
-// LoginWebAuthn completes a passwordless passkey sign-in and issues tokens.
+// LoginWebAuthn completes a passwordless passkey sign-in.
 //
-// The MFA gate is deliberately NOT consulted: a verified passkey with user
-// verification already is two factors (possession of the authenticator plus the
-// biometric), so challenging for a second one would be asking the user to prove
-// the same thing twice. That is also why 'mfa' below is conditional on the UV
-// flag rather than assumed — see WebAuthnIdentity.UserVerified.
+// A passkey with user verification already is two factors (possession of the
+// authenticator plus the biometric), so it is never sent through the MFA gate:
+// challenging for a second one would be asking the user to prove the same thing
+// twice. That is also why 'mfa' below is conditional on the UV flag rather than
+// assumed — see WebAuthnIdentity.UserVerified. A passkey WITHOUT user
+// verification on an application with federated_mfa = enforce goes through the
+// application MFA gate (#194), so the result may carry an OTPChallenge or
+// MFAEnrollment instead of Token; with 'trust' (the default) it never does.
 //
-// It is also why passkeys are off until a tenant enables them: skipping the MFA
+// Passkeys are off until a tenant enables them: accepting them without the MFA
 // gate is a change to the tenant's authentication policy, and only they can make
 // it. See migration 00072.
-// Returns the verified identity alongside the tokens. The caller needs it for
+// Returns the verified identity alongside the result. The caller needs it for
 // the audit row: which account signed in and with WHICH passkey, and neither is
 // recoverable from an AuthResult — a user with four devices needs their audit
 // trail to name the one that was used.
-func (s *AuthService) LoginWebAuthn(ctx context.Context, token string, r *http.Request) (*AuthResult, *WebAuthnIdentity, error) {
+func (s *AuthService) LoginWebAuthn(ctx context.Context, token string, r *http.Request) (*LoginResult, *WebAuthnIdentity, error) {
 	return s.loginWebAuthn(ctx, token, r, false)
 }
 
@@ -1482,12 +1485,22 @@ func (s *AuthService) LoginWebAuthn(ctx context.Context, token string, r *http.R
 // enforceSessionCap has already run inside that transaction and evicted the
 // user's least-recently-used session — a write no later revocation can undo.
 func (s *AuthService) LoginWebAuthnForCookieSession(ctx context.Context, token string, r *http.Request) (*AuthResult, *WebAuthnIdentity, error) {
-	return s.loginWebAuthn(ctx, token, r, true)
+	res, id, err := s.loginWebAuthn(ctx, token, r, true)
+	if err != nil {
+		return nil, id, err
+	}
+	// The application MFA gate only ever holds an application-scoped sign-in,
+	// and those are refused above before it runs, so a result without tokens
+	// cannot reach here. Refused rather than dereferenced if it ever does.
+	if res.Token == nil {
+		return nil, id, ErrCookieSessionNotAvailable
+	}
+	return res.Token, id, nil
 }
 
 // loginWebAuthn is the shared body. refuseApplicationScoped stops between
 // verifying the assertion and issuing tokens.
-func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.Request, refuseApplicationScoped bool) (*AuthResult, *WebAuthnIdentity, error) {
+func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.Request, refuseApplicationScoped bool) (*LoginResult, *WebAuthnIdentity, error) {
 	if s.webauthnSvc == nil {
 		return nil, nil, ErrWebAuthnNotConfigured
 	}
@@ -1543,12 +1556,34 @@ func (s *AuthService) loginWebAuthn(ctx context.Context, token string, r *http.R
 		amr = append(amr, AMRUserVerif, AMRMFA)
 	}
 
+	// Application MFA for passkey sign-in (#194). A user-verified passkey is
+	// already two factors and satisfies the application's MFA requirement, so
+	// it is never gated. One WITHOUT user verification is a single factor
+	// (possession): on an application with federated_mfa = enforce it goes
+	// through the same gate as password login — OTP challenge or forced
+	// enrolment — and the finished session keeps the passkey grant. 'trust'
+	// (the default) and tenant-level logins are unchanged: the gate returns nil.
+	if !id.UserVerified && id.AppID != "" {
+		appRowID, perr := strconv.ParseInt(id.AppID, 10, 64)
+		if perr != nil {
+			return nil, id, fmt.Errorf("passkey login: invalid application id %q: %w", id.AppID, perr)
+		}
+		gate, err := s.mfaGateWith(ctx, mfaGateOptions{federated: FirstFactorPasskey},
+			id.UserID, id.TenantID, appRowID, id.AppID, id.Email, id.Role, perms, false, nil, orgSessionRequest{})
+		if err != nil {
+			return nil, id, err
+		}
+		if gate != nil {
+			return gate, id, nil
+		}
+	}
+
 	result, err := s.issueTokenPair(ctx, id.UserID, id.TenantID, id.Email, id.Role, perms,
 		sessionContext{amr: amr, grant: GrantPasskey}, id.AppID)
 	if err != nil {
 		return nil, nil, err
 	}
-	return result, id, nil
+	return &LoginResult{Token: result}, id, nil
 }
 
 // revokeAllAfterClone signs the account out everywhere after a clone detection.

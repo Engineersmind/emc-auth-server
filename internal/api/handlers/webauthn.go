@@ -206,13 +206,14 @@ func (h *WebAuthnHandler) LoginBegin(c echo.Context) error {
 // LoginComplete handles POST /api/v1/auth/passkey/login/complete.
 //
 // @Summary      Complete passwordless passkey sign-in
-// @Description  Verifies the assertion and returns a token pair. The request body is the raw PublicKeyCredential from the browser.
+// @Description  Verifies the assertion and returns a token pair. The request body is the raw PublicKeyCredential from the browser. A user-verified passkey satisfies application MFA. A passkey WITHOUT user verification on an application with federated_mfa=enforce goes through the application MFA gate and may return 200 {requires_otp, otp_session_token, methods, expires_in} or 403 {mfa_enrollment_required, enrollment_token, allowed_methods, expires_in} instead of tokens, finished at /api/v1/auth/login/otp or /api/v1/auth/login/mfa/*.
 // @Tags         Passkeys
 // @Produce      json
 // @Param        ceremony_token  query  string  true  "Token from login/begin"
 // @Success      200  {object}  auth.AuthResult
 // @Failure      401  {object}  map[string]string
 // @Failure      403  {object}  map[string]string
+// @Failure      503  {object}  APIError  "app_mfa_unavailable - a second factor is due and this server cannot run it; no tokens issued"
 // @Param        Authorization  header  string  false  "Basic base64(client_id:client_secret). Optional for a backend acting for its users: with it the call is limited per end user and by the application quota instead of per IP. Without it, the per-IP limit applies as before"
 // @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only with valid Basic credentials, when the application trusts forwarded IPs; see /docs/reference/rate-limits"
 // @Failure      429  {object}  map[string]string  "Rate limited; wait Retry-After seconds"
@@ -220,10 +221,23 @@ func (h *WebAuthnHandler) LoginBegin(c echo.Context) error {
 func (h *WebAuthnHandler) LoginComplete(c echo.Context) error {
 	result, id, err := h.authSvc.LoginWebAuthn(c.Request().Context(), c.QueryParam("ceremony_token"), c.Request())
 	if err != nil {
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
+		}
 		return h.loginFailure(c, err)
 	}
+	// A passkey without user verification on an application with
+	// federated_mfa = enforce (#194): the same challenge shapes password login
+	// returns. Not audited as a sign-in — none has happened yet; the OTP or
+	// enrolment completion is.
+	if result.OTPChallenge != nil {
+		return c.JSON(http.StatusOK, result.OTPChallenge)
+	}
+	if result.MFAEnrollment != nil {
+		return c.JSON(http.StatusForbidden, result.MFAEnrollment)
+	}
 	h.auditPasskeyLogin(c, id)
-	return c.JSON(http.StatusOK, result)
+	return c.JSON(http.StatusOK, result.Token)
 }
 
 // SessionLoginComplete handles POST /api/v1/auth/passkey/session.

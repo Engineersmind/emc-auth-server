@@ -272,7 +272,7 @@ func TestGoogleLoginFlowIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ExchangeLoginCode: %v", err)
 		}
-		if tokens.AccessToken == "" || tokens.RefreshToken == "" {
+		if tokens.Token == nil || tokens.Token.AccessToken == "" || tokens.Token.RefreshToken == "" {
 			t.Fatal("exchange returned empty token pair")
 		}
 

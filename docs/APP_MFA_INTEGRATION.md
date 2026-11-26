@@ -115,16 +115,95 @@ a session issued while MFA was off stays valid until its refresh token expires
 (up to 30 days), and turning MFA off does not end sessions that did MFA.
 App-wide session revoke is tracked in #196.
 
-**Known gap — social and passkey sign-ins.** Google (and other social) and
-passkey sign-ins do not go through the application MFA gate at all, whatever
-`mfa_enabled` and `mode` say. This predates the switch and is fixed by the
-opt-in `federated_mfa = enforce` setting (#194).
+Social and passkey sign-ins follow the switch and `mode` only when the
+application opts in with `federated_mfa: "enforce"` (§2.3b).
+
+### 2.3b Social and passkey sign-ins (`federated_mfa`)
+```
+PUT /api/v1/applications/{appID}/mfa            Bearer <admin>
+{ "federated_mfa": "enforce" }                   # mode may be omitted
+→ 200 (policy incl. "federated_mfa": "enforce")
+```
+
+| | `federated_mfa: "trust"` (default) | `federated_mfa: "enforce"` |
+|---|---|---|
+| Social sign-in (Google, GitHub) | tokens at `/auth/oauth/exchange`, no app MFA step — unchanged | the **same app MFA gate as password login** runs at `/auth/oauth/exchange` |
+| Passkey **with** user verification (biometric / PIN) | tokens | tokens — a user-verified passkey is already two factors and **satisfies** app MFA |
+| Passkey **without** user verification | tokens, no app MFA step | the same app MFA gate as password login runs at `/auth/passkey/login/complete` |
+
+`enforce` changes the response contract of those two endpoints **for this
+application only**. Where a second factor is due they answer exactly like
+`/auth/apps/login` (§3.2):
+
+| Status | Body | Next step |
+|---|---|---|
+| 200 | `access_token` … | done (nothing due) |
+| 200 | `requires_otp: true, otp_session_token, methods[], expires_in` | §3.3 (`POST /auth/login/otp`) |
+| 403 | `mfa_enrollment_required: true, enrollment_token, allowed_methods[], expires_in` | §3.4 (`/auth/login/mfa/*`) |
+| 503 | `error: "app_mfa_unavailable"` | the server cannot run the challenge; no tokens |
+
+The `login_code` is spent at the exchange either way; the challenge token
+replaces it. The finished session keeps the original grant (`gty: "social"` /
+`"passkey"`) and its `amr` records the extra factor (`fed`/`hwk` + `otp`,
+`mfa`). Everything else — switch off, `mode`, `allowed_methods`, role rules (§2.3c) —
+applies to these sign-ins exactly as to password login. Tenant-level (console)
+social and passkey sign-ins are not affected.
+
+Every real change writes an `admin.mfa_federated_changed` audit event
+(`old_federated_mfa`, `new_federated_mfa`). Turn `enforce` on only once your
+social-callback and passkey code handles the challenge responses above — a
+client that only knows the token shape will treat them as a failure.
+
+### 2.3c Role-based MFA rules (`/mfa/role-rules`)
+Require MFA only of users holding certain roles, on an otherwise `optional`
+application.
+```
+GET /api/v1/applications/{appID}/mfa/role-rules            Bearer <admin>
+→ 200 { "application_id": "149",
+        "rules": [ { "role_id": "12", "role_name": "finance", "created_at": "…", "created_by": "7" } ] }
+
+PUT /api/v1/applications/{appID}/mfa/role-rules            Bearer <admin>
+{ "role_ids": ["12", "15"] }                                # the WHOLE new list; [] clears
+→ 200 (same shape as GET)
+```
+Also under `/api/v1/tenants/{tid}/applications/{appID}/mfa/role-rules`, with
+the same permissions as the `/mfa` routes.
+
+- A user holding **any** listed role — as their primary role or any
+  additional grant — is treated as `required`: challenged if enrolled, forced
+  to enrol otherwise, and unable to remove their last factor. Roles are read
+  from the database at each login, never from the token.
+- Rules apply only while `mfa_enabled` is true and `mode` is not `disabled`.
+  Under `required` they add nothing (everyone is already covered).
+- **Rules cover social and passkey sign-ins only when `federated_mfa` is
+  `enforce`** (§2.3b). With `trust`, a covered user signing in with Google or
+  a passkey is not challenged.
+- Only the application's own live roles are accepted → otherwise
+  **400 `mfa_role_rule_invalid_role`**. At most 100 roles → **400
+  `mfa_role_rules_too_many`**.
+- A non-empty list while the switch is off or the mode is `disabled` →
+  **409 `mfa_role_rules_inactive`**. Clearing (`[]`) is always accepted.
+- A non-empty list while `email` is the only allowed method and passwordless
+  email-code sign-in is on for the application → **409
+  `mfa_role_rules_passwordless_conflict`** (covered users could no longer sign
+  in by email code). Conversely, while rules exist, turning email codes on or
+  narrowing the methods to `email` only is refused with
+  `passwordless_mfa_conflict` — rules count as `required` for that check.
+- A role listed by a rule cannot be deleted → `DELETE /roles/{id}` answers
+  **409 `role_in_mfa_rule`**; remove the rule first.
+- Forced enrolment offers only allowed methods this server can run; if none
+  can run, sign-in is refused with **503 `app_mfa_unavailable`**.
+- Every real change writes `admin.mfa_role_rules_set` (`old_role_ids`,
+  `new_role_ids`, `old_role_names`, `new_role_names`). Changes apply at the
+  next login.
+- `GET /auth/me/mfa` for a covered user reports
+  `"mfa_required_by": "role:<name>"`.
 
 ### 2.4 Read policy + enrollment stats (dashboard)
 ```
 GET /api/v1/applications/{appID}/mfa            Bearer <admin>
 → 200 {
-  "application_id": "149", "mfa_enabled": true, "mode": "required",
+  "application_id": "149", "mfa_enabled": true, "mode": "required", "federated_mfa": "trust",
   "allowed_methods": ["totp","email"],
   "enrolled_users": 1,          // active TOTP
   "pending_enrollments": 0,     // TOTP enrolled, never activated
@@ -180,6 +259,7 @@ POST /api/v1/auth/apps/login                    Basic <app credentials>
 | 200 | `requires_otp: true, otp_session_token, methods[], expires_in: 300` | second factor needed → §3.3. If `methods` includes `"email"`, a code was already emailed |
 | 403 | `mfa_enrollment_required: true, enrollment_token, allowed_methods[], expires_in: 600` | `required` app + not enrolled → §3.4 |
 | 401 | `error` | bad user or app credentials |
+| 503 | `error: "app_mfa_unavailable"` | a second factor is due (user has an active permitted factor, or the app is `required`) but this server cannot run the challenge (no Redis / TOTP service, or none of the user's methods is configured). **No tokens.** Not a credential failure — do not tell the user their password is wrong |
 | 429 | `error, retry_after` | rate limited (5/min/IP, 10/min/client) |
 
 ### 3.3 Complete the OTP challenge (enrolled user)
@@ -244,11 +324,11 @@ matches your application.
 | Purpose | Endpoint | Notes |
 |---|---|---|
 | My MFA state | `GET /api/v1/auth/otp/status` | `{ enrolled, active, backup_codes_remaining, email_active, mfa_enabled }` — warn user when codes run low; hide MFA settings when `mfa_enabled` is false |
-| Which methods I may use | `GET /api/v1/auth/me/mfa` | `{ mfa_required, mfa_enabled, mode, methods: [{ method, allowed, available, active }] }`. For an app user `allowed` = `mfa_enabled` **and** `mode != "disabled"` **and** method in the app's `allowed_methods` — only offer methods with `allowed: true` |
+| Which methods I may use | `GET /api/v1/auth/me/mfa` | `{ mfa_required, mfa_enabled, mode, mfa_required_by?, methods: [{ method, allowed, available, active }] }`. `mfa_required_by` is `"role:<name>"` when an MFA role rule covers the user (§2.3c). For an app user `allowed` = `mfa_enabled` **and** `mode != "disabled"` **and** method in the app's `allowed_methods` — only offer methods with `allowed: true` |
 | Enroll TOTP | `POST /api/v1/auth/otp/enroll` body `{}` or `{ "code" }` | 403 `mfa_switched_off` if the app's switch is off; 403 if app mode `disabled` or `totp` not allowed. **Re-enroll while active (new phone) requires current TOTP/backup code in `code`** |
 | Activate TOTP | `POST /api/v1/auth/otp/activate` `{ "code" }` | first authenticator code |
 | Regenerate backup codes | `POST /api/v1/auth/otp/backup-codes` `{ "code" }` | → `{ "backup_codes": [×8] }`; TOTP secret unchanged; all old codes die |
-| Disable TOTP | `DELETE /api/v1/auth/otp` `{ "code" }` | 403 under `required` unless email MFA remains active (last-factor guard; lifted while the switch is off) |
+| Disable TOTP | `DELETE /api/v1/auth/otp` `{ "code" }` | 403 under `required` or an MFA role rule unless email MFA remains active (last-factor guard; lifted while the switch is off) |
 | Enroll email MFA | `POST /api/v1/auth/otp/email/enroll` | sends verification code; 403 `mfa_switched_off` if the switch is off; 403 if `disabled`/method not allowed |
 | Activate email MFA | `POST /api/v1/auth/otp/email/activate` `{ "code" }` | inbox proven before it becomes a factor |
 | Send proof code | `POST /api/v1/auth/otp/email/send` | fresh code for the disable action below |
@@ -263,6 +343,7 @@ switch on `error`, never parse `message`. MFA switch codes:
 | `mfa_switched_off` | 403 | enrolment attempted while the app's MFA switch is off — self-service enrolment, or a forced-enrolment token (`/auth/login/mfa/enroll`, `/email`, `/activate`) minted before the switch was turned off. The enrolment token is invalidated; sign in again |
 | `mfa_switch_off_service_token` | 403 | a service/API-key token tried to turn MFA off |
 | `mfa_switch_off_stale_session` | 403 | turning MFA off without an MFA sign-in in the last 10 minutes |
+| `app_mfa_unavailable` | 503 | sign-in refused: the application requires a second factor at this login and the server cannot run it. Returned by every first factor that goes through the app MFA gate (password, magic link, email code, and social / unverified-passkey sign-ins under `federated_mfa: "enforce"`). Fail-closed since #193: before it, such a server issued tokens without MFA |
 
 ---
 

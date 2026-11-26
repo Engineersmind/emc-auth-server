@@ -567,10 +567,10 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// set, so with the switch off every application is password only and the
 	// password endpoints never consult the policy.
 	pwlessPolicySvc := auth.NewPasswordlessPolicyService(deps.Pool, deps.Logger).
-		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
-			cfg, err := totpSvc.GetAppMFAConfig(ctx, appRowID)
-			return cfg.Mode, cfg.Methods, err
-		}).
+		// Active MFA role rules count as 'required' here (#195), so turning
+		// email codes on for an email-only application with rules is refused
+		// just as it is for one whose mode is 'required'.
+		WithMFAConfig(totpSvc.EffectiveAppMFAModeForConflict).
 		WithTemplateEnabled(func(ctx context.Context, tenantID int64, appRowID *int64) bool {
 			return tmplSvc.IsTypeEnabled(ctx, tenantID, appRowID, mailer.TemplatePasswordlessCode)
 		})
@@ -1780,6 +1780,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// application configuration, so it rides the apps:* permissions.
 	adminGroup.GET("/tenants/:tid/applications/:appID/mfa", adminHandler.GetApplicationMFA, appAppsRead)
 	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appAppsWrite)
+	adminGroup.GET("/tenants/:tid/applications/:appID/mfa/role-rules", adminHandler.GetApplicationMFARoleRules, appAppsRead)
+	adminGroup.PUT("/tenants/:tid/applications/:appID/mfa/role-rules", adminHandler.UpdateApplicationMFARoleRules, appAppsWrite)
 	adminGroup.DELETE("/tenants/:tid/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, appUsersWrite)
 
 	// Per-scope passkey policy under the canonical family (issue #112).
@@ -2060,6 +2062,8 @@ func RegisterRoutes(e *echo.Echo, deps Deps) (stop func()) {
 	// /tenants/:tid/applications/:appID/mfa family (issue #63).
 	adminGroup.GET("/applications/:appID/mfa", adminHandler.GetApplicationMFA, appsRead)
 	adminGroup.PUT("/applications/:appID/mfa", adminHandler.UpdateApplicationMFA, appsWrite)
+	adminGroup.GET("/applications/:appID/mfa/role-rules", adminHandler.GetApplicationMFARoleRules, appsRead)
+	adminGroup.PUT("/applications/:appID/mfa/role-rules", adminHandler.UpdateApplicationMFARoleRules, appsWrite)
 	adminGroup.DELETE("/applications/:appID/users/:uid/mfa", adminHandler.ResetUserMFA, usersWrite)
 
 	// Per-scope passkey policy — flat aliases of the canonical

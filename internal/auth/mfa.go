@@ -38,6 +38,23 @@ const (
 	MFAMethodEmail = "email"
 )
 
+// Federated MFA settings (#194). Stored in application_mfa_settings.federated_mfa;
+// the CHECK constraint mirrors this set. They decide whether social (Google,
+// GitHub) and passkey sign-ins go through the application MFA gate.
+const (
+	// FederatedMFATrust accepts the identity provider / passkey as is: no
+	// application MFA step (the default, and the pre-#194 behaviour).
+	FederatedMFATrust = "trust"
+	// FederatedMFAEnforce runs the same application MFA gate as password login
+	// before tokens are issued. A user-verified passkey satisfies it.
+	FederatedMFAEnforce = "enforce"
+)
+
+// ValidFederatedMFA reports whether v is one of the accepted federated_mfa values.
+func ValidFederatedMFA(v string) bool {
+	return v == FederatedMFATrust || v == FederatedMFAEnforce
+}
+
 // ValidMFAMode reports whether mode is one of the accepted policy values.
 func ValidMFAMode(mode string) bool {
 	return mode == MFAModeDisabled || mode == MFAModeOptional || mode == MFAModeRequired
@@ -89,6 +106,10 @@ var ErrInvalidMFAMode = errors.New("mode must be one of: disabled, optional, req
 // empty method set.
 var ErrInvalidMFAMethods = errors.New("allowed_methods must be a non-empty subset of: totp, email")
 
+// ErrInvalidFederatedMFA is returned when a policy update carries an unknown
+// federated_mfa value.
+var ErrInvalidFederatedMFA = errors.New("federated_mfa must be one of: trust, enforce")
+
 // ErrMFAMethodsNeedMode is returned when an update carries allowed_methods
 // without a mode. Methods are only ever written together with the mode, so
 // accepting them alone would return success while silently dropping them.
@@ -107,6 +128,16 @@ var ErrMFAMethodNotAllowed = errors.New("this MFA method is not allowed for this
 // ErrMFAEnrollmentDisabled (mode 'disabled') so a portal can say which one the
 // administrator set.
 var ErrMFASwitchedOff = errors.New("MFA is switched off for this application")
+
+// ErrAppMFAUnavailable is returned by the application MFA gate when the
+// application's policy requires a second factor at this login — the user has an
+// active factor the application permits, or the mode is 'required' — but this
+// deployment cannot run the challenge: no Redis to hold it, no TOTP service to
+// complete it, or none of the methods the user could use is configured here.
+// The login is refused and no tokens are issued (#193). The application-level
+// twin of ErrAdminMFAUnavailable: failing open on a configuration gap would make
+// the requirement optional in exactly the deployments least likely to notice.
+var ErrAppMFAUnavailable = errors.New("the application requires two-factor authentication, which is not available on this server")
 
 // ErrMFARequiredByPolicy is returned when a user attempts to remove their last
 // active second factor while their application's MFA mode is 'required'.
@@ -140,6 +171,10 @@ type MFAPolicy struct {
 	MFAEnabled     bool     `json:"mfa_enabled"`
 	Mode           string   `json:"mode"`
 	AllowedMethods []string `json:"allowed_methods"`
+	// FederatedMFA is "trust" (social and passkey sign-ins skip the
+	// application MFA gate) or "enforce" (they go through it; a user-verified
+	// passkey satisfies it). #194.
+	FederatedMFA string `json:"federated_mfa"`
 	// Passwordless magic-link sign-in (opt-in; the redirect URL is the
 	// application frontend that receives ?token=…).
 	MagicLinkEnabled     bool   `json:"magic_link_enabled"`
@@ -163,19 +198,31 @@ type AppMFAConfig struct {
 	Enabled bool
 	Mode    string
 	Methods []string
+	// FederatedMFA decides whether social and passkey sign-ins are gated
+	// (FederatedMFAEnforce) or trusted (FederatedMFATrust, the default).
+	FederatedMFA string
 }
 
 // GetAppMFAConfig returns the effective MFA configuration for an application.
 // Absence of a policy row means switch on + 'optional' + TOTP-only
 // (pre-feature behaviour). This is the login hot-path read — one PK lookup.
 func (s *TOTPService) GetAppMFAConfig(ctx context.Context, appRowID int64) (AppMFAConfig, error) {
+	return loadAppMFAConfig(ctx, s.pool, appRowID)
+}
+
+// loadAppMFAConfig is GetAppMFAConfig over any querier. Package-level so the
+// login gate can read the policy with only the database pool: whether a
+// challenge is due must be decidable even on a deployment that has no TOTP
+// service or Redis, which is exactly when the gate has to refuse rather than
+// wave the login through (#193).
+func loadAppMFAConfig(ctx context.Context, q mfaSettingsQuerier, appRowID int64) (AppMFAConfig, error) {
 	cfg := AppMFAConfig{}
-	err := s.pool.QueryRow(ctx, `
-		SELECT mfa_enabled, mode, allowed_methods FROM application_mfa_settings WHERE application_id = $1
-	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods)
+	err := q.QueryRow(ctx, `
+		SELECT mfa_enabled, mode, allowed_methods, federated_mfa FROM application_mfa_settings WHERE application_id = $1
+	`, appRowID).Scan(&cfg.Enabled, &cfg.Mode, &cfg.Methods, &cfg.FederatedMFA)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return AppMFAConfig{Enabled: true, Mode: MFAModeOptional, Methods: defaultMFAMethods()}, nil
+			return AppMFAConfig{Enabled: true, Mode: MFAModeOptional, Methods: defaultMFAMethods(), FederatedMFA: FederatedMFATrust}, nil
 		}
 		return AppMFAConfig{}, fmt.Errorf("load app MFA config: %w", err)
 	}
@@ -201,14 +248,15 @@ func (s *TOTPService) GetAppMFAPolicy(ctx context.Context, tenantID, appRowID in
 		MFAEnabled:     true,
 		Mode:           MFAModeOptional,
 		AllowedMethods: defaultMFAMethods(),
+		FederatedMFA:   FederatedMFATrust,
 	}
 
 	var updatedAt time.Time
 	err := s.pool.QueryRow(ctx, `
-		SELECT mfa_enabled, mode, allowed_methods, magic_link_enabled, magic_link_redirect_url, updated_at
+		SELECT mfa_enabled, mode, allowed_methods, federated_mfa, magic_link_enabled, magic_link_redirect_url, updated_at
 		FROM application_mfa_settings
 		WHERE application_id = $1 AND tenant_id = $2
-	`, appRowID, tenantID).Scan(&p.MFAEnabled, &p.Mode, &p.AllowedMethods, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
+	`, appRowID, tenantID).Scan(&p.MFAEnabled, &p.Mode, &p.AllowedMethods, &p.FederatedMFA, &p.MagicLinkEnabled, &p.MagicLinkRedirectURL, &updatedAt)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("load app MFA policy: %w", err)
 	}
@@ -263,9 +311,11 @@ func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier,
 	}
 	// Required MFA with email as the only method cannot be satisfied by a user who
 	// signed in with an emailed code, so refuse it while email codes are on (#203).
-	// The stored methods are read through q, so inside the admin PUT's
-	// transaction this sees the same row the upsert below replaces.
-	if mode == MFAModeRequired && s.emailCodeEnabled != nil {
+	// An 'optional' application with active role rules is 'required' for every
+	// covered user (#195), so it is refused the same way. The stored methods and
+	// rules are read through q, so inside the admin PUT's transaction this sees
+	// the same rows the upsert below replaces.
+	if (mode == MFAModeRequired || mode == MFAModeOptional) && s.emailCodeEnabled != nil {
 		eff := methods
 		if eff == nil {
 			cur, cErr := storedAppMFAMethods(ctx, q, appRowID)
@@ -274,8 +324,18 @@ func (s *TOTPService) setAppMFAPolicy(ctx context.Context, q mfaSettingsQuerier,
 			}
 			eff = cur
 		}
-		if len(eff) == 1 && eff[0] == MFAMethodEmail && s.emailCodeEnabled(ctx, tenantID, appRowID) {
-			return ErrPasswordlessMFAConflict
+		if emailOnlyMFAMethods(eff) {
+			effectivelyRequired := mode == MFAModeRequired
+			if !effectivelyRequired {
+				has, hErr := appHasMFARoleRules(ctx, q, appRowID)
+				if hErr != nil {
+					return hErr
+				}
+				effectivelyRequired = has
+			}
+			if effectivelyRequired && s.emailCodeEnabled(ctx, tenantID, appRowID) {
+				return ErrPasswordlessMFAConflict
+			}
 		}
 	}
 	tag, err := q.Exec(ctx, `
@@ -378,17 +438,27 @@ type AppMFAUpdate struct {
 	Methods              []string
 	MagicLinkEnabled     *bool
 	MagicLinkRedirectURL *string
+	// FederatedMFA, when non-empty, sets the federated_mfa setting (#194).
+	FederatedMFA string
 }
 
-// AppMFAUpdateResult reports what the master switch was before and after the
-// update, so the caller audits and notifies only on a real change.
+// AppMFAUpdateResult reports what the master switch and the federated_mfa
+// setting were before and after the update, so the caller audits and notifies
+// only on a real change.
 type AppMFAUpdateResult struct {
-	PrevEnabled bool
-	NewEnabled  bool
+	PrevEnabled      bool
+	NewEnabled       bool
+	PrevFederatedMFA string
+	NewFederatedMFA  string
 }
 
 // SwitchChanged reports whether the update flipped the master switch.
 func (r AppMFAUpdateResult) SwitchChanged() bool { return r.PrevEnabled != r.NewEnabled }
+
+// FederatedMFAChanged reports whether the update changed federated_mfa.
+func (r AppMFAUpdateResult) FederatedMFAChanged() bool {
+	return r.PrevFederatedMFA != r.NewFederatedMFA
+}
 
 // UpdateAppMFASettings applies an admin MFA update — switch, mode/methods and
 // magic-link — in ONE transaction, so a failure part-way (say an invalid
@@ -412,6 +482,9 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 	if u.Methods != nil && !ValidMFAMethods(u.Methods) {
 		return res, ErrInvalidMFAMethods
 	}
+	if u.FederatedMFA != "" && !ValidFederatedMFA(u.FederatedMFA) {
+		return res, ErrInvalidFederatedMFA
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -429,15 +502,17 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 		return res, fmt.Errorf("lock application for MFA update: %w", err)
 	}
 
-	// No settings row means the switch is on (the column default and the
-	// login-path default agree).
+	// No settings row means the switch is on and federated_mfa is 'trust' (the
+	// column defaults and the login-path defaults agree).
 	res.PrevEnabled = true
+	res.PrevFederatedMFA = FederatedMFATrust
 	if err = tx.QueryRow(ctx, `
-		SELECT mfa_enabled FROM application_mfa_settings WHERE application_id = $1 AND tenant_id = $2
-	`, appRowID, tenantID).Scan(&res.PrevEnabled); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		SELECT mfa_enabled, federated_mfa FROM application_mfa_settings WHERE application_id = $1 AND tenant_id = $2
+	`, appRowID, tenantID).Scan(&res.PrevEnabled, &res.PrevFederatedMFA); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return res, fmt.Errorf("read app MFA switch: %w", err)
 	}
 	res.NewEnabled = res.PrevEnabled
+	res.NewFederatedMFA = res.PrevFederatedMFA
 
 	// Re-sending the current value writes nothing: the handler audits only a
 	// real flip, so rewriting updated_by/updated_at here would leave "last
@@ -460,6 +535,26 @@ func (s *TOTPService) UpdateAppMFASettings(ctx context.Context, tenantID, appRow
 			return res, ErrAppNotFound
 		}
 		res.NewEnabled = *u.Enabled
+	}
+
+	if u.FederatedMFA != "" {
+		tag, execErr := tx.Exec(ctx, `
+			INSERT INTO application_mfa_settings (application_id, tenant_id, federated_mfa, updated_by, updated_at)
+			VALUES ($1, $2, $3, $4, NOW())
+			ON CONFLICT (application_id) DO UPDATE
+			SET federated_mfa = EXCLUDED.federated_mfa,
+			    updated_by    = EXCLUDED.updated_by,
+			    updated_at    = NOW()
+			WHERE application_mfa_settings.tenant_id = EXCLUDED.tenant_id
+		`, appRowID, tenantID, u.FederatedMFA, updatedBy)
+		if execErr != nil {
+			return res, fmt.Errorf("upsert app federated MFA: %w", execErr)
+		}
+		// Tenant-pinned DO UPDATE — see SetAppMFAPolicy.
+		if tag.RowsAffected() == 0 {
+			return res, ErrAppNotFound
+		}
+		res.NewFederatedMFA = u.FederatedMFA
 	}
 
 	if u.Mode != "" {
@@ -646,6 +741,16 @@ type userMFAContext struct {
 	enabled        bool
 	mode           string
 	allowedMethods []string
+	// ruleRole is the name of a role the user holds that the application's
+	// MFA role rules list (#195), "" when none. Read from the database.
+	ruleRole string
+}
+
+// roleRuleApplies reports whether an MFA role rule covers this user right now:
+// the user holds a listed role, the switch is on and the mode is not
+// 'disabled' (#195).
+func (uc *userMFAContext) roleRuleApplies() bool {
+	return uc.appRowID != nil && uc.enabled && uc.mode != MFAModeDisabled && uc.ruleRole != ""
 }
 
 // switchedOff reports whether the user belongs to an application whose MFA
@@ -655,10 +760,11 @@ func (uc *userMFAContext) switchedOff() bool {
 }
 
 // requiredByPolicy reports whether the application mandates MFA for this
-// user right now: mode 'required' AND the switch on. While the switch is off
-// nothing is required, so the last-factor removal guard stands down.
+// user right now: the switch on AND (mode 'required' OR an MFA role rule covers
+// the user, #195). While the switch is off nothing is required, so the
+// last-factor removal guard stands down.
 func (uc *userMFAContext) requiredByPolicy() bool {
-	return uc.appRowID != nil && uc.enabled && uc.mode == MFAModeRequired
+	return (uc.appRowID != nil && uc.enabled && uc.mode == MFAModeRequired) || uc.roleRuleApplies()
 }
 
 // methodPermitted reports whether the user may use the given MFA method:
@@ -678,13 +784,25 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	var enabled *bool
 	var mode *string
 	var methods []string
+	var ruleRole *string
+	// The role-rule subquery reads both role sources (users.role_id and
+	// user_roles) — see mfaRuleRoleFor, whose predicate this mirrors.
 	err := pool.QueryRow(ctx, `
-		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods
+		SELECT u.application_id, oc.name, ams.mfa_enabled, ams.mode, ams.allowed_methods,
+		       (SELECT r.name
+		        FROM application_mfa_role_rules rr
+		        JOIN roles r ON r.id = rr.role_id AND r.deleted_at IS NULL
+		        WHERE rr.application_id = u.application_id AND rr.tenant_id = u.tenant_id
+		          AND (rr.role_id = u.role_id
+		               OR EXISTS (SELECT 1 FROM user_roles ur
+		                          WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id AND ur.role_id = rr.role_id))
+		        ORDER BY r.name
+		        LIMIT 1)
 		FROM users u
 		LEFT JOIN oauth_clients oc ON oc.id = u.application_id
 		LEFT JOIN application_mfa_settings ams ON ams.application_id = u.application_id
 		WHERE u.id = $1 AND u.tenant_id = $2 AND u.deleted_at IS NULL
-	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods)
+	`, userID, tenantID).Scan(&uc.appRowID, &appName, &enabled, &mode, &methods, &ruleRole)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrUserNotFound
@@ -702,6 +820,9 @@ func loadUserMFAContext(ctx context.Context, pool *pgxpool.Pool, userID, tenantI
 	}
 	if len(methods) > 0 {
 		uc.allowedMethods = methods
+	}
+	if ruleRole != nil {
+		uc.ruleRole = *ruleRole
 	}
 	return uc, nil
 }
@@ -846,7 +967,8 @@ func emailMFAActive(ctx context.Context, pool *pgxpool.Pool, userID int64) (bool
 }
 
 // DisableUser is the user-initiated TOTP disable path: policy-checked, then
-// code-verified via Disable. Users of a 'required' application may only
+// code-verified via Disable. Users of a 'required' application, or covered by an
+// MFA role rule (#195), may only
 // remove TOTP while another active second factor (email MFA) remains — the
 // last factor cannot be removed under a mandate. While the application's MFA
 // master switch is off there is no mandate, so the guard does not apply.

@@ -45,6 +45,11 @@ var (
 	// role from different scopes — an application's users can only hold that
 	// application's roles, and tenant-level users only tenant-level roles.
 	ErrRoleScope = errors.New("role does not belong to this user's application")
+	// ErrRoleInMFARule is returned when deleting a role that an application MFA
+	// role rule still lists (#195). Deleting it would silently drop the MFA
+	// requirement on everyone who held it; the rule must be removed first. The
+	// soft-delete equivalent of the rule table's ON DELETE RESTRICT.
+	ErrRoleInMFARule = errors.New("role is listed by an application MFA role rule; remove the rule first")
 )
 
 // ---------------------------------------------------------------------------
@@ -1504,6 +1509,20 @@ func (s *Service) DeleteRole(ctx context.Context, tenantID, roleID int64) ([]int
 	}
 	if ct.RowsAffected() == 0 {
 		return nil, ErrNotFound
+	}
+
+	// After the soft-delete, which row-locks the role: a concurrent
+	// SetAppMFARoleRules locks the same row FOR SHARE, so either it committed
+	// first and its rule is visible to this statement, or it waits and then
+	// finds the role deleted. Either way no rule can name a deleted role.
+	var inRule bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM application_mfa_role_rules WHERE role_id = $1 AND tenant_id = $2)
+	`, roleID, tenantID).Scan(&inRule); err != nil {
+		return nil, fmt.Errorf("delete role: check MFA role rules: %w", err)
+	}
+	if inRule {
+		return nil, ErrRoleInMFARule
 	}
 
 	// Collected before the detach, for the same reason RevokeAllUserSessions

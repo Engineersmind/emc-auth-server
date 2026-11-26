@@ -308,6 +308,15 @@ const (
 	// switch (#192). Metadata: old_mfa_enabled, new_mfa_enabled. Emitted only
 	// when the value actually changed, and mailed to the app's administrators.
 	ActionAdminMFASwitchChanged = "admin.mfa_switch_changed"
+	// ActionAdminMFAFederatedChanged is a real change of an application's
+	// federated_mfa setting (#194): whether social and passkey sign-ins go
+	// through the application MFA gate. Metadata: old_federated_mfa,
+	// new_federated_mfa. Emitted only when the value actually changed.
+	ActionAdminMFAFederatedChanged = "admin.mfa_federated_changed"
+	// ActionAdminMFARoleRulesSet is a real change of an application's MFA role
+	// rules (#195): the roles whose holders must use MFA. Metadata:
+	// old_role_ids, new_role_ids, old_role_names, new_role_names.
+	ActionAdminMFARoleRulesSet = "admin.mfa_role_rules_set"
 
 	// Admin — mandatory administrator MFA policy (migration 00094): which
 	// methods satisfy the requirement, per tenant and for the platform.

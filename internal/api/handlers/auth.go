@@ -430,6 +430,7 @@ func softLockMeta(err error, base map[string]any) map[string]any {
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string  "Invalid credentials"
 // @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
+// @Failure      503   {object}  APIError  "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued"
 // @Router       /api/v1/auth/login [post]
 func (h *AuthHandler) Login(c echo.Context) error {
 	var req LoginRequest
@@ -466,6 +467,9 @@ func (h *AuthHandler) Login(c echo.Context) error {
 		}, err)
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
+		}
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
 		}
 		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
@@ -677,6 +681,7 @@ func (h *AuthHandler) AppRegister(c echo.Context) error {
 // @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
 // @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
 // @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
+// @Failure      503   {object}  APIError  "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued"
 // @Router       /api/v1/auth/apps/login [post]
 func (h *AuthHandler) AppLogin(c echo.Context) error {
 	var req AppLoginRequest
@@ -742,6 +747,9 @@ func (h *AuthHandler) AppLogin(c echo.Context) error {
 		}
 		if containsMsg(err, "invalid credentials") {
 			return invalidCredentials(c, err)
+		}
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
 		}
 		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
@@ -864,6 +872,7 @@ type MagicLinkVerifyRequest struct {
 // @Failure      403  {object}  map[string]string  "MFA enrollment required"
 // @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
 // @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
+// @Failure      503   {object}  APIError  "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued"
 // @Router       /api/v1/auth/apps/login/magic/verify [post]
 func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 	var req MagicLinkVerifyRequest
@@ -896,6 +905,9 @@ func (h *AuthHandler) AppMagicLinkVerify(c echo.Context) error {
 		}
 		if errors.Is(err, auth.ErrInvalidMagicLink) {
 			return c.JSON(http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		}
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
 		}
 		return fail(c, http.StatusInternalServerError, "login_failed")
 	}
@@ -2851,6 +2863,7 @@ func revokeRejectedSession(c echo.Context, svc *auth.AuthService, logger zerolog
 // @Failure      400   {object}  map[string]string
 // @Failure      401   {object}  map[string]string
 // @Failure      428   {object}  map[string]string  "captcha_required or captcha_invalid - fetch POST /api/v1/captcha/challenge and retry; do NOT treat as bad credentials"
+// @Failure      503   {object}  APIError  "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued"
 // @Router       /api/v1/auth/session [post]
 func (h *AuthHandler) SessionLogin(c echo.Context) error {
 	var req LoginRequest
@@ -2915,6 +2928,9 @@ func (h *AuthHandler) SessionLogin(c echo.Context) error {
 		}
 		if errors.Is(err, auth.ErrAdminMFAUnavailable) {
 			return fail(c, http.StatusServiceUnavailable, "mfa_unavailable")
+		}
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
+			return resp
 		}
 		return fail(c, http.StatusInternalServerError, "login_failed")
 	}

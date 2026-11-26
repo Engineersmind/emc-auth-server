@@ -213,6 +213,7 @@ func (h *AuthHandler) PasswordlessResend(c echo.Context) error {
 // @Failure      409  {object}  APIError  "organization_selection_required"
 // @Param        X-EMC-Forwarded-For  header  string  false  "End user's IP. Used only when the application trusts forwarded IPs and the client secret is valid; see /docs/reference/rate-limits"
 // @Failure      429  {object}  map[string]string  "Rate limited. The limiter field says which limit (user, app or ip); wait Retry-After seconds"
+// @Failure      503   {object}  APIError  "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued"
 // @Router       /api/v1/auth/apps/passwordless/verify [post]
 func (h *AuthHandler) PasswordlessVerify(c echo.Context) error {
 	if !h.passwordlessEnabled {
@@ -247,6 +248,9 @@ func (h *AuthHandler) PasswordlessVerify(c echo.Context) error {
 		attachAppContext(c.Request().Context(), &ev, h.appSvc, clientID)
 		h.auditFailure(c, ev, err)
 		if handled, resp := h.passwordlessError(c, err); handled {
+			return resp
+		}
+		if handled, resp := appMFAUnavailableResponse(c, err); handled {
 			return resp
 		}
 		h.logger.Error().Err(err).Msg("passwordless verify failed")

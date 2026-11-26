@@ -40,7 +40,13 @@
 //     not "principal" but "account".
 package handlers
 
-import "github.com/labstack/echo/v4"
+import (
+	"errors"
+	"net/http"
+
+	"github.com/engineersmind/emc-auth-server/internal/auth"
+	"github.com/labstack/echo/v4"
+)
 
 // APIError is the body of every failed response.
 type APIError struct {
@@ -149,6 +155,16 @@ var errorMessages = map[string]string{
 	"mfa_switch_off_service_token": "Turning two-factor authentication off needs a signed-in administrator. Service and API-key tokens can only turn it on.",
 	"mfa_switch_off_stale_session": "To turn two-factor authentication off, sign in again with two-factor authentication and retry within 10 minutes.",
 
+	// Application MFA gate cannot run a due challenge (#193).
+	"app_mfa_unavailable": "This application requires two-factor authentication, which isn't available on this server right now. Try again later or contact the application's administrator.",
+
+	// Application MFA role rules (#195).
+	"mfa_role_rules_inactive":              "Role rules can only be set while two-factor authentication is on for this application and its mode isn't disabled. Turn it on first, then add the rules.",
+	"mfa_role_rule_invalid_role":           "Every role in a two-factor rule must be one of this application's own roles. Check the role list and try again.",
+	"mfa_role_rules_too_many":              "That's more role rules than one application can have. Remove some roles and try again.",
+	"mfa_role_rules_passwordless_conflict": "Role rules can't be set while email is the only two-factor method and email-code sign-in is on, or those users could not sign in. Allow another method or turn off email-code sign-in first.",
+	"role_in_mfa_rule":                     "This role is named by a two-factor authentication rule. Remove it from the application's role rules before deleting the role.",
+
 	// --- Passwords -------------------------------------------------------
 	"password_too_short":    "Choose a password of at least 8 characters.",
 	"password_incorrect":    "That isn't your current password.",
@@ -215,4 +231,16 @@ var errorMessages = map[string]string{
 	"import_job_missing": "We couldn't find that import. It may have finished and been cleared.",
 	"import_job_invalid": "That import reference isn't valid.",
 	"import_failed":      "We couldn't run that import. Try again — if it keeps happening, contact your administrator.",
+}
+
+// appMFAUnavailableResponse answers a sign-in the application MFA gate refused
+// because a second factor is due and this deployment cannot run the challenge
+// (#193). 503, not 401: the credentials were right, and telling the user they
+// were wrong would send them to reset a password that works. Reports false when
+// err is anything else, so callers fall through to their own mapping.
+func appMFAUnavailableResponse(c echo.Context, err error) (bool, error) {
+	if !errors.Is(err, auth.ErrAppMFAUnavailable) {
+		return false, nil
+	}
+	return true, fail(c, http.StatusServiceUnavailable, "app_mfa_unavailable")
 }

@@ -1342,7 +1342,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional) plus enrollment stats over the application's own user base.",
+                "description": "Returns the application's MFA mode (disabled|optional|required; no explicit policy = optional), master switch (mfa_enabled), federated_mfa (trust|enforce — whether social and passkey sign-ins go through the application MFA gate; default trust) plus enrollment stats over the application's own user base.",
                 "produces": [
                     "application/json"
                 ],
@@ -1392,7 +1392,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400.",
+                "description": "Sets the application's MFA master switch, mode and (optionally) allowed methods, in one transaction. mfa_enabled=false runs the application without MFA: nobody is challenged or forced to enrol and new enrolment is refused, but mode, allowed methods and every enrolled factor are kept and apply again when it is turned back on. Changes apply at each user's NEXT login; existing sessions are not re-checked. Turning MFA on is allowed for any authorised caller; turning it OFF is refused for service/API-key tokens (mfa_switch_off_service_token) and requires a session signed in with MFA in the last 10 minutes (mfa_switch_off_stale_session). mode: 'required' forces enrollment in an allowed method at the next login of every not-yet-enrolled user; 'disabled' rejects new enrollments (already-active enrollments still gate login — use mfa_enabled=false to stop that); 'optional' restores the default opt-in behaviour. mode may be omitted when only mfa_enabled and/or the magic-link fields are sent. allowed_methods omitted keeps the current set (default [\"totp\"]); allowed_methods sent without mode is a 400. federated_mfa: \"trust\" (default) lets social (Google, GitHub) and passkey sign-ins skip the application MFA gate; \"enforce\" runs the same gate as password login before tokens are issued (a user-verified passkey satisfies it). A real change of federated_mfa is audited as admin.mfa_federated_changed with old and new values.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1450,6 +1450,132 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/applications/{appID}/mfa/role-rules": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the roles whose holders must use MFA on this application, as if its mode were 'required'. Rules apply only while the application's MFA switch (mfa_enabled) is on and its mode is not 'disabled'. They cover password, magic-link and email-code sign-ins, and social / unverified-passkey sign-ins only when federated_mfa is 'enforce'.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "List application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Replace application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "The complete new list of role ids",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateMFARoleRulesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "mfa_role_rules_inactive | mfa_role_rules_passwordless_conflict",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -3055,6 +3181,12 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
                     }
                 }
             }
@@ -3214,6 +3346,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -4255,6 +4393,12 @@ const docTemplate = `{
                                 "type": "string"
                             }
                         }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
                     }
                 }
             }
@@ -4847,6 +4991,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -5590,7 +5740,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/oauth/exchange": {
             "post": {
-                "description": "Consumes the single-use login_code issued by the social login callback and returns the standard access + refresh token pair.",
+                "description": "Consumes the single-use login_code issued by the social login callback and returns the standard access + refresh token pair. When the application has federated_mfa=enforce and its MFA policy requires a second factor at this sign-in, the response is instead the same challenge password login returns: 200 {requires_otp, otp_session_token, methods, expires_in} (finish at POST /api/v1/auth/login/otp) or 403 {mfa_enrollment_required, enrollment_token, allowed_methods, expires_in} (finish via /api/v1/auth/login/mfa/*). Applications on federated_mfa=trust (the default) always receive the token pair.",
                 "consumes": [
                     "application/json"
                 ],
@@ -5649,6 +5799,12 @@ const docTemplate = `{
                             }
                         }
                     },
+                    "403": {
+                        "description": "federated_mfa=enforce and the user must enrol a second factor first",
+                        "schema": {
+                            "$ref": "#/definitions/auth.MFAEnrollmentChallenge"
+                        }
+                    },
                     "429": {
                         "description": "Rate limited; wait Retry-After seconds",
                         "schema": {
@@ -5656,6 +5812,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - a second factor is due and this server cannot run it; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -6195,7 +6357,7 @@ const docTemplate = `{
         },
         "/api/v1/auth/passkey/login/complete": {
             "post": {
-                "description": "Verifies the assertion and returns a token pair. The request body is the raw PublicKeyCredential from the browser.",
+                "description": "Verifies the assertion and returns a token pair. The request body is the raw PublicKeyCredential from the browser. A user-verified passkey satisfies application MFA. A passkey WITHOUT user verification on an application with federated_mfa=enforce goes through the application MFA gate and may return 200 {requires_otp, otp_session_token, methods, expires_in} or 403 {mfa_enrollment_required, enrollment_token, allowed_methods, expires_in} instead of tokens, finished at /api/v1/auth/login/otp or /api/v1/auth/login/mfa/*.",
                 "produces": [
                     "application/json"
                 ],
@@ -6256,6 +6418,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - a second factor is due and this server cannot run it; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -6772,6 +6940,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "503": {
+                        "description": "app_mfa_unavailable - the application requires a second factor this server cannot run; no tokens issued",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -8425,6 +8599,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "409": {
+                        "description": "role_in_mfa_rule - an application MFA role rule lists this role; remove the rule first",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -10277,6 +10457,132 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/tenants/{tid}/applications/{appID}/mfa/role-rules": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Returns the roles whose holders must use MFA on this application, as if its mode were 'required'. Rules apply only while the application's MFA switch (mfa_enabled) is on and its mode is not 'disabled'. They cover password, magic-link and email-code sign-ins, and social / unverified-passkey sign-ins only when federated_mfa is 'enforce'.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "List application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            },
+            "put": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Replaces the application's whole MFA role-rule list in one transaction. A user holding any listed role (as primary role or any additional grant, read from the database at each login) is treated as 'required': challenged if enrolled, forced to enrol in an allowed method otherwise, and unable to remove their last factor. Only the application's own live roles are accepted (400 mfa_role_rule_invalid_role). A non-empty list is refused while the MFA switch is off or the mode is 'disabled' (409 mfa_role_rules_inactive), and while email is the only allowed MFA method and passwordless email-code sign-in is on for the application (409 mfa_role_rules_passwordless_conflict: covered users could no longer sign in by email code); an empty list (clear) is always accepted. At most 100 roles (400 mfa_role_rules_too_many). A role listed by a rule cannot be deleted until the rule is removed. A real change is audited as admin.mfa_role_rules_set with the old and new lists. Applies at each user's NEXT login.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "admin-applications"
+                ],
+                "summary": "Replace application MFA role rules",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Application ID",
+                        "name": "appID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "description": "The complete new list of role ids",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handlers.UpdateMFARoleRulesRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.MFARoleRulesResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "invalid body | mfa_role_rule_invalid_role | mfa_role_rules_too_many",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Application not found",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "mfa_role_rules_inactive | mfa_role_rules_passwordless_conflict",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -12244,6 +12550,12 @@ const docTemplate = `{
                             "additionalProperties": {
                                 "type": "string"
                             }
+                        }
+                    },
+                    "409": {
+                        "description": "role_in_mfa_rule - an application MFA role rule lists this role; remove the rule first",
+                        "schema": {
+                            "$ref": "#/definitions/handlers.APIError"
                         }
                     }
                 }
@@ -16220,6 +16532,20 @@ const docTemplate = `{
                 },
                 "updated_at": {
                     "type": "string"
+                },
+                "variables": {
+                    "description": "Variables lists every variable a template of this type may reference, so\nthe editor shows what the server really renders. Read-only.",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/mailer.TemplateVariable"
+                    }
+                },
+                "warnings": {
+                    "description": "Warnings is set only on a save response: problems found in the template just\nstored (for example an unknown variable, which would make every send fall\nback to the built-in). The save itself still succeeded.",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             }
         },
@@ -16355,6 +16681,26 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.MFAEnrollmentChallenge": {
+            "type": "object",
+            "properties": {
+                "allowed_methods": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "enrollment_token": {
+                    "type": "string"
+                },
+                "expires_in": {
+                    "type": "integer"
+                },
+                "mfa_enrollment_required": {
+                    "type": "boolean"
+                }
+            }
+        },
         "auth.MFAMethodStatus": {
             "type": "object",
             "properties": {
@@ -16398,6 +16744,10 @@ const docTemplate = `{
                     "description": "Enrollment stats over the application's own isolated user base — for the\nowner dashboard. Pending = TOTP enrolled but never activated.",
                     "type": "integer"
                 },
+                "federated_mfa": {
+                    "description": "FederatedMFA is \"trust\" (social and passkey sign-ins skip the\napplication MFA gate) or \"enforce\" (they go through it; a user-verified\npasskey satisfies it). #194.",
+                    "type": "string"
+                },
                 "magic_link_enabled": {
                     "description": "Passwordless magic-link sign-in (opt-in; the redirect URL is the\napplication frontend that receives ?token=…).",
                     "type": "boolean"
@@ -16424,6 +16774,24 @@ const docTemplate = `{
                 }
             }
         },
+        "auth.MFARoleRule": {
+            "type": "object",
+            "properties": {
+                "created_at": {
+                    "type": "string"
+                },
+                "created_by": {
+                    "description": "CreatedBy is the users.id of the administrator who added the rule; empty\nfor a service token or an account since deleted.",
+                    "type": "string"
+                },
+                "role_id": {
+                    "type": "string"
+                },
+                "role_name": {
+                    "type": "string"
+                }
+            }
+        },
         "auth.MFAStatus": {
             "type": "object",
             "properties": {
@@ -16440,6 +16808,10 @@ const docTemplate = `{
                 "mfa_required": {
                     "description": "MFARequired is true when the caller is an administrator and MFA is\ntherefore mandatory for them.",
                     "type": "boolean"
+                },
+                "mfa_required_by": {
+                    "description": "MFARequiredBy is \"role:\u003cname\u003e\" when an application MFA role rule covers\nthe caller (#195): they hold that role, the switch is on and the mode is\nnot 'disabled', so MFA is required of them whatever Mode says and they\ncannot remove their last factor. Omitted otherwise.",
+                    "type": "string"
                 },
                 "mode": {
                     "description": "Mode is the caller's effective MFA mode: the application's mode for an\napplication user, \"required\" for an administrator, \"optional\" for a\ntenant-level user.",
@@ -17943,6 +18315,20 @@ const docTemplate = `{
                 }
             }
         },
+        "handlers.MFARoleRulesResponse": {
+            "type": "object",
+            "properties": {
+                "application_id": {
+                    "type": "string"
+                },
+                "rules": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/auth.MFARoleRule"
+                    }
+                }
+            }
+        },
         "handlers.MagicLinkRequest": {
             "type": "object",
             "properties": {
@@ -18653,6 +19039,10 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "federated_mfa": {
+                    "description": "FederatedMFA is \"trust\" (default: social and passkey sign-ins skip the\napplication MFA gate) or \"enforce\" (they go through it; a user-verified\npasskey satisfies it). Omitted or \"\" keeps the stored value. #194.",
+                    "type": "string"
+                },
                 "magic_link_enabled": {
                     "type": "boolean"
                 },
@@ -18711,6 +19101,17 @@ const docTemplate = `{
             "properties": {
                 "origins": {
                     "description": "e.g. [\"https://app.example.com\"]",
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "handlers.UpdateMFARoleRulesRequest": {
+            "type": "object",
+            "properties": {
+                "role_ids": {
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -19030,6 +19431,22 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "publicKey": {}
+            }
+        },
+        "mailer.TemplateVariable": {
+            "type": "object",
+            "properties": {
+                "availability": {
+                    "description": "Availability is VarAlways when every send fills it, or VarOptional when it\ncan be empty — in which case the template should wrap it in {{if}} so the\nsurrounding row disappears instead of rendering blank.",
+                    "type": "string"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "name": {
+                    "description": "Name is the reference as written in a template, e.g. \"{{.Link}}\".",
+                    "type": "string"
+                }
             }
         },
         "saml.SAMLConfig": {

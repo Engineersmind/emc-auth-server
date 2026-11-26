@@ -39,10 +39,9 @@ func newPWFixture(t *testing.T) *pwFixture {
 		t.Fatalf("clear passwordless policies: %v", err)
 	}
 	policy := auth.NewPasswordlessPolicyService(f.pool, testhelper.TestLogger()).
-		WithMFAConfig(func(ctx context.Context, appRowID int64) (string, []string, error) {
-			cfg, err := f.totpSvc.GetAppMFAConfig(ctx, appRowID)
-			return cfg.Mode, cfg.Methods, err
-		})
+		// The same reader production wires (routes.go): active MFA role rules
+		// count as 'required' for the passwordless-conflict check (#195).
+		WithMFAConfig(f.totpSvc.EffectiveAppMFAModeForConflict)
 	f.authSvc.WithPasswordless(policy, pwKey, nil)
 	return &pwFixture{mfaFixture: f, policy: policy, rc: testhelper.NewTestRedis(t)}
 }
@@ -740,6 +739,70 @@ func TestPasswordlessPolicy_MFAConflict(t *testing.T) {
 		auth.PasswordlessWriteInput{Row: auth.PasswordlessPolicyRow{EmailOTPEnabled: ref(true)}})
 	if !errors.Is(err, auth.ErrPasswordlessMFAConflict) {
 		t.Errorf("enable codes with required email-only MFA = %v, want ErrPasswordlessMFAConflict", err)
+	}
+}
+
+// Role rules make covered users 'required' (#195), so the email-only conflict
+// applies to an 'optional' application with rules exactly as to a 'required'
+// one — from all three directions: adding rules, turning email codes on, and
+// narrowing the allowed methods to email only (PR #246 review).
+func TestPasswordlessPolicy_MFARoleRulesConflict(t *testing.T) {
+	f := newPWFixture(t)
+	_, appID := f.createApp(t, "pw-rr-conflict")
+	f.totpSvc.WithEmailCodeCheck(func(ctx context.Context, tenantID, appRowID int64) bool {
+		return f.policy.Resolve(ctx, tenantID, &appRowID).EmailOTPEnabled
+	})
+	role := f.appRole(t, &appID, "pw-rr")
+	sc := auth.PasswordlessScope{TenantID: &f.tenantID, ApplicationID: &appID}
+	setCodes := func(on bool) error {
+		version := 0
+		if v, err := f.policy.View(f.ctx, sc); err == nil && v.Row != nil {
+			version = v.Row.Version
+		}
+		_, err := f.policy.Put(f.ctx, sc, auth.PasswordlessWriteInput{
+			Row: auth.PasswordlessPolicyRow{EmailOTPEnabled: ref(on)}, Version: version,
+		})
+		return err
+	}
+
+	// Optional + email only + codes on, no rules: allowed (nobody is required).
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional, []string{auth.MFAMethodEmail}, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy(optional, email): %v", err)
+	}
+	if err := setCodes(true); err != nil {
+		t.Fatalf("enable codes without rules: %v", err)
+	}
+
+	// 1. Adding a rule is refused; clearing stays allowed.
+	if _, err := f.totpSvc.SetAppMFARoleRules(f.ctx, f.tenantID, appID, []int64{role}, nil); !errors.Is(err, auth.ErrMFARoleRulesPasswordlessConflict) {
+		t.Fatalf("add rule with codes on and email-only MFA = %v, want ErrMFARoleRulesPasswordlessConflict", err)
+	}
+	if rules, _ := f.totpSvc.ListAppMFARoleRules(f.ctx, f.tenantID, appID); len(rules) != 0 {
+		t.Fatalf("refused write left rules behind: %+v", rules)
+	}
+	f.setRules(t, appID)
+
+	// 2. With a rule in place, turning email codes on is refused.
+	if err := setCodes(false); err != nil {
+		t.Fatalf("disable codes: %v", err)
+	}
+	f.setRules(t, appID, role)
+	if err := setCodes(true); !errors.Is(err, auth.ErrPasswordlessMFAConflict) {
+		t.Errorf("enable codes with role rules and email-only MFA = %v, want ErrPasswordlessMFAConflict", err)
+	}
+
+	// 3. With a rule and codes on, narrowing methods to email only is refused.
+	f.setRules(t, appID)
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional,
+		[]string{auth.MFAMethodTOTP, auth.MFAMethodEmail}, nil); err != nil {
+		t.Fatalf("SetAppMFAPolicy(optional, totp+email): %v", err)
+	}
+	if err := setCodes(true); err != nil {
+		t.Fatalf("enable codes with TOTP allowed: %v", err)
+	}
+	f.setRules(t, appID, role)
+	if err := f.totpSvc.SetAppMFAPolicy(f.ctx, f.tenantID, appID, auth.MFAModeOptional, []string{auth.MFAMethodEmail}, nil); !errors.Is(err, auth.ErrPasswordlessMFAConflict) {
+		t.Errorf("narrow to email-only with role rules and codes on = %v, want ErrPasswordlessMFAConflict", err)
 	}
 }
 
